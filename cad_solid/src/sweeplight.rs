@@ -50,7 +50,11 @@ pub enum PathKind {
     /// Corners are filleted at `fillet` (clamped to what the adjacent segments allow — md B6),
     /// the path is re-centred on its plan centroid (md B9), and a closed path is re-oriented
     /// CLOCKWISE so the profile's +u faces outward.
-    Custom { pts: Vec<glam::Vec2>, closed: bool, fillet: f32 },
+    Custom {
+        pts: Vec<glam::Vec2>,
+        closed: bool,
+        fillet: f32,
+    },
 }
 
 /// Which face carries the lens.
@@ -75,7 +79,12 @@ impl ProfileKind {
             ProfileKind::Blade => "Blade",
         }
     }
-    pub const ALL: [ProfileKind; 4] = [ProfileKind::RingInner, ProfileKind::Downlight, ProfileKind::Round, ProfileKind::Blade];
+    pub const ALL: [ProfileKind; 4] = [
+        ProfileKind::RingInner,
+        ProfileKind::Downlight,
+        ProfileKind::Round,
+        ProfileKind::Blade,
+    ];
 }
 
 /// The three controls (md C9) plus the profile dimensions.
@@ -200,7 +209,11 @@ fn make_profile(kind: ProfileKind, width: f32, height: f32, lens: f32) -> Profil
             }
             for k in 0..n {
                 let mid_v = (pts[k][1] + pts[(k + 1) % n][1]) * 0.5;
-                mats.push(if mid_v < -1.55 * r { Material::Lens } else { Material::Body });
+                mats.push(if mid_v < -1.55 * r {
+                    Material::Lens
+                } else {
+                    Material::Body
+                });
             }
             Profile { pts, mats }
         }
@@ -258,7 +271,12 @@ fn catmull_rom(ctrl: &[Vec3], samples: usize) -> Vec<Vec3> {
     let get = |i: i64| ctrl[i.clamp(0, n as i64 - 1) as usize];
     let mut out = Vec::new();
     for seg in 0..n - 1 {
-        let (p0, p1, p2, p3) = (get(seg as i64 - 1), get(seg as i64), get(seg as i64 + 1), get(seg as i64 + 2));
+        let (p0, p1, p2, p3) = (
+            get(seg as i64 - 1),
+            get(seg as i64),
+            get(seg as i64 + 1),
+            get(seg as i64 + 2),
+        );
         let a = 0.5f32;
         let t01 = p0.distance(p1).max(1e-6).powf(a);
         let t12 = p1.distance(p2).max(1e-6).powf(a);
@@ -314,7 +332,11 @@ fn sample_path(inp: &SweepInput) -> (Vec<Vec3>, bool) {
                 let arc_n = ((std::f32::consts::FRAC_PI_2 * f / STEP).round() as usize).max(4);
                 for k in 0..=arc_n {
                     let a = (a0 + 90.0 * k as f32 / arc_n as f32).to_radians();
-                    pts.push(Vec3::new(centre.x + f * a.cos(), centre.y + f * a.sin(), -inp.drop));
+                    pts.push(Vec3::new(
+                        centre.x + f * a.cos(),
+                        centre.y + f * a.sin(),
+                        -inp.drop,
+                    ));
                 }
                 // The straight to the next corner start falls out of the resample.
             }
@@ -333,7 +355,11 @@ fn sample_path(inp: &SweepInput) -> (Vec<Vec3>, bool) {
             ];
             (catmull_rom(&ctrl, 24), false)
         }
-        PathKind::Custom { pts, closed, fillet } => {
+        PathKind::Custom {
+            pts,
+            closed,
+            fillet,
+        } => {
             // Clean: drop consecutive near-duplicates and a duplicated closing point.
             let mut p: Vec<glam::Vec2> = Vec::with_capacity(pts.len());
             for &q in &pts {
@@ -345,7 +371,12 @@ fn sample_path(inp: &SweepInput) -> (Vec<Vec3>, bool) {
                 p.pop();
             }
             // Re-centre on the plan centroid (md B9) so the fixture is a local object.
-            let c = p.iter().copied().reduce(|a, b| a + b).unwrap_or(glam::Vec2::ZERO) / p.len().max(1) as f32;
+            let c = p
+                .iter()
+                .copied()
+                .reduce(|a, b| a + b)
+                .unwrap_or(glam::Vec2::ZERO)
+                / p.len().max(1) as f32;
             for q in &mut p {
                 *q -= c;
             }
@@ -372,7 +403,11 @@ fn sample_path(inp: &SweepInput) -> (Vec<Vec3>, bool) {
                 .iter()
                 .enumerate()
                 .map(|(i, q)| {
-                    let t = if closed || total < 1e-6 { 0.0 } else { cum[i] / total };
+                    let t = if closed || total < 1e-6 {
+                        0.0
+                    } else {
+                        cum[i] / total
+                    };
                     Vec3::new(q.x, q.y, -(inp.drop * (1.0 - t) + inp.drop_end * t))
                 })
                 .collect();
@@ -407,7 +442,9 @@ fn fillet_polyline(p: &[glam::Vec2], closed: bool, radius: f32) -> Vec<glam::Vec
         }
         let half = (std::f32::consts::PI - turn) * 0.5; // interior half-angle
         let mut t = radius / half.tan().max(1e-4);
-        t = t.min(0.48 * cur.distance(prev)).min(0.48 * cur.distance(next));
+        t = t
+            .min(0.48 * cur.distance(prev))
+            .min(0.48 * cur.distance(next));
         let r_eff = t * half.tan();
         let p0 = cur - a * t;
         let p1 = cur + b * t;
@@ -482,7 +519,9 @@ fn make_frames(p: &[Vec3], closed: bool) -> (Frames, f32) {
             p[i.clamp(0, n as i64 - 1) as usize]
         }
     };
-    let mut t: Vec<Vec3> = (0..n as i64).map(|i| (at(i + 1) - at(i - 1)).normalize_or_zero()).collect();
+    let mut t: Vec<Vec3> = (0..n as i64)
+        .map(|i| (at(i + 1) - at(i - 1)).normalize_or_zero())
+        .collect();
     for i in 0..n {
         if t[i].length_squared() < 0.5 {
             t[i] = Vec3::X; // degenerate guard
@@ -508,7 +547,9 @@ fn make_frames(p: &[Vec3], closed: bool) -> (Frames, f32) {
         ni = (ni - t[i + 1] * ni.dot(t[i + 1])).normalize_or_zero();
         nrm[i + 1] = ni;
     }
-    let mut b: Vec<Vec3> = (0..n).map(|i| t[i].cross(nrm[i]).normalize_or_zero()).collect();
+    let mut b: Vec<Vec3> = (0..n)
+        .map(|i| t[i].cross(nrm[i]).normalize_or_zero())
+        .collect();
 
     // Twist closure (closed): distribute the residual roll linearly (md C5).
     if closed {
@@ -571,7 +612,16 @@ fn min_curve_radius(p: &[Vec3], closed: bool) -> f32 {
 
 // ============================ mesh emit ============================
 
-fn push_tri(mesh: &mut SolidMesh, part: u32, a: Vec3, b: Vec3, c: Vec3, na: Vec3, nb: Vec3, nc: Vec3) {
+fn push_tri(
+    mesh: &mut SolidMesh,
+    part: u32,
+    a: Vec3,
+    b: Vec3,
+    c: Vec3,
+    na: Vec3,
+    nb: Vec3,
+    nc: Vec3,
+) {
     mesh.positions.push(a.into());
     mesh.positions.push(b.into());
     mesh.positions.push(c.into());
@@ -707,7 +757,9 @@ pub fn build(inp: &SweepInput) -> Result<(SweepMetrics, SolidMesh, Vec<Material>
     let (frames, worst_tz) = make_frames(&pts, closed);
     let mut warnings = Vec::new();
     if worst_tz > 0.90 {
-        warnings.push(format!("path reaches |T·Z| = {worst_tz:.2} — near-vertical; the profile may bank there"));
+        warnings.push(format!(
+            "path reaches |T·Z| = {worst_tz:.2} — near-vertical; the profile may bank there"
+        ));
     }
 
     let mut mesh = SolidMesh::default();
@@ -754,7 +806,11 @@ pub fn build(inp: &SweepInput) -> Result<(SweepMetrics, SolidMesh, Vec<Material>
             let nrm = if flip { -frames.t[i] } else { frames.t[i] };
             for j in 0..np {
                 let a = world(i, profile.pts[j][0], profile.pts[j][1]);
-                let b = world(i, profile.pts[(j + 1) % np][0], profile.pts[(j + 1) % np][1]);
+                let b = world(
+                    i,
+                    profile.pts[(j + 1) % np][0],
+                    profile.pts[(j + 1) % np][1],
+                );
                 if flip {
                     push_tri(&mut mesh, PART_BODY, c, b, a, nrm, nrm, nrm);
                 } else {
@@ -781,7 +837,15 @@ pub fn build(inp: &SweepInput) -> Result<(SweepMetrics, SolidMesh, Vec<Material>
     };
     for &i in &stations {
         let p = pts[i];
-        push_cylinder(&mut mesh, PART_ROD, p.x, p.y, ROD_R, p.z + ROD_SINK - inp.height.min(0.05), 0.0);
+        push_cylinder(
+            &mut mesh,
+            PART_ROD,
+            p.x,
+            p.y,
+            ROD_R,
+            p.z + ROD_SINK - inp.height.min(0.05),
+            0.0,
+        );
         push_cylinder(&mut mesh, PART_ROD, p.x, p.y, ROSE_R, -ROSE_H, 0.0);
     }
     let droppers = stations.len();
@@ -793,7 +857,9 @@ pub fn build(inp: &SweepInput) -> Result<(SweepMetrics, SolidMesh, Vec<Material>
         0.0
     };
     if achieved > 2.0 {
-        warnings.push(format!("hanger spacing {achieved:.2} m exceeds 2.0 m — the profile may sag"));
+        warnings.push(format!(
+            "hanger spacing {achieved:.2} m exceeds 2.0 m — the profile may sag"
+        ));
     }
     if total_len > 60.0 {
         warnings.push(format!(
@@ -811,7 +877,11 @@ pub fn build(inp: &SweepInput) -> Result<(SweepMetrics, SolidMesh, Vec<Material>
         total_drop,
         warnings,
     };
-    Ok((metrics, mesh, vec![Material::Body, Material::Lens, Material::Rod]))
+    Ok((
+        metrics,
+        mesh,
+        vec![Material::Body, Material::Lens, Material::Rod],
+    ))
 }
 
 // ============================ tests ============================
@@ -821,7 +891,10 @@ mod tests {
     use super::*;
 
     fn ring(radius: f32) -> SweepInput {
-        SweepInput { path: PathKind::Ring { radius }, ..Default::default() }
+        SweepInput {
+            path: PathKind::Ring { radius },
+            ..Default::default()
+        }
     }
 
     /// The md's key visual property: on the reference ring, the LENS faces the centre.
@@ -845,7 +918,10 @@ mod tests {
                 }
             }
         }
-        assert!(lens_r.1 < 0.4, "lens sits inboard of the path radius: {lens_r:?}");
+        assert!(
+            lens_r.1 < 0.4,
+            "lens sits inboard of the path radius: {lens_r:?}"
+        );
         assert!(body_max_r > 0.4, "body reaches outboard of the path radius");
     }
 
@@ -856,7 +932,10 @@ mod tests {
         assert!(m.droppers >= 3, "{} droppers", m.droppers);
         assert!((m.achieved_spacing - m.path_len / m.droppers as f32).abs() < 1e-4);
         // The md's reference: a 5.03 m ring at 1.0 m spacing hangs on 5.
-        let big = SweepInput { path: PathKind::Ring { radius: 0.8 }, ..Default::default() };
+        let big = SweepInput {
+            path: PathKind::Ring { radius: 0.8 },
+            ..Default::default()
+        };
         let (m2, _, _) = build(&big).unwrap();
         assert_eq!(m2.droppers, 5, "5.03 m ring at 1.0 m spacing → 5 droppers");
     }
@@ -865,7 +944,10 @@ mod tests {
     #[test]
     fn open_scurve_caps_and_end_pins() {
         let inp = SweepInput {
-            path: PathKind::SCurve { length: 4.0, width: 0.5 },
+            path: PathKind::SCurve {
+                length: 4.0,
+                width: 0.5,
+            },
             drop_end: 1.0,
             ..Default::default()
         };
@@ -880,7 +962,10 @@ mod tests {
                 }
             }
         }
-        assert!((top - 0.0).abs() < 1e-5, "suspension reaches the ceiling: {top}");
+        assert!(
+            (top - 0.0).abs() < 1e-5,
+            "suspension reaches the ceiling: {top}"
+        );
         // Descends: lowest fixture point near the far-end drop.
         let (mn, _) = mesh.bounds().unwrap();
         assert!(mn[2] < -1.0, "descends to the far drop: {}", mn[2]);
@@ -897,7 +982,13 @@ mod tests {
     /// Arc-length resample is uniform (md C4) — max deviation of step lengths is tiny.
     #[test]
     fn resample_is_uniform() {
-        let inp = SweepInput { path: PathKind::SCurve { length: 3.0, width: 0.4 }, ..Default::default() };
+        let inp = SweepInput {
+            path: PathKind::SCurve {
+                length: 3.0,
+                width: 0.4,
+            },
+            ..Default::default()
+        };
         let (raw, closed) = sample_path(&inp);
         let (pts, total) = resample(&raw, closed);
         let step = total / (pts.len() - 1) as f32;
@@ -910,7 +1001,13 @@ mod tests {
     /// RMF frames never flip: consecutive normals stay on the same side (md C5).
     #[test]
     fn frames_do_not_flip_on_the_s_curve() {
-        let inp = SweepInput { path: PathKind::SCurve { length: 4.0, width: 0.8 }, ..Default::default() };
+        let inp = SweepInput {
+            path: PathKind::SCurve {
+                length: 4.0,
+                width: 0.8,
+            },
+            ..Default::default()
+        };
         let (raw, closed) = sample_path(&inp);
         let (pts, _) = resample(&raw, closed);
         let (f, _) = make_frames(&pts, closed);
@@ -926,25 +1023,44 @@ mod tests {
     fn custom_polyline_corner_is_filleted() {
         let inp = SweepInput {
             path: PathKind::Custom {
-                pts: vec![glam::Vec2::new(0.0, 0.0), glam::Vec2::new(2.0, 0.0), glam::Vec2::new(2.0, 1.5)],
+                pts: vec![
+                    glam::Vec2::new(0.0, 0.0),
+                    glam::Vec2::new(2.0, 0.0),
+                    glam::Vec2::new(2.0, 1.5),
+                ],
                 closed: false,
                 fillet: 0.25,
             },
             ..Default::default()
         };
         let (m, _, _) = build(&inp).expect("filleted corner sweeps");
-        assert!(m.min_radius > 0.15, "corner rounded near the fillet radius: {}", m.min_radius);
-        assert!(m.path_len > 3.0 && m.path_len < 3.6, "≈ leg lengths minus the corner cut: {}", m.path_len);
+        assert!(
+            m.min_radius > 0.15,
+            "corner rounded near the fillet radius: {}",
+            m.min_radius
+        );
+        assert!(
+            m.path_len > 3.0 && m.path_len < 3.6,
+            "≈ leg lengths minus the corner cut: {}",
+            m.path_len
+        );
         // The same polyline with NO fillet folds through itself and must be rejected.
         let sharp = SweepInput {
             path: PathKind::Custom {
-                pts: vec![glam::Vec2::new(0.0, 0.0), glam::Vec2::new(2.0, 0.0), glam::Vec2::new(2.0, 1.5)],
+                pts: vec![
+                    glam::Vec2::new(0.0, 0.0),
+                    glam::Vec2::new(2.0, 0.0),
+                    glam::Vec2::new(2.0, 1.5),
+                ],
                 closed: false,
                 fillet: 0.0,
             },
             ..Default::default()
         };
-        assert!(build(&sharp).is_err(), "an unfilleted right angle folds the profile");
+        assert!(
+            build(&sharp).is_err(),
+            "an unfilleted right angle folds the profile"
+        );
     }
 
     /// A CLOSED user loop drawn counter-clockwise is re-oriented so the lens still faces inward,
@@ -959,14 +1075,21 @@ mod tests {
             glam::Vec2::new(4.0, 6.0),
         ];
         let inp = SweepInput {
-            path: PathKind::Custom { pts: sq, closed: true, fillet: 0.3 },
+            path: PathKind::Custom {
+                pts: sq,
+                closed: true,
+                fillet: 0.3,
+            },
             ..Default::default()
         };
         let (m, mesh, _) = build(&inp).expect("closed custom loop builds");
         assert!(m.droppers >= 3);
         let (mn, mx) = mesh.bounds().unwrap();
         // Re-centred: the fixture straddles the origin, not (5, 5).
-        assert!(mn[0] < 0.0 && mx[0] > 0.0 && mn[1] < 0.0 && mx[1] > 0.0, "recentred: {mn:?} {mx:?}");
+        assert!(
+            mn[0] < 0.0 && mx[0] > 0.0 && mn[1] < 0.0 && mx[1] > 0.0,
+            "recentred: {mn:?} {mx:?}"
+        );
         // Lens inboard (same radial check as the ring — orientation was fixed to CW).
         let mut lens_max = 0.0f32;
         let mut body_max = 0.0f32;
@@ -981,18 +1104,30 @@ mod tests {
                 }
             }
         }
-        assert!(lens_max < body_max, "lens sits inboard of the body: {lens_max} vs {body_max}");
+        assert!(
+            lens_max < body_max,
+            "lens sits inboard of the body: {lens_max} vs {body_max}"
+        );
     }
 
     /// Racetrack: closed, valid, and its fillets respect the profile reach.
     #[test]
     fn racetrack_builds_closed() {
         let inp = SweepInput {
-            path: PathKind::Racetrack { w: 1.8, d: 0.9, fillet: 0.25 },
+            path: PathKind::Racetrack {
+                w: 1.8,
+                d: 0.9,
+                fillet: 0.25,
+            },
             ..Default::default()
         };
         let (m, _, _) = build(&inp).unwrap();
-        assert!(m.path_len > 4.0 && m.min_radius > 0.2, "len {} minR {}", m.path_len, m.min_radius);
+        assert!(
+            m.path_len > 4.0 && m.min_radius > 0.2,
+            "len {} minR {}",
+            m.path_len,
+            m.min_radius
+        );
         assert!(m.droppers >= 3);
     }
 }
@@ -1007,7 +1142,10 @@ mod emitter_tests {
     use super::*;
 
     fn ring(r: f32) -> SweepInput {
-        SweepInput { path: PathKind::Ring { radius: r }, ..SweepInput::default() }
+        SweepInput {
+            path: PathKind::Ring { radius: r },
+            ..SweepInput::default()
+        }
     }
 
     /// THE SPECIFICATION. Flux is `length × W/m × lm/W`, and the emitters must carry all of it —
@@ -1042,7 +1180,10 @@ mod emitter_tests {
             (coarse - fine).abs() / fine < 0.02,
             "coarse {coarse:.0} lm vs fine {fine:.0} lm — the sampling is changing the answer",
         );
-        assert!(emitters(&inp, 0.05).len() > emitters(&inp, 0.5).len(), "…but the counts differ");
+        assert!(
+            emitters(&inp, 0.05).len() > emitters(&inp, 0.5).len(),
+            "…but the counts differ"
+        );
     }
 
     /// Longer run, more light — at a fixed W/m that is the whole meaning of the unit.
@@ -1050,7 +1191,10 @@ mod emitter_tests {
     fn a_longer_run_emits_proportionally_more() {
         let small: f64 = emitters(&ring(1.0), 0.2).iter().map(|e| e.lumens).sum();
         let big: f64 = emitters(&ring(2.0), 0.2).iter().map(|e| e.lumens).sum();
-        assert!((big / small - 2.0).abs() < 0.05, "double the radius should double the flux");
+        assert!(
+            (big / small - 2.0).abs() < 0.05,
+            "double the radius should double the flux"
+        );
     }
 
     /// A fitting specified with no output produces NO emitters — not a set of zero-flux lights,
@@ -1094,7 +1238,10 @@ mod emitter_tests {
         assert!(em.len() > 20);
         for e in &em {
             let d = (e.pos[0] * e.pos[0] + e.pos[1] * e.pos[1]).sqrt();
-            assert!((d - r).abs() < 0.05, "emitter {d:.3} m from centre, ring is {r}");
+            assert!(
+                (d - r).abs() < 0.05,
+                "emitter {d:.3} m from centre, ring is {r}"
+            );
         }
     }
 }

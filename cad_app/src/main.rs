@@ -1,46 +1,46 @@
 mod aci_picker;
 mod app;
+mod assets; // where bundled data lives at runtime — see the module docs
+mod calc; // command-line calculator + lazy user variables (pure, no UI deps)
 mod color; // colour management — sRGB decode/encode + the display view transform (AgX &c.)
 mod command;
 mod dbg_recorder;
 mod dock;
 mod door_mat; // what the parametric door is made of — one palette, preview + build read it
-mod env_map; // HDR image-based lighting — a real environment instead of the analytic sky
 mod env; // environment lighting — the analytic sky, its SH ambient, and the AO settings
-mod factory;   // 3D Factory — cad_solid wired into the app
+mod env_map; // HDR image-based lighting — a real environment instead of the analytic sky
+mod factory; // 3D Factory — cad_solid wired into the app
 mod gpu;
-mod assets; // where bundled data lives at runtime — see the module docs
 mod handles; // swappable door-handle library (assets/handles/handles.json)
 mod hatch_trace;
-mod light;
-mod isolux; // isolux lines — marching squares over a calculated field
 mod illuminaire; // Illuminaire — a library of fittings: a 2D block + a photometric file
+mod isolux; // isolux lines — marching squares over a calculated field
+mod layer_glyphs;
+mod light;
+mod light3d;
 mod light_report; // the SIMLUX calculation written out as a standalone HTML report
 mod light_store; // the last calculation, kept beside the drawing so closing the app does not lose it
-mod report; // report generation — page layout, PDF output, and the options that drive them
-mod light3d;
+mod matball; // CPU material-ball preview — the same BRDF and sky the viewport uses
 mod material_graph; // Materials Factory — node-based material authoring (compiles to renderer params)
-mod mesh_io;      // OBJ furniture import
+mod mesh_io; // OBJ furniture import
 mod mesh_preview; // CPU preview of a parametric build, shown before it is inserted
 mod param_editor;
-mod matball;   // CPU material-ball preview — the same BRDF and sky the viewport uses
 mod pathtrace; // in-app progressive path tracer — shared core + CPU backend
-mod proc_tex;  // Rust twin of the shader's procedural evaluation (path tracer + preview read it)
 mod pathtrace_gpu; // GPU backend: the same tracer in a GL 3.3 fragment shader
+mod proc_tex; // Rust twin of the shader's procedural evaluation (path tracer + preview read it)
 mod radiance_export; // offline Radiance render export (.rad geometry + gensky sky)
 #[cfg(test)]
 mod render_probe; // headless villa render → PNG, so a change to the LOOK can be judged by looking
+mod report; // report generation — page layout, PDF output, and the options that drive them
 #[cfg(test)]
 mod report_figs; // renders the Phase 2–4 report's figures from the code they document
 mod settings;
 mod simlux_io;
-mod solar;      // Radiance-based sun position for daylight rendering
+mod solar; // Radiance-based sun position for daylight rendering
 mod texture_set; // PBR texture-set folders: filename → map slot, and the loader that follows it
 mod theme;
-mod varreg;
-mod calc; // command-line calculator + lazy user variables (pure, no UI deps)
-mod layer_glyphs; // 2D glyph helpers shared by the canvas rails (dim/zoom rail icons)
-// wall feature logic now lives in the `cad_wall` crate (see ARCHITECTURE.md).
+mod varreg; // 2D glyph helpers shared by the canvas rails (dim/zoom rail icons)
+            // wall feature logic now lives in the `cad_wall` crate (see ARCHITECTURE.md).
 
 fn main() -> Result<(), eframe::Error> {
     // A CRASH MUST LEAVE SOMETHING BEHIND. A Windows GUI build has no console, so a panic prints
@@ -52,7 +52,9 @@ fn main() -> Result<(), eframe::Error> {
     // usually the informative one and overwriting loses the first.
     std::panic::set_hook(Box::new(|info| {
         let bt = std::backtrace::Backtrace::force_capture();
-        let where_ = info.location().map_or("?".to_string(), |l| format!("{}:{}", l.file(), l.line()));
+        let where_ = info
+            .location()
+            .map_or("?".to_string(), |l| format!("{}:{}", l.file(), l.line()));
         let msg = info
             .payload()
             .downcast_ref::<&str>()
@@ -65,7 +67,10 @@ fn main() -> Result<(), eframe::Error> {
             option_env!("SIMLUX_BUILD").unwrap_or("unknown"),
         );
         eprintln!("{text}");
-        if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        if let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
@@ -98,14 +103,13 @@ fn main() -> Result<(), eframe::Error> {
         panic!("deliberate test panic — SIMLUX_TEST_PANIC was set");
     }
 
-
     // BEFORE ANYTHING CAN RUN A BOOLEAN — the generators, an autoloaded fixture, a reopened
     // project. csgrs keeps its tolerance in a `OnceLock` whose first READER initialises it to the
     // default, so this has to be the earliest thing that touches the crate or it silently no-ops.
     // At the default, cuts on work smaller than about 300 mm come back with the wrong volume and
     // no error of any kind. See `cad_solid::BOOLEAN_TOLERANCE` for the measurements.
     match cad_solid::init_boolean_tolerance() {
-        Ok(t)  => eprintln!("[simlux] boolean tolerance {t:e}"),
+        Ok(t) => eprintln!("[simlux] boolean tolerance {t:e}"),
         Err(e) => eprintln!("[simlux] WARNING: {e}"),
     }
 
@@ -208,8 +212,14 @@ mod the_window_names_its_build {
         assert!(t.starts_with("SIMLUX"), "the app lost its name: {t:?}");
         let n = option_env!("SIMLUX_BUILD_NO").unwrap_or("?");
         let c = option_env!("SIMLUX_BUILD").unwrap_or("dev");
-        assert!(t.contains(n), "the title does not name the build number ({n}): {t:?}");
-        assert!(t.contains(c), "the title does not name the commit ({c}): {t:?}");
+        assert!(
+            t.contains(n),
+            "the title does not name the build number ({n}): {t:?}"
+        );
+        assert!(
+            t.contains(c),
+            "the title does not name the commit ({c}): {t:?}"
+        );
     }
 
     /// AND `build.rs` ACTUALLY STAMPED IT. A title that faithfully prints "?" and "dev" would pass

@@ -21,28 +21,71 @@ use cad_kernel::{Document, Geom};
 
 /// DXF entity names RUST_CAD's `read_dxf` currently turns into geometry.
 /// (INSERT → BlockRef, with the BLOCKS section parsed into the block table.)
-const SUPPORTED: &[&str] = &["LINE", "CIRCLE", "ARC", "ELLIPSE", "POINT", "LWPOLYLINE", "INSERT"];
+const SUPPORTED: &[&str] = &[
+    "LINE",
+    "CIRCLE",
+    "ARC",
+    "ELLIPSE",
+    "POINT",
+    "LWPOLYLINE",
+    "INSERT",
+];
 
 /// Common DXF entity names we tally when scanning a file (everything not in
 /// SUPPORTED is reported as DROPPED, so we can see what coverage is missing).
 const ENTITY_VOCAB: &[&str] = &[
-    "LINE", "CIRCLE", "ARC", "ELLIPSE", "POINT", "LWPOLYLINE", "POLYLINE",
-    "SPLINE", "INSERT", "TEXT", "MTEXT", "ATTRIB", "ATTDEF", "DIMENSION",
-    "HATCH", "SOLID", "3DSOLID", "3DFACE", "LEADER", "MLEADER", "MLINE",
-    "RAY", "XLINE", "WIPEOUT", "IMAGE", "TABLE", "TOLERANCE", "VIEWPORT",
-    "REGION", "BODY", "SHAPE", "TRACE", "ACAD_PROXY_ENTITY",
+    "LINE",
+    "CIRCLE",
+    "ARC",
+    "ELLIPSE",
+    "POINT",
+    "LWPOLYLINE",
+    "POLYLINE",
+    "SPLINE",
+    "INSERT",
+    "TEXT",
+    "MTEXT",
+    "ATTRIB",
+    "ATTDEF",
+    "DIMENSION",
+    "HATCH",
+    "SOLID",
+    "3DSOLID",
+    "3DFACE",
+    "LEADER",
+    "MLEADER",
+    "MLINE",
+    "RAY",
+    "XLINE",
+    "WIPEOUT",
+    "IMAGE",
+    "TABLE",
+    "TOLERANCE",
+    "VIEWPORT",
+    "REGION",
+    "BODY",
+    "SHAPE",
+    "TRACE",
+    "ACAD_PROXY_ENTITY",
 ];
 
 fn geom_kind(g: &Geom) -> &'static str {
     match g {
-        Geom::Line(_) => "Line",          Geom::Circle(_) => "Circle",
-        Geom::Arc(_) => "Arc",            Geom::Ellipse(_) => "Ellipse",
-        Geom::EllipseArc(_) => "EllipseArc", Geom::Point(_) => "Point",
-        Geom::Polyline(_) => "Polyline",  Geom::Hatch(_) => "Hatch",
-        Geom::Spline(_) => "Spline",      Geom::Wall(_) => "Wall",
-        Geom::Text(_) => "Text",          Geom::Dimension(_) => "Dimension",
+        Geom::Line(_) => "Line",
+        Geom::Circle(_) => "Circle",
+        Geom::Arc(_) => "Arc",
+        Geom::Ellipse(_) => "Ellipse",
+        Geom::EllipseArc(_) => "EllipseArc",
+        Geom::Point(_) => "Point",
+        Geom::Polyline(_) => "Polyline",
+        Geom::Hatch(_) => "Hatch",
+        Geom::Spline(_) => "Spline",
+        Geom::Wall(_) => "Wall",
+        Geom::Text(_) => "Text",
+        Geom::Dimension(_) => "Dimension",
         Geom::BlockRef(_) => "BlockRef",
-        Geom::Leader(_) => "Leader",      Geom::AttrDef(_) => "AttrDef",
+        Geom::Leader(_) => "Leader",
+        Geom::AttrDef(_) => "AttrDef",
         Geom::CenterMark(_) => "CenterMark",
         Geom::Xline(_) => "Xline",
         Geom::Ray(_) => "Ray",
@@ -73,7 +116,7 @@ fn tally_entities(dxf: &str) -> Vec<(String, usize)> {
             let v = value.to_ascii_uppercase();
             match v.as_str() {
                 "SECTION" => expect_section_name = true,
-                "ENDSEC"  => section.clear(),
+                "ENDSEC" => section.clear(),
                 _ if section == "ENTITIES" && ENTITY_VOCAB.contains(&v.as_str()) => {
                     *counts.entry(v).or_insert(0) += 1;
                 }
@@ -91,7 +134,9 @@ fn tally_entities(dxf: &str) -> Vec<(String, usize)> {
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1).cloned())
 }
 
 fn main() {
@@ -112,19 +157,31 @@ fn main() {
         let Some(tmpl) = converter else {
             eprintln!("\n! '{input}' is DWG — RUST_CAD has no native DWG reader.");
             eprintln!("  Provide a converter, e.g.:");
-            eprintln!("    --converter \"dwgconv {{in}} {{out}}\"   (the ACadSharp NativeAOT tool)");
+            eprintln!(
+                "    --converter \"dwgconv {{in}} {{out}}\"   (the ACadSharp NativeAOT tool)"
+            );
             eprintln!("    --converter \"ODAFileConverter ...\"     (ODA File Converter)");
             std::process::exit(2);
         };
         let out = std::env::temp_dir().join("rustcad_import_sandbox.dxf");
-        let cmd = tmpl.replace("{in}", &shell_quote(&input))
-                      .replace("{out}", &shell_quote(&out.to_string_lossy()));
+        let cmd = tmpl
+            .replace("{in}", &shell_quote(&input))
+            .replace("{out}", &shell_quote(&out.to_string_lossy()));
         println!("converting via: {cmd}");
-        let status = std::process::Command::new("sh").arg("-c").arg(&cmd).status();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .status();
         match status {
             Ok(s) if s.success() && out.exists() => out.to_string_lossy().to_string(),
-            Ok(s) => { eprintln!("! converter exited {s} (no DXF produced)"); std::process::exit(3); }
-            Err(e) => { eprintln!("! could not run converter: {e}"); std::process::exit(3); }
+            Ok(s) => {
+                eprintln!("! converter exited {s} (no DXF produced)");
+                std::process::exit(3);
+            }
+            Err(e) => {
+                eprintln!("! could not run converter: {e}");
+                std::process::exit(3);
+            }
         }
     } else {
         input.clone()
@@ -133,7 +190,10 @@ fn main() {
     // ---- 2. read the DXF text -----------------------------------------
     let dxf = match std::fs::read_to_string(&dxf_path) {
         Ok(t) => t,
-        Err(e) => { eprintln!("! cannot read DXF '{dxf_path}': {e}"); std::process::exit(4); }
+        Err(e) => {
+            eprintln!("! cannot read DXF '{dxf_path}': {e}");
+            std::process::exit(4);
+        }
     };
     println!("dxf:   {dxf_path}  ({} KB)", dxf.len() / 1024);
 
@@ -143,15 +203,28 @@ fn main() {
     let mut dropped: Vec<(String, usize)> = Vec::new();
     for (name, n) in &present {
         let ok = SUPPORTED.contains(&name.as_str());
-        println!("  {:<14} {:>7}   {}", name, n, if ok { "✓ imported" } else { "✗ DROPPED (reader gap)" });
-        if !ok { dropped.push((name.clone(), *n)); }
+        println!(
+            "  {:<14} {:>7}   {}",
+            name,
+            n,
+            if ok {
+                "✓ imported"
+            } else {
+                "✗ DROPPED (reader gap)"
+            }
+        );
+        if !ok {
+            dropped.push((name.clone(), *n));
+        }
     }
-    if present.is_empty() { println!("  (none recognised — is this an ENTITIES-bearing DXF?)"); }
+    if present.is_empty() {
+        println!("  (none recognised — is this an ENTITIES-bearing DXF?)");
+    }
 
     // ---- 4. parse into the kernel Document ----------------------------
     match cad_io::dxf::read_dxf(&dxf) {
         Ok(doc) => report_doc(&doc, &out_rsm),
-        Err(e)  => eprintln!("\n! read_dxf failed: {e}"),
+        Err(e) => eprintln!("\n! read_dxf failed: {e}"),
     }
 
     // ---- 5. verdict ---------------------------------------------------
@@ -160,10 +233,20 @@ fn main() {
         println!("  all recognised entities are supported by the reader.");
     } else {
         let lost: usize = dropped.iter().map(|(_, n)| n).sum();
-        println!("  {} entit{} across {} type(s) were DROPPED:",
-                 lost, if lost == 1 { "y" } else { "ies" }, dropped.len());
-        println!("  {}", dropped.iter().map(|(n, c)| format!("{n}×{c}"))
-                 .collect::<Vec<_>>().join(", "));
+        println!(
+            "  {} entit{} across {} type(s) were DROPPED:",
+            lost,
+            if lost == 1 { "y" } else { "ies" },
+            dropped.len()
+        );
+        println!(
+            "  {}",
+            dropped
+                .iter()
+                .map(|(n, c)| format!("{n}×{c}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         println!("  → these are the cad_io DXF-reader gaps to close for real files.");
     }
 }
@@ -171,17 +254,33 @@ fn main() {
 fn report_doc(doc: &Document, out_rsm: &Option<String>) {
     println!("\n-- imported into Document --");
     let mut kinds: std::collections::BTreeMap<&str, usize> = Default::default();
-    for d in &doc.dobjects { *kinds.entry(geom_kind(&d.geom)).or_insert(0) += 1; }
+    for d in &doc.dobjects {
+        *kinds.entry(geom_kind(&d.geom)).or_insert(0) += 1;
+    }
     println!("  dobjects: {}", doc.dobjects.len());
-    for (k, n) in &kinds { println!("    {:<12} {}", k, n); }
-    println!("  layers:   {} ({})", doc.layers.layers.len(),
-             doc.layers.layers.iter().map(|l| l.name.clone()).collect::<Vec<_>>().join(", "));
+    for (k, n) in &kinds {
+        println!("    {:<12} {}", k, n);
+    }
+    println!(
+        "  layers:   {} ({})",
+        doc.layers.layers.len(),
+        doc.layers
+            .layers
+            .iter()
+            .map(|l| l.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     println!("  blocks:   {}", doc.blocks.blocks.len());
 
     if let Some(path) = out_rsm {
         let bytes = cad_io::rsm::write_rsm(doc);
         match std::fs::write(path, &bytes) {
-            Ok(_)  => println!("\n  → wrote {} ({} KB) — open it in RUST_CAD", path, bytes.len() / 1024),
+            Ok(_) => println!(
+                "\n  → wrote {} ({} KB) — open it in RUST_CAD",
+                path,
+                bytes.len() / 1024
+            ),
             Err(e) => eprintln!("\n! could not write {path}: {e}"),
         }
     }

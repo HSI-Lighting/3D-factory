@@ -49,9 +49,16 @@ pub enum Prim {
     /// A filled region (even-odd): outer loop first, successive loops are holes.
     /// Non-Solid pen fill styles are expanded into extra pattern geometry at
     /// scene build; the Fill itself stays solid.
-    Fill { loops: Vec<Vec<(f64, f64)>>, rgb: (u8, u8, u8), dither: bool },
+    Fill {
+        loops: Vec<Vec<(f64, f64)>>,
+        rgb: (u8, u8, u8),
+        dither: bool,
+    },
     /// A triangle soup fill (text glyphs).
-    Tris { tris: Vec<[(f64, f64); 3]>, rgb: (u8, u8, u8) },
+    Tris {
+        tris: Vec<[(f64, f64); 3]>,
+        rgb: (u8, u8, u8),
+    },
 }
 
 /// The full flattened plot: page size + primitives, ready to emit.
@@ -90,7 +97,11 @@ fn curve_segments(r_world: f64, sweep_abs: f64, s: f64) -> usize {
     } else {
         let ratio = (1.0 - CHORD_TOL_MM / r_paper).clamp(-1.0, 1.0);
         let theta_max = 2.0 * ratio.acos(); // max radians per segment
-        if theta_max <= 1e-6 { 4096 } else { (sweep_abs / theta_max).ceil() as usize }
+        if theta_max <= 1e-6 {
+            4096
+        } else {
+            (sweep_abs / theta_max).ceil() as usize
+        }
     };
     // Smoothness floor: at least MIN_SEGS_PER_TURN over a full circle, scaled
     // to this arc's sweep.
@@ -111,7 +122,9 @@ pub fn build_scene(doc: &Document, table: &PlotStyleTable, cfg: &PlotConfig) -> 
     }
     let (mn, mx) = resolve_extents(doc, cfg);
     let xform = PageXform::build(cfg, mn, mx);
-    let bbox_diag = ((mx.x - mn.x).powi(2) + (mx.y - mn.y).powi(2)).sqrt().max(1.0);
+    let bbox_diag = ((mx.x - mn.x).powi(2) + (mx.y - mn.y).powi(2))
+        .sqrt()
+        .max(1.0);
     // Window area → clip every primitive to the picked rectangle (only the parts
     // INSIDE the window are plotted). Extents/Display → no clip.
     let clip = if let cad_kernel::plotstyle::PlotArea::Window { min, max } = cfg.area {
@@ -150,7 +163,12 @@ pub fn build_scene(doc: &Document, table: &PlotStyleTable, cfg: &PlotConfig) -> 
             continue;
         }
         // AutoCAD plot gating: skip non-plottable layers.
-        if doc.layers.get(d.style.layer).map(|l| !l.plottable).unwrap_or(false) {
+        if doc
+            .layers
+            .get(d.style.layer)
+            .map(|l| !l.plottable)
+            .unwrap_or(false)
+        {
             continue;
         }
         b.emit_dobject(&d.geom, &d.style, None, 0);
@@ -169,11 +187,21 @@ pub fn build_scene(doc: &Document, table: &PlotStyleTable, cfg: &PlotConfig) -> 
 /// through its own camera. Colours go through the per-layout / per-viewport
 /// CTB (empty = monochrome, the historical layout default), NOT the plot-style
 /// table.
-fn build_layout_scene(doc: &Document, table: &PlotStyleTable, cfg: &PlotConfig,
-                      layout: &cad_kernel::Layout) -> Scene {
+fn build_layout_scene(
+    doc: &Document,
+    table: &PlotStyleTable,
+    cfg: &PlotConfig,
+    layout: &cad_kernel::Layout,
+) -> Scene {
     let pw = layout.page_w_mm;
     let ph = layout.page_h_mm;
-    let xform = PageXform { s: 1.0, tx: 0.0, ty: 0.0, page_w_mm: pw, page_h_mm: ph };
+    let xform = PageXform {
+        s: 1.0,
+        tx: 0.0,
+        ty: 0.0,
+        page_w_mm: pw,
+        page_h_mm: ph,
+    };
     let mut b = Builder {
         doc,
         table,
@@ -187,7 +215,12 @@ fn build_layout_scene(doc: &Document, table: &PlotStyleTable, cfg: &PlotConfig,
         cur_fill: FillStyle::Solid,
         cur_dither: false,
         cur_adaptive: true,
-        scene: Scene { page_w_mm: pw, page_h_mm: ph, prims: Vec::new(), skipped_dims: 0 },
+        scene: Scene {
+            page_w_mm: pw,
+            page_h_mm: ph,
+            prims: Vec::new(),
+            skipped_dims: 0,
+        },
         fonts: None,
         layers: &doc.layers,
         ctb_mode: true,
@@ -198,13 +231,31 @@ fn build_layout_scene(doc: &Document, table: &PlotStyleTable, cfg: &PlotConfig,
     let fw = pw.max(1.0);
     let fh = ph.max(1.0);
     b.push_stroke(
-        &[Vec2::new(0.0, 0.0), Vec2::new(fw, 0.0), Vec2::new(fw, fh), Vec2::new(0.0, fh)],
-        true, false, 0.5, (0, 0, 0));
+        &[
+            Vec2::new(0.0, 0.0),
+            Vec2::new(fw, 0.0),
+            Vec2::new(fw, fh),
+            Vec2::new(0.0, fh),
+        ],
+        true,
+        false,
+        0.5,
+        (0, 0, 0),
+    );
 
     // Paper-space entities — layout CTB overrides colours.
     for d in &layout.entities {
-        if !d.style.visible { continue; }
-        if doc.layers.get(d.style.layer).map(|l| !l.plottable).unwrap_or(false) { continue; }
+        if !d.style.visible {
+            continue;
+        }
+        if doc
+            .layers
+            .get(d.style.layer)
+            .map(|l| !l.plottable)
+            .unwrap_or(false)
+        {
+            continue;
+        }
         b.emit_dobject(&d.geom, &d.style, None, 0);
     }
 
@@ -224,8 +275,12 @@ fn build_layout_scene(doc: &Document, table: &PlotStyleTable, cfg: &PlotConfig,
                     Vec2::new(vp.model_center.0 - hw, vp.model_center.1 - hh),
                     Vec2::new(vp.model_center.0 + hw, vp.model_center.1 + hh),
                 ))
-            } else { None }
-        } else { None };
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let vp_xform = PageXform {
             s: ms,
             tx: vp_cx - vp.model_center.0 * ms,
@@ -246,18 +301,36 @@ fn build_layout_scene(doc: &Document, table: &PlotStyleTable, cfg: &PlotConfig,
             cur_fill: FillStyle::Solid,
             cur_dither: false,
             cur_adaptive: true,
-            scene: Scene { page_w_mm: pw, page_h_mm: ph, prims: Vec::new(), skipped_dims: 0 },
+            scene: Scene {
+                page_w_mm: pw,
+                page_h_mm: ph,
+                prims: Vec::new(),
+                skipped_dims: 0,
+            },
             fonts: None,
             layers: &layout.layers,
             ctb_mode: true,
             // Per-viewport CTB, inheriting the LAYOUT's when the viewport has
             // none (ViewportData::ctb_name: "None = inherit from layout").
             // Empty at every level = full colour (matches the canvas).
-            ctb: vp.ctb_name.as_deref().or(layout.ctb_name.as_deref()).unwrap_or(""),
+            ctb: vp
+                .ctb_name
+                .as_deref()
+                .or(layout.ctb_name.as_deref())
+                .unwrap_or(""),
         };
         for d in doc.dobjects.iter() {
-            if !d.style.visible { continue; }
-            if layout.layers.get(d.style.layer).map(|l| !l.plottable).unwrap_or(false) { continue; }
+            if !d.style.visible {
+                continue;
+            }
+            if layout
+                .layers
+                .get(d.style.layer)
+                .map(|l| !l.plottable)
+                .unwrap_or(false)
+            {
+                continue;
+            }
             vb.emit_dobject(&d.geom, &d.style, None, 0);
         }
         b.scene.prims.extend(vb.scene.prims);
@@ -300,15 +373,22 @@ fn resolve_extents(doc: &Document, cfg: &PlotConfig) -> (Vec2, Vec2) {
         if !doc.is_visible(i) {
             continue;
         }
-        if doc.layers.get(d.style.layer).map(|l| !l.plottable).unwrap_or(false) {
+        if doc
+            .layers
+            .get(d.style.layer)
+            .map(|l| !l.plottable)
+            .unwrap_or(false)
+        {
             continue;
         }
         let (lo, hi) = d.bbox();
         if !lo.x.is_finite() || !hi.x.is_finite() {
             continue;
         }
-        mn.x = mn.x.min(lo.x); mn.y = mn.y.min(lo.y);
-        mx.x = mx.x.max(hi.x); mx.y = mx.y.max(hi.y);
+        mn.x = mn.x.min(lo.x);
+        mn.y = mn.y.min(lo.y);
+        mx.x = mx.x.max(hi.x);
+        mx.y = mx.y.max(hi.y);
         any = true;
     }
     if !any {
@@ -318,9 +398,9 @@ fn resolve_extents(doc: &Document, cfg: &PlotConfig) -> (Vec2, Vec2) {
 }
 
 struct Builder<'a> {
-    doc:   &'a Document,
+    doc: &'a Document,
     table: &'a PlotStyleTable,
-    cfg:   &'a PlotConfig,
+    cfg: &'a PlotConfig,
     xform: PageXform,
     bbox_diag: f64,
     /// Window clip rectangle (world space), or None for Extents/Display. Layout
@@ -395,7 +475,9 @@ impl<'a> Builder<'a> {
     /// it is distinct from an explicit 0.25 mm; explicit Custom widths print
     /// exactly. Multiplied by the global `lw_scale` only.
     fn width_mm(&self, style: &Style, aci: Option<u8>) -> f32 {
-        let pen_lw = self.pen_table().and_then(|t| aci.map(|a| t.style(a).lineweight));
+        let pen_lw = self
+            .pen_table()
+            .and_then(|t| aci.map(|a| t.style(a).lineweight));
         let base = match pen_lw {
             Some(PlotWidth::Fixed(w)) => w,
             // UseObject — or no pen table at all (built-in/unknown CTB in a
@@ -444,9 +526,13 @@ impl<'a> Builder<'a> {
         rgb
     }
 
-    fn s(&self) -> f64 { self.xform.s }
+    fn s(&self) -> f64 {
+        self.xform.s
+    }
 
-    fn tf(&self, p: Vec2) -> (f64, f64) { self.xform.apply(p.x, p.y) }
+    fn tf(&self, p: Vec2) -> (f64, f64) {
+        self.xform.apply(p.x, p.y)
+    }
 
     fn push_stroke(
         &mut self,
@@ -472,8 +558,16 @@ impl<'a> Builder<'a> {
                     if run.len() >= 2 {
                         let pts: Vec<(f64, f64)> = run.iter().map(|&p| self.tf(p)).collect();
                         self.scene.prims.push(Prim::Stroke {
-                            pts, closed: false, width_mm, rgb, dash_mm: dash.clone(),
-                            dash_offset_mm: dash_offset, cap, join, dither, smooth,
+                            pts,
+                            closed: false,
+                            width_mm,
+                            rgb,
+                            dash_mm: dash.clone(),
+                            dash_offset_mm: dash_offset,
+                            cap,
+                            join,
+                            dither,
+                            smooth,
                         });
                     }
                 }
@@ -481,8 +575,16 @@ impl<'a> Builder<'a> {
             None => {
                 let pts: Vec<(f64, f64)> = world.iter().map(|&p| self.tf(p)).collect();
                 self.scene.prims.push(Prim::Stroke {
-                    pts, closed, width_mm, rgb, dash_mm: dash,
-                    dash_offset_mm: dash_offset, cap, join, dither, smooth,
+                    pts,
+                    closed,
+                    width_mm,
+                    rgb,
+                    dash_mm: dash,
+                    dash_offset_mm: dash_offset,
+                    cap,
+                    join,
+                    dither,
+                    smooth,
                 });
             }
         }
@@ -514,7 +616,8 @@ impl<'a> Builder<'a> {
     /// plot) — the entity's own chain resolves (style, then layer). Empty =
     /// solid (continuous).
     fn linetype_dash_mm(&self, style: &Style, aci: Option<u8>) -> Vec<f32> {
-        let override_id = self.pen_table()
+        let override_id = self
+            .pen_table()
             .and_then(|t| aci.map(|a| t.style(a).linetype))
             .and_then(|lt| match lt {
                 PlotLinetype::UseObject => None,
@@ -524,7 +627,9 @@ impl<'a> Builder<'a> {
             self.doc.linetypes.get(id)
         } else {
             self.doc.linetypes.get(style.linetype).or_else(|| {
-                self.layers.get(style.layer).and_then(|l| self.doc.linetypes.get(l.linetype))
+                self.layers
+                    .get(style.layer)
+                    .and_then(|l| self.doc.linetypes.get(l.linetype))
             })
         };
         let Some(lt) = lt else { return Vec::new() };
@@ -532,7 +637,10 @@ impl<'a> Builder<'a> {
             return Vec::new();
         }
         let sc = (style.linetype_scale.max(1e-4)) as f64 * self.xform.s;
-        lt.pattern.iter().map(|&seg| ((seg.abs() as f64) * sc) as f32).collect()
+        lt.pattern
+            .iter()
+            .map(|&seg| ((seg.abs() as f64) * sc) as f32)
+            .collect()
     }
 
     /// Flatten + emit one entity. `byblock` supplies the ByBlock color substitute
@@ -556,13 +664,23 @@ impl<'a> Builder<'a> {
         // table at all (built-in/unknown CTB in a layout plot) — falls back to
         // the defaults: cap Round, join Round, fill Solid, dither off,
         // adaptive on. Copy out before mutating `self`.
-        let (pen_end, pen_join, pen_fill, pen_dither, pen_adaptive) = match self
-            .pen_table()
-            .and_then(|t| aci.map(|a| t.style(a)))
-        {
-            Some(p) => (p.end_style, p.join_style, p.fill_style, p.dither, p.adaptive),
-            None => (EndStyle::UseObject, JoinStyle::UseObject, FillStyle::UseObject, false, true),
-        };
+        let (pen_end, pen_join, pen_fill, pen_dither, pen_adaptive) =
+            match self.pen_table().and_then(|t| aci.map(|a| t.style(a))) {
+                Some(p) => (
+                    p.end_style,
+                    p.join_style,
+                    p.fill_style,
+                    p.dither,
+                    p.adaptive,
+                ),
+                None => (
+                    EndStyle::UseObject,
+                    JoinStyle::UseObject,
+                    FillStyle::UseObject,
+                    false,
+                    true,
+                ),
+            };
         self.cur_cap = match pen_end {
             EndStyle::UseObject => EndStyle::Round,
             other => other,
@@ -613,14 +731,29 @@ impl<'a> Builder<'a> {
                 VectorPrimitive::Segment { p0, p1 } => {
                     self.chain_append(&mut chain, &mut smooth, &[*p0, *p1], false, w, rgb);
                 }
-                VectorPrimitive::Arc { center, radius, start_angle, sweep_angle } => {
+                VectorPrimitive::Arc {
+                    center,
+                    radius,
+                    start_angle,
+                    sweep_angle,
+                } => {
                     let n = curve_segments(*radius, sweep_angle.abs(), s);
                     let pts = sample_arc(*center, *radius, *start_angle, *sweep_angle, n);
                     self.chain_append(&mut chain, &mut smooth, &pts, true, w, rgb);
                 }
-                VectorPrimitive::EllipseArc { center, major, ratio, start_param, sweep_param } => {
+                VectorPrimitive::EllipseArc {
+                    center,
+                    major,
+                    ratio,
+                    start_param,
+                    sweep_param,
+                } => {
                     let a = major.len();
-                    let el = cad_kernel::Ellipse { center: *center, major: *major, ratio: *ratio };
+                    let el = cad_kernel::Ellipse {
+                        center: *center,
+                        major: *major,
+                        ratio: *ratio,
+                    };
                     let n = curve_segments(a, sweep_param.abs(), s).max(4);
                     let pts: Vec<Vec2> = (0..=n)
                         .map(|i| {
@@ -630,16 +763,20 @@ impl<'a> Builder<'a> {
                         .collect();
                     self.chain_append(&mut chain, &mut smooth, &pts, true, w, rgb);
                 }
-                VectorPrimitive::Spline { degree, control_points, .. } => {
+                VectorPrimitive::Spline {
+                    degree,
+                    control_points,
+                    ..
+                } => {
                     let sp = cad_kernel::Spline {
                         degree: *degree,
                         control_points: control_points.clone(),
                         weights: vec![1.0; control_points.len()],
                         knots: None,
-                        width: 0.0,   // no width channel in VectorPrimitive
+                        width: 0.0, // no width channel in VectorPrimitive
                     };
-                    let n = curve_segments(bbox_diag * 0.5, std::f64::consts::TAU, s)
-                        .clamp(32, 512);
+                    let n =
+                        curve_segments(bbox_diag * 0.5, std::f64::consts::TAU, s).clamp(32, 512);
                     let pts = sp.tessellate(n);
                     self.chain_append(&mut chain, &mut smooth, &pts, true, w, rgb);
                 }
@@ -654,12 +791,26 @@ impl<'a> Builder<'a> {
                 VectorPrimitive::Point { position, size } => {
                     self.flush_chain(&mut chain, smooth, w, rgb);
                     smooth = true;
-                    let hs = if *size > 0.0 { *size } else { bbox_diag * 0.004 };
+                    let hs = if *size > 0.0 {
+                        *size
+                    } else {
+                        bbox_diag * 0.004
+                    };
                     let c = *position;
-                    self.push_stroke(&[Vec2::new(c.x - hs, c.y), Vec2::new(c.x + hs, c.y)],
-                        false, false, w, rgb);
-                    self.push_stroke(&[Vec2::new(c.x, c.y - hs), Vec2::new(c.x, c.y + hs)],
-                        false, false, w, rgb);
+                    self.push_stroke(
+                        &[Vec2::new(c.x - hs, c.y), Vec2::new(c.x + hs, c.y)],
+                        false,
+                        false,
+                        w,
+                        rgb,
+                    );
+                    self.push_stroke(
+                        &[Vec2::new(c.x, c.y - hs), Vec2::new(c.x, c.y + hs)],
+                        false,
+                        false,
+                        w,
+                        rgb,
+                    );
                 }
                 VectorPrimitive::FilledPolygon { outer, holes } => {
                     self.flush_chain(&mut chain, smooth, w, rgb);
@@ -670,7 +821,9 @@ impl<'a> Builder<'a> {
                             let lp2 = match self.clip {
                                 Some((mn, mx)) => {
                                     let c = clip_polygon_rect(lp, mn, mx);
-                                    if c.len() < 3 { return None; }
+                                    if c.len() < 3 {
+                                        return None;
+                                    }
                                     c
                                 }
                                 None => lp.clone(),
@@ -690,24 +843,39 @@ impl<'a> Builder<'a> {
                         self.emit_fill_pattern(&mapped, rgb);
                     }
                 }
-                VectorPrimitive::Text { position, content, height, rotation } => {
+                VectorPrimitive::Text {
+                    position,
+                    content,
+                    height,
+                    rotation,
+                } => {
                     self.flush_chain(&mut chain, smooth, w, rgb);
                     smooth = true;
                     let t = cad_kernel::Text {
-                        position: *position, text: content.clone(),
-                        height: *height, angle: *rotation,
+                        position: *position,
+                        text: content.clone(),
+                        height: *height,
+                        angle: *rotation,
                         h_align: cad_kernel::TextHAlign::Left,
                         v_align: cad_kernel::TextVAlign::Baseline,
-                        style: 0, font_name: String::new(),
-                        bold: false, oblique: 0.0, width_factor: 1.0,
-                        outline_only: false, outline_width: 0.0,
+                        style: 0,
+                        font_name: String::new(),
+                        bold: false,
+                        oblique: 0.0,
+                        width_factor: 1.0,
+                        outline_only: false,
+                        outline_width: 0.0,
                         underline: false,
                         list_mode: cad_kernel::TextListKind::None,
                         line_spacing: 1.5,
                     };
                     self.emit_text(&t, rgb);
                 }
-                VectorPrimitive::ViewportRect { center, width, height } => {
+                VectorPrimitive::ViewportRect {
+                    center,
+                    width,
+                    height,
+                } => {
                     self.flush_chain(&mut chain, smooth, w, rgb);
                     smooth = true;
                     // The viewport FRAME prints on the paper (restored from
@@ -766,8 +934,7 @@ impl<'a> Builder<'a> {
             chain.clear();
             return;
         }
-        let mut closed = chain.len() > 2
-            && (chain[0] - chain[chain.len() - 1]).len() < 1e-7;
+        let mut closed = chain.len() > 2 && (chain[0] - chain[chain.len() - 1]).len() < 1e-7;
         if closed {
             chain.pop();
             if chain.len() < 3 {
@@ -795,8 +962,10 @@ impl<'a> Builder<'a> {
         let (mut mxx, mut mxy) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
         for lp in loops {
             for &(x, y) in lp {
-                mnx = mnx.min(x); mny = mny.min(y);
-                mxx = mxx.max(x); mxy = mxy.max(y);
+                mnx = mnx.min(x);
+                mny = mny.min(y);
+                mxx = mxx.max(x);
+                mxy = mxy.max(y);
             }
         }
         if !mnx.is_finite() || !mxx.is_finite() {
@@ -808,28 +977,98 @@ impl<'a> Builder<'a> {
         let mut extra: Vec<Prim> = Vec::new();
         match fill {
             FillStyle::HorizontalBars => {
-                extra.extend(pattern_line_strokes(mn, mx, Vec2::new(1.0, 0.0), 1.5, rgb, dither));
+                extra.extend(pattern_line_strokes(
+                    mn,
+                    mx,
+                    Vec2::new(1.0, 0.0),
+                    1.5,
+                    rgb,
+                    dither,
+                ));
             }
             FillStyle::VerticalBars => {
-                extra.extend(pattern_line_strokes(mn, mx, Vec2::new(0.0, 1.0), 1.5, rgb, dither));
+                extra.extend(pattern_line_strokes(
+                    mn,
+                    mx,
+                    Vec2::new(0.0, 1.0),
+                    1.5,
+                    rgb,
+                    dither,
+                ));
             }
             FillStyle::SlantRight => {
-                extra.extend(pattern_line_strokes(mn, mx, Vec2::new(1.0, 1.0), 2.0, rgb, dither));
+                extra.extend(pattern_line_strokes(
+                    mn,
+                    mx,
+                    Vec2::new(1.0, 1.0),
+                    2.0,
+                    rgb,
+                    dither,
+                ));
             }
             FillStyle::SlantLeft => {
-                extra.extend(pattern_line_strokes(mn, mx, Vec2::new(-1.0, 1.0), 2.0, rgb, dither));
+                extra.extend(pattern_line_strokes(
+                    mn,
+                    mx,
+                    Vec2::new(-1.0, 1.0),
+                    2.0,
+                    rgb,
+                    dither,
+                ));
             }
             FillStyle::Diamonds => {
-                extra.extend(pattern_line_strokes(mn, mx, Vec2::new(1.0, 1.0), 2.0, rgb, dither));
-                extra.extend(pattern_line_strokes(mn, mx, Vec2::new(-1.0, 1.0), 2.0, rgb, dither));
+                extra.extend(pattern_line_strokes(
+                    mn,
+                    mx,
+                    Vec2::new(1.0, 1.0),
+                    2.0,
+                    rgb,
+                    dither,
+                ));
+                extra.extend(pattern_line_strokes(
+                    mn,
+                    mx,
+                    Vec2::new(-1.0, 1.0),
+                    2.0,
+                    rgb,
+                    dither,
+                ));
             }
             FillStyle::Crosshatch => {
-                extra.extend(pattern_line_strokes(mn, mx, Vec2::new(1.0, 0.0), 2.0, rgb, dither));
-                extra.extend(pattern_line_strokes(mn, mx, Vec2::new(0.0, 1.0), 2.0, rgb, dither));
+                extra.extend(pattern_line_strokes(
+                    mn,
+                    mx,
+                    Vec2::new(1.0, 0.0),
+                    2.0,
+                    rgb,
+                    dither,
+                ));
+                extra.extend(pattern_line_strokes(
+                    mn,
+                    mx,
+                    Vec2::new(0.0, 1.0),
+                    2.0,
+                    rgb,
+                    dither,
+                ));
             }
             FillStyle::Checkerboard => {
-                extra.extend(pattern_line_strokes(mn, mx, Vec2::new(1.0, 0.0), 2.0, rgb, dither));
-                extra.extend(pattern_line_strokes(mn, mx, Vec2::new(0.0, 1.0), 2.0, rgb, dither));
+                extra.extend(pattern_line_strokes(
+                    mn,
+                    mx,
+                    Vec2::new(1.0, 0.0),
+                    2.0,
+                    rgb,
+                    dither,
+                ));
+                extra.extend(pattern_line_strokes(
+                    mn,
+                    mx,
+                    Vec2::new(0.0, 1.0),
+                    2.0,
+                    rgb,
+                    dither,
+                ));
                 extra.extend(checkerboard_squares(mn, mx, loops, rgb, dither));
             }
             FillStyle::SquareDots => {
@@ -841,7 +1080,9 @@ impl<'a> Builder<'a> {
     }
 
     fn emit_blockref(&mut self, br: &BlockRef, parent: ((u8, u8, u8), Option<u8>), depth: u32) {
-        let Some(block) = self.doc.blocks.get(br.block) else { return };
+        let Some(block) = self.doc.blocks.get(br.block) else {
+            return;
+        };
         // Clone the child geoms + styles out so we don't hold a borrow of the
         // block table across the recursive &mut self calls.
         let base = block.base;
@@ -870,7 +1111,11 @@ impl<'a> Builder<'a> {
         let font_name: String = if !t.font_name.is_empty() {
             t.font_name.clone()
         } else {
-            self.doc.text_styles.get(t.style).map(|s| s.font_name.clone()).unwrap_or_default()
+            self.doc
+                .text_styles
+                .get(t.style)
+                .map(|s| s.font_name.clone())
+                .unwrap_or_default()
         };
         let req = cad_text::TextRequest {
             text: &t.text,
@@ -893,9 +1138,9 @@ impl<'a> Builder<'a> {
             .iter()
             // Window clip: keep glyph triangles fully inside the rect (approx).
             .filter(|tri| match self.clip {
-                Some((mn, mx)) => tri.iter().all(|p| {
-                    p.x >= mn.x && p.x <= mx.x && p.y >= mn.y && p.y <= mx.y
-                }),
+                Some((mn, mx)) => tri
+                    .iter()
+                    .all(|p| p.x >= mn.x && p.x <= mx.x && p.y >= mn.y && p.y <= mx.y),
                 None => true,
             })
             .map(|tri| [self.tf(tri[0]), self.tf(tri[1]), self.tf(tri[2])])
@@ -945,11 +1190,19 @@ fn clip_seg(a: Vec2, b: Vec2, mn: Vec2, mx: Vec2) -> Option<(Vec2, Vec2)> {
         } else {
             let r = q[i] / p[i];
             if p[i] < 0.0 {
-                if r > t1 { return None; }
-                if r > t0 { t0 = r; }
+                if r > t1 {
+                    return None;
+                }
+                if r > t0 {
+                    t0 = r;
+                }
             } else {
-                if r < t0 { return None; }
-                if r < t1 { t1 = r; }
+                if r < t0 {
+                    return None;
+                }
+                if r < t1 {
+                    t1 = r;
+                }
             }
         }
     }
@@ -1024,11 +1277,19 @@ fn clip_polygon_rect(poly: &[Vec2], mn: Vec2, mx: Vec2) -> Vec<Vec2> {
             let t = match kind {
                 0 | 1 => {
                     let d = b.x - a.x;
-                    if d.abs() < 1e-12 { 0.0 } else { (val - a.x) / d }
+                    if d.abs() < 1e-12 {
+                        0.0
+                    } else {
+                        (val - a.x) / d
+                    }
                 }
                 _ => {
                     let d = b.y - a.y;
-                    if d.abs() < 1e-12 { 0.0 } else { (val - a.y) / d }
+                    if d.abs() < 1e-12 {
+                        0.0
+                    } else {
+                        (val - a.y) / d
+                    }
                 }
             };
             Vec2::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y))
@@ -1182,8 +1443,12 @@ fn checkerboard_squares(
     dither: bool,
 ) -> Vec<Prim> {
     const CELL: f64 = 2.0;
-    let Some((i0, i1)) = grid_range(mn.x, mx.x, CELL, 100_000.0) else { return Vec::new() };
-    let Some((j0, j1)) = grid_range(mn.y, mx.y, CELL, 100_000.0) else { return Vec::new() };
+    let Some((i0, i1)) = grid_range(mn.x, mx.x, CELL, 100_000.0) else {
+        return Vec::new();
+    };
+    let Some((j0, j1)) = grid_range(mn.y, mx.y, CELL, 100_000.0) else {
+        return Vec::new();
+    };
     if (i1 - i0 + 1).max(0) * (j1 - j0 + 1).max(0) > 200_000 {
         return Vec::new();
     }
@@ -1223,8 +1488,12 @@ fn square_dots(
 ) -> Vec<Prim> {
     const SPACING: f64 = 2.0;
     const SIZE: f64 = 0.2;
-    let Some((i0, i1)) = grid_range(mn.x, mx.x, SPACING, 100_000.0) else { return Vec::new() };
-    let Some((j0, j1)) = grid_range(mn.y, mx.y, SPACING, 100_000.0) else { return Vec::new() };
+    let Some((i0, i1)) = grid_range(mn.x, mx.x, SPACING, 100_000.0) else {
+        return Vec::new();
+    };
+    let Some((j0, j1)) = grid_range(mn.y, mx.y, SPACING, 100_000.0) else {
+        return Vec::new();
+    };
     if (i1 - i0 + 1).max(0) * (j1 - j0 + 1).max(0) > 200_000 {
         return Vec::new();
     }
@@ -1250,4 +1519,3 @@ fn square_dots(
     }
     out
 }
-

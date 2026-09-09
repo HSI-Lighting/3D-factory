@@ -19,15 +19,20 @@ use cad_script::{ScriptEngine, ScriptMeta, ScriptOp, ScriptOpReply, ScriptReply,
 use std::io::{self, BufRead, Write};
 
 fn main() {
-    let stdin  = io::stdin();
+    let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut doc = Document::default();
 
     for line in stdin.lock().lines() {
-        let line = match line { Ok(l) => l, Err(_) => break };
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
         match parse(trimmed) {
             Ok(Command::Python(Some(code))) => {
                 writeln!(out, "py> {}", code).ok();
@@ -69,21 +74,37 @@ fn main() {
                                         .collect();
                                     writeln!(out, "run> {} {}", stem, shown.join(" ")).ok();
                                     out.flush().ok();
-                                    run_python(&mut doc, PythonJob::Script {
-                                        path, name: stem, args: Vec::new(), params,
-                                    });
+                                    run_python(
+                                        &mut doc,
+                                        PythonJob::Script {
+                                            path,
+                                            name: stem,
+                                            args: Vec::new(),
+                                            params,
+                                        },
+                                    );
                                 } else {
                                     writeln!(out, "run> {} {}", stem, args.join(" ")).ok();
                                     out.flush().ok();
-                                    run_python(&mut doc, PythonJob::Script {
-                                        path, name: stem, args, params: Vec::new(),
-                                    });
+                                    run_python(
+                                        &mut doc,
+                                        PythonJob::Script {
+                                            path,
+                                            name: stem,
+                                            args,
+                                            params: Vec::new(),
+                                        },
+                                    );
                                 }
                             }
                             None => {
-                                writeln!(out,
+                                writeln!(
+                                    out,
                                     "! run: no script '{}' in scripts/ (available: {})",
-                                    name, cli_script_names().join(", ")).ok();
+                                    name,
+                                    cli_script_names().join(", ")
+                                )
+                                .ok();
                             }
                         }
                     }
@@ -94,7 +115,9 @@ fn main() {
                 // document) — same file the app's `pyhelp` window shows.
                 let mut dirs = vec![std::path::PathBuf::from("docs")];
                 if let Ok(exe) = std::env::current_exe() {
-                    if let Some(d) = exe.parent() { dirs.push(d.join("docs")); }
+                    if let Some(d) = exe.parent() {
+                        dirs.push(d.join("docs"));
+                    }
                 }
                 let mut shown = false;
                 for dir in dirs {
@@ -106,7 +129,9 @@ fn main() {
                     }
                 }
                 if !shown {
-                    println!("! cannot find docs/scripting_api.md (looked in ./docs and <exe dir>/docs)");
+                    println!(
+                        "! cannot find docs/scripting_api.md (looked in ./docs and <exe dir>/docs)"
+                    );
                 }
             }
             Ok(other) => {
@@ -114,7 +139,9 @@ fn main() {
                 write!(out, "{}", s).ok();
                 out.flush().ok();
             }
-            Err(e) => { writeln!(out, "! parse error: {}", e).ok(); }
+            Err(e) => {
+                writeln!(out, "! parse error: {}", e).ok();
+            }
         }
     }
 
@@ -130,9 +157,12 @@ fn main() {
     for i in 0..doc.dobjects.len() {
         for j in (i + 1)..doc.dobjects.len() {
             for p in intersect(&doc.dobjects[i].geom, &doc.dobjects[j].geom) {
-                writeln!(out,
+                writeln!(
+                    out,
                     "  ({:>12.6}, {:>12.6})    [dobjects #{} ∩ #{}]",
-                    p.x, p.y, i, j).ok();
+                    p.x, p.y, i, j
+                )
+                .ok();
                 count += 1;
             }
         }
@@ -256,14 +286,21 @@ fn apply_line(doc: &mut Document, cmd: Command) -> String {
 enum PythonJob {
     Text(String),
     File(std::path::PathBuf),
-    Script { path: std::path::PathBuf, name: String, args: Vec<String>, params: Vec<(String, String)> },
+    Script {
+        path: std::path::PathBuf,
+        name: String,
+        args: Vec<String>,
+        params: Vec<(String, String)>,
+    },
 }
 
 /// Named scripts listed in ./scripts (or the exe's directory).
 fn cli_script_names() -> Vec<String> {
     let mut dirs = vec![std::path::PathBuf::from("scripts")];
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(d) = exe.parent() { dirs.push(d.join("scripts")); }
+        if let Some(d) = exe.parent() {
+            dirs.push(d.join("scripts"));
+        }
     }
     let mut names = Vec::new();
     for dir in dirs {
@@ -287,11 +324,15 @@ fn cli_script_names() -> Vec<String> {
 fn cli_resolve_script(name: &str) -> Option<(String, std::path::PathBuf)> {
     let mut dirs = vec![std::path::PathBuf::from("scripts")];
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(d) = exe.parent() { dirs.push(d.join("scripts")); }
+        if let Some(d) = exe.parent() {
+            dirs.push(d.join("scripts"));
+        }
     }
     for dir in dirs {
         let mut p = dir.join(name);
-        if p.extension().is_none() { p.set_extension("py"); }
+        if p.extension().is_none() {
+            p.set_extension("py");
+        }
         if p.is_file() {
             let stem = p.file_stem()?.to_string_lossy().into_owned();
             return Some((stem, p));
@@ -301,7 +342,10 @@ fn cli_resolve_script(name: &str) -> Option<(String, std::path::PathBuf)> {
                 let path = e.path();
                 if path.extension().is_some_and(|x| x == "py") {
                     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
-                    if stem.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(name)) {
+                    if stem
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case(name))
+                    {
                         return Some((stem.unwrap_or_default(), path));
                     }
                 }
@@ -318,7 +362,12 @@ fn run_python(doc: &mut Document, job: PythonJob) {
     match job {
         PythonJob::Text(code) => eng.submit_text(code),
         PythonJob::File(path) => eng.submit_file(path),
-        PythonJob::Script { path, name, args, params } => {
+        PythonJob::Script {
+            path,
+            name,
+            args,
+            params,
+        } => {
             // Slice 5: learn the declaration first (a no-op metadata pass)
             // so LENGTH inputs convert through the document's display unit.
             let mut spec: Option<ScriptMeta> = None;
@@ -340,7 +389,9 @@ fn run_python(doc: &mut Document, job: PythonJob) {
                         _ => {}
                     }
                 }
-                if done { break; }
+                if done {
+                    break;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             match spec {
@@ -348,7 +399,9 @@ fn run_python(doc: &mut Document, job: PythonJob) {
                     // named as typed, positional mapped onto the declared
                     // order; lengths convert display → scene.
                     let raw: Vec<(String, String)> = if params.is_empty() && !args.is_empty() {
-                        m.params.iter().zip(args.iter())
+                        m.params
+                            .iter()
+                            .zip(args.iter())
                             .map(|(p, a)| (p.name.clone(), a.clone()))
                             .collect()
                     } else {
@@ -361,15 +414,18 @@ fn run_python(doc: &mut Document, job: PythonJob) {
                             continue;
                         };
                         match p.ptype {
-                            cad_script::ParamType::Length => {
-                                match doc.units.parse_distance(v) {
-                                    Some(s) if s.is_finite() => converted.push((k.clone(), format!("{}", s))),
-                                    _ => {
-                                        println!("! run {}: {}: '{}' is not a valid length", name, k, v);
-                                        return;
-                                    }
+                            cad_script::ParamType::Length => match doc.units.parse_distance(v) {
+                                Some(s) if s.is_finite() => {
+                                    converted.push((k.clone(), format!("{}", s)))
                                 }
-                            }
+                                _ => {
+                                    println!(
+                                        "! run {}: {}: '{}' is not a valid length",
+                                        name, k, v
+                                    );
+                                    return;
+                                }
+                            },
                             // Catalog dropdowns validate against the live
                             // catalogs and canonicalize the spelling.
                             cad_script::ParamType::Linetype
@@ -378,12 +434,18 @@ fn run_python(doc: &mut Document, job: PythonJob) {
                             | cad_script::ParamType::HatchPattern
                             | cad_script::ParamType::Choice => {
                                 let choices: Vec<String> = match p.ptype {
-                                    cad_script::ParamType::Linetype => doc.linetypes
-                                        .linetypes.iter().map(|l| l.name.clone()).collect(),
-                                    cad_script::ParamType::Layer => doc.layers
-                                        .layers.iter().map(|l| l.name.clone()).collect(),
-                                    cad_script::ParamType::Block => doc.blocks
-                                        .blocks.iter().map(|b| b.name.clone()).collect(),
+                                    cad_script::ParamType::Linetype => doc
+                                        .linetypes
+                                        .linetypes
+                                        .iter()
+                                        .map(|l| l.name.clone())
+                                        .collect(),
+                                    cad_script::ParamType::Layer => {
+                                        doc.layers.layers.iter().map(|l| l.name.clone()).collect()
+                                    }
+                                    cad_script::ParamType::Block => {
+                                        doc.blocks.blocks.iter().map(|b| b.name.clone()).collect()
+                                    }
                                     cad_script::ParamType::HatchPattern => {
                                         cad_kernel::patterns::PATTERN_NAMES
                                             .iter()
@@ -395,7 +457,13 @@ fn run_python(doc: &mut Document, job: PythonJob) {
                                 if choices.is_empty()
                                     || !choices.iter().any(|c| c.eq_ignore_ascii_case(v.trim()))
                                 {
-                                    println!("! run {}: {}: '{}' is not one of [{}]", name, k, v, choices.join(", "));
+                                    println!(
+                                        "! run {}: {}: '{}' is not one of [{}]",
+                                        name,
+                                        k,
+                                        v,
+                                        choices.join(", ")
+                                    );
                                     return;
                                 }
                                 let canonical = choices
@@ -430,8 +498,12 @@ fn run_python(doc: &mut Document, job: PythonJob) {
         let mut finished = false;
         for r in eng.poll() {
             match r {
-                ScriptReply::Print(s) => { write!(out, "{}", s).ok(); }
-                ScriptReply::Value(v) => { writeln!(out, "= {}", v).ok(); }
+                ScriptReply::Print(s) => {
+                    write!(out, "{}", s).ok();
+                }
+                ScriptReply::Value(v) => {
+                    writeln!(out, "= {}", v).ok();
+                }
                 ScriptReply::Error(e) => {
                     writeln!(out, "{}", e.trim_end()).ok();
                 }
@@ -441,7 +513,9 @@ fn run_python(doc: &mut Document, job: PythonJob) {
             }
         }
         out.flush().ok();
-        if finished { break; }
+        if finished {
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
@@ -463,7 +537,8 @@ fn stamp_fresh_style(doc: &Document, style: &mut Style) {
         // BYLAYER (u32::MAX) → follow the active layer's linetype at draw
         // time (linetype has no ByLayer variant); else the current linetype.
         style.linetype = if doc.current_linetype == LinetypeTable::BYLAYER {
-            doc.layers.get(doc.layers.active)
+            doc.layers
+                .get(doc.layers.active)
                 .map(|l| l.linetype)
                 .unwrap_or(LinetypeTable::CONTINUOUS)
         } else {
@@ -471,9 +546,7 @@ fn stamp_fresh_style(doc: &Document, style: &mut Style) {
         };
         style.lineweight = doc.current_lineweight;
     }
-    if style.layer == LayerTable::LAYER_ZERO
-        && doc.layers.active != LayerTable::LAYER_ZERO
-    {
+    if style.layer == LayerTable::LAYER_ZERO && doc.layers.active != LayerTable::LAYER_ZERO {
         style.layer = doc.layers.active;
     }
 }
@@ -510,7 +583,8 @@ fn cli_apply_op(doc: &mut Document, op: &ScriptOp) -> ScriptOpReply {
                 .map(|lt| lt.name.clone())
                 .unwrap_or_else(|| format!("#{}", id))
         };
-        let lineweight = lineweight::resolve_lineweight(d.style.lineweight, d.style.layer, &doc.layers);
+        let lineweight =
+            lineweight::resolve_lineweight(d.style.lineweight, d.style.layer, &doc.layers);
         Entity {
             handle: d.handle,
             layer: layer.map(|l| l.name.clone()).unwrap_or_default(),
@@ -522,7 +596,10 @@ fn cli_apply_op(doc: &mut Document, op: &ScriptOp) -> ScriptOpReply {
             style: d.style,
         }
     };
-    let cli_transform = |doc: &mut Document, indices: &[usize], f: &dyn Fn(&Geom) -> Geom| -> Result<usize, String> {
+    let cli_transform = |doc: &mut Document,
+                         indices: &[usize],
+                         f: &dyn Fn(&Geom) -> Geom|
+     -> Result<usize, String> {
         if indices.iter().all(|&i| i >= doc.dobjects.len()) {
             return Err("none of the given entity indices exist".into());
         }
@@ -967,91 +1044,134 @@ fn cli_apply_op(doc: &mut Document, op: &ScriptOp) -> ScriptOpReply {
 
 fn describe(g: &Geom) -> String {
     match g {
-        Geom::Line(l)   => format!(
+        Geom::Line(l) => format!(
             "line ({:.4},{:.4}) -> ({:.4},{:.4})",
-            l.a.x, l.a.y, l.b.x, l.b.y),
-        Geom::Xline(x)  => format!(
+            l.a.x, l.a.y, l.b.x, l.b.y
+        ),
+        Geom::Xline(x) => format!(
             "xline base=({:.4},{:.4}) dir=({:.4},{:.4})",
-            x.base.x, x.base.y, x.dir.x, x.dir.y),
-        Geom::Ray(r)    => format!(
+            x.base.x, x.base.y, x.dir.x, x.dir.y
+        ),
+        Geom::Ray(r) => format!(
             "ray base=({:.4},{:.4}) dir=({:.4},{:.4})",
-            r.base.x, r.base.y, r.dir.x, r.dir.y),
-        Geom::Donut(d)  => format!(
+            r.base.x, r.base.y, r.dir.x, r.dir.y
+        ),
+        Geom::Donut(d) => format!(
             "donut center=({:.4},{:.4}) r={:.4}->{:.4}",
-            d.center.x, d.center.y, d.inner_radius, d.outer_radius),
+            d.center.x, d.center.y, d.inner_radius, d.outer_radius
+        ),
         Geom::Wipeout(wo) => format!("wipeout {} vertices", wo.pts.len()),
-        Geom::Region(rg)  => format!("region {} vertices", rg.loop_pts.len()),
-        Geom::Table(t)  => format!(
-            "table {}×{} at ({:.4},{:.4})", t.n_rows, t.n_cols,
-            t.insert.x, t.insert.y),
-        Geom::Xref(x)   => format!(
+        Geom::Region(rg) => format!("region {} vertices", rg.loop_pts.len()),
+        Geom::Table(t) => format!(
+            "table {}×{} at ({:.4},{:.4})",
+            t.n_rows, t.n_cols, t.insert.x, t.insert.y
+        ),
+        Geom::Xref(x) => format!(
             "xref '{}' -> {} at ({:.4},{:.4}) ({} children)",
-            x.name, x.path, x.insert.x, x.insert.y, x.cached.len()),
+            x.name,
+            x.path,
+            x.insert.x,
+            x.insert.y,
+            x.cached.len()
+        ),
         Geom::Circle(c) => format!(
             "circle c=({:.4},{:.4}) r={:.4}",
-            c.center.x, c.center.y, c.radius),
-        Geom::Arc(a)    => format!(
+            c.center.x, c.center.y, c.radius
+        ),
+        Geom::Arc(a) => format!(
             "arc c=({:.4},{:.4}) r={:.4} start={:.4}° sweep={:.4}°",
-            a.center.x, a.center.y, a.radius,
-            a.start_angle.to_degrees(), a.sweep_angle.to_degrees()),
+            a.center.x,
+            a.center.y,
+            a.radius,
+            a.start_angle.to_degrees(),
+            a.sweep_angle.to_degrees()
+        ),
         Geom::Ellipse(el) => format!(
             "ellipse c=({:.4},{:.4}) a={:.4} ratio={:.4} rot={:.4}°",
-            el.center.x, el.center.y, el.semi_major(), el.ratio,
-            el.major.angle().to_degrees()),
+            el.center.x,
+            el.center.y,
+            el.semi_major(),
+            el.ratio,
+            el.major.angle().to_degrees()
+        ),
         Geom::EllipseArc(ea) => format!(
             "ellipsearc c=({:.4},{:.4}) a={:.4} ratio={:.4} start={:.4}° sweep={:.4}°",
-            ea.ellipse.center.x, ea.ellipse.center.y,
-            ea.ellipse.semi_major(), ea.ellipse.ratio,
-            ea.start_param.to_degrees(), ea.sweep_param.to_degrees()),
+            ea.ellipse.center.x,
+            ea.ellipse.center.y,
+            ea.ellipse.semi_major(),
+            ea.ellipse.ratio,
+            ea.start_param.to_degrees(),
+            ea.sweep_param.to_degrees()
+        ),
         Geom::Point(pt) => format!(
             "point ({:.4},{:.4}) style={} size={:.4}",
-            pt.location.x, pt.location.y, pt.style, pt.size),
+            pt.location.x, pt.location.y, pt.style, pt.size
+        ),
         Geom::Polyline(p) => format!(
             "polyline {} verts{} length={:.4}",
             p.vertices.len(),
             if p.closed { " (closed)" } else { "" },
-            p.length()),
+            p.length()
+        ),
         Geom::Hatch(h) => format!(
             "hatch ({} boundary loops, {:?})",
-            h.boundary_handles.len(), h.pattern),
+            h.boundary_handles.len(),
+            h.pattern
+        ),
         Geom::Spline(s) => format!(
             "spline (degree {}, {} control points)",
-            s.degree, s.control_points.len()),
+            s.degree,
+            s.control_points.len()
+        ),
         Geom::Wall(w) => format!(
             "wall ({:.4},{:.4}) -> ({:.4},{:.4}) thk={:.4}",
-            w.start.x, w.start.y, w.end.x, w.end.y, w.thickness),
+            w.start.x, w.start.y, w.end.x, w.end.y, w.thickness
+        ),
         Geom::Text(t) => format!(
             "text \"{}\" @ ({:.4},{:.4}) h={:.4} ang={:.2}°",
-            t.text, t.position.x, t.position.y, t.height,
-            t.angle.to_degrees()),
+            t.text,
+            t.position.x,
+            t.position.y,
+            t.height,
+            t.angle.to_degrees()
+        ),
         Geom::Dimension(d) => {
             use cad_kernel::DimKind;
             let kind_name = match &d.kind {
-                DimKind::Linear { .. }   => "linear",
-                DimKind::Radius { .. }   => "radius",
+                DimKind::Linear { .. } => "linear",
+                DimKind::Radius { .. } => "radius",
                 DimKind::Diameter { .. } => "diameter",
-                DimKind::Angular { .. }  => "angular",
-                DimKind::ArcLen { .. }   => "arc-length",
+                DimKind::Angular { .. } => "angular",
+                DimKind::ArcLen { .. } => "arc-length",
                 DimKind::Ordinate { .. } => "ordinate",
                 DimKind::JoggedRadius { .. } => "jogged radius",
             };
-            format!("dim {} value={:.4} style={}",
-                kind_name, d.measured_value(), d.style)
+            format!(
+                "dim {} value={:.4} style={}",
+                kind_name,
+                d.measured_value(),
+                d.style
+            )
         }
         Geom::BlockRef(br) => format!(
             "blockref #{} at ({:.4},{:.4}) scale={:.3} rot={:.4}",
-            br.block, br.insert.x, br.insert.y, br.scale, br.rotation),
+            br.block, br.insert.x, br.insert.y, br.scale, br.rotation
+        ),
         Geom::Viewport(vp) => format!(
             "viewport ({:.4},{:.4}) {}x{}",
-            vp.center.x, vp.center.y, vp.width, vp.height),
-        Geom::Leader(l) => format!(
-            "leader ({} pts, text \"{}\")",
-            l.pts.len(), l.label.text),
+            vp.center.x, vp.center.y, vp.width, vp.height
+        ),
+        Geom::Leader(l) => format!("leader ({} pts, text \"{}\")", l.pts.len(), l.label.text),
         Geom::AttrDef(a) => format!(
             "attdef \"{}\" at ({:.4},{:.4}) h={:.4}",
-            a.tag, a.position.x, a.position.y, a.height),
+            a.tag, a.position.x, a.position.y, a.height
+        ),
         Geom::CenterMark(cm) => format!(
             "centermark at ({:.4},{:.4}) size={:.4} rot={:.2}°",
-            cm.center.x, cm.center.y, cm.size, cm.rotation.to_degrees()),
+            cm.center.x,
+            cm.center.y,
+            cm.size,
+            cm.rotation.to_degrees()
+        ),
     }
 }

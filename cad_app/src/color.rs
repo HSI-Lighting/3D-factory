@@ -15,19 +15,31 @@
 /// the linear toe matters for dark values, which is most of a shadowed interior.
 #[inline]
 pub fn srgb_to_linear(c: f32) -> f32 {
-    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 /// Encode linear light back to sRGB for the display.
 #[inline]
 pub fn linear_to_srgb(c: f32) -> f32 {
-    if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+    if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
 }
 
 /// Decode an authored sRGB colour (what a colour picker shows) to linear.
 #[inline]
 pub fn srgb_to_linear3(c: [f32; 3]) -> [f32; 3] {
-    [srgb_to_linear(c[0]), srgb_to_linear(c[1]), srgb_to_linear(c[2])]
+    [
+        srgb_to_linear(c[0]),
+        srgb_to_linear(c[1]),
+        srgb_to_linear(c[2]),
+    ]
 }
 
 /// How scene-referred linear light is mapped to the display. Mirrors Blender's Color Management
@@ -50,7 +62,12 @@ pub enum ViewTransform {
 }
 
 impl ViewTransform {
-    pub const ALL: [ViewTransform; 4] = [ViewTransform::AgX, ViewTransform::PbrNeutral, ViewTransform::Standard, ViewTransform::Raw];
+    pub const ALL: [ViewTransform; 4] = [
+        ViewTransform::AgX,
+        ViewTransform::PbrNeutral,
+        ViewTransform::Standard,
+        ViewTransform::Raw,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -126,7 +143,15 @@ impl ColorPipeline {
     /// The identity: write the framebuffer out untouched and treat vertex colours as display
     /// values. Byte-for-byte the behaviour every caller had before this module existed.
     pub fn passthrough() -> Self {
-        Self { view: ViewTransform::Raw, exposure: 0.0, look: 0.0, punchy: 0.0, linearize_vertex: false, bloom: 0.0, bloom_threshold: 1.0 }
+        Self {
+            view: ViewTransform::Raw,
+            exposure: 0.0,
+            look: 0.0,
+            punchy: 0.0,
+            linearize_vertex: false,
+            bloom: 0.0,
+            bloom_threshold: 1.0,
+        }
     }
 }
 
@@ -154,14 +179,14 @@ const AGX_MAX_EV: f32 = 4.026_069;
 // resampled onto a uniform grid (`scratchpad/dump_punchy.py`). The test checks it against ten
 // colours that were never on the sampled sweep.
 const PUNCHY_LUT: [f32; 64] = [
-    0.001357, 0.002420, 0.003654, 0.005323, 0.007895, 0.011978, 0.018567, 0.028132,
-    0.041393, 0.056671, 0.071043, 0.086717, 0.101449, 0.116141, 0.131683, 0.145700,
-    0.161421, 0.175483, 0.190250, 0.204997, 0.219195, 0.233577, 0.247661, 0.261671,
-    0.276110, 0.289852, 0.303332, 0.317304, 0.331619, 0.345426, 0.359088, 0.373148,
-    0.388629, 0.404560, 0.420509, 0.436587, 0.453730, 0.471928, 0.490141, 0.508102,
-    0.526447, 0.545720, 0.565015, 0.583139, 0.603021, 0.622921, 0.641385, 0.661669,
-    0.681926, 0.700788, 0.721327, 0.740618, 0.760949, 0.780786, 0.800854, 0.820606,
-    0.840921, 0.860221, 0.880576, 0.900408, 0.919790, 0.939201, 0.958755, 0.978845,
+    0.001357, 0.002420, 0.003654, 0.005323, 0.007895, 0.011978, 0.018567, 0.028132, 0.041393,
+    0.056671, 0.071043, 0.086717, 0.101449, 0.116141, 0.131683, 0.145700, 0.161421, 0.175483,
+    0.190250, 0.204997, 0.219195, 0.233577, 0.247661, 0.261671, 0.276110, 0.289852, 0.303332,
+    0.317304, 0.331619, 0.345426, 0.359088, 0.373148, 0.388629, 0.404560, 0.420509, 0.436587,
+    0.453730, 0.471928, 0.490141, 0.508102, 0.526447, 0.545720, 0.565015, 0.583139, 0.603021,
+    0.622921, 0.641385, 0.661669, 0.681926, 0.700788, 0.721327, 0.740618, 0.760949, 0.780786,
+    0.800854, 0.820606, 0.840921, 0.860221, 0.880576, 0.900408, 0.919790, 0.939201, 0.958755,
+    0.978845,
 ];
 
 /// One channel of plain AgX output → the same channel with the Punchy look, by linear
@@ -178,7 +203,11 @@ fn punchy_channel(x: f32, amount: f32) -> f32 {
 
 /// Apply the Punchy look to a display-referred AgX triple.
 pub fn agx_punchy(c: [f32; 3], amount: f32) -> [f32; 3] {
-    [punchy_channel(c[0], amount), punchy_channel(c[1], amount), punchy_channel(c[2], amount)]
+    [
+        punchy_channel(c[0], amount),
+        punchy_channel(c[1], amount),
+        punchy_channel(c[2], amount),
+    ]
 }
 
 // Stored as ROWS — each row sums to 1, which is what keeps a neutral scene grey neutral. (GLSL's
@@ -209,7 +238,8 @@ fn mat_mul(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
 fn agx_contrast(x: f32) -> f32 {
     let x2 = x * x;
     let x4 = x2 * x2;
-    15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232
+    15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x
+        - 0.00232
 }
 
 fn agx(c: [f32; 3]) -> [f32; 3] {
@@ -226,13 +256,21 @@ fn agx(c: [f32; 3]) -> [f32; 3] {
 fn agx_look(c: [f32; 3], sat: f32) -> [f32; 3] {
     let luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
     let s = 1.0 + sat;
-    [luma + s * (c[0] - luma), luma + s * (c[1] - luma), luma + s * (c[2] - luma)]
+    [
+        luma + s * (c[0] - luma),
+        luma + s * (c[1] - luma),
+        luma + s * (c[2] - luma),
+    ]
 }
 
 /// Back out of AgX's display encoding into linear, ready for the sRGB encode.
 fn agx_eotf(c: [f32; 3]) -> [f32; 3] {
     let v = mat_mul(&AGX_M_INV, c);
-    [v[0].max(0.0).powf(2.2), v[1].max(0.0).powf(2.2), v[2].max(0.0).powf(2.2)]
+    [
+        v[0].max(0.0).powf(2.2),
+        v[1].max(0.0).powf(2.2),
+        v[2].max(0.0).powf(2.2),
+    ]
 }
 
 /// The Khronos PBR Neutral tone mapper, as published.
@@ -273,7 +311,11 @@ pub fn tonemap(p: ColorPipeline, c: [f32; 3]) -> [f32; 3] {
         ViewTransform::AgX => agx_eotf(agx_look(agx(v), p.look)),
         ViewTransform::PbrNeutral => {
             let t = pbr_neutral(v);
-            if p.look.abs() > 1e-6 { agx_look(t, p.look) } else { t }
+            if p.look.abs() > 1e-6 {
+                agx_look(t, p.look)
+            } else {
+                t
+            }
         }
         _ => v, // Standard: straight to the encode, clipping at 1.0
     };
@@ -284,7 +326,11 @@ pub fn tonemap(p: ColorPipeline, c: [f32; 3]) -> [f32; 3] {
     ];
     // The Punchy curve was sampled from OCIO in DISPLAY-referred sRGB, so it belongs here — after
     // the encode, not before it.
-    if p.punchy > 1e-6 { agx_punchy(d, p.punchy) } else { d }
+    if p.punchy > 1e-6 {
+        agx_punchy(d, p.punchy)
+    } else {
+        d
+    }
 }
 
 /// Convenience for the path tracers: one linear channel triple straight to display bytes.
@@ -422,8 +468,14 @@ mod tests {
         let there = mat_mul(&AGX_M, [0.4, 0.4, 0.4]);
         let back = mat_mul(&AGX_M_INV, there);
         for k in 0..3 {
-            assert!((there[k] - 0.4).abs() < 1e-3, "grey tinted by AGX_M: {there:?}");
-            assert!((back[k] - 0.4).abs() < 1e-3, "matrices are not inverses: {back:?}");
+            assert!(
+                (there[k] - 0.4).abs() < 1e-3,
+                "grey tinted by AGX_M: {there:?}"
+            );
+            assert!(
+                (back[k] - 0.4).abs() < 1e-3,
+                "matrices are not inverses: {back:?}"
+            );
         }
     }
 
@@ -439,12 +491,21 @@ mod tests {
     /// past 1.0 instead of clipping. `1 − e⁻ˣ` — what this replaced — is at 0.993 by x = 5.
     #[test]
     fn agx_rolls_off_highlights_instead_of_clipping() {
-        let p = ColorPipeline { view: ViewTransform::AgX, ..Default::default() };
+        let p = ColorPipeline {
+            view: ViewTransform::AgX,
+            ..Default::default()
+        };
         let at = |x: f32| tonemap(p, [x, x, x])[0];
         let (a, b, c) = (at(2.0), at(8.0), at(32.0));
         assert!(a < b && b < c, "must stay monotone: {a} {b} {c}");
-        assert!(c < 1.0, "AgX should still not have clipped at 32× over-range: {c}");
-        assert!(b - a > 0.02, "8× must be visibly brighter than 2×: {a} vs {b}");
+        assert!(
+            c < 1.0,
+            "AgX should still not have clipped at 32× over-range: {c}"
+        );
+        assert!(
+            b - a > 0.02,
+            "8× must be visibly brighter than 2×: {a} vs {b}"
+        );
         assert!(at(0.0) < 0.02, "black must stay black: {}", at(0.0));
     }
 
@@ -454,13 +515,24 @@ mod tests {
             if view == ViewTransform::Raw {
                 continue;
             }
-            let p = ColorPipeline { view, ..Default::default() };
+            let p = ColorPipeline {
+                view,
+                ..Default::default()
+            };
             let mut prev = -1.0f32;
             let mut x = 0.0f32;
             while x < 64.0 {
                 let v = tonemap(p, [x, x, x])[0];
-                assert!((0.0..=1.0).contains(&v), "{}: {x} -> {v} out of gamut", view.label());
-                assert!(v >= prev - 1e-4, "{}: not monotone at {x} ({prev} -> {v})", view.label());
+                assert!(
+                    (0.0..=1.0).contains(&v),
+                    "{}: {x} -> {v} out of gamut",
+                    view.label()
+                );
+                assert!(
+                    v >= prev - 1e-4,
+                    "{}: not monotone at {x} ({prev} -> {v})",
+                    view.label()
+                );
                 prev = v;
                 x = if x < 1.0 { x + 0.02 } else { x * 1.1 };
             }
@@ -483,11 +555,17 @@ mod tests {
         // that matters, because below that a display cannot show the difference anyway.
         for (agx, want) in GREYS {
             let got = agx_punchy([agx; 3], 1.0)[0];
-            assert!((got - want).abs() < 1.0 / 255.0, "AgX {agx}: got {got} want {want}");
+            assert!(
+                (got - want).abs() < 1.0 / 255.0,
+                "AgX {agx}: got {got} want {want}"
+            );
         }
         // `amount` is a real dial: 0 must be the identity.
         for (agx, _) in GREYS {
-            assert!((agx_punchy([agx; 3], 0.0)[0] - agx).abs() < 1e-6, "amount 0 leaves AgX alone");
+            assert!(
+                (agx_punchy([agx; 3], 0.0)[0] - agx).abs() < 1e-6,
+                "amount 0 leaves AgX alone"
+            );
         }
     }
 
@@ -528,12 +606,20 @@ mod tests {
             for k in 0..3 {
                 assert!(
                     got[k] <= agx_ref[k] + 1e-4,
-                    "punchy must not brighten channel {k}: {} from {}", got[k], agx_ref[k]
+                    "punchy must not brighten channel {k}: {} from {}",
+                    got[k],
+                    agx_ref[k]
                 );
             }
         }
-        assert!(worst < 0.06, "divergence from Blender has grown to {worst:.4}");
-        assert!(worst > 0.01, "if this is now near-exact the approximation was replaced — update the claim");
+        assert!(
+            worst < 0.06,
+            "divergence from Blender has grown to {worst:.4}"
+        );
+        assert!(
+            worst > 0.01,
+            "if this is now near-exact the approximation was replaced — update the claim"
+        );
     }
 
     /// Punchy must DARKEN and SATURATE — that is the whole reason for it. Checked on the villa's
@@ -543,22 +629,44 @@ mod tests {
         let sat = |c: [f32; 3]| {
             let mx = c[0].max(c[1]).max(c[2]);
             let mn = c[0].min(c[1]).min(c[2]);
-            if mx > 1e-6 { (mx - mn) / mx } else { 0.0 }
+            if mx > 1e-6 {
+                (mx - mn) / mx
+            } else {
+                0.0
+            }
         };
         for scene in [[0.30f32, 0.12, 0.07], [0.10, 0.18, 0.06]] {
-            let plain = ColorPipeline { view: ViewTransform::AgX, ..Default::default() };
-            let punchy = ColorPipeline { punchy: 1.0, ..plain };
+            let plain = ColorPipeline {
+                view: ViewTransform::AgX,
+                ..Default::default()
+            };
+            let punchy = ColorPipeline {
+                punchy: 1.0,
+                ..plain
+            };
             let a = tonemap(plain, scene);
             let b = tonemap(punchy, scene);
             let lum = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
             assert!(lum(b) < lum(a), "punchy darkens: {b:?} vs {a:?}");
-            assert!(sat(b) > sat(a) + 0.02, "punchy recovers colour: {:.3} vs {:.3}", sat(b), sat(a));
+            assert!(
+                sat(b) > sat(a) + 0.02,
+                "punchy recovers colour: {:.3} vs {:.3}",
+                sat(b),
+                sat(a)
+            );
         }
     }
 
     fn exposure_is_measured_in_stops() {
-        let base = ColorPipeline { view: ViewTransform::AgX, exposure: 0.0, ..Default::default() };
-        let up = ColorPipeline { exposure: 1.0, ..base };
+        let base = ColorPipeline {
+            view: ViewTransform::AgX,
+            exposure: 0.0,
+            ..Default::default()
+        };
+        let up = ColorPipeline {
+            exposure: 1.0,
+            ..base
+        };
         for c in [[0.05, 0.1, 0.2], [0.4, 0.4, 0.4], [1.5, 0.9, 0.3]] {
             let a = tonemap(up, c);
             let b = tonemap(base, [c[0] * 2.0, c[1] * 2.0, c[2] * 2.0]);
@@ -571,12 +679,18 @@ mod tests {
     /// Khronos PBR Neutral's selling point: an in-gamut albedo survives the transform unshifted.
     #[test]
     fn pbr_neutral_preserves_in_gamut_colour() {
-        let p = ColorPipeline { view: ViewTransform::PbrNeutral, ..Default::default() };
+        let p = ColorPipeline {
+            view: ViewTransform::PbrNeutral,
+            ..Default::default()
+        };
         let c = [0.2, 0.35, 0.15];
         let out = tonemap(p, c);
         for k in 0..3 {
             // Only the published 0.04 black offset moves it; hue must not swing.
-            assert!((out[k] - linear_to_srgb(c[k] - 0.04)).abs() < 0.02, "{out:?} from {c:?}");
+            assert!(
+                (out[k] - linear_to_srgb(c[k] - 0.04)).abs() < 0.02,
+                "{out:?} from {c:?}"
+            );
         }
     }
 
@@ -595,19 +709,35 @@ mod tests {
             .collect();
         for row in AGX_M.iter().chain(AGX_M_INV.iter()) {
             for v in row {
-                assert!(lits.iter().any(|l| (l - v).abs() < 1e-6), "{v} missing from the shader copy");
+                assert!(
+                    lits.iter().any(|l| (l - v).abs() < 1e-6),
+                    "{v} missing from the shader copy"
+                );
             }
         }
         assert!(VIEW_GLSL.contains("15.5 * x4 * x2 - 40.14"));
         assert!(SRGB_GLSL.contains("0.04045"));
         // agx_contrast is the published fit: it maps the log-domain midpoint near the middle.
         assert!((agx_contrast(0.0) + 0.00232).abs() < 1e-6);
-        assert!((agx_contrast(1.0) - 1.0).abs() < 0.02, "{}", agx_contrast(1.0));
+        assert!(
+            (agx_contrast(1.0) - 1.0).abs() < 0.02,
+            "{}",
+            agx_contrast(1.0)
+        );
         // A neutral scene grey must come out neutral — no channel drift through the matrices.
-        let p = ColorPipeline { view: ViewTransform::AgX, ..Default::default() };
+        let p = ColorPipeline {
+            view: ViewTransform::AgX,
+            ..Default::default()
+        };
         let g = tonemap(p, [0.18, 0.18, 0.18]);
-        assert!((g[0] - g[1]).abs() < 1e-4 && (g[1] - g[2]).abs() < 1e-4, "grey drifted: {g:?}");
-        assert!((0.35..0.55).contains(&g[0]), "scene mid-grey should land near display mid: {g:?}");
+        assert!(
+            (g[0] - g[1]).abs() < 1e-4 && (g[1] - g[2]).abs() < 1e-4,
+            "grey drifted: {g:?}"
+        );
+        assert!(
+            (0.35..0.55).contains(&g[0]),
+            "scene mid-grey should land near display mid: {g:?}"
+        );
     }
 
     #[test]

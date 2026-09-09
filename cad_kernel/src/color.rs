@@ -24,20 +24,26 @@ use std::collections::HashMap;
 /// truecolors) it cuts to under 10 MB.
 #[derive(Clone, Debug, Default)]
 pub struct TrueColorTable {
-    rgbs:   Vec<u32>,                   // index → 0x00RRGGBB
-    by_rgb: HashMap<u32, u16>,          // 0x00RRGGBB → index (dedup)
+    rgbs: Vec<u32>,            // index → 0x00RRGGBB
+    by_rgb: HashMap<u32, u16>, // 0x00RRGGBB → index (dedup)
 }
 
 impl TrueColorTable {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Intern an RGB. Identical RGBs share the same index — call any
     /// number of times. Returns the index for `Color::TrueColorRef`.
     pub fn intern(&mut self, rgb: u32) -> u16 {
         let rgb = rgb & 0x00FFFFFF;
-        if let Some(&idx) = self.by_rgb.get(&rgb) { return idx; }
-        assert!(self.rgbs.len() < u16::MAX as usize,
-            "TrueColorTable overflow (>65 535 unique colors)");
+        if let Some(&idx) = self.by_rgb.get(&rgb) {
+            return idx;
+        }
+        assert!(
+            self.rgbs.len() < u16::MAX as usize,
+            "TrueColorTable overflow (>65 535 unique colors)"
+        );
         let idx = self.rgbs.len() as u16;
         self.rgbs.push(rgb);
         self.by_rgb.insert(rgb, idx);
@@ -50,8 +56,12 @@ impl TrueColorTable {
         self.rgbs.get(idx as usize).copied()
     }
 
-    pub fn len(&self) -> usize { self.rgbs.len() }
-    pub fn is_empty(&self) -> bool { self.rgbs.is_empty() }
+    pub fn len(&self) -> usize {
+        self.rgbs.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.rgbs.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,7 +82,9 @@ pub enum Color {
 }
 
 impl Default for Color {
-    fn default() -> Self { Color::ByLayer }
+    fn default() -> Self {
+        Color::ByLayer
+    }
 }
 
 impl Color {
@@ -81,9 +93,11 @@ impl Color {
         match self {
             Color::TrueColorRef(idx) => {
                 let v = tc.get(idx)?;
-                Some((((v >> 16) & 0xFF) as u8,
-                      ((v >>  8) & 0xFF) as u8,
-                      ( v        & 0xFF) as u8))
+                Some((
+                    ((v >> 16) & 0xFF) as u8,
+                    ((v >> 8) & 0xFF) as u8,
+                    (v & 0xFF) as u8,
+                ))
             }
             _ => None,
         }
@@ -94,24 +108,32 @@ impl Color {
 /// concrete `(r, g, b)`. ByBlock falls back to ByLayer until block support
 /// lands. ACI indices are resolved through `aci_palette`. TrueColorRef
 /// values are dereferenced via the document's `TrueColorTable`.
-pub fn resolve_color(c: Color, layer_id: u32, layers: &LayerTable, tc: &TrueColorTable) -> (u8, u8, u8) {
+pub fn resolve_color(
+    c: Color,
+    layer_id: u32,
+    layers: &LayerTable,
+    tc: &TrueColorTable,
+) -> (u8, u8, u8) {
     let to_rgb = |idx: u16| -> (u8, u8, u8) {
         let v = tc.get(idx).unwrap_or(0xFFFFFF);
-        (((v >> 16) & 0xFF) as u8,
-         ((v >>  8) & 0xFF) as u8,
-         ( v        & 0xFF) as u8)
+        (
+            ((v >> 16) & 0xFF) as u8,
+            ((v >> 8) & 0xFF) as u8,
+            (v & 0xFF) as u8,
+        )
     };
     match c {
         Color::TrueColorRef(idx) => to_rgb(idx),
-        Color::Aci(idx)          => aci_palette(idx),
+        Color::Aci(idx) => aci_palette(idx),
         Color::ByLayer | Color::ByBlock => {
-            let layer_color = layers.get(layer_id)
+            let layer_color = layers
+                .get(layer_id)
                 .map(|l| l.color)
-                .unwrap_or(Color::Aci(7));  // white-ish fallback
+                .unwrap_or(Color::Aci(7)); // white-ish fallback
             match layer_color {
-                Color::ByLayer | Color::ByBlock => (255, 255, 255),  // safety: break loop
-                Color::TrueColorRef(idx)        => to_rgb(idx),
-                Color::Aci(i)                   => aci_palette(i),
+                Color::ByLayer | Color::ByBlock => (255, 255, 255), // safety: break loop
+                Color::TrueColorRef(idx) => to_rgb(idx),
+                Color::Aci(i) => aci_palette(i),
             }
         }
     }
@@ -130,17 +152,17 @@ pub fn resolve_color(c: Color, layer_id: u32, layers: &LayerTable, tc: &TrueColo
 pub fn aci_palette(idx: u8) -> (u8, u8, u8) {
     // Named colors (0..=9).
     match idx {
-        0     => return (  0,   0,   0),    // ByBlock placeholder (black on light bg)
-        1     => return (255,   0,   0),    // red
-        2     => return (255, 255,   0),    // yellow
-        3     => return (  0, 255,   0),    // green
-        4     => return (  0, 255, 255),    // cyan
-        5     => return (  0,   0, 255),    // blue
-        6     => return (255,   0, 255),    // magenta
-        7     => return (255, 255, 255),    // white / black depending on bg
-        8     => return ( 65,  65,  65),    // dark gray
-        9     => return (128, 128, 128),    // mid gray
-        _     => {}
+        0 => return (0, 0, 0),       // ByBlock placeholder (black on light bg)
+        1 => return (255, 0, 0),     // red
+        2 => return (255, 255, 0),   // yellow
+        3 => return (0, 255, 0),     // green
+        4 => return (0, 255, 255),   // cyan
+        5 => return (0, 0, 255),     // blue
+        6 => return (255, 0, 255),   // magenta
+        7 => return (255, 255, 255), // white / black depending on bg
+        8 => return (65, 65, 65),    // dark gray
+        9 => return (128, 128, 128), // mid gray
+        _ => {}
     }
 
     // Grays at the end (250..=255).
@@ -157,11 +179,11 @@ pub fn aci_palette(idx: u8) -> (u8, u8, u8) {
     //   sub 2 = light tint
     //   sub 3 = light tint, dimmer
     //   etc. (alternating S/V steps the official table uses)
-    let h_idx = (idx - 10) / 10;          // 0..24
-    let sub   = (idx - 10) % 10;          // 0..10
-    let hue = h_idx as f32 * 15.0;        // degrees
-    // The 10 (saturation, value) pairs used by AutoCAD's wheel:
-    // (full-sat full-val), (full-sat 65% val), (half-tint full-val), ...
+    let h_idx = (idx - 10) / 10; // 0..24
+    let sub = (idx - 10) % 10; // 0..10
+    let hue = h_idx as f32 * 15.0; // degrees
+                                   // The 10 (saturation, value) pairs used by AutoCAD's wheel:
+                                   // (full-sat full-val), (full-sat 65% val), (half-tint full-val), ...
     let (s, v): (f32, f32) = match sub {
         0 => (1.00, 1.00),
         1 => (1.00, 0.65),
@@ -180,7 +202,7 @@ pub fn aci_palette(idx: u8) -> (u8, u8, u8) {
 
 /// HSV → RGB, hue in degrees, s and v in [0,1]. Returns u8 RGB.
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
-    let h = h.rem_euclid(360.0) / 60.0;     // 0..6
+    let h = h.rem_euclid(360.0) / 60.0; // 0..6
     let c = v * s;
     let x = c * (1.0 - (h % 2.0 - 1.0).abs());
     let m = v - c;
@@ -205,7 +227,7 @@ mod tests {
     fn truecolor_intern_and_resolve() {
         let mut tc = TrueColorTable::new();
         let idx1 = tc.intern(0xFF8040);
-        let idx2 = tc.intern(0xFF8040);          // dedup
+        let idx2 = tc.intern(0xFF8040); // dedup
         assert_eq!(idx1, idx2);
         assert_eq!(tc.len(), 1);
         let c = Color::TrueColorRef(idx1);
@@ -230,7 +252,13 @@ mod tests {
         let mut prev = 0_u8;
         for i in 250..=255 {
             let v = aci_palette(i).0;
-            assert!(v > prev, "ACI {} ({}) not brighter than previous {}", i, v, prev);
+            assert!(
+                v > prev,
+                "ACI {} ({}) not brighter than previous {}",
+                i,
+                v,
+                prev
+            );
             prev = v;
         }
     }
@@ -240,7 +268,13 @@ mod tests {
         // ACI 10 starts the wheel at hue=0° (red), full saturation, full value.
         // Should round to roughly (255, 0, 0).
         let (r, g, b) = aci_palette(10);
-        assert!(r > 240 && g < 15 && b < 15, "ACI 10 should be ~red, got ({},{},{})", r, g, b);
+        assert!(
+            r > 240 && g < 15 && b < 15,
+            "ACI 10 should be ~red, got ({},{},{})",
+            r,
+            g,
+            b
+        );
     }
 
     #[test]
@@ -254,8 +288,11 @@ mod tests {
             }
         }
         // ACI 7 is intentionally white. Nothing else should be exactly white.
-        assert!(white_count <= 2,
-            "{} ACI indices return pure white; palette is incomplete", white_count);
+        assert!(
+            white_count <= 2,
+            "{} ACI indices return pure white; palette is incomplete",
+            white_count
+        );
     }
 
     #[test]
@@ -263,15 +300,16 @@ mod tests {
         let mut t = LayerTable::with_defaults();
         let tc = TrueColorTable::new();
         let id = t.add(Layer {
-            name:       "WALLS".into(),
-            color:      Color::Aci(3),     // green
-            linetype:   0,
+            name: "WALLS".into(),
+            color: Color::Aci(3), // green
+            linetype: 0,
             lineweight: crate::lineweight::Lineweight::Default,
-            visible:    true,
-            locked:     false,
-            frozen:     false,
-            plottable:  true,
-            order:      0,});
+            visible: true,
+            locked: false,
+            frozen: false,
+            plottable: true,
+            order: 0,
+        });
         assert_eq!(resolve_color(Color::ByLayer, id, &t, &tc), (0, 255, 0));
     }
 

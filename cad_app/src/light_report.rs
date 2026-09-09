@@ -51,7 +51,10 @@ pub struct ReportInput<'a> {
 
 /// Minimal HTML escaping — a room called `Smith & Sons <Ltd>` must not break the document.
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// Render the report. Self-contained: the returned string IS the file.
@@ -65,10 +68,16 @@ pub fn render(inp: &ReportInput) -> String {
 /// average over ground that is not one space. The head and the closing tags belong to the
 /// DOCUMENT; everything between them is written once per room.
 pub fn render_all(doc_title: &str, rooms: &[ReportInput]) -> String {
-    let Some(first) = rooms.first() else { return String::new() };
+    let Some(first) = rooms.first() else {
+        return String::new();
+    };
     // THE DOCUMENT IS THE PROJECT; each room is a section of it. Titling the file after the first
     // room means a three-room report opens in a browser tab called after one of them.
-    let title = if doc_title.trim().is_empty() { first.title.as_str() } else { doc_title.trim() };
+    let title = if doc_title.trim().is_empty() {
+        first.title.as_str()
+    } else {
+        doc_title.trim()
+    };
     let mut h = String::with_capacity(16 * 1024);
     h.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
     h.push_str(&format!("<title>{} — SIMLUX</title>", esc(title)));
@@ -105,7 +114,10 @@ fn body(inp: &ReportInput, named: bool) -> String {
     h.push_str(&kpi(&format!("{:.0} lx", g.avg), "average maintained"));
     h.push_str(&kpi(&format!("{:.2}", g.u0()), "uniformity U₀"));
     if let Some(i) = inp.installation {
-        h.push_str(&kpi(&format!("{:.2} W/m²", i.power_density), "power density"));
+        h.push_str(&kpi(
+            &format!("{:.2} W/m²", i.power_density),
+            "power density",
+        ));
         h.push_str(&kpi(&format!("{} fitting(s)", i.count), "installed"));
     }
     h.push_str("</div>");
@@ -145,7 +157,12 @@ fn body(inp: &ReportInput, named: bool) -> String {
     h.push_str(&tr2("Working plane", &format!("{:.3} m", p.origin.z)));
     h.push_str(&tr2(
         "Calculation area",
-        &format!("{:.2} × {:.2} m — {:.2} m²", p.width, p.depth, p.width * p.depth),
+        &format!(
+            "{:.2} × {:.2} m — {:.2} m²",
+            p.width,
+            p.depth,
+            p.width * p.depth
+        ),
     ));
     // A uniformity figure without its grid cannot be reproduced by anyone, including us. This is
     // the lesson of the DIALux comparison, where their U₀ could not be reproduced for exactly that
@@ -177,7 +194,10 @@ fn body(inp: &ReportInput, named: bool) -> String {
         ),
     ));
     for (name, rho) in &inp.materials {
-        h.push_str(&tr2(&format!("Reflectance — {}", esc(name)), &format!("{:.0} %", rho * 100.0)));
+        h.push_str(&tr2(
+            &format!("Reflectance — {}", esc(name)),
+            &format!("{:.0} %", rho * 100.0),
+        ));
     }
     h.push_str("</table>");
 
@@ -185,15 +205,27 @@ fn body(inp: &ReportInput, named: bool) -> String {
     mark(&mut h, Section::WorkingPlane);
     h.push_str("<h2>Working plane</h2><table>");
     h.push_str(&tr2("Average  Ē", &format!("{:.0} lx", g.avg)));
-    h.push_str(&tr2("Minimum  E<sub>min</sub>", &format!("{:.0} lx", g.min)));
-    h.push_str(&tr2("Maximum  E<sub>max</sub>", &format!("{:.0} lx", g.max)));
+    h.push_str(&tr2(
+        "Minimum  E<sub>min</sub>",
+        &format!("{:.0} lx", g.min),
+    ));
+    h.push_str(&tr2(
+        "Maximum  E<sub>max</sub>",
+        &format!("{:.0} lx", g.max),
+    ));
     h.push_str(&tr2("Median", &format!("{:.0} lx", g.median())));
     h.push_str(&tr2(
         "10th / 90th percentile",
         &format!("{:.0} / {:.0} lx", g.percentile(10.0), g.percentile(90.0)),
     ));
-    h.push_str(&tr2("Uniformity  U₀ = E<sub>min</sub>/Ē", &format!("{:.2}", g.u0())));
-    h.push_str(&tr2("Diversity  U₁ = E<sub>min</sub>/E<sub>max</sub>", &format!("{:.2}", g.u1())));
+    h.push_str(&tr2(
+        "Uniformity  U₀ = E<sub>min</sub>/Ē",
+        &format!("{:.2}", g.u0()),
+    ));
+    h.push_str(&tr2(
+        "Diversity  U₁ = E<sub>min</sub>/E<sub>max</sub>",
+        &format!("{:.2}", g.u1()),
+    ));
     if let Some(f) = g.direct_fraction() {
         h.push_str(&tr2(
             "Direct / indirect",
@@ -261,10 +293,16 @@ fn body(inp: &ReportInput, named: bool) -> String {
             (bb * 255.0).round() as u8,
         ));
     }
-    h.push_str(&format!("</span><span class=\"lgz\">{top:.0} lx</span></div>"));
+    h.push_str(&format!(
+        "</span><span class=\"lgz\">{top:.0} lx</span></div>"
+    ));
     h.push_str(&format!(
         "<p class=\"note\">Scale 0 – {top:.0} lx ({}).</p>",
-        if inp.scale_auto { "auto — this room's maximum" } else { "pinned" },
+        if inp.scale_auto {
+            "auto — this room's maximum"
+        } else {
+            "pinned"
+        },
     ));
 
     // ---- the field, as numbers ------------------------------------------------------------------
@@ -275,7 +313,11 @@ fn body(inp: &ReportInput, named: bool) -> String {
     for r in (0..p.rows).rev() {
         h.push_str("<tr>");
         for c in 0..p.cols {
-            let v = g.values.get((r * p.cols + c) as usize).copied().unwrap_or(0.0);
+            let v = g
+                .values
+                .get((r * p.cols + c) as usize)
+                .copied()
+                .unwrap_or(0.0);
             h.push_str(&format!("<td class=\"g\">{v:.0}</td>"));
         }
         h.push_str("</tr>");
@@ -316,14 +358,20 @@ fn body(inp: &ReportInput, named: bool) -> String {
         h.push_str(&tr2("Fittings", &format!("{}", i.count)));
         h.push_str(&tr2("Connected load", &format!("{:.0} W", i.total_watts)));
         h.push_str(&tr2("Installed flux", &format!("{:.0} lm", i.total_lumens)));
-        h.push_str(&tr2("Power density", &format!("{:.2} W/m²", i.power_density)));
+        h.push_str(&tr2(
+            "Power density",
+            &format!("{:.2} W/m²", i.power_density),
+        ));
         if g.avg > 0.0 {
             h.push_str(&tr2(
                 "Power density per 100 lx",
                 &format!("{:.2} W/m²/100 lx", i.power_density / g.avg * 100.0),
             ));
         }
-        h.push_str(&tr2("Installation efficacy", &format!("{:.0} lm/W", i.efficacy)));
+        h.push_str(&tr2(
+            "Installation efficacy",
+            &format!("{:.0} lm/W", i.efficacy),
+        ));
         h.push_str("</table>");
         // A density computed from half the fittings is worse than none at all, so say which are
         // missing their data rather than quietly averaging over the rest.
@@ -485,12 +533,23 @@ fn schedule_table(rows: &[crate::report::layout::ScheduleRow]) -> String {
             } else {
                 format!("<span class=\"sub\">{}</span>", sub.join(" · "))
             },
-            if r.manufacturer.trim().is_empty() { "—".into() } else { esc(r.manufacturer.trim()) },
+            if r.manufacturer.trim().is_empty() {
+                "—".into()
+            } else {
+                esc(r.manufacturer.trim())
+            },
             dash(r.watts, 1),
             dash(r.lumens, 0),
-            r.efficacy().map(|e| format!("{e:.0}")).unwrap_or_else(|| "—".into()),
+            r.efficacy()
+                .map(|e| format!("{e:.0}"))
+                .unwrap_or_else(|| "—".into()),
             if l > 0.0 || wd > 0.0 {
-                format!("{:.0} × {:.0} × {:.0} mm", l * 1000.0, wd * 1000.0, ht * 1000.0)
+                format!(
+                    "{:.0} × {:.0} × {:.0} mm",
+                    l * 1000.0,
+                    wd * 1000.0,
+                    ht * 1000.0
+                )
             } else {
                 "—".into()
             },
@@ -518,16 +577,23 @@ fn mark(h: &mut String, s: Section) {
 /// identifying itself and are never dropped — a page with no title is not a shorter report, it is
 /// an anonymous one.
 fn filter_sections(html: String, keep: &[Section]) -> String {
-    let Some(first) = html.find("<!--SEC:") else { return html };
+    let Some(first) = html.find("<!--SEC:") else {
+        return html;
+    };
     let mut out = String::with_capacity(html.len());
     out.push_str(&html[..first]);
     let mut rest = &html[first..];
     while let Some(start) = rest.find("<!--SEC:") {
         let name_at = start + 8;
-        let Some(end_tag) = rest[name_at..].find("-->") else { break };
+        let Some(end_tag) = rest[name_at..].find("-->") else {
+            break;
+        };
         let name = &rest[name_at..name_at + end_tag];
         let body_at = name_at + end_tag + 3;
-        let body_end = rest[body_at..].find("<!--SEC:").map(|i| body_at + i).unwrap_or(rest.len());
+        let body_end = rest[body_at..]
+            .find("<!--SEC:")
+            .map(|i| body_at + i)
+            .unwrap_or(rest.len());
         // "END" is not a section: it marks the closing tags, which are part of the document
         // rather than part of any of its contents.
         let on = name == "END" || keep.iter().any(|s| format!("{s:?}") == name);
@@ -540,7 +606,11 @@ fn filter_sections(html: String, keep: &[Section]) -> String {
 }
 
 fn kpi(value: &str, label: &str) -> String {
-    format!("<div><b>{}</b><span>{}</span></div>", esc(value), esc(label))
+    format!(
+        "<div><b>{}</b><span>{}</span></div>",
+        esc(value),
+        esc(label)
+    )
 }
 
 fn tr2(k: &str, v: &str) -> String {
@@ -626,7 +696,13 @@ mod tests {
     }
 
     fn plane(cols: u32, rows: u32) -> CalcPlane {
-        CalcPlane { origin: Vertex::new(0.0, 0.0, 0.8), width: 4.0, depth: 4.0, cols, rows }
+        CalcPlane {
+            origin: Vertex::new(0.0, 0.0, 0.8),
+            width: 4.0,
+            depth: 4.0,
+            cols,
+            rows,
+        }
     }
 
     pub(super) fn input<'a>(g: &'a LuxGrid, p: &'a CalcPlane) -> ReportInput<'a> {
@@ -634,7 +710,12 @@ mod tests {
             title: "Test room".into(),
             grid: g,
             plane: p,
-            maintenance: Maintenance { llmf: 0.8, lsf: 1.0, lmf: 1.0, rsmf: 1.0 },
+            maintenance: Maintenance {
+                llmf: 0.8,
+                lsf: 1.0,
+                lmf: 1.0,
+                rsmf: 1.0,
+            },
             installation: None,
             surfaces: &[],
             cylindrical_avg: None,
@@ -662,12 +743,19 @@ mod tests {
         let p = plane(4, 4);
         let html = render(&input(&g, &p));
         for v in [0, 50, 100, 150] {
-            assert!(html.contains(&format!("\"g\">{v}</td>")), "cell {v} missing");
+            assert!(
+                html.contains(&format!("\"g\">{v}</td>")),
+                "cell {v} missing"
+            );
         }
         // Grid cells carry their own class so this counts THEM and not the conditions table, which
         // is also made of `<td>` — the first version of this counted 30 and was measuring the
         // wrong thing.
-        assert_eq!(html.matches("<td class=\"g\">").count(), 16, "16 cells expected");
+        assert_eq!(
+            html.matches("<td class=\"g\">").count(),
+            16,
+            "16 cells expected"
+        );
     }
 
     /// Rows run far-to-near so the table reads like the plan, not upside down.
@@ -689,9 +777,15 @@ mod tests {
         let g = grid(vec![100.0; 4], 2, 2);
         let p = plane(2, 2);
         let html = render(&input(&g, &p));
-        assert!(!html.contains("Cylindrical"), "cylindrical was never calculated");
+        assert!(
+            !html.contains("Cylindrical"),
+            "cylindrical was never calculated"
+        );
         assert!(!html.contains("Room surfaces"), "no surfaces were reported");
-        assert!(!html.contains("Connected load"), "no installation was summarised");
+        assert!(
+            !html.contains("Connected load"),
+            "no installation was summarised"
+        );
 
         let mut with = input(&g, &p);
         with.cylindrical_avg = Some(75.0);
@@ -707,14 +801,20 @@ mod tests {
         let p = plane(8, 8);
         let html = render(&input(&g, &p));
         assert!(html.contains("0.50 m spacing"), "the grid must be stated");
-        assert!(!html.contains("optimistic"), "8 × 8 on a 4 m room IS the standard grid");
+        assert!(
+            !html.contains("optimistic"),
+            "8 × 8 on a 4 m room IS the standard grid"
+        );
 
         // …and a 2 × 2 grid on the same room is not.
         let g = grid(vec![100.0; 4], 2, 2);
         let p = plane(2, 2);
         let html = render(&input(&g, &p));
         assert!(html.contains("optimistic"), "a coarse grid must be flagged");
-        assert!(html.contains("8 × 8"), "…and say what the standard asks for");
+        assert!(
+            html.contains("8 × 8"),
+            "…and say what the standard asks for"
+        );
     }
 
     /// Unassigned points are declared. A result computed from half a layout looks exactly like one
@@ -726,7 +826,10 @@ mod tests {
         let mut i = input(&g, &p);
         i.unassigned = 3;
         let html = render(&i);
-        assert!(html.contains("3 light point(s) have no fitting"), "must say so");
+        assert!(
+            html.contains("3 light point(s) have no fitting"),
+            "must say so"
+        );
     }
 
     /// A room name with HTML in it must not break the document.
@@ -737,7 +840,10 @@ mod tests {
         let mut i = input(&g, &p);
         i.title = "Smith & Sons <script>alert(1)</script>".into();
         let html = render(&i);
-        assert!(!html.contains("<script>"), "raw markup leaked into the document");
+        assert!(
+            !html.contains("<script>"),
+            "raw markup leaked into the document"
+        );
         assert!(html.contains("Smith &amp; Sons"));
     }
 
@@ -748,7 +854,12 @@ mod tests {
         let g = grid(vec![100.0; 4], 2, 2);
         let p = plane(2, 2);
         let mut i = input(&g, &p);
-        i.maintenance = Maintenance { llmf: 0.95, lsf: 1.0, lmf: 0.90, rsmf: 0.94 };
+        i.maintenance = Maintenance {
+            llmf: 0.95,
+            lsf: 1.0,
+            lmf: 0.90,
+            rsmf: 0.94,
+        };
         let html = render(&i);
         assert!(html.contains("LLMF 0.95"), "sub-factors must be visible");
         assert!(html.contains("0.80"), "…and their product");
@@ -768,21 +879,51 @@ mod the_report_carries_the_false_colour_field {
         let min = vals.iter().cloned().fold(f64::MAX, f64::min);
         let max = vals.iter().cloned().fold(f64::MIN, f64::max);
         let avg = vals.iter().sum::<f64>() / vals.len() as f64;
-        LuxGrid { cols, rows, values: vals, min, max, avg, maintenance: 0.8,
-                  direct: Vec::new(), indirect: Vec::new() }
+        LuxGrid {
+            cols,
+            rows,
+            values: vals,
+            min,
+            max,
+            avg,
+            maintenance: 0.8,
+            direct: Vec::new(),
+            indirect: Vec::new(),
+        }
     }
 
     fn plane(cols: u32, rows: u32) -> CalcPlane {
-        CalcPlane { origin: cad_light::Vertex::new(0.0, 0.0, 0.8), width: 4.0, depth: 4.0, cols, rows }
+        CalcPlane {
+            origin: cad_light::Vertex::new(0.0, 0.0, 0.8),
+            width: 4.0,
+            depth: 4.0,
+            cols,
+            rows,
+        }
     }
 
     fn base<'a>(g: &'a LuxGrid, p: &'a CalcPlane) -> ReportInput<'a> {
         ReportInput {
-            title: "R".into(), grid: g, plane: p,
-            maintenance: Maintenance { llmf: 0.8, lsf: 1.0, lmf: 1.0, rsmf: 1.0 },
-            installation: None, surfaces: &[], cylindrical_avg: None,
-            eye_height: 1.2, room_height: 3.0, materials: Vec::new(), unassigned: 0,
-            ramp: crate::light::lux_rgb, scale_top: 500.0, scale_auto: true, mask: Vec::new(),
+            title: "R".into(),
+            grid: g,
+            plane: p,
+            maintenance: Maintenance {
+                llmf: 0.8,
+                lsf: 1.0,
+                lmf: 1.0,
+                rsmf: 1.0,
+            },
+            installation: None,
+            surfaces: &[],
+            cylindrical_avg: None,
+            eye_height: 1.2,
+            room_height: 3.0,
+            materials: Vec::new(),
+            unassigned: 0,
+            ramp: crate::light::lux_rgb,
+            scale_top: 500.0,
+            scale_auto: true,
+            mask: Vec::new(),
             sections: crate::report::Section::all(),
             images: Vec::new(),
             schedule: Vec::new(),
@@ -797,9 +938,15 @@ mod the_report_carries_the_false_colour_field {
         let g = grid(vec![100.0, 200.0, 300.0, 400.0], 2, 2);
         let p = plane(2, 2);
         let html = render(&base(&g, &p));
-        assert_eq!(html.matches("class=\"fc\" style=\"background:rgb(").count(), 4);
+        assert_eq!(
+            html.matches("class=\"fc\" style=\"background:rgb(").count(),
+            4
+        );
         for v in ["100", "200", "300", "400"] {
-            assert!(html.contains(&format!(">{v}</td>")), "{v} lx is not on the plot");
+            assert!(
+                html.contains(&format!(">{v}</td>")),
+                "{v} lx is not on the plot"
+            );
         }
     }
 
@@ -810,12 +957,18 @@ mod the_report_carries_the_false_colour_field {
         let g = grid(vec![100.0, 900.0], 2, 1);
         let p = plane(2, 1);
         let auto = render(&base(&g, &p));
-        assert!(auto.contains("500 lx"), "the top of the scale must be on the page");
+        assert!(
+            auto.contains("500 lx"),
+            "the top of the scale must be on the page"
+        );
         assert!(auto.contains("auto"), "…and whether it was auto");
 
         let mut pinned = base(&g, &p);
         pinned.scale_auto = false;
-        assert!(render(&pinned).contains("pinned"), "a pinned scale must say so");
+        assert!(
+            render(&pinned).contains("pinned"),
+            "a pinned scale must say so"
+        );
     }
 
     /// It follows the CHOSEN palette, so the file matches the screen.
@@ -834,7 +987,10 @@ mod the_report_carries_the_false_colour_field {
             .expect("a coloured cell");
         let n: Vec<i32> = c.split(',').filter_map(|t| t.trim().parse().ok()).collect();
         assert_eq!(n.len(), 3);
-        assert!(n[0] == n[1] && n[1] == n[2], "greyscale must be neutral, got {n:?}");
+        assert!(
+            n[0] == n[1] && n[1] == n[2],
+            "greyscale must be neutral, got {n:?}"
+        );
     }
 
     /// Cells outside the room are blank, not coloured — colouring them would report illuminance on
@@ -846,7 +1002,11 @@ mod the_report_carries_the_false_colour_field {
         let mut masked = base(&g, &p);
         masked.mask = vec![true, false];
         let html = render(&masked);
-        assert_eq!(html.matches("class=\"fc out\"").count(), 1, "the outside cell is blank");
+        assert_eq!(
+            html.matches("class=\"fc out\"").count(),
+            1,
+            "the outside cell is blank"
+        );
         assert_eq!(
             html.matches("class=\"fc\" style=\"background:rgb(").count(),
             1,
@@ -861,7 +1021,11 @@ mod the_report_carries_the_false_colour_field {
         let g = grid(vec![100.0, 200.0, 300.0, 400.0], 2, 2);
         let p = plane(2, 2);
         let html = render(&base(&g, &p));
-        assert_eq!(html.matches("class=\"g\"").count(), 4, "every value still has a plain cell");
+        assert_eq!(
+            html.matches("class=\"g\"").count(),
+            4,
+            "every value still has a plain cell"
+        );
         assert!(html.contains("Illuminance grid (lx)"));
         assert!(html.contains("Illuminance — false colour"));
     }
@@ -872,8 +1036,14 @@ mod the_report_carries_the_false_colour_field {
         let g = grid(vec![250.0], 1, 1);
         let p = plane(1, 1);
         let html = render(&base(&g, &p));
-        assert!(html.contains("class=\"legend\""), "the plot needs its scale drawn");
-        assert!(html.matches("<i style=\"background:rgb(").count() >= 20, "sampled across the ramp");
+        assert!(
+            html.contains("class=\"legend\""),
+            "the plot needs its scale drawn"
+        );
+        assert!(
+            html.matches("<i style=\"background:rgb(").count() >= 20,
+            "sampled across the ramp"
+        );
     }
 }
 
@@ -901,7 +1071,13 @@ mod the_html_honours_the_chosen_sections {
     }
 
     fn plane() -> CalcPlane {
-        CalcPlane { origin: cad_light::Vertex::new(0.0, 0.0, 0.8), width: 4.0, depth: 4.0, cols: 2, rows: 2 }
+        CalcPlane {
+            origin: cad_light::Vertex::new(0.0, 0.0, 0.8),
+            width: 4.0,
+            depth: 4.0,
+            cols: 2,
+            rows: 2,
+        }
     }
 
     fn with<'a>(g: &'a LuxGrid, p: &'a CalcPlane, keep: Vec<Section>) -> ReportInput<'a> {
@@ -916,9 +1092,15 @@ mod the_html_honours_the_chosen_sections {
         let (g, p) = (grid(), plane());
         let html = render(&with(&g, &p, Section::all()));
         for h in ["Conditions", "Working plane", "Illuminance grid (lx)"] {
-            assert!(html.contains(h), "{h} went missing with everything selected");
+            assert!(
+                html.contains(h),
+                "{h} went missing with everything selected"
+            );
         }
-        assert!(!html.contains("<!--SEC:"), "the markers must not survive into the file");
+        assert!(
+            !html.contains("<!--SEC:"),
+            "the markers must not survive into the file"
+        );
     }
 
     /// A SECTION SWITCHED OFF IS GONE — heading, table and all.
@@ -926,11 +1108,23 @@ mod the_html_honours_the_chosen_sections {
     fn an_unselected_section_is_absent() {
         let (g, p) = (grid(), plane());
         let html = render(&with(&g, &p, vec![Section::WorkingPlane]));
-        assert!(html.contains("Working plane"), "the one that was kept is missing");
-        assert!(!html.contains("Illuminance grid (lx)"), "the grid heading survived");
-        assert!(!html.contains("<h2>Conditions</h2>"), "the conditions table survived");
+        assert!(
+            html.contains("Working plane"),
+            "the one that was kept is missing"
+        );
+        assert!(
+            !html.contains("Illuminance grid (lx)"),
+            "the grid heading survived"
+        );
+        assert!(
+            !html.contains("<h2>Conditions</h2>"),
+            "the conditions table survived"
+        );
         // …and the numbers that only that section prints went with it.
-        assert!(!html.contains("class=\"grid\""), "the grid table survived its heading");
+        assert!(
+            !html.contains("class=\"grid\""),
+            "the grid table survived its heading"
+        );
     }
 
     /// THE TITLE IS NEVER DROPPED. A report with no sections is a shorter report; a report with no
@@ -943,9 +1137,15 @@ mod the_html_honours_the_chosen_sections {
     fn the_title_survives_an_empty_selection() {
         let (g, p) = (grid(), plane());
         let html = render(&with(&g, &p, Vec::new()));
-        assert!(html.contains("Test room"), "the title went with the sections");
+        assert!(
+            html.contains("Test room"),
+            "the title went with the sections"
+        );
         assert!(html.ends_with("</html>"), "the document did not close");
-        assert!(!html.contains("<h2>"), "no section should have been printed");
+        assert!(
+            !html.contains("<h2>"),
+            "no section should have been printed"
+        );
         assert!(
             !html.contains("average maintained"),
             "the headline survived an empty selection — Summary is a section like any other",
@@ -957,7 +1157,10 @@ mod the_html_honours_the_chosen_sections {
     fn the_headline_belongs_to_summary() {
         let (g, p) = (grid(), plane());
         let html = render(&with(&g, &p, vec![Section::Summary]));
-        assert!(html.contains("average maintained"), "Summary did not bring the headline back");
+        assert!(
+            html.contains("average maintained"),
+            "Summary did not bring the headline back"
+        );
         assert!(html.contains("Test room"));
     }
 
@@ -1048,10 +1251,19 @@ mod the_html_carries_the_same_sections_as_the_pdf {
     fn the_schedule_is_in_the_html() {
         let (g, p) = (grid2(), plane2());
         let html = render(&furnished(&g, &p));
-        for want in ["Luminaire schedule", "OCULUS GRANDE 2.0", "HSI Lighting", "OG20-36", "LED 3000K"] {
+        for want in [
+            "Luminaire schedule",
+            "OCULUS GRANDE 2.0",
+            "HSI Lighting",
+            "OG20-36",
+            "LED 3000K",
+        ] {
             assert!(html.contains(want), "{want:?} is not in the HTML report");
         }
-        assert!(html.contains("264.0"), "the connected load (12 × 22 W) is missing");
+        assert!(
+            html.contains("264.0"),
+            "the connected load (12 × 22 W) is missing"
+        );
         assert!(html.contains("109"), "the efficacy (2400/22) is missing");
     }
 
@@ -1060,13 +1272,29 @@ mod the_html_carries_the_same_sections_as_the_pdf {
     fn the_layout_is_drawn_as_svg() {
         let (g, p) = (grid2(), plane2());
         let html = render(&furnished(&g, &p));
-        assert!(html.contains("<h2>Lighting layout</h2>"), "no layout section");
-        assert!(html.contains("<svg class=\"layout\""), "the drawing is not inline SVG");
-        assert!(html.contains("viewBox=\"0 0 8.000 6.000\""), "the viewBox is not the room");
+        assert!(
+            html.contains("<h2>Lighting layout</h2>"),
+            "no layout section"
+        );
+        assert!(
+            html.contains("<svg class=\"layout\""),
+            "the drawing is not inline SVG"
+        );
+        assert!(
+            html.contains("viewBox=\"0 0 8.000 6.000\""),
+            "the viewBox is not the room"
+        );
         assert!(html.contains("<polygon"), "the room outline was not drawn");
-        assert!(html.contains("2 fitting(s)"), "the fitting count is missing");
+        assert!(
+            html.contains("2 fitting(s)"),
+            "the fitting count is missing"
+        );
         // Two markers, each a pair of crossing lines plus a box.
-        assert_eq!(html.matches("stroke=\"#c8963c\"").count(), 2, "a marker per fitting");
+        assert_eq!(
+            html.matches("stroke=\"#c8963c\"").count(),
+            2,
+            "a marker per fitting"
+        );
     }
 
     /// THE DRAWING IS NOT UPSIDE DOWN. A plan reads with +y up and SVG measures down, so it is
@@ -1108,15 +1336,30 @@ mod the_html_carries_the_same_sections_as_the_pdf {
     fn both_honour_their_tick_boxes() {
         let (g, p) = (grid2(), plane2());
         let mut i = furnished(&g, &p);
-        i.sections = Section::all().into_iter().filter(|s| *s != Section::Schedule).collect();
+        i.sections = Section::all()
+            .into_iter()
+            .filter(|s| *s != Section::Schedule)
+            .collect();
         let html = render(&i);
-        assert!(!html.contains("Luminaire schedule"), "the schedule ignored its tick box");
+        assert!(
+            !html.contains("Luminaire schedule"),
+            "the schedule ignored its tick box"
+        );
         assert!(html.contains("Lighting layout"), "the layout went with it");
 
         let mut i = furnished(&g, &p);
-        i.sections = Section::all().into_iter().filter(|s| *s != Section::Layout).collect();
+        i.sections = Section::all()
+            .into_iter()
+            .filter(|s| *s != Section::Layout)
+            .collect();
         let html = render(&i);
-        assert!(!html.contains("Lighting layout"), "the layout ignored its tick box");
-        assert!(html.contains("Luminaire schedule"), "the schedule went with it");
+        assert!(
+            !html.contains("Lighting layout"),
+            "the layout ignored its tick box"
+        );
+        assert!(
+            html.contains("Luminaire schedule"),
+            "the schedule went with it"
+        );
     }
 }

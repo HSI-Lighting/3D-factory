@@ -294,14 +294,28 @@ fn auto_leg(length: f32, include_wall: bool) -> (Vec<BaseModule>, Vec<WallModule
     let base = (0..n)
         .map(|i| {
             if i % 3 == 1 {
-                BaseModule { kind: BaseKind::Drawers, width: 0.0, count: 3 }
+                BaseModule {
+                    kind: BaseKind::Drawers,
+                    width: 0.0,
+                    count: 3,
+                }
             } else {
-                BaseModule { kind: BaseKind::Door, width: 0.0, count: 1 }
+                BaseModule {
+                    kind: BaseKind::Door,
+                    width: 0.0,
+                    count: 1,
+                }
             }
         })
         .collect();
     let wall = if include_wall {
-        (0..n).map(|_| WallModule { kind: WallKind::Door, width: 0.0, count: 1 }).collect()
+        (0..n)
+            .map(|_| WallModule {
+                kind: WallKind::Door,
+                width: 0.0,
+                count: 1,
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -312,7 +326,14 @@ fn auto_leg(length: f32, include_wall: bool) -> (Vec<BaseModule>, Vec<WallModule
 /// add auto-filled return legs seated by a quarter-turn, and one corner square per inside corner.
 fn legs_of(inp: &KitchenInput) -> (Vec<Leg>, Vec<[f32; 2]>) {
     let d = BASE_D;
-    let main = |rot, tx, ty| Leg { base: inp.base.clone(), wall: inp.wall.clone(), length: inp.length, rot, tx, ty };
+    let main = |rot, tx, ty| Leg {
+        base: inp.base.clone(),
+        wall: inp.wall.clone(),
+        length: inp.length,
+        rot,
+        tx,
+        ty,
+    };
     match inp.shape {
         KitchenShape::Straight => (vec![main(Rot::D0, 0.0, 0.0)], Vec::new()),
         KitchenShape::L => {
@@ -320,7 +341,14 @@ fn legs_of(inp: &KitchenInput) -> (Vec<Leg>, Vec<[f32; 2]>) {
             (
                 vec![
                     main(Rot::D0, d, 0.0),
-                    Leg { base: bb, wall: bw, length: inp.length_b, rot: Rot::Dm90, tx: 0.0, ty: d + inp.length_b },
+                    Leg {
+                        base: bb,
+                        wall: bw,
+                        length: inp.length_b,
+                        rot: Rot::Dm90,
+                        tx: 0.0,
+                        ty: d + inp.length_b,
+                    },
                 ],
                 vec![[0.0, 0.0]],
             )
@@ -331,8 +359,22 @@ fn legs_of(inp: &KitchenInput) -> (Vec<Leg>, Vec<[f32; 2]>) {
             (
                 vec![
                     main(Rot::D0, d, 0.0),
-                    Leg { base: bb, wall: bw, length: inp.length_b, rot: Rot::Dm90, tx: 0.0, ty: d + inp.length_b },
-                    Leg { base: cb, wall: cw, length: inp.length_c, rot: Rot::D90, tx: 2.0 * d + inp.length, ty: d },
+                    Leg {
+                        base: bb,
+                        wall: bw,
+                        length: inp.length_b,
+                        rot: Rot::Dm90,
+                        tx: 0.0,
+                        ty: d + inp.length_b,
+                    },
+                    Leg {
+                        base: cb,
+                        wall: cw,
+                        length: inp.length_c,
+                        rot: Rot::D90,
+                        tx: 2.0 * d + inp.length,
+                        ty: d,
+                    },
                 ],
                 vec![[0.0, 0.0], [d + inp.length, 0.0]],
             )
@@ -341,13 +383,19 @@ fn legs_of(inp: &KitchenInput) -> (Vec<Leg>, Vec<[f32; 2]>) {
 }
 
 /// Lay a lane out along `[0, length]` (spec §B5): fixed widths sum, flex (width 0) shares the rest.
-fn place<T>(mods: &[T], length: f32, width_of: impl Fn(&T) -> f32) -> Result<Vec<Placed>, ArchError> {
+fn place<T>(
+    mods: &[T],
+    length: f32,
+    width_of: impl Fn(&T) -> f32,
+) -> Result<Vec<Placed>, ArchError> {
     let fixed: f32 = mods.iter().map(&width_of).filter(|w| *w > 0.0).sum();
     let flex = mods.iter().filter(|m| width_of(m) <= 0.0).count();
     let flex_w = if flex > 0 {
         let w = (length - fixed) / flex as f32;
         if w <= 0.0 {
-            return Err(ArchError::Invalid("fixed module widths exceed the run length"));
+            return Err(ArchError::Invalid(
+                "fixed module widths exceed the run length",
+            ));
         }
         w
     } else {
@@ -356,8 +404,16 @@ fn place<T>(mods: &[T], length: f32, width_of: impl Fn(&T) -> f32) -> Result<Vec
     let mut out = Vec::new();
     let mut u = 0.0;
     for (idx, m) in mods.iter().enumerate() {
-        let mw = if width_of(m) > 0.0 { width_of(m) } else { flex_w };
-        out.push(Placed { idx, u0: u, u1: u + mw });
+        let mw = if width_of(m) > 0.0 {
+            width_of(m)
+        } else {
+            flex_w
+        };
+        out.push(Placed {
+            idx,
+            u0: u,
+            u1: u + mw,
+        });
         u += mw;
     }
     if u - length > 1e-6 {
@@ -372,7 +428,9 @@ pub fn plan(inp: &KitchenInput) -> Result<(KitchenMetrics, Vec<String>), ArchErr
         return Err(ArchError::NonPositive("run length"));
     }
     if inp.base.is_empty() {
-        return Err(ArchError::Invalid("the base lane needs at least one module"));
+        return Err(ArchError::Invalid(
+            "the base lane needs at least one module",
+        ));
     }
     if matches!(inp.shape, KitchenShape::L | KitchenShape::U) && inp.length_b <= 0.0 {
         return Err(ArchError::NonPositive("return-leg B length"));
@@ -429,7 +487,11 @@ pub fn plan(inp: &KitchenInput) -> Result<(KitchenMetrics, Vec<String>), ArchErr
         }
     }
 
-    let handles = if inp.handles { door_leaves + drawers } else { 0 };
+    let handles = if inp.handles {
+        door_leaves + drawers
+    } else {
+        0
+    };
 
     let m = KitchenMetrics {
         length: inp.length,
@@ -451,7 +513,9 @@ pub fn plan(inp: &KitchenInput) -> Result<(KitchenMetrics, Vec<String>), ArchErr
     // ── warnings (spec §B10) — evaluated on the editable MAIN leg. ──
     let mut warn = Vec::new();
     if !inp.include_wall {
-        warn.push("upper (wall) cabinets are OFF — base run, worktop, plinth and tall units only".into());
+        warn.push(
+            "upper (wall) cabinets are OFF — base run, worktop, plinth and tall units only".into(),
+        );
     }
     if corner_ct > 0 {
         warn.push("corner units are blind fillers and return legs are auto-filled — tune the main leg here".into());
@@ -468,12 +532,19 @@ pub fn plan(inp: &KitchenInput) -> Result<(KitchenMetrics, Vec<String>), ArchErr
             BaseKind::Door => {
                 let leaf = (p.u1 - p.u0) / m.count.max(1) as f32;
                 if leaf > 0.620 {
-                    warn.push(format!("base door leaf {:.0} mm is over 620 mm — will sag and foul; split the bay", leaf * 1000.0));
+                    warn.push(format!(
+                        "base door leaf {:.0} mm is over 620 mm — will sag and foul; split the bay",
+                        leaf * 1000.0
+                    ));
                 }
             }
             BaseKind::Drawers => {
                 if (BASE_H / m.count.max(1) as f32) < 0.100 {
-                    warn.push(format!("{} drawers gives {:.0} mm fronts — too shallow", m.count.max(1), BASE_H / m.count.max(1) as f32 * 1000.0));
+                    warn.push(format!(
+                        "{} drawers gives {:.0} mm fronts — too shallow",
+                        m.count.max(1),
+                        BASE_H / m.count.max(1) as f32 * 1000.0
+                    ));
                 }
             }
             _ => {}
@@ -513,7 +584,16 @@ fn push_box(mesh: &mut SolidMesh, part: u32, x: [f32; 2], y: [f32; 2], z: [f32; 
     if (x1 - x0) < 1e-6 || (y1 - y0) < 1e-6 || (z1 - z0) < 1e-6 {
         return;
     }
-    let c = [[x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0], [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]];
+    let c = [
+        [x0, y0, z0],
+        [x1, y0, z0],
+        [x1, y1, z0],
+        [x0, y1, z0],
+        [x0, y0, z1],
+        [x1, y0, z1],
+        [x1, y1, z1],
+        [x0, y1, z1],
+    ];
     let quads: [([usize; 4], [f32; 3]); 6] = [
         ([0, 3, 2, 1], [0.0, 0.0, -1.0]),
         ([4, 5, 6, 7], [0.0, 0.0, 1.0]),
@@ -549,11 +629,25 @@ fn push_prism_z(mesh: &mut SolidMesh, part: u32, poly: &[[f32; 2]], z0: f32, z1:
     let vtx = |i: usize, z: f32| [poly[i][0], poly[i][1], z];
     let mut tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
         let sub = |p: [f32; 3], q: [f32; 3]| [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
-        let cross = |u: [f32; 3], w: [f32; 3]| [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+        let cross = |u: [f32; 3], w: [f32; 3]| {
+            [
+                u[1] * w[2] - u[2] * w[1],
+                u[2] * w[0] - u[0] * w[2],
+                u[0] * w[1] - u[1] * w[0],
+            ]
+        };
         let dot = |u: [f32; 3], w: [f32; 3]| u[0] * w[0] + u[1] * w[1] + u[2] * w[2];
-        let tc = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0];
+        let tc = [
+            (a[0] + b[0] + c[0]) / 3.0,
+            (a[1] + b[1] + c[1]) / 3.0,
+            (a[2] + b[2] + c[2]) / 3.0,
+        ];
         let out = sub(tc, centroid);
-        let (p, q, r) = if dot(cross(sub(b, a), sub(c, a)), out) < 0.0 { (a, c, b) } else { (a, b, c) };
+        let (p, q, r) = if dot(cross(sub(b, a), sub(c, a)), out) < 0.0 {
+            (a, c, b)
+        } else {
+            (a, b, c)
+        };
         let mut nrm = cross(sub(q, p), sub(r, p));
         let len = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt();
         if len > 1e-9 {
@@ -593,13 +687,49 @@ fn push_handle(mesh: &mut SolidMesh, part: u32, cu: f32, cz: f32, v_face: f32, v
     let y_bar = [v_face + proj - d, v_face + proj];
     let y_post = [v_face - OVERLAP, v_face + proj];
     if vertical {
-        push_box(mesh, part, [cu - d / 2.0, cu + d / 2.0], y_bar, [cz - l / 2.0, cz + l / 2.0]);
-        push_box(mesh, part, [cu - d / 2.0, cu + d / 2.0], y_post, [cz - l / 2.0, cz - l / 2.0 + d]);
-        push_box(mesh, part, [cu - d / 2.0, cu + d / 2.0], y_post, [cz + l / 2.0 - d, cz + l / 2.0]);
+        push_box(
+            mesh,
+            part,
+            [cu - d / 2.0, cu + d / 2.0],
+            y_bar,
+            [cz - l / 2.0, cz + l / 2.0],
+        );
+        push_box(
+            mesh,
+            part,
+            [cu - d / 2.0, cu + d / 2.0],
+            y_post,
+            [cz - l / 2.0, cz - l / 2.0 + d],
+        );
+        push_box(
+            mesh,
+            part,
+            [cu - d / 2.0, cu + d / 2.0],
+            y_post,
+            [cz + l / 2.0 - d, cz + l / 2.0],
+        );
     } else {
-        push_box(mesh, part, [cu - l / 2.0, cu + l / 2.0], y_bar, [cz - d / 2.0, cz + d / 2.0]);
-        push_box(mesh, part, [cu - l / 2.0, cu - l / 2.0 + d], y_post, [cz - d / 2.0, cz + d / 2.0]);
-        push_box(mesh, part, [cu + l / 2.0 - d, cu + l / 2.0], y_post, [cz - d / 2.0, cz + d / 2.0]);
+        push_box(
+            mesh,
+            part,
+            [cu - l / 2.0, cu + l / 2.0],
+            y_bar,
+            [cz - d / 2.0, cz + d / 2.0],
+        );
+        push_box(
+            mesh,
+            part,
+            [cu - l / 2.0, cu - l / 2.0 + d],
+            y_post,
+            [cz - d / 2.0, cz + d / 2.0],
+        );
+        push_box(
+            mesh,
+            part,
+            [cu + l / 2.0 - d, cu + l / 2.0],
+            y_post,
+            [cz - d / 2.0, cz + d / 2.0],
+        );
     }
 }
 
@@ -614,40 +744,107 @@ enum Top {
 /// Two sides, a deck, a back, a top (full / rails / none) and shelves — all `Carcass` (spec §B6).
 /// Sides inset by `CARC_GAP/2` so neighbours never share a face.
 #[allow(clippy::too_many_arguments)]
-fn carcass(mesh: &mut SolidMesh, part: u32, u0: f32, u1: f32, v0: f32, v1: f32, z0: f32, z1: f32, top: Top, shelves: usize) {
+fn carcass(
+    mesh: &mut SolidMesh,
+    part: u32,
+    u0: f32,
+    u1: f32,
+    v0: f32,
+    v1: f32,
+    z0: f32,
+    z1: f32,
+    top: Top,
+    shelves: usize,
+) {
     let g = CARC_GAP / 2.0;
     let (a, b) = (u0 + g, u1 - g);
     push_box(mesh, part, [a, a + PANEL_T], [v0, v1], [z0, z1]); // side L
     push_box(mesh, part, [b - PANEL_T, b], [v0, v1], [z0, z1]); // side R
-    push_box(mesh, part, [a + PANEL_T, b - PANEL_T], [v0, v1], [z0, z0 + PANEL_T]); // deck
-    push_box(mesh, part, [a + PANEL_T, b - PANEL_T], [v0, v0 + BACK_T], [z0 + PANEL_T, z1]); // back
+    push_box(
+        mesh,
+        part,
+        [a + PANEL_T, b - PANEL_T],
+        [v0, v1],
+        [z0, z0 + PANEL_T],
+    ); // deck
+    push_box(
+        mesh,
+        part,
+        [a + PANEL_T, b - PANEL_T],
+        [v0, v0 + BACK_T],
+        [z0 + PANEL_T, z1],
+    ); // back
     match top {
         Top::Full => {
-            push_box(mesh, part, [a + PANEL_T, b - PANEL_T], [v0, v1], [z1 - PANEL_T, z1]);
+            push_box(
+                mesh,
+                part,
+                [a + PANEL_T, b - PANEL_T],
+                [v0, v1],
+                [z1 - PANEL_T, z1],
+            );
         }
         Top::Rails => {
-            push_box(mesh, part, [a + PANEL_T, b - PANEL_T], [v1 - 0.080, v1], [z1 - PANEL_T, z1]);
-            push_box(mesh, part, [a + PANEL_T, b - PANEL_T], [v0 + BACK_T, v0 + BACK_T + 0.080], [z1 - PANEL_T, z1]);
+            push_box(
+                mesh,
+                part,
+                [a + PANEL_T, b - PANEL_T],
+                [v1 - 0.080, v1],
+                [z1 - PANEL_T, z1],
+            );
+            push_box(
+                mesh,
+                part,
+                [a + PANEL_T, b - PANEL_T],
+                [v0 + BACK_T, v0 + BACK_T + 0.080],
+                [z1 - PANEL_T, z1],
+            );
         }
         Top::None => {}
     }
     for k in 0..shelves {
         let zz = z0 + (z1 - z0) * (k + 1) as f32 / (shelves + 1) as f32;
-        push_box(mesh, part, [a + PANEL_T, b - PANEL_T], [v0 + BACK_T, v1 - 0.020], [zz, zz + SHELF_T]);
+        push_box(
+            mesh,
+            part,
+            [a + PANEL_T, b - PANEL_T],
+            [v0 + BACK_T, v1 - 0.020],
+            [zz, zz + SHELF_T],
+        );
     }
 }
 
 /// `n` overlay door leaves across `[u0,u1]` + their vertical pulls (hinges mirror about centre).
 #[allow(clippy::too_many_arguments)]
-fn doors_in(mesh: &mut SolidMesh, front: u32, handle: Option<u32>, u0: f32, u1: f32, z0: f32, z1: f32, v_face: f32, n: usize) {
+fn doors_in(
+    mesh: &mut SolidMesh,
+    front: u32,
+    handle: Option<u32>,
+    u0: f32,
+    u1: f32,
+    z0: f32,
+    z1: f32,
+    v_face: f32,
+    n: usize,
+) {
     let g = DOOR_GAP / 2.0;
     let w = (u1 - u0) / n as f32;
     for k in 0..n {
         let (a, b) = (u0 + k as f32 * w + g, u0 + (k + 1) as f32 * w - g);
-        push_box(mesh, front, [a, b], [v_face, v_face + DOOR_T], [z0 + g, z1 - g]);
+        push_box(
+            mesh,
+            front,
+            [a, b],
+            [v_face, v_face + DOOR_T],
+            [z0 + g, z1 - g],
+        );
         if let Some(h) = handle {
             let hinge_left = (k as f32 + 0.5) < n as f32 / 2.0;
-            let hu = if hinge_left { b - HANDLE_INSET } else { a + HANDLE_INSET };
+            let hu = if hinge_left {
+                b - HANDLE_INSET
+            } else {
+                a + HANDLE_INSET
+            };
             push_handle(mesh, h, hu, (z0 + z1) / 2.0, v_face + DOOR_T, true);
         }
     }
@@ -655,73 +852,204 @@ fn doors_in(mesh: &mut SolidMesh, front: u32, handle: Option<u32>, u0: f32, u1: 
 
 /// `n` drawer fronts stacked over `[z0,z1]` + horizontal pulls.
 #[allow(clippy::too_many_arguments)]
-fn drawers_in(mesh: &mut SolidMesh, front: u32, handle: Option<u32>, u0: f32, u1: f32, z0: f32, z1: f32, v_face: f32, n: usize) {
+fn drawers_in(
+    mesh: &mut SolidMesh,
+    front: u32,
+    handle: Option<u32>,
+    u0: f32,
+    u1: f32,
+    z0: f32,
+    z1: f32,
+    v_face: f32,
+    n: usize,
+) {
     let g = DOOR_GAP / 2.0;
     let h = (z1 - z0) / n as f32;
     for k in 0..n {
         let (a, b) = (z0 + k as f32 * h, z0 + (k + 1) as f32 * h);
-        push_box(mesh, front, [u0 + g, u1 - g], [v_face, v_face + DOOR_T], [a + g, b - g]);
+        push_box(
+            mesh,
+            front,
+            [u0 + g, u1 - g],
+            [v_face, v_face + DOOR_T],
+            [a + g, b - g],
+        );
         if let Some(hn) = handle {
-            push_handle(mesh, hn, (u0 + u1) / 2.0, (a + b) / 2.0, v_face + DOOR_T, false);
+            push_handle(
+                mesh,
+                hn,
+                (u0 + u1) / 2.0,
+                (a + b) / 2.0,
+                v_face + DOOR_T,
+                false,
+            );
         }
     }
 }
 
 /// A full-height tall unit (spec §B7): carcass + bottom-first stack (door / niche / door).
-fn build_tall(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &KitchenInput, u0: f32, u1: f32) {
+fn build_tall(
+    mesh: &mut SolidMesh,
+    mats: &mut Vec<Material>,
+    inp: &KitchenInput,
+    u0: f32,
+    u1: f32,
+) {
     let carc = alloc(mats, Material::Carcass);
     let (z0, z1) = (BASE_Z0, TALL_TOP);
     let g = CARC_GAP / 2.0;
     let (a, b) = (u0 + g, u1 - g);
     push_box(mesh, carc, [a, a + PANEL_T], [0.0, TALL_D], [z0, z1]);
     push_box(mesh, carc, [b - PANEL_T, b], [0.0, TALL_D], [z0, z1]);
-    push_box(mesh, carc, [a + PANEL_T, b - PANEL_T], [0.0, BACK_T], [z0, z1]);
-    push_box(mesh, carc, [a + PANEL_T, b - PANEL_T], [0.0, TALL_D], [z0, z0 + PANEL_T]);
-    push_box(mesh, carc, [a + PANEL_T, b - PANEL_T], [0.0, TALL_D], [z1 - PANEL_T, z1]);
+    push_box(
+        mesh,
+        carc,
+        [a + PANEL_T, b - PANEL_T],
+        [0.0, BACK_T],
+        [z0, z1],
+    );
+    push_box(
+        mesh,
+        carc,
+        [a + PANEL_T, b - PANEL_T],
+        [0.0, TALL_D],
+        [z0, z0 + PANEL_T],
+    );
+    push_box(
+        mesh,
+        carc,
+        [a + PANEL_T, b - PANEL_T],
+        [0.0, TALL_D],
+        [z1 - PANEL_T, z1],
+    );
 
     let avail = (z1 - z0) - 2.0 * PANEL_T;
     let fixed: f32 = TALL_STACK.iter().filter_map(|(h, _)| *h).sum();
     let flex = TALL_STACK.iter().filter(|(h, _)| h.is_none()).count();
-    let fh = if flex > 0 { (avail - fixed) / flex as f32 } else { 0.0 };
+    let fh = if flex > 0 {
+        (avail - fixed) / flex as f32
+    } else {
+        0.0
+    };
 
     let front = alloc(mats, Material::Front);
-    let handle = if inp.handles { Some(alloc(mats, Material::Metal)) } else { None };
+    let handle = if inp.handles {
+        Some(alloc(mats, Material::Metal))
+    } else {
+        None
+    };
     let mut z = z0 + PANEL_T;
     for (k, (h, is_door)) in TALL_STACK.iter().enumerate() {
         let h = h.unwrap_or(fh);
         if k > 0 {
-            push_box(mesh, carc, [a + PANEL_T, b - PANEL_T], [0.0, TALL_D], [z, z + SHELF_T]); // divider
+            push_box(
+                mesh,
+                carc,
+                [a + PANEL_T, b - PANEL_T],
+                [0.0, TALL_D],
+                [z, z + SHELF_T],
+            ); // divider
         }
         if *is_door {
-            doors_in(mesh, front, handle, a + PANEL_T + FRONT_INSET, b - PANEL_T - FRONT_INSET, z, z + h, TALL_D, 1);
+            doors_in(
+                mesh,
+                front,
+                handle,
+                a + PANEL_T + FRONT_INSET,
+                b - PANEL_T - FRONT_INSET,
+                z,
+                z + h,
+                TALL_D,
+                1,
+            );
         }
         z += h;
     }
 }
 
 /// One base module. Returns whether it emitted a carcass (for leg placement it doesn't matter).
-fn build_base_module(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &KitchenInput, m: BaseModule, u0: f32, u1: f32) {
+fn build_base_module(
+    mesh: &mut SolidMesh,
+    mats: &mut Vec<Material>,
+    inp: &KitchenInput,
+    m: BaseModule,
+    u0: f32,
+    u1: f32,
+) {
     let (z0, z1) = (BASE_Z0, BASE_Z1);
     let fi = FRONT_INSET;
     match m.kind {
         BaseKind::Gap => {}
-        BaseKind::Void => carcass(mesh, alloc(mats, Material::Carcass), u0, u1, 0.0, BASE_D, z0, z1, Top::None, 0),
+        BaseKind::Void => carcass(
+            mesh,
+            alloc(mats, Material::Carcass),
+            u0,
+            u1,
+            0.0,
+            BASE_D,
+            z0,
+            z1,
+            Top::None,
+            0,
+        ),
         BaseKind::Tall => build_tall(mesh, mats, inp, u0, u1),
         BaseKind::Door | BaseKind::Drawers => {
-            carcass(mesh, alloc(mats, Material::Carcass), u0, u1, 0.0, BASE_D, z0, z1, Top::Rails, BASE_SHELVES);
+            carcass(
+                mesh,
+                alloc(mats, Material::Carcass),
+                u0,
+                u1,
+                0.0,
+                BASE_D,
+                z0,
+                z1,
+                Top::Rails,
+                BASE_SHELVES,
+            );
             let front = alloc(mats, Material::Front);
-            let handle = if inp.handles { Some(alloc(mats, Material::Metal)) } else { None };
-            if m.kind == BaseKind::Door {
-                doors_in(mesh, front, handle, u0 + fi, u1 - fi, z0 + fi, z1, BASE_D, m.count.max(1) as usize);
+            let handle = if inp.handles {
+                Some(alloc(mats, Material::Metal))
             } else {
-                drawers_in(mesh, front, handle, u0 + fi, u1 - fi, z0 + fi, z1, BASE_D, m.count.max(1) as usize);
+                None
+            };
+            if m.kind == BaseKind::Door {
+                doors_in(
+                    mesh,
+                    front,
+                    handle,
+                    u0 + fi,
+                    u1 - fi,
+                    z0 + fi,
+                    z1,
+                    BASE_D,
+                    m.count.max(1) as usize,
+                );
+            } else {
+                drawers_in(
+                    mesh,
+                    front,
+                    handle,
+                    u0 + fi,
+                    u1 - fi,
+                    z0 + fi,
+                    z1,
+                    BASE_D,
+                    m.count.max(1) as usize,
+                );
             }
         }
     }
 }
 
 /// One wall (upper) module.
-fn build_wall_module(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &KitchenInput, m: WallModule, u0: f32, u1: f32) {
+fn build_wall_module(
+    mesh: &mut SolidMesh,
+    mats: &mut Vec<Material>,
+    inp: &KitchenInput,
+    m: WallModule,
+    u0: f32,
+    u1: f32,
+) {
     let (z0, z1) = (WALL_Z0, WALL_Z1);
     let fi = FRONT_INSET;
     match m.kind {
@@ -732,26 +1060,79 @@ fn build_wall_module(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &Kitch
             let (a, b) = (u0 + g, u1 - g);
             push_box(mesh, carc, [a, a + PANEL_T], [0.0, WALL_D], [z0, z1]);
             push_box(mesh, carc, [b - PANEL_T, b], [0.0, WALL_D], [z0, z1]);
-            push_box(mesh, carc, [a + PANEL_T, b - PANEL_T], [0.0, WALL_D], [z1 - PANEL_T, z1]); // top
-            push_box(mesh, carc, [a + PANEL_T, b - PANEL_T], [0.0, WALL_D], [z0, z0 + PANEL_T]); // deck
-            push_box(mesh, carc, [a + PANEL_T, b - PANEL_T], [0.0, BACK_T], [z0, z1]); // back
+            push_box(
+                mesh,
+                carc,
+                [a + PANEL_T, b - PANEL_T],
+                [0.0, WALL_D],
+                [z1 - PANEL_T, z1],
+            ); // top
+            push_box(
+                mesh,
+                carc,
+                [a + PANEL_T, b - PANEL_T],
+                [0.0, WALL_D],
+                [z0, z0 + PANEL_T],
+            ); // deck
+            push_box(
+                mesh,
+                carc,
+                [a + PANEL_T, b - PANEL_T],
+                [0.0, BACK_T],
+                [z0, z1],
+            ); // back
             let n = m.count.max(1) as usize;
             for k in 0..n {
                 let zz = z0 + (z1 - z0) * (k + 1) as f32 / (n + 1) as f32;
-                push_box(mesh, carc, [a + PANEL_T, b - PANEL_T], [BACK_T, WALL_D], [zz, zz + SHELF_T]);
+                push_box(
+                    mesh,
+                    carc,
+                    [a + PANEL_T, b - PANEL_T],
+                    [BACK_T, WALL_D],
+                    [zz, zz + SHELF_T],
+                );
             }
         }
         WallKind::Door => {
-            carcass(mesh, alloc(mats, Material::Carcass), u0, u1, 0.0, WALL_D, z0, z1, Top::Full, WALL_SHELVES);
+            carcass(
+                mesh,
+                alloc(mats, Material::Carcass),
+                u0,
+                u1,
+                0.0,
+                WALL_D,
+                z0,
+                z1,
+                Top::Full,
+                WALL_SHELVES,
+            );
             let front = alloc(mats, Material::Front);
-            let handle = if inp.handles { Some(alloc(mats, Material::Metal)) } else { None };
-            doors_in(mesh, front, handle, u0 + fi, u1 - fi, z0 + fi, z1 - fi, WALL_D, m.count.max(1) as usize);
+            let handle = if inp.handles {
+                Some(alloc(mats, Material::Metal))
+            } else {
+                None
+            };
+            doors_in(
+                mesh,
+                front,
+                handle,
+                u0 + fi,
+                u1 - fi,
+                z0 + fi,
+                z1 - fi,
+                WALL_D,
+                m.count.max(1) as usize,
+            );
         }
     }
 }
 
 /// Maximal contiguous spans of base modules matching `pred`.
-fn spans(placed: &[Placed], base_mods: &[BaseModule], pred: impl Fn(BaseKind) -> bool) -> Vec<(f32, f32)> {
+fn spans(
+    placed: &[Placed],
+    base_mods: &[BaseModule],
+    pred: impl Fn(BaseKind) -> bool,
+) -> Vec<(f32, f32)> {
     let mut out: Vec<(f32, f32)> = Vec::new();
     for p in placed {
         if pred(base_mods[p.idx].kind) {
@@ -769,9 +1150,18 @@ fn spans(placed: &[Placed], base_mods: &[BaseModule], pred: impl Fn(BaseKind) ->
 
 /// Build ONE straight run (base + optional wall lanes, worktop, plinth, legs) in its local frame
 /// `[0, length]` along `u` (→ x), returning the mesh + material-per-part. Composed by [`build`].
-fn build_run(inp: &KitchenInput, base_mods: &[BaseModule], wall_mods: &[WallModule], length: f32) -> Result<(SolidMesh, Vec<Material>), ArchError> {
+fn build_run(
+    inp: &KitchenInput,
+    base_mods: &[BaseModule],
+    wall_mods: &[WallModule],
+    length: f32,
+) -> Result<(SolidMesh, Vec<Material>), ArchError> {
     let base = place(base_mods, length, |m| m.width)?;
-    let wall = if inp.include_wall { place(wall_mods, length, |m| m.width)? } else { Vec::new() };
+    let wall = if inp.include_wall {
+        place(wall_mods, length, |m| m.width)?
+    } else {
+        Vec::new()
+    };
 
     let mut mesh = SolidMesh::default();
     let mut mats: Vec<Material> = Vec::new();
@@ -789,16 +1179,40 @@ fn build_run(inp: &KitchenInput, base_mods: &[BaseModule], wall_mods: &[WallModu
     let face = alloc(&mut mats, Material::Stone);
     for (u0, u1) in spans(&base, base_mods, |k| k.bears_worktop()) {
         let (vb, vf) = (-WT_BACK, BASE_D + WT_FRONT);
-        push_box(&mut mesh, body, [u0, u1], [vb, vf], [BASE_Z1, WT_TOP - WT_RIM]);
-        push_box(&mut mesh, rim, [u0, u1], [vb, vf], [WT_TOP - WT_RIM - OVERLAP, WT_TOP]);
-        push_box(&mut mesh, face, [u0, u1], [vb, vf - WT_EDGE], [WT_TOP - WT_RIM, WT_TOP + OVERLAP]);
+        push_box(
+            &mut mesh,
+            body,
+            [u0, u1],
+            [vb, vf],
+            [BASE_Z1, WT_TOP - WT_RIM],
+        );
+        push_box(
+            &mut mesh,
+            rim,
+            [u0, u1],
+            [vb, vf],
+            [WT_TOP - WT_RIM - OVERLAP, WT_TOP],
+        );
+        push_box(
+            &mut mesh,
+            face,
+            [u0, u1],
+            [vb, vf - WT_EDGE],
+            [WT_TOP - WT_RIM, WT_TOP + OVERLAP],
+        );
     }
 
     // ── Plinth — recessed, under every non-gap base module (tall units too). ──
     let plinth = alloc(&mut mats, Material::Plinth);
     let front = BASE_D - PLINTH_SETBACK;
     for (u0, u1) in spans(&base, base_mods, |k| k.bears_plinth()) {
-        push_box(&mut mesh, plinth, [u0, u1], [front - PLINTH_T, front], [0.0, PLINTH_H + OVERLAP]);
+        push_box(
+            &mut mesh,
+            plinth,
+            [u0, u1],
+            [front - PLINTH_T, front],
+            [0.0, PLINTH_H + OVERLAP],
+        );
     }
 
     // ── Legs — octagonal chrome feet in front of the plinth. ──
@@ -812,7 +1226,8 @@ fn build_run(inp: &KitchenInput, base_mods: &[BaseModule], wall_mods: &[WallModu
             let u = p.u0 + 0.060 + (p.u1 - p.u0 - 0.120) * k as f32 / (cnt - 1) as f32;
             let cy = BASE_D - LEG_STANDOFF;
             push_prism_z(&mut mesh, leg, &octagon(u, cy, LEG_R), 0.0, PLINTH_H);
-            push_prism_z(&mut mesh, leg, &octagon(u, cy, LEG_R * 1.8), 0.0, 0.008); // foot
+            push_prism_z(&mut mesh, leg, &octagon(u, cy, LEG_R * 1.8), 0.0, 0.008);
+            // foot
         }
     }
 
@@ -842,17 +1257,40 @@ fn corner_unit(mesh: &mut SolidMesh, mats: &mut Vec<Material>, cx: f32, cy: f32)
     let m = WT_FRONT;
     let body = alloc(mats, Material::Stone);
     let rim = alloc(mats, Material::Edge);
-    push_box(mesh, body, [x0 - m, x1 + m], [y0 - m, y1 + m], [BASE_Z1, WT_TOP - WT_RIM]);
-    push_box(mesh, rim, [x0 - m, x1 + m], [y0 - m, y1 + m], [WT_TOP - WT_RIM - OVERLAP, WT_TOP]);
+    push_box(
+        mesh,
+        body,
+        [x0 - m, x1 + m],
+        [y0 - m, y1 + m],
+        [BASE_Z1, WT_TOP - WT_RIM],
+    );
+    push_box(
+        mesh,
+        rim,
+        [x0 - m, x1 + m],
+        [y0 - m, y1 + m],
+        [WT_TOP - WT_RIM - OVERLAP, WT_TOP],
+    );
 
     // Recessed plinth block (mostly hidden in the corner).
     let plinth = alloc(mats, Material::Plinth);
     let s = PLINTH_SETBACK;
-    push_box(mesh, plinth, [x0 + s, x1 - s], [y0 + s, y1 - s], [0.0, PLINTH_H + OVERLAP]);
+    push_box(
+        mesh,
+        plinth,
+        [x0 + s, x1 - s],
+        [y0 + s, y1 - s],
+        [0.0, PLINTH_H + OVERLAP],
+    );
 
     // Four feet.
     let leg = alloc(mats, Material::Metal);
-    for (fx, fy) in [(x0 + 0.08, y0 + 0.08), (x1 - 0.08, y0 + 0.08), (x0 + 0.08, y1 - 0.08), (x1 - 0.08, y1 - 0.08)] {
+    for (fx, fy) in [
+        (x0 + 0.08, y0 + 0.08),
+        (x1 - 0.08, y0 + 0.08),
+        (x0 + 0.08, y1 - 0.08),
+        (x1 - 0.08, y1 - 0.08),
+    ] {
         push_prism_z(mesh, leg, &octagon(fx, fy, LEG_R), 0.0, PLINTH_H);
         push_prism_z(mesh, leg, &octagon(fx, fy, LEG_R * 1.8), 0.0, 0.008);
     }
@@ -860,7 +1298,15 @@ fn corner_unit(mesh: &mut SolidMesh, mats: &mut Vec<Material>, cx: f32, cy: f32)
 
 /// Append `src` (built in its own local frame) into `dst`, rotated a quarter-turn about Z and
 /// translated to `(tx, ty)`, remapping every part id past `dst`'s current materials.
-fn append_transformed(dst: &mut SolidMesh, dmats: &mut Vec<Material>, src: &SolidMesh, smats: &[Material], rot: Rot, tx: f32, ty: f32) {
+fn append_transformed(
+    dst: &mut SolidMesh,
+    dmats: &mut Vec<Material>,
+    src: &SolidMesh,
+    smats: &[Material],
+    rot: Rot,
+    tx: f32,
+    ty: f32,
+) {
     let base = dmats.len() as u32;
     dmats.extend_from_slice(smats);
     for p in &src.positions {
@@ -906,7 +1352,10 @@ mod tests {
     fn levels_close() {
         assert!((BASE_Z0 + BASE_H + WT_T + SPLASH_H + WALL_H - WALL_Z1).abs() < 1e-6);
         let tall_carcass = TALL_TOP - BASE_Z0;
-        assert!((BASE_Z0 + tall_carcass - WALL_Z1).abs() < 1e-6, "tall top aligns with wall top");
+        assert!(
+            (BASE_Z0 + tall_carcass - WALL_Z1).abs() < 1e-6,
+            "tall top aligns with wall top"
+        );
         assert!((WT_TOP - 0.910).abs() < 1e-6 && (WALL_Z1 - 2.130).abs() < 1e-6);
     }
 
@@ -929,13 +1378,27 @@ mod tests {
     /// wall band (z ∈ [WALL_Z0, WALL_Z1] except the tall unit, which still rises there).
     #[test]
     fn include_wall_toggle_removes_the_upper_cabinets() {
-        let with = build(&KitchenInput { include_wall: true, ..Default::default() }).unwrap();
-        let without = build(&KitchenInput { include_wall: false, ..Default::default() }).unwrap();
-        assert!(without.1.tri_count() < with.1.tri_count(), "fewer tris without the upper cabinets");
+        let with = build(&KitchenInput {
+            include_wall: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let without = build(&KitchenInput {
+            include_wall: false,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            without.1.tri_count() < with.1.tri_count(),
+            "fewer tris without the upper cabinets"
+        );
         assert_eq!(without.0.wall_modules, 0);
         // Count vertices sitting in the wall band but away from the tall unit's u-range (≥3.0 m).
         let in_wall_band = |m: &SolidMesh| {
-            m.positions.iter().filter(|p| p[2] > WALL_Z0 + 0.05 && p[2] < WALL_Z1 - 0.05 && p[0] < 3.0).count()
+            m.positions
+                .iter()
+                .filter(|p| p[2] > WALL_Z0 + 0.05 && p[2] < WALL_Z1 - 0.05 && p[0] < 3.0)
+                .count()
         };
         assert!(in_wall_band(&with.1) > 0, "wall cabinets present when on");
         assert_eq!(in_wall_band(&without.1), 0, "no wall cabinets when off");
@@ -953,8 +1416,16 @@ mod tests {
                 assert!(v.is_finite());
             }
         }
-        let used: std::collections::HashSet<Material> = mesh.face_ids.iter().map(|&id| mats[id as usize]).collect();
-        for want in [Material::Carcass, Material::Front, Material::Stone, Material::Edge, Material::Plinth, Material::Metal] {
+        let used: std::collections::HashSet<Material> =
+            mesh.face_ids.iter().map(|&id| mats[id as usize]).collect();
+        for want in [
+            Material::Carcass,
+            Material::Front,
+            Material::Stone,
+            Material::Edge,
+            Material::Plinth,
+            Material::Metal,
+        ] {
             assert!(used.contains(&want), "mesh carries {want:?}");
         }
     }
@@ -963,14 +1434,29 @@ mod tests {
     /// extend in +Y past the main leg's depth (the return arm).
     #[test]
     fn l_shape_adds_a_leg_and_corner() {
-        let straight = build(&KitchenInput { shape: KitchenShape::Straight, ..Default::default() }).unwrap();
-        let (m, mesh, mats) = build(&KitchenInput { shape: KitchenShape::L, ..Default::default() }).unwrap();
+        let straight = build(&KitchenInput {
+            shape: KitchenShape::Straight,
+            ..Default::default()
+        })
+        .unwrap();
+        let (m, mesh, mats) = build(&KitchenInput {
+            shape: KitchenShape::L,
+            ..Default::default()
+        })
+        .unwrap();
         assert_eq!(m.corners, 1);
-        assert!(mesh.tri_count() > straight.1.tri_count(), "L has more geometry than straight");
+        assert!(
+            mesh.tri_count() > straight.1.tri_count(),
+            "L has more geometry than straight"
+        );
         assert_eq!(mesh.face_ids.len(), mesh.tri_count());
         assert!((*mesh.face_ids.iter().max().unwrap() as usize) < mats.len());
         // The return arm runs up +Y beyond the main leg (whose depth is only BASE_D).
-        let up_the_arm = mesh.positions.iter().filter(|p| p[1] > BASE_D + 0.5).count();
+        let up_the_arm = mesh
+            .positions
+            .iter()
+            .filter(|p| p[1] > BASE_D + 0.5)
+            .count();
         assert!(up_the_arm > 0, "return leg extends up +Y");
         for p in &mesh.positions {
             for v in p {
@@ -982,28 +1468,58 @@ mod tests {
     /// U adds two corners and two return arms (both ends).
     #[test]
     fn u_shape_has_two_corners_and_two_arms() {
-        let (m, mesh, _mats) = build(&KitchenInput { shape: KitchenShape::U, ..Default::default() }).unwrap();
+        let (m, mesh, _mats) = build(&KitchenInput {
+            shape: KitchenShape::U,
+            ..Default::default()
+        })
+        .unwrap();
         assert_eq!(m.corners, 2);
         let d = BASE_D;
         // Left arm sits near x≈0; right arm near x ≈ 2*D + length. Both should carry geometry.
-        let left_arm = mesh.positions.iter().filter(|p| p[0] < d - 0.05 && p[1] > d + 0.5).count();
-        let right_arm = mesh.positions.iter().filter(|p| p[0] > d + KitchenInput::default().length + 0.05 && p[1] > d + 0.5).count();
+        let left_arm = mesh
+            .positions
+            .iter()
+            .filter(|p| p[0] < d - 0.05 && p[1] > d + 0.5)
+            .count();
+        let right_arm = mesh
+            .positions
+            .iter()
+            .filter(|p| p[0] > d + KitchenInput::default().length + 0.05 && p[1] > d + 0.5)
+            .count();
         assert!(left_arm > 0, "left return arm present");
         assert!(right_arm > 0, "right return arm present");
     }
 
     #[test]
     fn rejects_bad_inputs() {
-        assert!(plan(&KitchenInput { length: 0.0, ..Default::default() }).is_err());
+        assert!(plan(&KitchenInput {
+            length: 0.0,
+            ..Default::default()
+        })
+        .is_err());
         // Fixed widths that exceed the run length.
         let over = KitchenInput {
             length: 1.0,
-            base: vec![BaseModule { kind: BaseKind::Door, width: 2.0, count: 1 }],
+            base: vec![BaseModule {
+                kind: BaseKind::Door,
+                width: 2.0,
+                count: 1,
+            }],
             ..Default::default()
         };
         assert!(plan(&over).is_err(), "overflow rejected");
         // L/U require positive return-leg lengths.
-        assert!(plan(&KitchenInput { shape: KitchenShape::L, length_b: 0.0, ..Default::default() }).is_err());
-        assert!(plan(&KitchenInput { shape: KitchenShape::U, length_c: 0.0, ..Default::default() }).is_err());
+        assert!(plan(&KitchenInput {
+            shape: KitchenShape::L,
+            length_b: 0.0,
+            ..Default::default()
+        })
+        .is_err());
+        assert!(plan(&KitchenInput {
+            shape: KitchenShape::U,
+            length_c: 0.0,
+            ..Default::default()
+        })
+        .is_err());
     }
 }

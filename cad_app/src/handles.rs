@@ -84,12 +84,17 @@ impl HandleLibrary {
     pub fn load(dir: impl AsRef<std::path::Path>) -> Result<Self, String> {
         let dir = dir.as_ref().to_path_buf();
         let path = dir.join("handles.json");
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let m: Manifest = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let m: Manifest =
+            serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         if m.schema != 1 {
             return Err(format!("{}: schema {} is not 1", path.display(), m.schema));
         }
-        Ok(Self { dir, handles: m.handles })
+        Ok(Self {
+            dir,
+            handles: m.handles,
+        })
     }
 
     pub fn get(&self, id: &str) -> Option<&Handle> {
@@ -155,7 +160,10 @@ impl Fitness {
     /// One line for a tooltip: why it is unavailable, or what to watch for.
     pub fn summary(&self) -> String {
         let all: Vec<&Complaint> = self.errors.iter().chain(self.warnings.iter()).collect();
-        all.iter().map(|c| c.message.as_str()).collect::<Vec<_>>().join("; ")
+        all.iter()
+            .map(|c| c.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 }
 
@@ -204,7 +212,9 @@ pub fn fitness(h: &Handle, d: &DoorFit) -> Fitness {
     if bottom < 0.0 {
         f.errors.push(Complaint {
             rule: "B4.3",
-            message: format!("the plate bottom lands at {bottom:.1} mm — below the foot of the leaf"),
+            message: format!(
+                "the plate bottom lands at {bottom:.1} mm — below the foot of the leaf"
+            ),
         });
     }
 
@@ -231,10 +241,16 @@ pub fn fitness(h: &Handle, d: &DoorFit) -> Fitness {
     if !(900.0..=1100.0).contains(&d.handle_height_mm) {
         f.warnings.push(Complaint {
             rule: "B4.6",
-            message: format!("handle at {:.0} mm is outside the usual 900–1100 mm", d.handle_height_mm),
+            message: format!(
+                "handle at {:.0} mm is outside the usual 900–1100 mm",
+                d.handle_height_mm
+            ),
         });
     }
-    if matches!(h.mount.as_str(), "backplate_euro" | "backplate_smart" | "euro" | "smart") {
+    if matches!(
+        h.mount.as_str(),
+        "backplate_euro" | "backplate_smart" | "euro" | "smart"
+    ) {
         f.warnings.push(Complaint {
             rule: "B4.7",
             message: "this pattern expects a lock case; without one the keyhole and thumbturn are decoration".into(),
@@ -386,10 +402,24 @@ mod tests {
         ];
         assert_eq!(l.handles.len(), 5, "five handles in the library");
         for (id, proj, reach, min_backset) in WANT {
-            let h = l.get(id).unwrap_or_else(|| panic!("{id} missing from the manifest"));
-            assert!((h.projection_mm - proj).abs() < 0.01, "{id} projection {} want {proj}", h.projection_mm);
-            assert!((h.lever_reach_mm - reach).abs() < 0.01, "{id} reach {} want {reach}", h.lever_reach_mm);
-            assert!((h.min_backset_mm - min_backset).abs() < 0.05, "{id} min backset {} want {min_backset}", h.min_backset_mm);
+            let h = l
+                .get(id)
+                .unwrap_or_else(|| panic!("{id} missing from the manifest"));
+            assert!(
+                (h.projection_mm - proj).abs() < 0.01,
+                "{id} projection {} want {proj}",
+                h.projection_mm
+            );
+            assert!(
+                (h.lever_reach_mm - reach).abs() < 0.01,
+                "{id} reach {} want {reach}",
+                h.lever_reach_mm
+            );
+            assert!(
+                (h.min_backset_mm - min_backset).abs() < 0.05,
+                "{id} min backset {} want {min_backset}",
+                h.min_backset_mm
+            );
         }
     }
 
@@ -400,11 +430,22 @@ mod tests {
     fn every_handle_points_its_lever_along_plus_x() {
         let Some(l) = lib() else { return };
         for h in &l.handles {
-            assert!(h.bbox_mm.min[0] < 0.0, "{}: nothing behind the spindle", h.id);
-            assert!(h.bbox_mm.max[0] > 0.0, "{}: nothing in front of the spindle", h.id);
+            assert!(
+                h.bbox_mm.min[0] < 0.0,
+                "{}: nothing behind the spindle",
+                h.id
+            );
+            assert!(
+                h.bbox_mm.max[0] > 0.0,
+                "{}: nothing in front of the spindle",
+                h.id
+            );
             assert!(
                 (h.bbox_mm.max[0] - h.lever_reach_mm).abs() < 0.01,
-                "{}: max.x {} is not the lever tip {}", h.id, h.bbox_mm.max[0], h.lever_reach_mm
+                "{}: max.x {} is not the lever tip {}",
+                h.id,
+                h.bbox_mm.max[0],
+                h.lever_reach_mm
             );
         }
     }
@@ -422,7 +463,11 @@ mod tests {
         ];
         for (w, ht, label) in LEAVES {
             for h in &l.handles {
-                let d = DoorFit { door_width_mm: w, door_height_mm: ht, ..Default::default() };
+                let d = DoorFit {
+                    door_width_mm: w,
+                    door_height_mm: ht,
+                    ..Default::default()
+                };
                 let f = fitness(h, &d);
                 assert!(f.ok(), "{} on the {label} leaf: {}", h.id, f.summary());
             }
@@ -435,7 +480,10 @@ mod tests {
     fn the_named_failures_fail_for_the_named_reasons() {
         let Some(l) = lib() else { return };
         // A 35 mm backset is under three handles' minimum; the other two mount.
-        let d = DoorFit { handle_backset_mm: 35.0, ..Default::default() };
+        let d = DoorFit {
+            handle_backset_mm: 35.0,
+            ..Default::default()
+        };
         let mut refused: Vec<&str> = Vec::new();
         for h in &l.handles {
             let f = fitness(h, &d);
@@ -451,11 +499,24 @@ mod tests {
         );
 
         // A 1850 mm handle on a 1981 mm leaf overruns for the smart lock and clears for the euro.
-        let d = DoorFit { handle_height_mm: 1850.0, door_height_mm: 1981.0, door_width_mm: 838.0, ..Default::default() };
+        let d = DoorFit {
+            handle_height_mm: 1850.0,
+            door_height_mm: 1981.0,
+            door_width_mm: 838.0,
+            ..Default::default()
+        };
         let smart = l.get("smartlock_keypad").unwrap();
         let f = fitness(smart, &d);
-        let over = f.errors.iter().find(|c| c.rule == "B4.3").expect("the smart lock must overrun");
-        assert!(over.message.contains("37.7"), "by 37.7 mm, got: {}", over.message);
+        let over = f
+            .errors
+            .iter()
+            .find(|c| c.rule == "B4.3")
+            .expect("the smart lock must overrun");
+        assert!(
+            over.message.contains("37.7"),
+            "by 37.7 mm, got: {}",
+            over.message
+        );
         let euro = l.get("lever_backplate_euro").unwrap();
         assert!(
             !fitness(euro, &d).errors.iter().any(|c| c.rule == "B4.3"),
@@ -487,13 +548,17 @@ mod tests {
     #[test]
     fn exactly_one_face_carries_the_mirrored_part() {
         for hinge in [1.0f32, -1.0] {
-            let d = DoorFit { hinge_side: hinge, ..Default::default() };
+            let d = DoorFit {
+                hinge_side: hinge,
+                ..Default::default()
+            };
             let front = mount_matrix(&d, Face::Front);
             let back = mount_matrix(&d, Face::Back);
             assert!(
                 (front.determinant() * back.determinant()) < 0.0,
                 "hinge {hinge}: one face mirrored, one not — dets {} and {}",
-                front.determinant(), back.determinant()
+                front.determinant(),
+                back.determinant()
             );
             // det M = -hand * face, exactly.
             assert!((front.determinant() + hinge).abs() < 1e-5);
@@ -511,10 +576,17 @@ mod tests {
             .into_iter()
             .filter(|f| mirrors_lettering(&mount_matrix(&d, *f)))
             .count();
-        assert_eq!(mirrored, 1, "exactly one face needs its lettering un-mirrored");
+        assert_eq!(
+            mirrored, 1,
+            "exactly one face needs its lettering un-mirrored"
+        );
 
         // A glyph at the left column must land in the left column after un-mirror + mount.
-        let face = if mirrors_lettering(&mount_matrix(&d, Face::Front)) { Face::Front } else { Face::Back };
+        let face = if mirrors_lettering(&mount_matrix(&d, Face::Front)) {
+            Face::Front
+        } else {
+            Face::Back
+        };
         let m = mount_matrix(&d, face);
         let left = glam::Vec3::new(-0.02, 0.0, 0.01); // a key left of the centreline
         let naive = m.transform_point3(left);
@@ -535,7 +607,10 @@ mod tests {
         let (sx, sz) = spindle(&d);
         let front = mount_matrix(&d, Face::Front).transform_point3(glam::Vec3::ZERO);
         assert!((front.x - sx).abs() < 1e-6 && (front.z - sz).abs() < 1e-6);
-        assert!(front.y.abs() < 1e-6, "the front spindle lies ON the front face, y = 0");
+        assert!(
+            front.y.abs() < 1e-6,
+            "the front spindle lies ON the front face, y = 0"
+        );
         let back = mount_matrix(&d, Face::Back).transform_point3(glam::Vec3::ZERO);
         assert!(
             (back.y + d.leaf_thickness_mm / 1000.0).abs() < 1e-6,
@@ -546,9 +621,11 @@ mod tests {
         let pf = mount_matrix(&d, Face::Front).transform_point3(out);
         let pb = mount_matrix(&d, Face::Back).transform_point3(out);
         assert!(pf.y > 0.0, "the front handle stands out of the front face");
-        assert!(pb.y < -d.leaf_thickness_mm / 1000.0, "the back handle stands out of the back face");
+        assert!(
+            pb.y < -d.leaf_thickness_mm / 1000.0,
+            "the back handle stands out of the back face"
+        );
     }
-
 
     /// The weld puts the real library mesh where it belongs on the real door: one copy per face,
     /// both standing OUT of their own face, both centred on the spindle, and neither overrunning
@@ -562,7 +639,9 @@ mod tests {
         let (sx, sz) = spindle(&fit);
         for h in &l.handles {
             let path = l.mesh_path(h);
-            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
             let (mesh, pbr) = crate::mesh_io::parse_fbx_pbr_at(&bytes, path.parent());
             if mesh.tri_count() == 0 {
                 continue;
@@ -570,35 +649,57 @@ mod tests {
             // Start from a door that already has parts 1..=7, as a real leaf does.
             let (mut p, mut n, mut ids) = (Vec::new(), Vec::new(), vec![1u32, 7]);
             crate::handles::weld_onto(
-                &fit, &mesh.positions, &mesh.normals, &pbr.part_ids, &mut p, &mut n, &mut ids,
+                &fit,
+                &mesh.positions,
+                &mesh.normals,
+                &pbr.part_ids,
+                &mut p,
+                &mut n,
+                &mut ids,
             );
             let welded = p.len() / 3;
             assert_eq!(welded, mesh.tri_count() * 2, "{}: one copy per face", h.id);
             assert_eq!(n.len(), p.len(), "{}: a normal per vertex", h.id);
-            assert!(ids[2..].iter().all(|&i| i > 7), "{}: handle ids continue past the door's", h.id);
+            assert!(
+                ids[2..].iter().all(|&i| i > 7),
+                "{}: handle ids continue past the door's",
+                h.id
+            );
 
             // Half the vertices stand out of the FRONT face (y > 0), half out of the BACK
             // (y < −leaf). Neither set may sit inside the leaf.
             let front = p.iter().filter(|v| v[1] > 1e-4).count();
             let back = p.iter().filter(|v| v[1] < -leaf_t - 1e-4).count();
-            assert!(front > 0 && back > 0, "{}: {front} front / {back} back vertices", h.id);
+            assert!(
+                front > 0 && back > 0,
+                "{}: {front} front / {back} back vertices",
+                h.id
+            );
 
-            let (lo, hi) = p.iter().fold(([f32::MAX; 3], [f32::MIN; 3]), |(mut a, mut b), v| {
-                for i in 0..3 {
-                    a[i] = a[i].min(v[i]);
-                    b[i] = b[i].max(v[i]);
-                }
-                (a, b)
-            });
+            let (lo, hi) = p
+                .iter()
+                .fold(([f32::MAX; 3], [f32::MIN; 3]), |(mut a, mut b), v| {
+                    for i in 0..3 {
+                        a[i] = a[i].min(v[i]);
+                        b[i] = b[i].max(v[i]);
+                    }
+                    (a, b)
+                });
             // The lever reaches INWARD from the spindle, never out past the leading edge.
             let lead = -fit.hinge_side * fit.door_width_mm / 2000.0;
             assert!(
                 (lo[0] - lead.min(sx)).abs() < 0.05 || lo[0] > lead.min(sx) - 0.05,
-                "{}: x {} runs past the leading edge {lead}", h.id, lo[0]
+                "{}: x {} runs past the leading edge {lead}",
+                h.id,
+                lo[0]
             );
             // And it is at the handle HEIGHT, not the plate's own centre — the trap the euro
             // backplate (spindle 45 mm above centre) exists to catch.
-            assert!(lo[2] < sz && hi[2] > sz, "{}: z {lo:?}..{hi:?} straddles the spindle {sz}", h.id);
+            assert!(
+                lo[2] < sz && hi[2] > sz,
+                "{}: z {lo:?}..{hi:?} straddles the spindle {sz}",
+                h.id
+            );
         }
     }
 
@@ -611,7 +712,9 @@ mod tests {
         let Some(l) = lib() else { return };
         for h in &l.handles {
             let path = l.mesh_path(h);
-            let Ok(bytes) = std::fs::read(&path) else { panic!("{}: unreadable", path.display()) };
+            let Ok(bytes) = std::fs::read(&path) else {
+                panic!("{}: unreadable", path.display())
+            };
             let (mesh, _) = crate::mesh_io::parse_fbx_pbr_at(&bytes, path.parent());
             assert!(mesh.tri_count() > 0, "{}: no triangles", h.id);
             let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
@@ -628,17 +731,27 @@ mod tests {
                 assert!(
                     (lo[k] - want_lo).abs() < 5e-4 && (hi[k] - want_hi).abs() < 5e-4,
                     "{}: axis {k} spans {:.4}..{:.4} m, manifest says {:.4}..{:.4}",
-                    h.id, lo[k], hi[k], want_lo, want_hi
+                    h.id,
+                    lo[k],
+                    hi[k],
+                    want_lo,
+                    want_hi
                 );
             }
             // …and the two numbers the picker shows must be the mesh's own.
             assert!(
                 (hi[2] * 1000.0 - h.projection_mm).abs() < 0.5,
-                "{}: mesh projects {:.2} mm, manifest says {:.2}", h.id, hi[2] * 1000.0, h.projection_mm
+                "{}: mesh projects {:.2} mm, manifest says {:.2}",
+                h.id,
+                hi[2] * 1000.0,
+                h.projection_mm
             );
             assert!(
                 (hi[0] * 1000.0 - h.lever_reach_mm).abs() < 0.5,
-                "{}: mesh reaches {:.2} mm, manifest says {:.2}", h.id, hi[0] * 1000.0, h.lever_reach_mm
+                "{}: mesh reaches {:.2} mm, manifest says {:.2}",
+                h.id,
+                hi[0] * 1000.0,
+                h.lever_reach_mm
             );
         }
     }

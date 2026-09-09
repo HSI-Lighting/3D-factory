@@ -42,8 +42,7 @@ pub struct Mesh {
 }
 
 /// A Lambertian surface material.
-#[derive(Debug, Clone)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Material {
     pub id: MaterialId,
     pub name: String,
@@ -56,16 +55,36 @@ pub struct Material {
 /// Sensible room defaults: floor 0.20, walls 0.50, ceiling 0.70.
 pub fn default_materials() -> Vec<Material> {
     vec![
-        Material { id: 0, name: "Floor".into(), reflectance: 0.20, color: [0.6, 0.6, 0.6] },
-        Material { id: 1, name: "Wall".into(), reflectance: 0.50, color: [0.8, 0.8, 0.8] },
-        Material { id: 2, name: "Ceiling".into(), reflectance: 0.70, color: [0.9, 0.9, 0.9] },
+        Material {
+            id: 0,
+            name: "Floor".into(),
+            reflectance: 0.20,
+            color: [0.6, 0.6, 0.6],
+        },
+        Material {
+            id: 1,
+            name: "Wall".into(),
+            reflectance: 0.50,
+            color: [0.8, 0.8, 0.8],
+        },
+        Material {
+            id: 2,
+            name: "Ceiling".into(),
+            reflectance: 0.70,
+            color: [0.9, 0.9, 0.9],
+        },
         // FURNITURE — its own material, not bucketed by orientation like the building.
         //
         // A desk top is not a floor and a cupboard side is not a wall; giving a shop's stock the
         // ceiling's 0.70 would recreate the empty-box error that including furniture exists to fix.
         // 0.35 is the middle of the range CIE 97 gives for furnished contents, and it is a stated
         // default the user can change rather than a number smuggled in from a texture.
-        Material { id: MATERIAL_FURNITURE, name: "Furniture".into(), reflectance: 0.35, color: [0.7, 0.65, 0.6] },
+        Material {
+            id: MATERIAL_FURNITURE,
+            name: "Furniture".into(),
+            reflectance: 0.35,
+            color: [0.7, 0.65, 0.6],
+        },
     ]
 }
 
@@ -179,7 +198,10 @@ impl Luminaire {
     ///
     /// The tilt goes TOWARD `rotation_deg`, so a fitting at 90° tilted 30° leans toward +Y.
     pub fn frame(&self) -> (Vec3, Vec3, Vec3) {
-        let (a, t) = ((self.rotation_deg as f64).to_radians(), (self.tilt_deg as f64).to_radians());
+        let (a, t) = (
+            (self.rotation_deg as f64).to_radians(),
+            (self.tilt_deg as f64).to_radians(),
+        );
         let (sa, ca) = (a.sin() as f32, a.cos() as f32);
         let (st, ct) = (t.sin() as f32, t.cos() as f32);
         // Straight down, tipped by `t` toward the azimuth.
@@ -250,7 +272,10 @@ pub fn installation_summary(
     profiles: &std::collections::HashMap<String, crate::ies::IesProfile>,
     area_m2: f64,
 ) -> Installation {
-    let mut s = Installation { area_m2, ..Default::default() };
+    let mut s = Installation {
+        area_m2,
+        ..Default::default()
+    };
     for l in luminaires {
         let Some(p) = profiles.get(&l.profile) else {
             continue; // an unassigned point is not a fixture yet
@@ -354,7 +379,11 @@ impl CalcPlane {
     /// optimistic, and optimism here is the direction that passes an installation which should fail.
     pub fn on_standard_grid(&self) -> CalcPlane {
         let (cols, rows) = en12464_cells(self.width, self.depth);
-        CalcPlane { cols, rows, ..*self }
+        CalcPlane {
+            cols,
+            rows,
+            ..*self
+        }
     }
 
     /// A human note for the report: "8 × 8 cells, 0.50 m spacing".
@@ -368,7 +397,10 @@ impl CalcPlane {
         if (dx - dy).abs() < 5e-3 {
             format!("{} × {} cells, {:.2} m spacing", self.cols, self.rows, dx)
         } else {
-            format!("{} × {} cells, {:.2} × {:.2} m spacing", self.cols, self.rows, dx, dy)
+            format!(
+                "{} × {} cells, {:.2} × {:.2} m spacing",
+                self.cols, self.rows, dx, dy
+            )
         }
     }
 
@@ -410,7 +442,11 @@ impl Default for RaySettings {
     /// keep whatever they were saved with — a result already issued should not change because the
     /// default moved.
     fn default() -> Self {
-        Self { rays_per_point: 64, max_bounces: 5, shadows: true }
+        Self {
+            rays_per_point: 64,
+            max_bounces: 5,
+            shadows: true,
+        }
     }
 }
 
@@ -446,7 +482,12 @@ pub struct Maintenance {
 impl Maintenance {
     /// No maintenance allowance — the INITIAL condition. Correct for "what will this look like on
     /// day one", wrong for anything that gets submitted.
-    pub const INITIAL: Maintenance = Maintenance { llmf: 1.0, lsf: 1.0, lmf: 1.0, rsmf: 1.0 };
+    pub const INITIAL: Maintenance = Maintenance {
+        llmf: 1.0,
+        lsf: 1.0,
+        lmf: 1.0,
+        rsmf: 1.0,
+    };
 
     /// The overall factor: the product of the four.
     pub fn factor(&self) -> f64 {
@@ -464,7 +505,12 @@ impl Default for Maintenance {
     /// have all four set from those sources; what must never happen again is the factor silently
     /// being 1.0.
     fn default() -> Self {
-        Self { llmf: 0.95, lsf: 1.00, lmf: 0.90, rsmf: 0.94 }
+        Self {
+            llmf: 0.95,
+            lsf: 1.00,
+            lmf: 0.90,
+            rsmf: 0.94,
+        }
     }
 }
 
@@ -533,7 +579,11 @@ impl LuxGrid {
 
     /// Overall uniformity `U₀ = Emin / Eavg` — the ratio EN 12464-1 sets a limit on.
     pub fn u0(&self) -> f64 {
-        if self.avg > 0.0 { self.min / self.avg } else { 0.0 }
+        if self.avg > 0.0 {
+            self.min / self.avg
+        } else {
+            0.0
+        }
     }
 
     /// Diversity `U₁ = Emin / Emax`, the stricter ratio used for sports and road lighting.
@@ -541,7 +591,11 @@ impl LuxGrid {
     /// Always ≤ `u0`, since the average cannot exceed the maximum. Reported alongside it because a
     /// room can hold a respectable U₀ while still having one corner far brighter than the rest.
     pub fn u1(&self) -> f64 {
-        if self.max > 0.0 { self.min / self.max } else { 0.0 }
+        if self.max > 0.0 {
+            self.min / self.max
+        } else {
+            0.0
+        }
     }
 
     /// The `p`-th percentile of the cell values, `p` in 0..=100 (linear interpolation).
@@ -598,11 +652,19 @@ mod metric_tests {
     #[test]
     fn the_maintenance_factor_is_the_product_of_its_parts() {
         assert_eq!(Maintenance::INITIAL.factor(), 1.0);
-        let m = Maintenance { llmf: 0.9, lsf: 0.95, lmf: 0.8, rsmf: 0.5 };
+        let m = Maintenance {
+            llmf: 0.9,
+            lsf: 0.95,
+            lmf: 0.8,
+            rsmf: 0.5,
+        };
         assert!((m.factor() - 0.9 * 0.95 * 0.8 * 0.5).abs() < 1e-12);
         // The shipped default is the ~0.80 a clean interior is normally quoted at.
         let d = Maintenance::default().factor();
-        assert!((0.78..=0.82).contains(&d), "default MF should be about 0.80, got {d}");
+        assert!(
+            (0.78..=0.82).contains(&d),
+            "default MF should be about 0.80, got {d}"
+        );
     }
 
     /// Percentiles interpolate, and the ends are the extremes. Worth pinning because an
@@ -614,7 +676,11 @@ mod metric_tests {
         assert_eq!(g.percentile(100.0), 500.0);
         assert_eq!(g.median(), 300.0);
         // Rank 0.5 of the way between cells 1 and 2 -> halfway between 200 and 300.
-        assert!((g.percentile(37.5) - 250.0).abs() < 1e-9, "got {}", g.percentile(37.5));
+        assert!(
+            (g.percentile(37.5) - 250.0).abs() < 1e-9,
+            "got {}",
+            g.percentile(37.5)
+        );
     }
 
     /// Percentiles do not care what order the cells arrived in — a grid is a spatial layout, and
@@ -697,7 +763,10 @@ mod metric_tests {
         let mut lums = vec![fixture(1, "A"), fixture(2, "A")];
         lums[0].dimming = 0.1;
         let s = installation_summary(&lums, &profiles, 10.0);
-        assert!((s.total_watts - 100.0).abs() < 1e-9, "both fixtures are still installed");
+        assert!(
+            (s.total_watts - 100.0).abs() < 1e-9,
+            "both fixtures are still installed"
+        );
     }
 
     /// A file with no wattage is COUNTED and REPORTED, not silently treated as 0 W. A power
@@ -713,7 +782,10 @@ mod metric_tests {
         assert_eq!(s.count, 2);
         assert_eq!(s.missing_watts, 1);
         assert_eq!(s.missing_lumens, 1);
-        assert!((s.total_watts - 40.0).abs() < 1e-9, "only the fixture that declares a load");
+        assert!(
+            (s.total_watts - 40.0).abs() < 1e-9,
+            "only the fixture that declares a load"
+        );
     }
 
     /// A point with no fitting on it is not a fixture and must not appear in the load.
@@ -746,17 +818,32 @@ mod uniformity_grid {
     #[test]
     fn spacing_follows_the_standards_formula() {
         // 4 m room: 0.2 · 5^0.602 = 0.527 -> the 0.5 m step.
-        assert!((en12464_spacing(4.0) - 0.5).abs() < 1e-6, "got {}", en12464_spacing(4.0));
+        assert!(
+            (en12464_spacing(4.0) - 0.5).abs() < 1e-6,
+            "got {}",
+            en12464_spacing(4.0)
+        );
         // 1 m: 0.2 · 5^0 = 0.2 exactly, the finest step in the table.
         assert!((en12464_spacing(1.0) - 0.2).abs() < 1e-6);
         // 10 m: 0.2 · 5 = 1.0.
-        assert!((en12464_spacing(10.0) - 1.0).abs() < 1e-6, "got {}", en12464_spacing(10.0));
+        assert!(
+            (en12464_spacing(10.0) - 1.0).abs() < 1e-6,
+            "got {}",
+            en12464_spacing(10.0)
+        );
         // 100 m: 0.2 · 25 = 5.0.
-        assert!((en12464_spacing(100.0) - 5.0).abs() < 1e-6, "got {}", en12464_spacing(100.0));
+        assert!(
+            (en12464_spacing(100.0) - 5.0).abs() < 1e-6,
+            "got {}",
+            en12464_spacing(100.0)
+        );
         // It only ever rounds DOWN — a finer grid than asked for is safe, a coarser one is not.
         for d in [2.0_f32, 3.7, 7.5, 12.0, 45.0, 200.0] {
             let p = en12464_spacing(d);
-            assert!(p <= 0.2 * 5.0_f32.powf(d.log10()) + 1e-6, "d = {d} rounded UP to {p}");
+            assert!(
+                p <= 0.2 * 5.0_f32.powf(d.log10()) + 1e-6,
+                "d = {d} rounded UP to {p}"
+            );
         }
         // …except below about 1 m, where the formula asks for finer than the standard tabulates
         // (0.5 m wants 0.115) and 0.2 m is the floor. Sampling a half-metre task area on 0.2 m is
@@ -792,7 +879,10 @@ mod uniformity_grid {
             let (c, r) = en12464_cells(w, d);
             let (dx, dy) = (w / c as f32, d / r as f32);
             let aspect = (dx / dy).max(dy / dx);
-            assert!(aspect <= 2.0 + 1e-3, "{w} x {d} gave cells {dx:.3} x {dy:.3} — {aspect:.2}:1");
+            assert!(
+                aspect <= 2.0 + 1e-3,
+                "{w} x {d} gave cells {dx:.3} x {dy:.3} — {aspect:.2}:1"
+            );
         }
     }
 
@@ -802,7 +892,10 @@ mod uniformity_grid {
     fn the_longer_dimension_sets_the_spacing() {
         // 12 m sets p = 1.0; the 2 m axis then refines only to satisfy the aspect cap.
         let (c, _) = en12464_cells(12.0, 2.0);
-        assert_eq!(c, 12, "the long axis should be on 1.0 m spacing, got {c} cells");
+        assert_eq!(
+            c, 12,
+            "the long axis should be on 1.0 m spacing, got {c} cells"
+        );
     }
 
     /// THE POINT OF ALL THIS: the grid uniformity is quoted on is INDEPENDENT of the grid drawn.
@@ -812,11 +905,15 @@ mod uniformity_grid {
             origin: Vertex::new(0.0, 0.0, 0.8),
             width: 4.0,
             depth: 4.0,
-            cols: 3, // …someone wanted a coarse picture
+            cols: 3,  // …someone wanted a coarse picture
             rows: 40, // …or a fine one
         };
         let std = base.on_standard_grid();
-        assert_eq!((std.cols, std.rows), (8, 8), "the display grid must not leak into the standard");
+        assert_eq!(
+            (std.cols, std.rows),
+            (8, 8),
+            "the display grid must not leak into the standard"
+        );
         // …and everything else about the plane is untouched: same place, same size, same height.
         assert_eq!(std.width, base.width);
         assert_eq!(std.depth, base.depth);
@@ -837,10 +934,23 @@ mod uniformity_grid {
         };
         let note = p.grid_note();
         assert!(note.contains('8'), "got {note:?}");
-        assert!(note.contains("0.50"), "the spacing has to be in it: {note:?}");
+        assert!(
+            note.contains("0.50"),
+            "the spacing has to be in it: {note:?}"
+        );
         // Non-square cells say so rather than quietly quoting one number.
-        let oblong = CalcPlane { width: 12.0, depth: 2.0, cols: 12, rows: 2, ..p };
-        assert!(oblong.grid_note().contains('×'), "got {:?}", oblong.grid_note());
+        let oblong = CalcPlane {
+            width: 12.0,
+            depth: 2.0,
+            cols: 12,
+            rows: 2,
+            ..p
+        };
+        assert!(
+            oblong.grid_note().contains('×'),
+            "got {:?}",
+            oblong.grid_note()
+        );
     }
 }
 
@@ -920,7 +1030,11 @@ mod a_fitting_may_be_re_rated {
         assert_eq!(l.output_scale(&p), before, "watts must not touch the light");
         assert_eq!(l.watts(&p), 32.0);
         assert_eq!(l.lumens(&p), 4000.0, "flux is unchanged");
-        assert_eq!(l.efficacy(&p), Some(125.0), "…so it is now 125 lm/W, which is the point");
+        assert_eq!(
+            l.efficacy(&p),
+            Some(125.0),
+            "…so it is now 125 lm/W, which is the point"
+        );
     }
 
     /// FLUX DOES CHANGE THE LIGHT, and it must: a luminaire's flux scales its whole distribution.
@@ -929,7 +1043,10 @@ mod a_fitting_may_be_re_rated {
         let p = profile(4000.0, 40.0);
         let mut l = lum();
         l.flux_override = Some(3600.0);
-        assert!((l.output_scale(&p) - 0.9).abs() < 1e-12, "3600 of 4000 is the profile at 0.9");
+        assert!(
+            (l.output_scale(&p) - 0.9).abs() < 1e-12,
+            "3600 of 4000 is the profile at 0.9"
+        );
         // …and it compounds with dimming rather than replacing it.
         l.dimming = 0.5;
         assert!((l.output_scale(&p) - 0.45).abs() < 1e-12);
@@ -942,7 +1059,11 @@ mod a_fitting_may_be_re_rated {
         let p = profile(0.0, 40.0);
         let mut l = lum();
         l.flux_override = Some(3600.0);
-        assert_eq!(l.output_scale(&p), 1.0, "no ratio is possible, so no scaling is applied");
+        assert_eq!(
+            l.output_scale(&p),
+            1.0,
+            "no ratio is possible, so no scaling is applied"
+        );
     }
 
     /// The connected load counts the FITTING's figures, so a re-rated fixture shows up in W/m².
@@ -958,7 +1079,10 @@ mod a_fitting_may_be_re_rated {
         a.watts_override = Some(32.0);
         let rerated = installation_summary(&[a, lum()], &profs, 10.0);
         assert!((rerated.total_watts - 72.0).abs() < 1e-9, "32 + 40, not 80");
-        assert!((rerated.total_lumens - 8000.0).abs() < 1e-9, "flux untouched");
+        assert!(
+            (rerated.total_lumens - 8000.0).abs() < 1e-9,
+            "flux untouched"
+        );
     }
 
     /// The override survives a save. It lives on the FIXTURE, in the project — the photometric file

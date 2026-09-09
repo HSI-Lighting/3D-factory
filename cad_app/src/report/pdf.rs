@@ -23,15 +23,49 @@
 #[derive(Clone, Debug)]
 pub enum Item {
     /// Filled rectangle. The false-colour plot is thousands of these.
-    Rect { x: f64, y: f64, w: f64, h: f64, fill: [u8; 3] },
+    Rect {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        fill: [u8; 3],
+    },
     /// Hairline rectangle outline.
-    Frame { x: f64, y: f64, w: f64, h: f64, rgb: [u8; 3], width: f64 },
+    Frame {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        rgb: [u8; 3],
+        width: f64,
+    },
     /// A straight line — rules under headings, table separators.
-    Line { x1: f64, y1: f64, x2: f64, y2: f64, rgb: [u8; 3], width: f64 },
+    Line {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        rgb: [u8; 3],
+        width: f64,
+    },
     /// Text with its baseline at `y`.
-    Text { x: f64, y: f64, size: f64, font: Font, rgb: [u8; 3], align: Align, text: String },
+    Text {
+        x: f64,
+        y: f64,
+        size: f64,
+        font: Font,
+        rgb: [u8; 3],
+        align: Align,
+        text: String,
+    },
     /// An image already encoded as JPEG, by index into the document's image table.
-    Image { x: f64, y: f64, w: f64, h: f64, idx: usize },
+    Image {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        idx: usize,
+    },
     /// A FILLED POLYGON — which is what a false-colour band actually is.
     ///
     /// Reported as: "the false color is still way too coarse make it smooth. it looks all
@@ -44,7 +78,10 @@ pub enum Item {
     /// Several rings, because one band is usually several disjoint pools and may enclose a
     /// brighter one. Filled with the EVEN-ODD rule so an inner ring reads as a hole rather than
     /// painting over the band inside it.
-    Poly { rings: Vec<Vec<(f64, f64)>>, fill: [u8; 3] },
+    Poly {
+        rings: Vec<Vec<(f64, f64)>>,
+        fill: [u8; 3],
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,9 +165,9 @@ fn char_width(c: char, font: Font) -> f64 {
     // bold heading, so both are here. Only the ranges this report emits are tabulated.
     let i = c as u32;
     let regular = match i {
-        32 => 278.0,  // space
-        33 => 278.0,  // !
-        34 => 355.0,  // "
+        32 => 278.0, // space
+        33 => 278.0, // !
+        34 => 355.0, // "
         35..=36 => 556.0,
         37 => 889.0, // %
         38 => 667.0, // &
@@ -307,7 +344,14 @@ impl Doc {
                     // whenever the two rings happened to wind the same way.
                     s.extend_from_slice(b"f*\n");
                 }
-                Item::Frame { x, y, w, h, rgb, width } => {
+                Item::Frame {
+                    x,
+                    y,
+                    w,
+                    h,
+                    rgb,
+                    width,
+                } => {
                     if *w <= 0.0 || *h <= 0.0 {
                         continue;
                     }
@@ -324,7 +368,14 @@ impl Doc {
                         .as_bytes(),
                     );
                 }
-                Item::Line { x1, y1, x2, y2, rgb, width } => {
+                Item::Line {
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    rgb,
+                    width,
+                } => {
                     s.extend_from_slice(
                         format!(
                             "{} RG {:.3} w {:.3} {:.3} m {:.3} {:.3} l S\n",
@@ -338,7 +389,15 @@ impl Doc {
                         .as_bytes(),
                     );
                 }
-                Item::Text { x, y, size, font, rgb, align, text } => {
+                Item::Text {
+                    x,
+                    y,
+                    size,
+                    font,
+                    rgb,
+                    align,
+                    text,
+                } => {
                     if text.is_empty() {
                         continue;
                     }
@@ -423,10 +482,16 @@ impl Doc {
             out.extend_from_slice(b"\nendobj\n");
         };
 
-        obj(&mut out, &mut offsets, 1, b"<< /Type /Catalog /Pages 2 0 R >>");
+        obj(
+            &mut out,
+            &mut offsets,
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+        );
 
-        let kids: String =
-            (0..n_pages).map(|i| format!("{} 0 R ", first_page + i)).collect::<String>();
+        let kids: String = (0..n_pages)
+            .map(|i| format!("{} 0 R ", first_page + i))
+            .collect::<String>();
         obj(
             &mut out,
             &mut offsets,
@@ -492,7 +557,11 @@ impl Doc {
             out.extend_from_slice(format!("{:010} 00000 n \n", offsets[n]).as_bytes());
         }
         out.extend_from_slice(
-            format!("trailer\n<< /Size {} /Root 1 0 R /Info << /Title (", n_objects + 1).as_bytes(),
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R /Info << /Title (",
+                n_objects + 1
+            )
+            .as_bytes(),
         );
         out.extend_from_slice(&pdf_str(&self.title));
         out.extend_from_slice(
@@ -523,7 +592,13 @@ mod tests {
                     align: Align::Left,
                     text: "Working plane".into(),
                 },
-                Item::Rect { x: 40.0, y: 80.0, w: 100.0, h: 20.0, fill: [255, 0, 0] },
+                Item::Rect {
+                    x: 40.0,
+                    y: 80.0,
+                    w: 100.0,
+                    h: 20.0,
+                    fill: [255, 0, 0],
+                },
             ],
         });
         d
@@ -553,7 +628,10 @@ mod tests {
             .and_then(|s| s.split('\n').next())
             .and_then(|s| s.trim().parse().ok())
             .expect("startxref must name a byte offset");
-        assert!(at(xref_at).starts_with(b"xref"), "startxref does not point at the table");
+        assert!(
+            at(xref_at).starts_with(b"xref"),
+            "startxref does not point at the table"
+        );
 
         // Every entry must land exactly on its own "<n> 0 obj".
         let n: usize = tail
@@ -568,7 +646,10 @@ mod tests {
         for i in 1..n {
             let l = lines.next().expect("an entry per object");
             let off: usize = l[..10].parse().expect("a ten-digit offset");
-            assert!(off > 0 && off < bytes.len(), "object {i} offset {off} is out of the file");
+            assert!(
+                off > 0 && off < bytes.len(),
+                "object {i} offset {off} is out of the file"
+            );
             assert!(
                 at(off).starts_with(format!("{i} 0 obj").as_bytes()),
                 "the table sends object {i} to {off}, which holds {:?}",
@@ -585,8 +666,15 @@ mod tests {
         d.pages.push(Page::default());
         d.pages.push(Page::default());
         let text = String::from_utf8_lossy(&d.write()).into_owned();
-        assert!(text.contains("/Count 3"), "the tree does not count three pages");
-        assert_eq!(text.matches("/Type /Page ").count(), 3, "three page objects");
+        assert!(
+            text.contains("/Count 3"),
+            "the tree does not count three pages"
+        );
+        assert_eq!(
+            text.matches("/Type /Page ").count(),
+            3,
+            "three page objects"
+        );
         assert_eq!(text.matches("/Type /Pages").count(), 1);
     }
 
@@ -597,7 +685,13 @@ mod tests {
     fn the_origin_is_moved_to_the_top_left() {
         let mut d = Doc::new(A4, "T");
         d.pages.push(Page {
-            items: vec![Item::Rect { x: 10.0, y: 0.0, w: 5.0, h: 20.0, fill: [0, 0, 0] }],
+            items: vec![Item::Rect {
+                x: 10.0,
+                y: 0.0,
+                w: 5.0,
+                h: 20.0,
+                fill: [0, 0, 0],
+            }],
         });
         let text = String::from_utf8_lossy(&d.write()).into_owned();
         // A band across the TOP 20 points of the page sits at y = height - 20 in PDF space.
@@ -612,8 +706,18 @@ mod tests {
     fn an_image_is_embedded_unaltered() {
         let mut d = doc();
         let bytes: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
-        d.images.push(Jpeg { bytes: bytes.clone(), w: 640, h: 480 });
-        d.pages[0].items.push(Item::Image { x: 0.0, y: 0.0, w: 100.0, h: 75.0, idx: 0 });
+        d.images.push(Jpeg {
+            bytes: bytes.clone(),
+            w: 640,
+            h: 480,
+        });
+        d.pages[0].items.push(Item::Image {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 75.0,
+            idx: 0,
+        });
         let out = d.write();
         let text = String::from_utf8_lossy(&out).into_owned();
         assert!(text.contains("/Filter /DCTDecode"));
@@ -623,7 +727,10 @@ mod tests {
             out.windows(bytes.len()).any(|w| w == bytes.as_slice()),
             "the image bytes were altered on the way in",
         );
-        assert!(text.contains("/Im0 "), "the image is not in the page resources");
+        assert!(
+            text.contains("/Im0 "),
+            "the image is not in the page resources"
+        );
     }
 
     /// AN IMAGE NOBODY ADDED IS NOT DRAWN. A stale index would emit `/Im7 Do` against a resource
@@ -631,9 +738,18 @@ mod tests {
     #[test]
     fn an_out_of_range_image_is_skipped() {
         let mut d = doc();
-        d.pages[0].items.push(Item::Image { x: 0.0, y: 0.0, w: 10.0, h: 10.0, idx: 3 });
+        d.pages[0].items.push(Item::Image {
+            x: 0.0,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+            idx: 3,
+        });
         let text = String::from_utf8_lossy(&d.write()).into_owned();
-        assert!(!text.contains("/Im3 Do"), "a missing image was referenced anyway");
+        assert!(
+            !text.contains("/Im3 Do"),
+            "a missing image was referenced anyway"
+        );
     }
 
     /// TEXT IS ESCAPED. An unescaped bracket closes the string literal early and everything after
@@ -657,7 +773,6 @@ mod tests {
         let text = String::from_utf8_lossy(&d.write()).into_owned();
         assert!(text.contains("(a \\(b\\) c) Tj"));
     }
-
 
     /// A NON-ASCII HEADING REACHES THE FILE AS THE BYTES A READER EXPECTS.
     ///
@@ -735,14 +850,23 @@ mod tests {
             .and_then(|s| s.split(' ').next())
             .and_then(|s| s.trim().parse().ok())
             .expect("a stream length");
-        let start = out.windows(8).position(|w| w == b"stream\n\x71").map(|i| i + 7);
-        let start = start.or_else(|| out.windows(7).position(|w| w == b"stream\n").map(|i| i + 7))
+        let start = out
+            .windows(8)
+            .position(|w| w == b"stream\n\x71")
+            .map(|i| i + 7);
+        let start = start
+            .or_else(|| out.windows(7).position(|w| w == b"stream\n").map(|i| i + 7))
             .expect("a stream");
         let end = out
             .windows(9)
             .position(|w| w == b"endstream")
             .expect("the stream must be closed");
-        assert_eq!(end - start, len, "/Length says {len}, the stream holds {}", end - start);
+        assert_eq!(
+            end - start,
+            len,
+            "/Length says {len}, the stream holds {}",
+            end - start
+        );
     }
     /// A CHARACTER WITH NO CODE POINT BECOMES A QUESTION MARK, not mojibake. Raw UTF-8 in a
     /// WinAnsi string comes out as two wrong glyphs, which reads as a corrupt file; `?` reads as a
@@ -775,7 +899,14 @@ mod tests {
             });
             let t = String::from_utf8_lossy(&d.write()).into_owned();
             let seg = t.split(" Td (").next().unwrap().to_string();
-            seg.rsplit("rg ").next().unwrap().split_whitespace().next().unwrap().parse::<f64>().unwrap()
+            seg.rsplit("rg ")
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap()
         };
         let left = make(Align::Left);
         let right = make(Align::Right);
@@ -784,7 +915,10 @@ mod tests {
         let w = text_width("1333 lx", 10.0, Font::Regular);
         assert!(w > 20.0, "the width table gave {w} for seven characters");
         assert!((right - (500.0 - w)).abs() < 1e-6, "right ends at x");
-        assert!((centre - (500.0 - w * 0.5)).abs() < 1e-6, "centre straddles x");
+        assert!(
+            (centre - (500.0 - w * 0.5)).abs() < 1e-6,
+            "centre straddles x"
+        );
     }
 
     /// A ZERO-SIZED RECTANGLE IS NOT DRAWN. `re` with a zero side is a hairline in some readers
@@ -795,8 +929,21 @@ mod tests {
         let mut d = Doc::new(A4, "x");
         d.pages.push(Page {
             items: vec![
-                Item::Rect { x: 0.0, y: 0.0, w: 0.0, h: 10.0, fill: [1, 2, 3] },
-                Item::Frame { x: 0.0, y: 0.0, w: 10.0, h: 0.0, rgb: [1, 2, 3], width: 1.0 },
+                Item::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.0,
+                    h: 10.0,
+                    fill: [1, 2, 3],
+                },
+                Item::Frame {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 10.0,
+                    h: 0.0,
+                    rgb: [1, 2, 3],
+                    width: 1.0,
+                },
             ],
         });
         let text = String::from_utf8_lossy(&d.write()).into_owned();

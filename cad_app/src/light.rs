@@ -8,13 +8,12 @@
 
 use std::collections::HashMap;
 
-use cad_light::{
-    MATERIAL_FURNITURE,
-    bbox, calculate_maintained as calc_lux, default_materials, extrude, extrude_handles,
-    installation_summary, parse_ies, parse_ldt, CalcPlane, IesProfile, Installation, LuxGrid,
-    Luminaire, Maintenance, Material, Mesh, PhotometryType, RaySettings, Vertex,
-};
 use cad_kernel::Document;
+use cad_light::{
+    bbox, calculate_maintained as calc_lux, default_materials, extrude, extrude_handles,
+    installation_summary, parse_ies, parse_ldt, CalcPlane, IesProfile, Installation, Luminaire,
+    LuxGrid, Maintenance, Material, Mesh, PhotometryType, RaySettings, Vertex, MATERIAL_FURNITURE,
+};
 
 /// Key for the always-available synthetic luminaire (works before any IES import).
 pub const BUILTIN: &str = "Built-in downlight (1000 cd)";
@@ -135,12 +134,18 @@ pub fn furniture_box_tris(
     // it were put the two −Z triangles' normals along +Z, i.e. the box inside out. Caught by
     // `the_proxy_is_wound_outward`, which is why that test exists.
     const FACES: [[usize; 3]; 12] = [
-        [0, 2, 3], [0, 3, 1], // −Z
-        [4, 5, 7], [4, 7, 6], // +Z
-        [0, 1, 5], [0, 5, 4], // −Y
-        [2, 6, 7], [2, 7, 3], // +Y
-        [0, 4, 6], [0, 6, 2], // −X
-        [1, 3, 7], [1, 7, 5], // +X
+        [0, 2, 3],
+        [0, 3, 1], // −Z
+        [4, 5, 7],
+        [4, 7, 6], // +Z
+        [0, 1, 5],
+        [0, 5, 4], // −Y
+        [2, 6, 7],
+        [2, 7, 3], // +Y
+        [0, 4, 6],
+        [0, 6, 2], // −X
+        [1, 3, 7],
+        [1, 7, 5], // +X
     ];
     Some(FACES.iter().map(|t| [c(t[0]), c(t[1]), c(t[2])]).collect())
 }
@@ -241,7 +246,13 @@ pub fn meshes_from_factory_detail(
         }
         // 0.7 ≈ 45°, so a surface is floor or ceiling only when it is nearer flat than upright.
         // A sloped ceiling therefore reads as a wall, which is the conservative way round.
-        let id = if n.z > 0.7 { 0 } else if n.z < -0.7 { 2 } else { 1 };
+        let id = if n.z > 0.7 {
+            0
+        } else if n.z < -0.7 {
+            2
+        } else {
+            1
+        };
         for p in [a, b, c] {
             buckets[id].push(Vertex::new(p.x, p.y, p.z));
         }
@@ -278,15 +289,18 @@ pub fn meshes_from_factory_detail(
             }
             continue;
         }
-        let Some(asset) = f.furniture_lib.get(inst.asset) else { continue };
-        let Some(m) = f.furniture_model_matrix(i) else { continue };
+        let Some(asset) = f.furniture_lib.get(inst.asset) else {
+            continue;
+        };
+        let Some(m) = f.furniture_model_matrix(i) else {
+            continue;
+        };
         let m = glam::Mat4::from_cols_array(&m);
         // `Proxy` is the DISPLAY detail and takes the same decimated geometry the 3D Factory draws,
         // so the two views show the same thing. It is what stops this buffer being 844 MB: every
         // instance is baked out in world space here, so the full mesh is paid for twenty-six times
         // over, and there is nowhere for a shared per-asset buffer to help.
-        let lod = (detail == FurnitureDetail::Proxy && asset.needs_lod())
-            .then(|| asset.lod_geom());
+        let lod = (detail == FurnitureDetail::Proxy && asset.needs_lod()).then(|| asset.lod_geom());
         let src: &[[f32; 3]] = match &lod {
             Some(l) => &l.positions,
             None => &asset.positions,
@@ -305,9 +319,17 @@ pub fn meshes_from_factory_detail(
         // Already a per-triangle soup, so the indices are just 0,1,2,3,… Welding would save a
         // little memory and cost the sharp edges that the BVH is perfectly happy to keep.
         let triangles = (0..verts.len() as u32 / 3)
-            .map(|t| cad_light::Triangle { a: t * 3, b: t * 3 + 1, c: t * 3 + 2 })
+            .map(|t| cad_light::Triangle {
+                a: t * 3,
+                b: t * 3 + 1,
+                c: t * 3 + 2,
+            })
             .collect();
-        out.push(Mesh { vertices: verts, triangles, material: id as u32 });
+        out.push(Mesh {
+            vertices: verts,
+            triangles,
+            material: id as u32,
+        });
     }
     out
 }
@@ -352,7 +374,11 @@ impl Obstacle {
                 mx = mx.max(*p);
             }
         }
-        Obstacle { tris, min: mn, max: mx }
+        Obstacle {
+            tris,
+            min: mn,
+            max: mx,
+        }
     }
 
     /// Whether this solid encloses `p`, by vertical ray parity against its own triangles.
@@ -641,8 +667,10 @@ fn merge_emitters(src: &[crate::factory::FurnEmitter]) -> Vec<crate::factory::Fu
 fn lambertian_profile(name: &str, lumens: f64, watts: f64) -> IesProfile {
     let vertical_angles: Vec<f64> = (0..=18).map(|i| i as f64 * 5.0).collect();
     let peak = lumens / std::f64::consts::PI;
-    let candela: Vec<f64> =
-        vertical_angles.iter().map(|g| peak * g.to_radians().cos().max(0.0)).collect();
+    let candela: Vec<f64> = vertical_angles
+        .iter()
+        .map(|g| peak * g.to_radians().cos().max(0.0))
+        .collect();
     IesProfile {
         name: name.to_string(),
         photometry: PhotometryType::C,
@@ -727,8 +755,6 @@ pub struct LightAction {
 
 /// (Legacy per-layer room groups now live in `factory.rooms` with
 /// [`crate::factory::RoomOrigin::ImportedLayer`] — see `simlux_io::RoomRec`.)
-
-
 
 /// How far a calculation has got, shared with whoever is watching it.
 ///
@@ -1135,7 +1161,11 @@ impl CalcJob {
             let ab = b - a;
             let len2 = ab.length_squared();
             // A degenerate segment is a point, and clamping t to 0 measures to it — which is right.
-            let t = if len2 > 1e-12 { ((p - a).dot(ab) / len2).clamp(0.0, 1.0) } else { 0.0 };
+            let t = if len2 > 1e-12 {
+                ((p - a).dot(ab) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
             if p.distance_squared(a + ab * t) < z2 {
                 return true;
             }
@@ -1148,7 +1178,9 @@ impl CalcJob {
         if poly.len() < 3 {
             return Vec::new();
         }
-        (0..poly.len()).map(|i| [poly[i], poly[(i + 1) % poly.len()]]).collect()
+        (0..poly.len())
+            .map(|i| [poly[i], poly[(i + 1) % poly.len()]])
+            .collect()
     }
 
     /// THE WORK. No `&self` on the app, no UI, no borrows — this is what runs on the worker.
@@ -1217,7 +1249,15 @@ impl CalcJob {
         timings.push(("surfaces", t.elapsed().as_secs_f64() * 1000.0));
         timings.push(("scene_tris", self.scene_tris as f64));
 
-        CalcOutcome { rooms, surfaces, meshes: self.meshes, timings, cancelled: false, fingerprint, mode: self.mode }
+        CalcOutcome {
+            rooms,
+            surfaces,
+            meshes: self.meshes,
+            timings,
+            cancelled: false,
+            fingerprint,
+            mode: self.mode,
+        }
     }
 
     /// Everything about ONE room, from an evaluator already built over the whole scene.
@@ -1230,8 +1270,11 @@ impl CalcJob {
         p: &CalcProgress,
         label: &str,
     ) -> RoomResult {
-        let (min_x, min_y, max_x, max_y) =
-            if poly.len() >= 3 { self.inset_bounds(poly_bounds(poly)) } else { self.fallback };
+        let (min_x, min_y, max_x, max_y) = if poly.len() >= 3 {
+            self.inset_bounds(poly_bounds(poly))
+        } else {
+            self.fallback
+        };
         let (w, d) = ((max_x - min_x).max(1e-3), (max_y - min_y).max(1e-3));
         let (cols, rows) = LightState::grid_for(w, d, self.cell_size);
         let grid_note = LightState::grid_note_for(w, d, self.cell_size, cols, rows);
@@ -1261,7 +1304,11 @@ impl CalcJob {
         // building's walls when one was not. The same rule as the outline test — a drawn room is
         // the room, and the geometry only stands in where there is nothing to stand in for.
         let edges = CalcJob::poly_edges(poly);
-        let boundary: &[[glam::Vec2; 2]] = if edges.is_empty() { &self.walls } else { &edges };
+        let boundary: &[[glam::Vec2; 2]] = if edges.is_empty() {
+            &self.walls
+        } else {
+            &edges
+        };
         let mask = LightState::measurable_mask(
             &plane,
             poly,
@@ -1319,8 +1366,11 @@ impl CalcJob {
         // THE ROOM'S OWN FITTINGS, and its own load. A power density taken over every fitting in
         // the building and divided by one room's floor is not a figure about anything.
         let fixtures = LightState::fixtures_in(poly, &self.lums);
-        let installation =
-            Some(installation_summary(&fixtures, &self.profiles, (w * d) as f64));
+        let installation = Some(installation_summary(
+            &fixtures,
+            &self.profiles,
+            (w * d) as f64,
+        ));
 
         RoomResult {
             name: name.to_string(),
@@ -1704,7 +1754,6 @@ impl Default for LightState {
     }
 }
 
-
 /// Re-point `from_block` after a reopen, from the name-keyed map the sidecar carries.
 ///
 /// A `from_block` is a POSITION in the block table, and positions do not survive a drawing that
@@ -1734,9 +1783,10 @@ pub fn repair_from_blocks(
         // Already pointing at a block that agrees with it — nothing to do. Checking the NAME
         // rather than merely that the index resolves is the point: after a table shifts, the old
         // index still resolves, just to the wrong definition.
-        let ok = l.from_block.and_then(|b| doc.blocks.get(b)).is_some_and(|blk| {
-            block_ies.get(&blk.name).is_some_and(|p| *p == l.profile)
-        });
+        let ok = l
+            .from_block
+            .and_then(|b| doc.blocks.get(b))
+            .is_some_and(|blk| block_ies.get(&blk.name).is_some_and(|p| *p == l.profile));
         if ok {
             continue;
         }
@@ -1919,7 +1969,10 @@ impl LightState {
     /// The search starts at the WORK PLANE, which is inside the room by definition; starting at
     /// the floor would catch the floor slab's own underside from the storey below.
     pub fn mount_z_at(&self, x: f32, y: f32) -> (f32, bool) {
-        match (self.mount_to_ceiling, ceiling_above(&self.meshes, x, y, self.plane_height)) {
+        match (
+            self.mount_to_ceiling,
+            ceiling_above(&self.meshes, x, y, self.plane_height),
+        ) {
             (true, Some(zc)) => (zc - self.ceiling_drop, true),
             _ => (self.mount_height, false),
         }
@@ -1940,7 +1993,6 @@ impl LightState {
         }
         best.map(|(_, id)| id)
     }
-
 
     /// Drop a light POINT at `(x, y)` — step ② of the workflow. Returns its id.
     ///
@@ -1997,7 +2049,6 @@ impl LightState {
         self.selected.clear();
     }
 
-
     /// Remember the fixtures as they are, so the edit about to happen can be taken back.
     ///
     /// Staged rather than pushed, because these methods are called from inside the panel's own
@@ -2047,7 +2098,11 @@ impl LightState {
             .filter(|l| self.selected.contains(&l.id))
             .map(|l| (l.id, l.position.x, l.position.y))
             .collect();
-        self.drag = Some(LumDrag { start, from: at, moved: false });
+        self.drag = Some(LumDrag {
+            start,
+            from: at,
+            moved: false,
+        });
     }
 
     /// Move the dragged fixtures so the grabbed one follows the pointer.
@@ -2081,7 +2136,9 @@ impl LightState {
     /// walks the whole model, so dragging across a 500k-triangle building would cost that on every
     /// frame — and the height is only interesting once the fixture has landed somewhere.
     pub fn end_drag(&mut self) -> bool {
-        let Some(d) = self.drag.take() else { return false };
+        let Some(d) = self.drag.take() else {
+            return false;
+        };
         if !d.moved {
             return false;
         }
@@ -2228,7 +2285,10 @@ impl LightState {
 
         // IES announces itself: every LM-63 file carries a TILT= line. EULUMDAT has no marker at
         // all, being a bare list of values, so it is what remains.
-        let looks_ies = text.lines().take(60).any(|l| l.trim_start().starts_with("TILT="));
+        let looks_ies = text
+            .lines()
+            .take(60)
+            .any(|l| l.trim_start().starts_with("TILT="));
         let ext_ldt = std::path::Path::new(&path)
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("ldt"));
@@ -2354,7 +2414,10 @@ impl LightState {
         self.last_msg = format!(
             "Placed {n} points ({rows}×{cols}) at {height}, {dx:.2} × {dy:.2} m pitch{}{}",
             if self.mount_to_ceiling && missed > 0 {
-                format!(" · {missed} found no ceiling and used {:.2} m", self.mount_height)
+                format!(
+                    " · {missed} found no ceiling and used {:.2} m",
+                    self.mount_height
+                )
             } else {
                 String::new()
             },
@@ -2390,7 +2453,9 @@ impl LightState {
         factory: Option<&crate::factory::FactoryState>,
     ) -> Vec<Mesh> {
         let mode = self.mode;
-        let from_3d = factory.map(|f| meshes_from_factory_mode(f, None, mode)).unwrap_or_default();
+        let from_3d = factory
+            .map(|f| meshes_from_factory_mode(f, None, mode))
+            .unwrap_or_default();
         if !from_3d.is_empty() {
             return from_3d;
         }
@@ -2402,7 +2467,10 @@ impl LightState {
             .map(|f| {
                 f.rooms
                     .iter()
-                    .filter(|r| r.origin == crate::factory::RoomOrigin::ImportedLayer && !r.handles.is_empty())
+                    .filter(|r| {
+                        r.origin == crate::factory::RoomOrigin::ImportedLayer
+                            && !r.handles.is_empty()
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -2468,7 +2536,12 @@ impl LightState {
             return;
         }
         // Read the first selected fixture's current figures; an edit applies to all of them.
-        let Some(first) = self.luminaires.iter().find(|l| sel.contains(&l.id)).cloned() else {
+        let Some(first) = self
+            .luminaires
+            .iter()
+            .find(|l| sel.contains(&l.id))
+            .cloned()
+        else {
             return;
         };
         let Some(prof) = self.profiles.get(&first.profile).cloned() else {
@@ -2486,12 +2559,17 @@ impl LightState {
         let overridden = first.watts_override.is_some() || first.flux_override.is_some();
 
         ui.label(
-            egui::RichText::new(format!("parameters — {} selected", sel.len())).small().weak(),
+            egui::RichText::new(format!("parameters — {} selected", sel.len()))
+                .small()
+                .weak(),
         );
         let mut changed_w = false;
         let mut changed_f = false;
         ui.horizontal(|ui| {
-            ui.add_sized([56.0, 18.0], egui::Label::new(egui::RichText::new("load").small()));
+            ui.add_sized(
+                [56.0, 18.0],
+                egui::Label::new(egui::RichText::new("load").small()),
+            );
             changed_w |= ui
                 .add(
                     egui::DragValue::new(&mut watts)
@@ -2500,9 +2578,14 @@ impl LightState {
                         .range(0.0..=10_000.0)
                         .suffix(" W"),
                 )
-                .on_hover_text("Connected load. Changes the power density; does NOT change the light.")
+                .on_hover_text(
+                    "Connected load. Changes the power density; does NOT change the light.",
+                )
                 .changed();
-            ui.add_sized([56.0, 18.0], egui::Label::new(egui::RichText::new("flux").small()));
+            ui.add_sized(
+                [56.0, 18.0],
+                egui::Label::new(egui::RichText::new("flux").small()),
+            );
             changed_f |= ui
                 .add(
                     egui::DragValue::new(&mut flux)
@@ -2520,7 +2603,10 @@ impl LightState {
         // Efficacy, derived. Editing it moves the FLUX at the current wattage.
         let mut eff = if watts > 0.0 { flux / watts } else { 0.0 };
         ui.horizontal(|ui| {
-            ui.add_sized([56.0, 18.0], egui::Label::new(egui::RichText::new("efficacy").small()));
+            ui.add_sized(
+                [56.0, 18.0],
+                egui::Label::new(egui::RichText::new("efficacy").small()),
+            );
             let r = ui.add_enabled(
                 watts > 0.0,
                 egui::DragValue::new(&mut eff)
@@ -2534,7 +2620,10 @@ impl LightState {
                 changed_f = true;
             }
             r.on_hover_text("flux ÷ load. Editing this sets the flux at the current wattage.");
-            ui.add_sized([44.0, 18.0], egui::Label::new(egui::RichText::new("aim").small()));
+            ui.add_sized(
+                [44.0, 18.0],
+                egui::Label::new(egui::RichText::new("aim").small()),
+            );
             changed_w |= false;
             if ui
                 .add(
@@ -2568,14 +2657,20 @@ impl LightState {
             self.last_msg = format!(
                 "{} fitting(s) re-rated — {watts:.1} W, {flux:.0} lm{}. Press Calculate.",
                 sel.len(),
-                if watts > 0.0 { format!(" ({:.0} lm/W)", flux / watts) } else { String::new() },
+                if watts > 0.0 {
+                    format!(" ({:.0} lm/W)", flux / watts)
+                } else {
+                    String::new()
+                },
             );
         }
         // A way back to the file's own figures, so an override is never a one-way door.
         if overridden
             && ui
                 .small_button("↺ back to the file's rating")
-                .on_hover_text("Drop the overrides and use the photometric file's own watts and flux")
+                .on_hover_text(
+                    "Drop the overrides and use the photometric file's own watts and flux",
+                )
                 .clicked()
         {
             for l in self.luminaires.iter_mut().filter(|l| sel.contains(&l.id)) {
@@ -2596,8 +2691,6 @@ impl LightState {
         }
     }
 
-
-
     /// Everything about ONE room, from an evaluator already built over the whole scene.
     ///
     /// The evaluator is shared deliberately: light crosses between rooms through openings, so the
@@ -2611,8 +2704,11 @@ impl LightState {
         poly: &[glam::Vec2],
         fallback: (f32, f32, f32, f32),
     ) -> RoomResult {
-        let (min_x, min_y, max_x, max_y) =
-            if poly.len() >= 3 { self.inset_bounds(poly_bounds(poly)) } else { fallback };
+        let (min_x, min_y, max_x, max_y) = if poly.len() >= 3 {
+            self.inset_bounds(poly_bounds(poly))
+        } else {
+            fallback
+        };
         let (w, d) = ((max_x - min_x).max(1e-3), (max_y - min_y).max(1e-3));
         let (cols, rows) = Self::grid_for(w, d, self.cell_size);
         let grid_note = self.grid_note(w, d);
@@ -2637,8 +2733,14 @@ impl LightState {
         // Only a drawn outline can bound the zone on this path -- it has no section to fall back
         // on, and offsetting from nothing is better than offsetting from the wrong thing.
         let edges = CalcJob::poly_edges(poly);
-        let mask =
-            Self::measurable_mask(&plane, poly, &[], Some(&floor_below), self.wall_zone, &edges);
+        let mask = Self::measurable_mask(
+            &plane,
+            poly,
+            &[],
+            Some(&floor_below),
+            self.wall_zone,
+            &edges,
+        );
         if !mask.is_empty() {
             Self::apply_room_mask(&mut grid, &mask);
         }
@@ -2681,8 +2783,11 @@ impl LightState {
         // THE ROOM'S OWN FITTINGS, and its own load. A power density taken over every fitting in
         // the building and divided by one room's floor is not a figure about anything.
         let fixtures = Self::fixtures_in(poly, lums);
-        let installation =
-            Some(installation_summary(&fixtures, &self.profiles, (w * d) as f64));
+        let installation = Some(installation_summary(
+            &fixtures,
+            &self.profiles,
+            (w * d) as f64,
+        ));
 
         RoomResult {
             name: name.to_string(),
@@ -2761,10 +2866,18 @@ impl LightState {
         }
         // A room whose geometry is selected wins; otherwise, only act when there is no ambiguity.
         let picked = f.rooms.iter().find(|r| {
-            r.floor.iter().chain(r.ceiling.iter()).chain(r.walls.iter()).chain(r.carve.iter())
+            r.floor
+                .iter()
+                .chain(r.ceiling.iter())
+                .chain(r.walls.iter())
+                .chain(r.carve.iter())
                 .any(|id| f.selection.contains(id))
         });
-        match picked.or(if f.rooms.len() == 1 { f.rooms.first() } else { None }) {
+        match picked.or(if f.rooms.len() == 1 {
+            f.rooms.first()
+        } else {
+            None
+        }) {
             Some(r) if r.footprint.len() >= 3 => Some(r.footprint.clone()),
             _ => None,
         }
@@ -2847,8 +2960,7 @@ impl LightState {
                 // AND OUT OF THE BORDER. The wall zone is the third test, applied here rather than
                 // by shrinking the grid, because a border is a distance from the OUTLINE and only
                 // a rectangle's outline is its bounding box.
-                let clear_of_wall =
-                    !in_room || !CalcJob::in_wall_zone(x, y, zone, boundary);
+                let clear_of_wall = !in_room || !CalcJob::in_wall_zone(x, y, zone, boundary);
                 m.push(in_room && free && clear_of_wall);
             }
         }
@@ -2866,7 +2978,6 @@ impl LightState {
         // must ask for it, or a helper named for one test would quietly apply three.
         Self::measurable_mask(plane, poly, &[], None, 0.0, &[])
     }
-
 
     /// Re-derive `avg` / `min` / `max` over the cells the mask keeps.
     ///
@@ -2908,11 +3019,15 @@ impl LightState {
         // A range placed lights never reach, so a generated id can never collide with a user's.
         let mut id = 1_000_000_u32;
         for (i, inst) in f.furniture.iter().enumerate() {
-            let Some(asset) = f.furniture_lib.get(inst.asset) else { continue };
+            let Some(asset) = f.furniture_lib.get(inst.asset) else {
+                continue;
+            };
             if asset.emitters.is_empty() {
                 continue;
             }
-            let Some(m) = f.furniture_model_matrix(i) else { continue };
+            let Some(m) = f.furniture_model_matrix(i) else {
+                continue;
+            };
             let m = glam::Mat4::from_cols_array(&m);
             let groups = merge_emitters(&asset.emitters);
             // One profile per ASSET: every point on a run carries the same share of its flux, so
@@ -2921,7 +3036,8 @@ impl LightState {
             if !self.profiles.contains_key(&profile) {
                 let per_lm = groups[0].lumens;
                 let per_w = groups[0].watts;
-                self.profiles.insert(profile.clone(), lambertian_profile(&profile, per_lm, per_w));
+                self.profiles
+                    .insert(profile.clone(), lambertian_profile(&profile, per_lm, per_w));
             }
             for e in &groups {
                 let p = m.transform_point3(glam::Vec3::from(e.pos));
@@ -3363,7 +3479,12 @@ impl LightState {
             // Every room has its own footprint; the fallback is only for a target without one.
             mesh_bbox(&meshes).or_else(|| bbox(doc))
         } else {
-            (if meshes.is_empty() { None } else { mesh_bbox(&meshes) }).or_else(|| bbox(doc))
+            (if meshes.is_empty() {
+                None
+            } else {
+                mesh_bbox(&meshes)
+            })
+            .or_else(|| bbox(doc))
         };
         let fallback = bounds?;
 
@@ -3413,10 +3534,15 @@ impl LightState {
             // THE WALLS, cut at the working plane -- the boundary a wall zone is measured from
             // when no room outline was drawn. Gathered here because the worker cannot see the
             // Factory, exactly like the obstacles below.
-            walls: factory.map(|f| f.section_at_z(self.plane_height)).unwrap_or_default(),
+            walls: factory
+                .map(|f| f.section_at_z(self.plane_height))
+                .unwrap_or_default(),
             obstacles: match factory {
                 // One list per target, in the same order — see `CalcJob::obstacles`.
-                Some(f) => targets.iter().map(|(_, p)| obstacles_in_mode(f, p, self.mode)).collect(),
+                Some(f) => targets
+                    .iter()
+                    .map(|(_, p)| obstacles_in_mode(f, p, self.mode))
+                    .collect(),
                 None => targets.iter().map(|_| Vec::new()).collect(),
             },
             targets,
@@ -3479,7 +3605,12 @@ impl LightState {
                 results.len(),
                 results
                     .iter()
-                    .map(|r| format!("{}: {:.0} lx avg, U0 {:.2}", r.name, r.grid.avg, r.grid.u0()))
+                    .map(|r| format!(
+                        "{}: {:.0} lx avg, U0 {:.2}",
+                        r.name,
+                        r.grid.avg,
+                        r.grid.u0()
+                    ))
                     .collect::<Vec<_>>()
                     .join("  ·  "),
             )
@@ -3527,8 +3658,16 @@ impl LightState {
         // Fit the orbit camera to everything calculated, not to one room of it.
         let (cx, cy) = {
             let n = self.rooms.len().max(1) as f32;
-            let sx: f32 = self.rooms.iter().map(|r| r.plane.origin.x + r.plane.width * 0.5).sum();
-            let sy: f32 = self.rooms.iter().map(|r| r.plane.origin.y + r.plane.depth * 0.5).sum();
+            let sx: f32 = self
+                .rooms
+                .iter()
+                .map(|r| r.plane.origin.x + r.plane.width * 0.5)
+                .sum();
+            let sy: f32 = self
+                .rooms
+                .iter()
+                .map(|r| r.plane.origin.y + r.plane.depth * 0.5)
+                .sum();
             (sx / n, sy / n)
         };
         self.cam_target = [cx, cy, 0.5 * self.room_height];
@@ -3566,7 +3705,9 @@ impl LightState {
     /// It stays because a test wants an answer, not a thread, and because keeping one path that
     /// does the whole thing is what makes the threaded one checkable against it.
     pub fn calculate(&mut self, doc: &Document, factory: Option<&crate::factory::FactoryState>) {
-        let Some(job) = self.prepare(doc, factory) else { return };
+        let Some(job) = self.prepare(doc, factory) else {
+            return;
+        };
         let progress = CalcProgress::default();
         let out = job.run(&progress);
         let selected = Self::selected_room(factory);
@@ -3756,8 +3897,9 @@ impl LightState {
             // as a PERFECT ABSORBER — every piece a black hole, which is a worse answer than the
             // empty box it replaced. Add the default rather than leave the gap.
             if !self.materials.iter().any(|m| m.id == MATERIAL_FURNITURE) {
-                if let Some(f) =
-                    default_materials().into_iter().find(|m| m.id == MATERIAL_FURNITURE)
+                if let Some(f) = default_materials()
+                    .into_iter()
+                    .find(|m| m.id == MATERIAL_FURNITURE)
                 {
                     self.materials.push(f);
                 }
@@ -3781,7 +3923,11 @@ impl LightState {
         // saved carries 0.0 for them, which is a real value for `wall_zone` and a nonsense one for
         // `eye_height` -- adopting either would silently change a reopened project.
         // The MODE, restored before anything asks for a fingerprint -- it is an input to one.
-        self.mode = if cfg.express { CalcMode::Express } else { CalcMode::Thorough };
+        self.mode = if cfg.express {
+            CalcMode::Express
+        } else {
+            CalcMode::Thorough
+        };
         if cfg.wall_zone > 0.0 {
             self.wall_zone = cfg.wall_zone;
         }
@@ -4411,52 +4557,59 @@ Type \n                     `straylights` to list them, `straylights purge` to r
         ui.label(egui::RichText::new("① Rooms").strong());
         if rooms.is_empty() {
             ui.label(
-                egui::RichText::new("None yet — in the 2D view's ROOMS list, select a closed \
+                egui::RichText::new(
+                    "None yet — in the 2D view's ROOMS list, select a closed \
                     outline and 'Make room': it is built at once and gets its own lux result. \
-                    Or import a layer below.")
-                    .small()
-                    .weak(),
+                    Or import a layer below.",
+                )
+                .small()
+                .weak(),
             );
         }
-        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-            for r in rooms {
-                let name = r.name.clone();
-                ui.horizontal(|ui| {
-                    let detail = match r.origin {
-                        crate::factory::RoomOrigin::Built => {
-                            format!("built 3D room · {:.2} m clear", r.height)
+        egui::ScrollArea::vertical()
+            .max_height(180.0)
+            .show(ui, |ui| {
+                for r in rooms {
+                    let name = r.name.clone();
+                    ui.horizontal(|ui| {
+                        let detail = match r.origin {
+                            crate::factory::RoomOrigin::Built => {
+                                format!("built 3D room · {:.2} m clear", r.height)
+                            }
+                            crate::factory::RoomOrigin::PlanDesignated => {
+                                format!("designated on the plan · {:.2} m clear", r.height)
+                            }
+                            crate::factory::RoomOrigin::ImportedLayer => format!(
+                                "layer '{}' · {} obj(s)",
+                                r.layer_name.clone().unwrap_or_default(),
+                                r.handles.len()
+                            ),
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("{}  {}", r.origin.glyph(), &name))
+                                .size(12.0),
+                        )
+                        .on_hover_text(detail);
+                        let mut h = r.height;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut h)
+                                    .update_while_editing(false)
+                                    .speed(0.05)
+                                    .suffix(" m")
+                                    .range(0.1..=20.0),
+                            )
+                            .on_hover_text("Clear height")
+                            .changed()
+                        {
+                            action.set_room_height = Some((r.id, h));
                         }
-                        crate::factory::RoomOrigin::PlanDesignated => {
-                            format!("designated on the plan · {:.2} m clear", r.height)
+                        if ui.button("✕").on_hover_text("Remove this room").clicked() {
+                            action.remove_room = Some(r.id);
                         }
-                        crate::factory::RoomOrigin::ImportedLayer => format!(
-                            "layer '{}' · {} obj(s)",
-                            r.layer_name.clone().unwrap_or_default(),
-                            r.handles.len()
-                        ),
-                    };
-                    ui.label(
-                        egui::RichText::new(format!("{}  {}", r.origin.glyph(), &name))
-                            .size(12.0),
-                    )
-                    .on_hover_text(detail);
-                    let mut h = r.height;
-                    if ui
-                        .add(egui::DragValue::new(&mut h).update_while_editing(false)
-                            .speed(0.05)
-                            .suffix(" m")
-                            .range(0.1..=20.0))
-                        .on_hover_text("Clear height")
-                        .changed()
-                    {
-                        action.set_room_height = Some((r.id, h));
-                    }
-                    if ui.button("✕").on_hover_text("Remove this room").clicked() {
-                        action.remove_room = Some(r.id);
-                    }
-                });
-            }
-        });
+                    });
+                }
+            });
         // Import a drafted layer as a room (its closed outlines extrude into
         // the walls; its largest ring becomes the room footprint).
         let imported: Vec<String> = rooms
@@ -4515,7 +4668,10 @@ Type \n                     `straylights` to list them, `straylights purge` to r
                 self.import_photometry();
             }
         });
-        ui.checkbox(&mut self.auto_center_light, "Auto-place one at room centre if none placed");
+        ui.checkbox(
+            &mut self.auto_center_light,
+            "Auto-place one at room centre if none placed",
+        );
 
         ui.separator();
 
@@ -4524,7 +4680,11 @@ Type \n                     `straylights` to list them, `straylights purge` to r
             ui.label(egui::RichText::new("Fixtures").strong());
             ui.label(egui::RichText::new(format!("({})", self.luminaires.len())).weak());
         });
-        let place_label = if self.place_mode { "◉ Placing… click the plan" } else { "＋ Place on plan" };
+        let place_label = if self.place_mode {
+            "◉ Placing… click the plan"
+        } else {
+            "＋ Place on plan"
+        };
         if ui.selectable_label(self.place_mode, place_label)
             .on_hover_text("Toggle, then click points on the 2D plan to drop fixtures. Drag a marker to move it. Esc / untoggle to stop.")
             .clicked()
@@ -4539,34 +4699,41 @@ Type \n                     `straylights` to list them, `straylights purge` to r
             let mut click: Option<u32> = None;
             let known: Vec<String> = self.profiles.keys().cloned().collect();
             let selected = self.selected.clone();
-            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
-                for l in self.luminaires.iter_mut() {
-                    let sel = selected.contains(&l.id);
-                    let fitted = known.contains(&l.profile);
-                    ui.horizontal(|ui| {
-                        let label = format!(
-                            "#{}  ({:.1}, {:.1}, {:.1})  {}",
-                            l.id,
-                            l.position.x,
-                            l.position.y,
-                            l.position.z,
-                            if fitted { l.profile.as_str() } else { "— no fitting —" },
-                        );
-                        let text = if fitted {
-                            egui::RichText::new(label)
-                        } else {
-                            egui::RichText::new(label).color(egui::Color32::from_rgb(230, 170, 90))
-                        };
-                        if ui.selectable_label(sel, text).clicked() {
-                            click = Some(l.id);
-                        }
-                        if ui.small_button("✕").clicked() {
-                            remove = Some(l.id);
-                        }
-                        ui.add(egui::Slider::new(&mut l.dimming, 0.0..=1.0).text("dim"));
-                    });
-                }
-            });
+            egui::ScrollArea::vertical()
+                .max_height(160.0)
+                .show(ui, |ui| {
+                    for l in self.luminaires.iter_mut() {
+                        let sel = selected.contains(&l.id);
+                        let fitted = known.contains(&l.profile);
+                        ui.horizontal(|ui| {
+                            let label = format!(
+                                "#{}  ({:.1}, {:.1}, {:.1})  {}",
+                                l.id,
+                                l.position.x,
+                                l.position.y,
+                                l.position.z,
+                                if fitted {
+                                    l.profile.as_str()
+                                } else {
+                                    "— no fitting —"
+                                },
+                            );
+                            let text = if fitted {
+                                egui::RichText::new(label)
+                            } else {
+                                egui::RichText::new(label)
+                                    .color(egui::Color32::from_rgb(230, 170, 90))
+                            };
+                            if ui.selectable_label(sel, text).clicked() {
+                                click = Some(l.id);
+                            }
+                            if ui.small_button("✕").clicked() {
+                                remove = Some(l.id);
+                            }
+                            ui.add(egui::Slider::new(&mut l.dimming, 0.0..=1.0).text("dim"));
+                        });
+                    }
+                });
             if let Some(id) = click {
                 let additive = ui.input(|i| i.modifiers.shift || i.modifiers.ctrl);
                 self.select(id, additive);
@@ -4600,9 +4767,14 @@ Type \n                     `straylights` to list them, `straylights purge` to r
 
         // ---- Quality ----------------------------------------------------
         ui.collapsing("Quality", |ui| {
-            ui.add(egui::Slider::new(&mut self.settings.max_bounces, 0..=3).text("Indirect bounces"));
+            ui.add(
+                egui::Slider::new(&mut self.settings.max_bounces, 0..=3).text("Indirect bounces"),
+            );
             let mut rays = self.settings.rays_per_point as i32;
-            if ui.add(egui::Slider::new(&mut rays, 8..=256).text("Rays / point")).changed() {
+            if ui
+                .add(egui::Slider::new(&mut rays, 8..=256).text("Rays / point"))
+                .changed()
+            {
                 self.settings.rays_per_point = rays.max(1) as u32;
             }
             ui.checkbox(&mut self.settings.shadows, "Cast shadows");
@@ -4652,7 +4824,6 @@ Type \n                     `straylights` to list them, `straylights purge` to r
             ui.checkbox(&mut self.show_isolux, "Isolux lines");
         });
 
-
         // ---- Results ----------------------------------------------------
         if let Some(g) = &self.grid {
             ui.separator();
@@ -4691,136 +4862,176 @@ Type \n                     `straylights` to list them, `straylights purge` to r
                     .weak(),
                 );
             }
-            egui::Grid::new("simlux_results").num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
-                let mut row = |ui: &mut egui::Ui, k: &str, v: String| {
-                    ui.label(egui::RichText::new(k).small().weak());
-                    ui.label(v);
-                    ui.end_row();
-                };
-                row(ui, "Average  Eavg", format!("{:.0} lx", g.avg));
-                row(ui, "Minimum  Emin", format!("{:.0} lx", g.min));
-                row(ui, "Maximum  Emax", format!("{:.0} lx", g.max));
-                row(ui, "Median", format!("{:.0} lx", g.median()));
-                // Percentiles say what the average cannot: 500 lx average is a different room
-                // when a tenth of it sits at 450 than when it sits at 150.
-                row(ui, "10th / 90th pct", format!("{:.0} / {:.0} lx", g.percentile(10.0), g.percentile(90.0)));
-                row(ui, "Uniformity  U₀ = Emin/Eavg", format!("{:.2}", g.u0()));
-                row(ui, "Diversity  U₁ = Emin/Emax", format!("{:.2}", g.u1()));
-                // WHICH GRID THE UNIFORMITY IS ON.
-                //
-                // U₀ is not a property of a room — it is a property of a room AND the grid it was
-                // sampled on, and a coarse grid always reports it too HIGH. Comparing against
-                // DIALux on three fully specified rooms showed the averages agreeing to 0.5 % while
-                // U₀ differed by a third, entirely from where the minimum was taken; and their
-                // figure could not be reproduced because the grid behind it is stated nowhere in
-                // their report. A uniformity quoted without its grid is not reproducible, so this
-                // says it — and flags a grid coarser than EN 12464-1 asks for, which is exactly the
-                // case where U₀ flatters the design.
-                if let Some(p) = self.plane.as_ref() {
-                    let (wc, wr) = cad_light::en12464_cells(p.width, p.depth);
-                    let note = if p.cols < wc || p.rows < wr {
-                        format!("{}  ⚠ EN 12464-1 asks {wc} × {wr}", p.grid_note())
-                    } else {
-                        p.grid_note()
-                    };
-                    row(ui, "…measured on", note);
-                }
-                // AND THE SAME ROOM ON THE STANDARD'S OWN GRID.
-                //
-                // The row above says which grid the figure came from; this one gives the figure a
-                // compliance claim actually rests on, because EN 12464-1 specifies the grid it is
-                // to be assessed on and that grid is COARSER than the working one for every room
-                // down to about 3 m — 1.94 m across a 33 m hall.
-                //
-                // Reported BESIDE the working figure and never instead of it. The working grid is
-                // the finer of the two, so its U₀ is the conservative number; swapping them would
-                // raise every uniformity in every project at once, which is the direction that
-                // passes an installation it should not. A designer needs both: one says how even
-                // the room really is, the other says whether it complies.
-                if let (Some(ge), Some(pe)) = (self.grid_en.as_ref(), self.plane_en.as_ref()) {
-                    row(
-                        ui,
-                        "…to EN 12464-1",
-                        format!("U₀ {:.2}   on {}", ge.u0(), pe.grid_note()),
-                    );
-                }
-                if let Some(f) = g.direct_fraction() {
-                    row(ui, "Direct / indirect", format!("{:.0}% / {:.0}%", f * 100.0, (1.0 - f) * 100.0));
-                }
-                if let Some(ez) = self.cylindrical_avg {
-                    row(
-                        ui,
-                        &format!("Cylindrical  Ez @ {:.1} m", self.eye_height),
-                        format!("{ez:.0} lx"),
-                    );
-                }
-                // ROOM SURFACES. EN 12464-1 does not stop at the work plane — it sets maintained
-                // levels for walls and ceilings too (an office wants roughly 50 lx on walls and
-                // 30 lx on the ceiling, each at U₀ ≥ 0.10), and a scheme that passes on the desk
-                // can still fail on those. Luminance is the quantity the appearance clauses are
-                // written in, and for a diffuse surface it is ρE/π — so a bright ceiling and a
-                // dark floor can receive the same light and look nothing alike.
-                if !self.surfaces.is_empty() {
-                    // egui forbids `add_space` inside a Grid ("You cannot advance
-                    // the cursor when in a grid layout") — the section heading is
-                    // a two-cell row with an empty second cell instead.
-                    ui.label(egui::RichText::new("room surfaces").small().weak());
-                    ui.label("");
-                    ui.end_row();
-                    for s in &self.surfaces {
-                        row(
-                            ui,
-                            &format!("{}  ({:.0} m²)", s.name, s.area_m2),
-                            format!(
-                                "{:.0} lx   {:.0} cd/m²   U₀ {:.2}",
-                                s.e_avg, s.l_avg, s.u0
-                            ),
-                        );
-                    }
-                }
-            });
-            // Ez is the one number that says whether the space renders faces. A room can hold its
-            // average on the desks and still read as flat, and nothing else on this panel shows it.
-            if let Some(ez) = self.cylindrical_avg {
-                let (verdict, col) = if ez >= 150.0 {
-                    ("good modelling — faces read well", egui::Color32::from_rgb(120, 200, 120))
-                } else if ez >= 50.0 {
-                    ("meets the usual 50 lx minimum", egui::Color32::from_rgb(220, 190, 100))
-                } else {
-                    ("below 50 lx — the space will read flat", egui::Color32::from_rgb(220, 130, 120))
-                };
-                ui.label(egui::RichText::new(format!("Ez {ez:.0} lx · {verdict}")).small().color(col));
-            }
-            // EN 12464-1 judges a workplace on U₀, and a scheme can meet its average and still
-            // fail here — so say which it is rather than leaving the reader to compare.
-            let u0 = g.u0();
-            let (verdict, col) = if u0 >= 0.60 {
-                ("meets 0.60 (work areas)", egui::Color32::from_rgb(120, 200, 120))
-            } else if u0 >= 0.40 {
-                ("meets 0.40 (circulation) — below 0.60 for work areas", egui::Color32::from_rgb(220, 190, 100))
-            } else {
-                ("below 0.40 — fails EN 12464 uniformity", egui::Color32::from_rgb(220, 130, 120))
-            };
-            ui.label(egui::RichText::new(format!("U₀ {u0:.2} · {verdict}")).small().color(col));
-
-            if let Some(i) = &self.installation {
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new("Installation").strong());
-                egui::Grid::new("simlux_energy").num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
+            egui::Grid::new("simlux_results")
+                .num_columns(2)
+                .spacing([12.0, 3.0])
+                .show(ui, |ui| {
                     let mut row = |ui: &mut egui::Ui, k: &str, v: String| {
                         ui.label(egui::RichText::new(k).small().weak());
                         ui.label(v);
                         ui.end_row();
                     };
-                    row(ui, "Fixtures", format!("{}", i.count));
-                    row(ui, "Connected load", format!("{:.0} W", i.total_watts));
-                    row(ui, "Power density", format!("{:.2} W/m²", i.power_density));
-                    row(ui, "Installed flux", format!("{:.0} lm", i.total_lumens));
-                    if i.efficacy > 0.0 {
-                        row(ui, "Efficacy", format!("{:.0} lm/W", i.efficacy));
+                    row(ui, "Average  Eavg", format!("{:.0} lx", g.avg));
+                    row(ui, "Minimum  Emin", format!("{:.0} lx", g.min));
+                    row(ui, "Maximum  Emax", format!("{:.0} lx", g.max));
+                    row(ui, "Median", format!("{:.0} lx", g.median()));
+                    // Percentiles say what the average cannot: 500 lx average is a different room
+                    // when a tenth of it sits at 450 than when it sits at 150.
+                    row(
+                        ui,
+                        "10th / 90th pct",
+                        format!("{:.0} / {:.0} lx", g.percentile(10.0), g.percentile(90.0)),
+                    );
+                    row(ui, "Uniformity  U₀ = Emin/Eavg", format!("{:.2}", g.u0()));
+                    row(ui, "Diversity  U₁ = Emin/Emax", format!("{:.2}", g.u1()));
+                    // WHICH GRID THE UNIFORMITY IS ON.
+                    //
+                    // U₀ is not a property of a room — it is a property of a room AND the grid it was
+                    // sampled on, and a coarse grid always reports it too HIGH. Comparing against
+                    // DIALux on three fully specified rooms showed the averages agreeing to 0.5 % while
+                    // U₀ differed by a third, entirely from where the minimum was taken; and their
+                    // figure could not be reproduced because the grid behind it is stated nowhere in
+                    // their report. A uniformity quoted without its grid is not reproducible, so this
+                    // says it — and flags a grid coarser than EN 12464-1 asks for, which is exactly the
+                    // case where U₀ flatters the design.
+                    if let Some(p) = self.plane.as_ref() {
+                        let (wc, wr) = cad_light::en12464_cells(p.width, p.depth);
+                        let note = if p.cols < wc || p.rows < wr {
+                            format!("{}  ⚠ EN 12464-1 asks {wc} × {wr}", p.grid_note())
+                        } else {
+                            p.grid_note()
+                        };
+                        row(ui, "…measured on", note);
                     }
-                    row(ui, "Assessed area", format!("{:.1} m²", i.area_m2));
+                    // AND THE SAME ROOM ON THE STANDARD'S OWN GRID.
+                    //
+                    // The row above says which grid the figure came from; this one gives the figure a
+                    // compliance claim actually rests on, because EN 12464-1 specifies the grid it is
+                    // to be assessed on and that grid is COARSER than the working one for every room
+                    // down to about 3 m — 1.94 m across a 33 m hall.
+                    //
+                    // Reported BESIDE the working figure and never instead of it. The working grid is
+                    // the finer of the two, so its U₀ is the conservative number; swapping them would
+                    // raise every uniformity in every project at once, which is the direction that
+                    // passes an installation it should not. A designer needs both: one says how even
+                    // the room really is, the other says whether it complies.
+                    if let (Some(ge), Some(pe)) = (self.grid_en.as_ref(), self.plane_en.as_ref()) {
+                        row(
+                            ui,
+                            "…to EN 12464-1",
+                            format!("U₀ {:.2}   on {}", ge.u0(), pe.grid_note()),
+                        );
+                    }
+                    if let Some(f) = g.direct_fraction() {
+                        row(
+                            ui,
+                            "Direct / indirect",
+                            format!("{:.0}% / {:.0}%", f * 100.0, (1.0 - f) * 100.0),
+                        );
+                    }
+                    if let Some(ez) = self.cylindrical_avg {
+                        row(
+                            ui,
+                            &format!("Cylindrical  Ez @ {:.1} m", self.eye_height),
+                            format!("{ez:.0} lx"),
+                        );
+                    }
+                    // ROOM SURFACES. EN 12464-1 does not stop at the work plane — it sets maintained
+                    // levels for walls and ceilings too (an office wants roughly 50 lx on walls and
+                    // 30 lx on the ceiling, each at U₀ ≥ 0.10), and a scheme that passes on the desk
+                    // can still fail on those. Luminance is the quantity the appearance clauses are
+                    // written in, and for a diffuse surface it is ρE/π — so a bright ceiling and a
+                    // dark floor can receive the same light and look nothing alike.
+                    if !self.surfaces.is_empty() {
+                        // egui forbids `add_space` inside a Grid ("You cannot advance
+                        // the cursor when in a grid layout") — the section heading is
+                        // a two-cell row with an empty second cell instead.
+                        ui.label(egui::RichText::new("room surfaces").small().weak());
+                        ui.label("");
+                        ui.end_row();
+                        for s in &self.surfaces {
+                            row(
+                                ui,
+                                &format!("{}  ({:.0} m²)", s.name, s.area_m2),
+                                format!(
+                                    "{:.0} lx   {:.0} cd/m²   U₀ {:.2}",
+                                    s.e_avg, s.l_avg, s.u0
+                                ),
+                            );
+                        }
+                    }
                 });
+            // Ez is the one number that says whether the space renders faces. A room can hold its
+            // average on the desks and still read as flat, and nothing else on this panel shows it.
+            if let Some(ez) = self.cylindrical_avg {
+                let (verdict, col) = if ez >= 150.0 {
+                    (
+                        "good modelling — faces read well",
+                        egui::Color32::from_rgb(120, 200, 120),
+                    )
+                } else if ez >= 50.0 {
+                    (
+                        "meets the usual 50 lx minimum",
+                        egui::Color32::from_rgb(220, 190, 100),
+                    )
+                } else {
+                    (
+                        "below 50 lx — the space will read flat",
+                        egui::Color32::from_rgb(220, 130, 120),
+                    )
+                };
+                ui.label(
+                    egui::RichText::new(format!("Ez {ez:.0} lx · {verdict}"))
+                        .small()
+                        .color(col),
+                );
+            }
+            // EN 12464-1 judges a workplace on U₀, and a scheme can meet its average and still
+            // fail here — so say which it is rather than leaving the reader to compare.
+            let u0 = g.u0();
+            let (verdict, col) = if u0 >= 0.60 {
+                (
+                    "meets 0.60 (work areas)",
+                    egui::Color32::from_rgb(120, 200, 120),
+                )
+            } else if u0 >= 0.40 {
+                (
+                    "meets 0.40 (circulation) — below 0.60 for work areas",
+                    egui::Color32::from_rgb(220, 190, 100),
+                )
+            } else {
+                (
+                    "below 0.40 — fails EN 12464 uniformity",
+                    egui::Color32::from_rgb(220, 130, 120),
+                )
+            };
+            ui.label(
+                egui::RichText::new(format!("U₀ {u0:.2} · {verdict}"))
+                    .small()
+                    .color(col),
+            );
+
+            if let Some(i) = &self.installation {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Installation").strong());
+                egui::Grid::new("simlux_energy")
+                    .num_columns(2)
+                    .spacing([12.0, 3.0])
+                    .show(ui, |ui| {
+                        let mut row = |ui: &mut egui::Ui, k: &str, v: String| {
+                            ui.label(egui::RichText::new(k).small().weak());
+                            ui.label(v);
+                            ui.end_row();
+                        };
+                        row(ui, "Fixtures", format!("{}", i.count));
+                        row(ui, "Connected load", format!("{:.0} W", i.total_watts));
+                        row(ui, "Power density", format!("{:.2} W/m²", i.power_density));
+                        row(ui, "Installed flux", format!("{:.0} lm", i.total_lumens));
+                        if i.efficacy > 0.0 {
+                            row(ui, "Efficacy", format!("{:.0} lm/W", i.efficacy));
+                        }
+                        row(ui, "Assessed area", format!("{:.1} m²", i.area_m2));
+                    });
                 // A density computed from half the fixtures looks exactly like one computed from
                 // all of them, so an incomplete file has to announce itself.
                 if i.missing_watts > 0 || i.missing_lumens > 0 {
@@ -4867,7 +5078,12 @@ pub enum LuxRamp {
 }
 
 impl LuxRamp {
-    pub const ALL: [LuxRamp; 4] = [LuxRamp::Classic, LuxRamp::Viridis, LuxRamp::Fire, LuxRamp::Grey];
+    pub const ALL: [LuxRamp; 4] = [
+        LuxRamp::Classic,
+        LuxRamp::Viridis,
+        LuxRamp::Fire,
+        LuxRamp::Grey,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -4920,7 +5136,11 @@ impl LuxRamp {
         let span = (hi.0 - lo.0).max(1e-6);
         let f = (t - lo.0) / span;
         let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f).round() as u8;
-        egui::Color32::from_rgb(lerp(lo.1[0], hi.1[0]), lerp(lo.1[1], hi.1[1]), lerp(lo.1[2], hi.1[2]))
+        egui::Color32::from_rgb(
+            lerp(lo.1[0], hi.1[0]),
+            lerp(lo.1[1], hi.1[1]),
+            lerp(lo.1[2], hi.1[2]),
+        )
     }
 
     /// The same, as float RGB (0..1) for the 3D floor heatmap.
@@ -4930,7 +5150,11 @@ impl LuxRamp {
     pub fn rgb_fn(self) -> fn(f32) -> (f32, f32, f32) {
         fn conv(r: LuxRamp, t: f32) -> (f32, f32, f32) {
             let c = r.color(t);
-            (c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0)
+            (
+                c.r() as f32 / 255.0,
+                c.g() as f32 / 255.0,
+                c.b() as f32 / 255.0,
+            )
         }
         match self {
             LuxRamp::Classic => |t| conv(LuxRamp::Classic, t),
@@ -4952,7 +5176,11 @@ pub fn lux_color(t: f32) -> egui::Color32 {
 /// plain function pointer into the 3D vertex builder.
 pub fn lux_rgb(t: f32) -> (f32, f32, f32) {
     let c = lux_color(t);
-    (c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0)
+    (
+        c.r() as f32 / 255.0,
+        c.g() as f32 / 255.0,
+        c.b() as f32 / 255.0,
+    )
 }
 
 /// THE LEGEND FOR THE SCALE THE VIEWS ARE ACTUALLY DRAWN IN — the report's.
@@ -4964,12 +5192,7 @@ pub fn lux_rgb(t: f32) -> (f32, f32, f32) {
 /// Banded, this draws one block per band with its floor written underneath and the top one left
 /// open-ended, because that is what the drawing does. Unbanded, it falls back to the gradient bar,
 /// which is the honest picture of a continuous scale.
-pub fn band_legend(
-    ui: &mut egui::Ui,
-    opt: &crate::report::Options,
-    room_max: f64,
-    ramp: LuxRamp,
-) {
+pub fn band_legend(ui: &mut egui::Ui, opt: &crate::report::Options, room_max: f64, ramp: LuxRamp) {
     if opt.scale.bands.is_empty() {
         legend_bar_with(ui, opt.scale.top_lx(room_max), ramp);
         return;
@@ -5038,7 +5261,6 @@ pub fn legend_bar_with(ui: &mut egui::Ui, max: f64, ramp: LuxRamp) {
         ui.label(format!("{max:.0} lx"));
     });
 }
-
 
 /// THE GRID THE UI PROMISES IS THE GRID THAT GETS CALCULATED — or the app says otherwise.
 ///
@@ -5127,12 +5349,15 @@ mod uniformity_is_quoted_with_its_grid {
         let e = s.plane_en.as_ref().expect("a standard plane");
         let (wc, wr) = cad_light::en12464_cells(p.width, p.depth);
         assert_eq!(
-            (e.cols, e.rows), (wc, wr),
+            (e.cols, e.rows),
+            (wc, wr),
             "the standard plane is {} × {}, but EN 12464-1 asks {wc} × {wr}",
-            e.cols, e.rows,
+            e.cols,
+            e.rows,
         );
         assert_ne!(
-            (e.cols, e.rows), (p.cols, p.rows),
+            (e.cols, e.rows),
+            (p.cols, p.rows),
             "the fixture must have two DIFFERENT grids or this test proves nothing",
         );
     }
@@ -5145,12 +5370,14 @@ mod uniformity_is_quoted_with_its_grid {
         let p = s.plane.as_ref().expect("a working plane");
         let (cols, rows) = LightState::grid_for(p.width, p.depth, 0.25);
         assert_eq!(
-            (p.cols, p.rows), (cols, rows),
+            (p.cols, p.rows),
+            (cols, rows),
             "the working plane stopped being the one the cell size asks for",
         );
         let g = s.grid.as_ref().expect("a working grid");
         assert_eq!(
-            (g.cols, g.rows), (cols, rows),
+            (g.cols, g.rows),
+            (cols, rows),
             "the working figures are no longer computed on the working grid",
         );
     }
@@ -5169,15 +5396,26 @@ mod uniformity_is_quoted_with_its_grid {
         assert!(
             e.cols < p.cols && e.rows < p.rows,
             "precondition: the standard's grid must be the coarser one — {} × {} against {} × {}",
-            e.cols, e.rows, p.cols, p.rows,
+            e.cols,
+            e.rows,
+            p.cols,
+            p.rows,
         );
-        let (g, ge) = (s.grid.as_ref().expect("grid"), s.grid_en.as_ref().expect("standard grid"));
-        assert!(g.avg > 1.0, "precondition: the room is lit ({:.1} lx)", g.avg);
+        let (g, ge) = (
+            s.grid.as_ref().expect("grid"),
+            s.grid_en.as_ref().expect("standard grid"),
+        );
+        assert!(
+            g.avg > 1.0,
+            "precondition: the room is lit ({:.1} lx)",
+            g.avg
+        );
         assert!(
             ge.u0() >= g.u0() - 1e-6,
             "the coarser standard grid reported U₀ {:.3}, BELOW the working grid's {:.3} — \
              the direction this whole choice rests on is wrong",
-            ge.u0(), g.u0(),
+            ge.u0(),
+            g.u0(),
         );
     }
 
@@ -5274,10 +5512,17 @@ mod uniformity_is_quoted_with_its_grid {
     #[test]
     fn both_are_reported_even_when_the_two_grids_agree() {
         let s = lit_room(3.0, 3.0, 0.25);
-        assert!(s.grid.is_some() && s.grid_en.is_some(), "both grids must be present");
+        assert!(
+            s.grid.is_some() && s.grid_en.is_some(),
+            "both grids must be present"
+        );
         let p = s.plane.as_ref().unwrap();
         let e = s.plane_en.as_ref().unwrap();
-        assert_eq!((p.cols, p.rows), (e.cols, e.rows), "the fixture's two grids must coincide");
+        assert_eq!(
+            (p.cols, p.rows),
+            (e.cols, e.rows),
+            "the fixture's two grids must coincide"
+        );
     }
 }
 #[cfg(test)]
@@ -5307,8 +5552,13 @@ mod the_grid_is_the_one_the_ui_says {
     #[test]
     fn every_room_gets_a_square_grid() {
         for (w, d) in [
-            (33.0_f32, 13.0_f32), (100.0, 4.0), (4.0, 100.0), (7.0, 7.0),
-            (250.0, 60.0), (1.0, 40.0), (0.5, 0.5),
+            (33.0_f32, 13.0_f32),
+            (100.0, 4.0),
+            (4.0, 100.0),
+            (7.0, 7.0),
+            (250.0, 60.0),
+            (1.0, 40.0),
+            (0.5, 0.5),
         ] {
             let (sx, sy) = spacing(w, d, 0.25);
             assert!(
@@ -5322,7 +5572,11 @@ mod the_grid_is_the_one_the_ui_says {
     /// satisfy "square" and still be wrong; this is the half that stops that.
     #[test]
     fn a_room_that_fits_gets_the_cell_size_it_asked_for() {
-        for (w, d, cell) in [(8.0_f32, 6.0_f32, 0.25_f32), (12.0, 10.0, 0.5), (33.0, 13.0, 1.0)] {
+        for (w, d, cell) in [
+            (8.0_f32, 6.0_f32, 0.25_f32),
+            (12.0, 10.0, 0.5),
+            (33.0, 13.0, 1.0),
+        ] {
             let (sx, sy) = spacing(w, d, cell);
             assert!(
                 (sx - cell).abs() < cell * 0.05 && (sy - cell).abs() < cell * 0.05,
@@ -5396,7 +5650,11 @@ mod the_grid_is_the_one_the_ui_says {
     fn a_grid_that_was_honoured_is_not_announced() {
         let mut s = LightState::new();
         s.cell_size = 0.25;
-        assert_eq!(s.grid_note(8.0, 6.0), None, "an ordinary room must not be flagged");
+        assert_eq!(
+            s.grid_note(8.0, 6.0),
+            None,
+            "an ordinary room must not be flagged"
+        );
     }
 }
 #[cfg(test)]
@@ -5415,12 +5673,19 @@ mod tests {
             cad_solid::BoolOp::Union,
             cad_solid::Plane::default(),
             cad_solid::Placement::default(),
-            cad_solid::Primitive::Box { w: 6.0, d: 4.0, h: 3.0 },
+            cad_solid::Primitive::Box {
+                w: 6.0,
+                d: 4.0,
+                h: 3.0,
+            },
         );
         f.recompute();
 
         let meshes = meshes_from_factory(&f);
-        assert!(!meshes.is_empty(), "a solid box must produce lighting geometry");
+        assert!(
+            !meshes.is_empty(),
+            "a solid box must produce lighting geometry"
+        );
 
         // A closed box has all three orientations, and each must land in its own material so the
         // engine's floor/wall/ceiling reflectances (0.20 / 0.50 / 0.70) actually apply.
@@ -5434,8 +5699,12 @@ mod tests {
         for m in &meshes {
             for t in &m.triangles {
                 for i in [t.a, t.b, t.c] {
-                    assert!((i as usize) < m.vertices.len(),
-                        "index {i} is past the {} vertices of material {}", m.vertices.len(), m.material);
+                    assert!(
+                        (i as usize) < m.vertices.len(),
+                        "index {i} is past the {} vertices of material {}",
+                        m.vertices.len(),
+                        m.material
+                    );
                 }
             }
         }
@@ -5445,8 +5714,10 @@ mod tests {
     #[test]
     fn an_empty_factory_leaves_the_2d_workflow_alone() {
         let f = crate::factory::FactoryState::default();
-        assert!(meshes_from_factory(&f).is_empty(),
-            "nothing modelled means nothing to hand over — the extrusion must stay in charge");
+        assert!(
+            meshes_from_factory(&f).is_empty(),
+            "nothing modelled means nothing to hand over — the extrusion must stay in charge"
+        );
     }
 
     /// The bounds come from the GEOMETRY, not the drawing.
@@ -5460,17 +5731,35 @@ mod tests {
         f.model.push(
             cad_solid::BoolOp::Union,
             cad_solid::Plane::from_basis(
-                glam::Vec3::new(3500.0, -6850.0, 0.0), glam::Vec3::X, glam::Vec3::Y),
+                glam::Vec3::new(3500.0, -6850.0, 0.0),
+                glam::Vec3::X,
+                glam::Vec3::Y,
+            ),
             cad_solid::Placement::default(),
-            cad_solid::Primitive::Box { w: 6.0, d: 4.0, h: 3.0 },
+            cad_solid::Primitive::Box {
+                w: 6.0,
+                d: 4.0,
+                h: 3.0,
+            },
         );
         f.recompute();
         let meshes = meshes_from_factory(&f);
 
         let (x0, y0, x1, y1) = mesh_bbox(&meshes).expect("a box has bounds");
-        assert!((x1 - x0 - 6.0).abs() < 0.01, "width should be 6 m, got {}", x1 - x0);
-        assert!((y1 - y0 - 4.0).abs() < 0.01, "depth should be 4 m, got {}", y1 - y0);
-        assert!(x0 > 3000.0, "…and it must be found where the building actually is, not at the origin");
+        assert!(
+            (x1 - x0 - 6.0).abs() < 0.01,
+            "width should be 6 m, got {}",
+            x1 - x0
+        );
+        assert!(
+            (y1 - y0 - 4.0).abs() < 0.01,
+            "depth should be 4 m, got {}",
+            y1 - y0
+        );
+        assert!(
+            x0 > 3000.0,
+            "…and it must be found where the building actually is, not at the origin"
+        );
         let h = mesh_height(&meshes).expect("a box has height");
         assert!((h - 3.0).abs() < 0.01, "height should be 3 m, got {h}");
     }
@@ -5505,13 +5794,25 @@ mod array_tests {
             v
         };
         assert_eq!(xs.len(), 3, "three distinct columns, got {xs:?}");
-        assert!((xs[0] - 2.0).abs() < 1e-3, "first column at half a pitch from the wall, got {}", xs[0]);
+        assert!(
+            (xs[0] - 2.0).abs() < 1e-3,
+            "first column at half a pitch from the wall, got {}",
+            xs[0]
+        );
         assert!((xs[1] - 6.0).abs() < 1e-3);
-        assert!((xs[2] - 10.0).abs() < 1e-3, "last column symmetric to the first, got {}", xs[2]);
+        assert!(
+            (xs[2] - 10.0).abs() < 1e-3,
+            "last column symmetric to the first, got {}",
+            xs[2]
+        );
 
         // Every one is at the mounting height, not the floor.
-        assert!(s.luminaires.iter().all(|l| (l.position.z - 3.0).abs() < 1e-6),
-            "fixtures must sit at the mount height");
+        assert!(
+            s.luminaires
+                .iter()
+                .all(|l| (l.position.z - 3.0).abs() < 1e-6),
+            "fixtures must sit at the mount height"
+        );
         // …and they all carry the active photometry, or the array would be lit by nothing.
         assert!(s.luminaires.iter().all(|l| l.profile == s.active_profile));
     }
@@ -5523,7 +5824,11 @@ mod array_tests {
         s.luminaires.clear();
         assert_eq!(s.add_luminaire_grid((5.0, 5.0, 5.0, 5.0), 3, 3), 0);
         assert!(s.luminaires.is_empty(), "no room means no array");
-        assert!(s.last_msg.contains("bounds"), "and it should say why: {}", s.last_msg);
+        assert!(
+            s.last_msg.contains("bounds"),
+            "and it should say why: {}",
+            s.last_msg
+        );
     }
 }
 
@@ -5569,7 +5874,10 @@ mod mounting_tests {
         assert!((b - 2.5).abs() < 1e-3, "bay B ceiling is 2.5 m, got {b}");
         // Outside the footprint there is nothing overhead, and inventing a height would be worse
         // than saying so.
-        assert!(ceiling_above(&m, 50.0, 4.0, 0.8).is_none(), "nothing overhead outside the room");
+        assert!(
+            ceiling_above(&m, 50.0, 4.0, 0.8).is_none(),
+            "nothing overhead outside the room"
+        );
     }
 
     /// An UP-facing surface is not a ceiling. A ray cast upward crosses both faces of a slab, and
@@ -5578,8 +5886,10 @@ mod mounting_tests {
     fn the_top_of_a_slab_is_not_a_ceiling() {
         let up_only = vec![Mesh {
             vertices: vec![
-                Vertex::new(0.0, 0.0, 3.0), Vertex::new(6.0, 0.0, 3.0),
-                Vertex::new(6.0, 6.0, 3.0), Vertex::new(0.0, 6.0, 3.0),
+                Vertex::new(0.0, 0.0, 3.0),
+                Vertex::new(6.0, 0.0, 3.0),
+                Vertex::new(6.0, 6.0, 3.0),
+                Vertex::new(0.0, 6.0, 3.0),
             ],
             triangles: vec![
                 cad_light::Triangle { a: 0, b: 1, c: 2 },
@@ -5587,8 +5897,10 @@ mod mounting_tests {
             ],
             material: 0,
         }];
-        assert!(ceiling_above(&up_only, 3.0, 3.0, 0.8).is_none(),
-            "an up-facing surface overhead is the TOP of a slab, not a ceiling");
+        assert!(
+            ceiling_above(&up_only, 3.0, 3.0, 0.8).is_none(),
+            "an up-facing surface overhead is the TOP of a slab, not a ceiling"
+        );
     }
 
     /// The array follows the stepped ceiling instead of putting everything at one height.
@@ -5607,15 +5919,37 @@ mod mounting_tests {
 
         // 1 row x 4 cols over 0..12 => x at 1.5, 4.5, 7.5, 10.5: two under each bay.
         assert_eq!(s.add_luminaire_grid((0.0, 0.0, 12.0, 8.0), 1, 4), 4);
-        let mut by_x: Vec<(f32, f32)> =
-            s.luminaires.iter().map(|l| (l.position.x, l.position.z)).collect();
+        let mut by_x: Vec<(f32, f32)> = s
+            .luminaires
+            .iter()
+            .map(|l| (l.position.x, l.position.z))
+            .collect();
         by_x.sort_by(|a, b| a.0.total_cmp(&b.0));
-        assert!((by_x[0].1 - 4.0).abs() < 1e-3, "x=1.5 is under the high bay, got z={}", by_x[0].1);
-        assert!((by_x[1].1 - 4.0).abs() < 1e-3, "x=4.5 is under the high bay, got z={}", by_x[1].1);
-        assert!((by_x[2].1 - 2.5).abs() < 1e-3, "x=7.5 is under the low bay, got z={}", by_x[2].1);
-        assert!((by_x[3].1 - 2.5).abs() < 1e-3, "x=10.5 is under the low bay, got z={}", by_x[3].1);
-        assert!(s.last_msg.contains("2.50–4.00 m"),
-            "the message should report the SPREAD on a stepped ceiling: {}", s.last_msg);
+        assert!(
+            (by_x[0].1 - 4.0).abs() < 1e-3,
+            "x=1.5 is under the high bay, got z={}",
+            by_x[0].1
+        );
+        assert!(
+            (by_x[1].1 - 4.0).abs() < 1e-3,
+            "x=4.5 is under the high bay, got z={}",
+            by_x[1].1
+        );
+        assert!(
+            (by_x[2].1 - 2.5).abs() < 1e-3,
+            "x=7.5 is under the low bay, got z={}",
+            by_x[2].1
+        );
+        assert!(
+            (by_x[3].1 - 2.5).abs() < 1e-3,
+            "x=10.5 is under the low bay, got z={}",
+            by_x[3].1
+        );
+        assert!(
+            s.last_msg.contains("2.50–4.00 m"),
+            "the message should report the SPREAD on a stepped ceiling: {}",
+            s.last_msg
+        );
     }
 
     /// A pendant drop hangs below whatever it is fixed to, per fixture.
@@ -5630,8 +5964,16 @@ mod mounting_tests {
         s.add_luminaire_grid((0.0, 0.0, 12.0, 8.0), 1, 2);
         let mut z: Vec<f32> = s.luminaires.iter().map(|l| l.position.z).collect();
         z.sort_by(f32::total_cmp);
-        assert!((z[0] - 2.0).abs() < 1e-3, "0.5 m below the 2.5 m ceiling, got {}", z[0]);
-        assert!((z[1] - 3.5).abs() < 1e-3, "0.5 m below the 4 m ceiling, got {}", z[1]);
+        assert!(
+            (z[0] - 2.0).abs() < 1e-3,
+            "0.5 m below the 2.5 m ceiling, got {}",
+            z[0]
+        );
+        assert!(
+            (z[1] - 3.5).abs() < 1e-3,
+            "0.5 m below the 4 m ceiling, got {}",
+            z[1]
+        );
     }
 
     /// Turning it OFF restores one fixed height — the old behaviour, kept for a designer who wants
@@ -5644,8 +5986,12 @@ mod mounting_tests {
         s.mount_to_ceiling = false;
         s.mount_height = 3.2;
         s.add_luminaire_grid((0.0, 0.0, 12.0, 8.0), 1, 4);
-        assert!(s.luminaires.iter().all(|l| (l.position.z - 3.2).abs() < 1e-6),
-            "with the toggle off every fixture sits at the set height");
+        assert!(
+            s.luminaires
+                .iter()
+                .all(|l| (l.position.z - 3.2).abs() < 1e-6),
+            "with the toggle off every fixture sits at the set height"
+        );
     }
 }
 
@@ -5679,11 +6025,22 @@ mod placement_tests {
     #[test]
     fn a_new_point_starts_without_a_fitting() {
         let mut s = room();
-        assert_eq!(s.active_profile, UNASSIGNED, "nothing is chosen on a fresh project");
+        assert_eq!(
+            s.active_profile, UNASSIGNED,
+            "nothing is chosen on a fresh project"
+        );
         let id = s.place_point(2.0, 3.0);
         assert_eq!(s.luminaires.len(), 1);
-        assert_eq!(s.unassigned_count(), 1, "the point is waiting for a fitting");
-        assert_eq!(s.selected, vec![id], "and it is selected, ready to be fitted out");
+        assert_eq!(
+            s.unassigned_count(),
+            1,
+            "the point is waiting for a fitting"
+        );
+        assert_eq!(
+            s.selected,
+            vec![id],
+            "and it is selected, ready to be fitted out"
+        );
         assert!(!s.is_assigned(&s.luminaires[0]));
     }
 
@@ -5691,7 +6048,8 @@ mod placement_tests {
     #[test]
     fn choosing_a_fitting_fills_in_the_points_that_have_none() {
         let mut s = room();
-        s.profiles.insert("Downlight 3000K".into(), fitting("Downlight 3000K"));
+        s.profiles
+            .insert("Downlight 3000K".into(), fitting("Downlight 3000K"));
         s.place_point(1.0, 1.0);
         s.place_point(2.0, 1.0);
         s.place_point(3.0, 1.0);
@@ -5716,7 +6074,14 @@ mod placement_tests {
         s.select(b, false);
         s.select(c, true);
         assert_eq!(s.assign_profile("B"), 2);
-        let by = |id: u32| s.luminaires.iter().find(|l| l.id == id).unwrap().profile.clone();
+        let by = |id: u32| {
+            s.luminaires
+                .iter()
+                .find(|l| l.id == id)
+                .unwrap()
+                .profile
+                .clone()
+        };
         assert_eq!(by(a), "A", "the unselected fixture keeps its fitting");
         assert_eq!(by(b), "B");
         assert_eq!(by(c), "B");
@@ -5729,7 +6094,11 @@ mod placement_tests {
         let mut s = room();
         let far = s.place_point(0.0, 0.0);
         let near = s.place_point(0.30, 0.0);
-        assert_eq!(s.pick_at(0.25, 0.0, 0.5), Some(near), "0.25 is nearer the 0.30 marker");
+        assert_eq!(
+            s.pick_at(0.25, 0.0, 0.5),
+            Some(near),
+            "0.25 is nearer the 0.30 marker"
+        );
         assert_eq!(s.pick_at(0.05, 0.0, 0.5), Some(far));
         assert_eq!(s.pick_at(5.0, 5.0, 0.5), None, "nothing within reach");
     }
@@ -5751,7 +6120,11 @@ mod placement_tests {
             (l.position.x, l.position.y)
         };
         assert_eq!(pos(a), (1.5, 2.0));
-        assert_eq!(pos(b), (3.5, 2.0), "the other selected fixture moved by the same delta");
+        assert_eq!(
+            pos(b),
+            (3.5, 2.0),
+            "the other selected fixture moved by the same delta"
+        );
     }
 
     /// Pressing on an UNSELECTED marker grabs that one alone — a drag always moves what is under
@@ -5797,9 +6170,11 @@ mod placement_tests {
         s.begin_drag(id, (3.0, 4.0));
         s.drag_to((9.0, 4.0)); // over into the 2.5 m bay
         assert!(s.end_drag());
-        assert!((s.luminaires[0].position.z - 2.5).abs() < 1e-3,
+        assert!(
+            (s.luminaires[0].position.z - 2.5).abs() < 1e-3,
             "it should hang from the low ceiling it was dropped under, got {}",
-            s.luminaires[0].position.z);
+            s.luminaires[0].position.z
+        );
     }
 
     /// Deleting removes exactly the selection and nothing else.
@@ -5854,15 +6229,26 @@ mod placement_tests {
         s.assign_profile("A");
         let doc = Document::default();
         let cfg = s.to_config(&doc);
-        assert_eq!(cfg.luminaires.len(), 2, "the layout is written to the sidecar");
+        assert_eq!(
+            cfg.luminaires.len(),
+            2,
+            "the layout is written to the sidecar"
+        );
 
         let mut reopened = LightState::new();
         reopened.luminaires.clear();
         reopened.apply_config(cfg, &doc);
         assert_eq!(reopened.luminaires.len(), 2);
-        assert_eq!(reopened.unassigned_count(), 0, "the fitting came back with the library");
+        assert_eq!(
+            reopened.unassigned_count(),
+            0,
+            "the fitting came back with the library"
+        );
         let next = reopened.place_point(9.0, 9.0);
-        assert!(next > 2, "a new point gets a fresh id, not one already in use");
+        assert!(
+            next > 2,
+            "a new point gets a fresh id, not one already in use"
+        );
     }
 
     /// A NEW project computes maintained illuminance. This is the setting that decides whether
@@ -5871,8 +6257,14 @@ mod placement_tests {
     fn a_new_project_is_quoted_at_a_maintenance_factor() {
         let s = LightState::new();
         let mf = s.maintenance.factor();
-        assert!(mf < 1.0, "a fresh project must not report INITIAL lux as the answer, got {mf}");
-        assert!((0.78..=0.82).contains(&mf), "the shipped default is about 0.80, got {mf}");
+        assert!(
+            mf < 1.0,
+            "a fresh project must not report INITIAL lux as the answer, got {mf}"
+        );
+        assert!(
+            (0.78..=0.82).contains(&mf),
+            "the shipped default is about 0.80, got {mf}"
+        );
     }
 
     /// …but a project saved BEFORE maintenance existed comes back at the initial condition.
@@ -5887,7 +6279,11 @@ mod placement_tests {
         let mut cfg = s.to_config(&doc);
         cfg.maintenance = None; // as written by a build that predates the factor
         s.apply_config(cfg, &doc);
-        assert_eq!(s.maintenance.factor(), 1.0, "restored as INITIAL, not silently maintained");
+        assert_eq!(
+            s.maintenance.factor(),
+            1.0,
+            "restored as INITIAL, not silently maintained"
+        );
     }
 
     /// A maintenance factor set by the user round-trips a save.
@@ -5895,13 +6291,21 @@ mod placement_tests {
     fn the_maintenance_factor_survives_a_save() {
         let doc = Document::default();
         let mut s = LightState::new();
-        s.maintenance = Maintenance { llmf: 0.88, lsf: 0.99, lmf: 0.85, rsmf: 0.92 };
+        s.maintenance = Maintenance {
+            llmf: 0.88,
+            lsf: 0.99,
+            lmf: 0.85,
+            rsmf: 0.92,
+        };
         let want = s.maintenance.factor();
         let cfg = s.to_config(&doc);
         let mut reopened = LightState::new();
         reopened.apply_config(cfg, &doc);
         assert!((reopened.maintenance.factor() - want).abs() < 1e-12);
-        assert!((reopened.maintenance.llmf - 0.88).abs() < 1e-12, "the sub-factors, not just the product");
+        assert!(
+            (reopened.maintenance.llmf - 0.88).abs() < 1e-12,
+            "the sub-factors, not just the product"
+        );
     }
 
     /// A fixture whose fitting did NOT come back comes in unassigned, so the toolbar can say so.
@@ -5949,7 +6353,12 @@ mod furniture_in_the_light_scene {
         let normals = vec![[0.0, 0.0, 1.0]; 6];
         f.add_furniture_asset(
             "slab".into(),
-            crate::mesh_io::ObjMesh { positions, normals, color: None, alpha: Vec::new() },
+            crate::mesh_io::ObjMesh {
+                positions,
+                normals,
+                color: None,
+                alpha: Vec::new(),
+            },
         )
     }
 
@@ -5975,14 +6384,24 @@ mod furniture_in_the_light_scene {
     #[test]
     fn furniture_reaches_the_engine_at_all() {
         let mut f = a_room();
-        let bare = meshes_from_factory(&f).iter().map(|m| m.triangles.len()).sum::<usize>();
+        let bare = meshes_from_factory(&f)
+            .iter()
+            .map(|m| m.triangles.len())
+            .sum::<usize>();
         assert!(bare > 0, "the building itself should be there");
 
         let a = slab_asset(&mut f, 0.5, 0.0);
         f.place_mode = crate::factory::PlaceMode::Centre;
         f.place_furniture(a, glam::Vec3::new(3.0, 3.0, 0.0));
-        let with = meshes_from_factory(&f).iter().map(|m| m.triangles.len()).sum::<usize>();
-        assert_eq!(with, bare + 2, "the slab's two triangles must reach the engine");
+        let with = meshes_from_factory(&f)
+            .iter()
+            .map(|m| m.triangles.len())
+            .sum::<usize>();
+        assert_eq!(
+            with,
+            bare + 2,
+            "the slab's two triangles must reach the engine"
+        );
     }
 
     /// …under its OWN material, not bucketed by orientation with the building. A desk top is not a
@@ -5998,13 +6417,24 @@ mod furniture_in_the_light_scene {
         assert!(furn.is_some(), "furniture must be its own mesh");
         assert_eq!(furn.unwrap().triangles.len(), 2);
         // The slab faces UP, so a bucket-by-orientation pass would have filed it as floor.
-        let floor = meshes.iter().find(|m| m.material == 0).map(|m| m.triangles.len()).unwrap_or(0);
+        let floor = meshes
+            .iter()
+            .find(|m| m.material == 0)
+            .map(|m| m.triangles.len())
+            .unwrap_or(0);
         let bare_floor = {
             let mut g = a_room();
             let _ = &mut g;
-            meshes_from_factory(&g).iter().find(|m| m.material == 0).map(|m| m.triangles.len()).unwrap_or(0)
+            meshes_from_factory(&g)
+                .iter()
+                .find(|m| m.material == 0)
+                .map(|m| m.triangles.len())
+                .unwrap_or(0)
         };
-        assert_eq!(floor, bare_floor, "the slab was filed as floor instead of furniture");
+        assert_eq!(
+            floor, bare_floor,
+            "the slab was filed as floor instead of furniture"
+        );
     }
 
     /// Its POSE is applied. A piece is placed somewhere, and the engine has to see it there —
@@ -6016,7 +6446,10 @@ mod furniture_in_the_light_scene {
         f.place_mode = crate::factory::PlaceMode::Centre;
         f.place_furniture(a, glam::Vec3::new(4.5, 1.5, 0.0));
         let meshes = meshes_from_factory(&f);
-        let m = meshes.iter().find(|m| m.material == MATERIAL_FURNITURE).unwrap();
+        let m = meshes
+            .iter()
+            .find(|m| m.material == MATERIAL_FURNITURE)
+            .unwrap();
         let cx = m.vertices.iter().map(|v| v.x).sum::<f32>() / m.vertices.len() as f32;
         let cy = m.vertices.iter().map(|v| v.y).sum::<f32>() / m.vertices.len() as f32;
         assert!((cx - 4.5).abs() < 1e-3, "x = {cx}, expected 4.5");
@@ -6059,7 +6492,11 @@ mod furniture_in_the_light_scene {
         };
         // DIRECT ONLY: the shadow is the thing under test, and bounced light would fill it in and
         // blur exactly the effect being measured.
-        let settings = RaySettings { rays_per_point: 1, max_bounces: 0, shadows: true };
+        let settings = RaySettings {
+            rays_per_point: 1,
+            max_bounces: 0,
+            shadows: true,
+        };
         let materials = cad_light::default_materials();
 
         let open = calculate(
@@ -6081,7 +6518,10 @@ mod furniture_in_the_light_scene {
             &settings,
         );
 
-        assert!(open.avg > 1.0, "precondition: the point is lit with nothing in the way");
+        assert!(
+            open.avg > 1.0,
+            "precondition: the point is lit with nothing in the way"
+        );
         assert!(
             shaded.avg < open.avg * 0.05,
             "the panel should block the fitting: {:.1} lx open, {:.1} lx shaded",
@@ -6118,16 +6558,36 @@ mod curved_lights_are_real_lights {
         // A minimal body for the fixture: the asset needs geometry, and the rebase is applied to
         // the emitters through the SAME bounds, so this stands in for the real extrusion.
         let v = |x: f32, z: f32| [x, 0.0, z];
-        let positions = vec![v(-0.5, 0.0), v(0.5, 0.0), v(0.5, 0.1), v(-0.5, 0.0), v(0.5, 0.1), v(-0.5, 0.1)];
+        let positions = vec![
+            v(-0.5, 0.0),
+            v(0.5, 0.0),
+            v(0.5, 0.1),
+            v(-0.5, 0.0),
+            v(0.5, 0.1),
+            v(-0.5, 0.1),
+        ];
         let idx = f.add_furniture_asset(
             "Curved light 1".into(),
-            crate::mesh_io::ObjMesh { positions, normals: vec![[0.0, -1.0, 0.0]; 6], color: None, alpha: Vec::new() },
+            crate::mesh_io::ObjMesh {
+                positions,
+                normals: vec![[0.0, -1.0, 0.0]; 6],
+                color: None,
+                alpha: Vec::new(),
+            },
         );
         if let Some(a) = f.furniture_lib.get_mut(idx) {
             a.cct_k = 3000;
             a.emitters = vec![
-                crate::factory::FurnEmitter { pos: [-0.25, 0.0, 0.0], lumens: 1000.0, watts: 10.0 },
-                crate::factory::FurnEmitter { pos: [0.25, 0.0, 0.0], lumens: 1000.0, watts: 10.0 },
+                crate::factory::FurnEmitter {
+                    pos: [-0.25, 0.0, 0.0],
+                    lumens: 1000.0,
+                    watts: 10.0,
+                },
+                crate::factory::FurnEmitter {
+                    pos: [0.25, 0.0, 0.0],
+                    lumens: 1000.0,
+                    watts: 10.0,
+                },
             ];
         }
         f.place_mode = crate::factory::PlaceMode::Centre;
@@ -6153,11 +6613,21 @@ mod curved_lights_are_real_lights {
         let f = a_room_with_a_curved_light(glam::Vec3::new(3.0, 3.0, 2.5));
         let mut s = LightState::new();
         let lums = s.generated_luminaires(&f);
-        let p = s.profiles.get(&lums[0].profile).expect("its profile must be in the table");
+        let p = s
+            .profiles
+            .get(&lums[0].profile)
+            .expect("its profile must be in the table");
         // Lambertian: Phi = pi * I0, so a 1000 lm point peaks at 1000/pi cd straight down.
-        assert!((p.candela[0][0] - 1000.0 / std::f64::consts::PI).abs() < 1e-6, "I0 = {}", p.candela[0][0]);
+        assert!(
+            (p.candela[0][0] - 1000.0 / std::f64::consts::PI).abs() < 1e-6,
+            "I0 = {}",
+            p.candela[0][0]
+        );
         assert!(p.candela[0][18] < 1e-9, "and nothing at the horizon");
-        assert_eq!(p.watts, 10.0, "its share of the connected load, for the power density");
+        assert_eq!(
+            p.watts, 10.0,
+            "its share of the connected load, for the power density"
+        );
     }
 
     /// THE POINT OF DERIVING THEM. Move the fixture and its light moves — this is why the emitters
@@ -6165,18 +6635,32 @@ mod curved_lights_are_real_lights {
     #[test]
     fn the_light_follows_the_fixture() {
         let mut s = LightState::new();
-        let here = s.generated_luminaires(&a_room_with_a_curved_light(glam::Vec3::new(1.0, 1.0, 2.5)));
-        let there = s.generated_luminaires(&a_room_with_a_curved_light(glam::Vec3::new(4.0, 2.0, 2.0)));
+        let here =
+            s.generated_luminaires(&a_room_with_a_curved_light(glam::Vec3::new(1.0, 1.0, 2.5)));
+        let there =
+            s.generated_luminaires(&a_room_with_a_curved_light(glam::Vec3::new(4.0, 2.0, 2.0)));
         let mid = |v: &[Luminaire]| {
             let n = v.len() as f32;
-            (v.iter().map(|l| l.position.x).sum::<f32>() / n, v.iter().map(|l| l.position.y).sum::<f32>() / n,
-             v.iter().map(|l| l.position.z).sum::<f32>() / n)
+            (
+                v.iter().map(|l| l.position.x).sum::<f32>() / n,
+                v.iter().map(|l| l.position.y).sum::<f32>() / n,
+                v.iter().map(|l| l.position.z).sum::<f32>() / n,
+            )
         };
         let (ax, ay, az) = mid(&here);
         let (bx, by, bz) = mid(&there);
-        assert!((ax - 1.0).abs() < 1e-3 && (ay - 1.0).abs() < 1e-3, "first at ({ax}, {ay})");
-        assert!((bx - 4.0).abs() < 1e-3 && (by - 2.0).abs() < 1e-3, "second at ({bx}, {by})");
-        assert!((az - bz).abs() > 0.4, "and it carried its mounting height with it: {az} vs {bz}");
+        assert!(
+            (ax - 1.0).abs() < 1e-3 && (ay - 1.0).abs() < 1e-3,
+            "first at ({ax}, {ay})"
+        );
+        assert!(
+            (bx - 4.0).abs() < 1e-3 && (by - 2.0).abs() < 1e-3,
+            "second at ({bx}, {by})"
+        );
+        assert!(
+            (az - bz).abs() > 0.4,
+            "and it carried its mounting height with it: {az} vs {bz}"
+        );
     }
 
     /// Ordinary furniture is not a light. A chair with an emissive-looking texture must not start
@@ -6209,7 +6693,10 @@ mod curved_lights_are_real_lights {
             s.grid.as_ref().map(|g| g.avg).unwrap_or(0.0)
         };
         let (on, off) = (avg(&lit), avg(&dark));
-        assert!(off < 1e-6, "precondition: with no emitters the room is dark, got {off:.3} lx");
+        assert!(
+            off < 1e-6,
+            "precondition: with no emitters the room is dark, got {off:.3} lx"
+        );
         assert!(on > 1.0, "the curved light must light the room: {on:.1} lx");
     }
 
@@ -6231,7 +6718,10 @@ mod curved_lights_are_real_lights {
         };
         let (warm, cool) = (avg_at(2700), avg_at(6500));
         assert!(warm > 1.0, "precondition: it is lit");
-        assert!((warm - cool).abs() < 1e-9, "2700 K gave {warm:.4} lx, 6500 K gave {cool:.4} lx");
+        assert!(
+            (warm - cool).abs() < 1e-9,
+            "2700 K gave {warm:.4} lx, 6500 K gave {cool:.4} lx"
+        );
     }
 
     /// The tint it DOES drive has to be the right way round: warm is redder than cool.
@@ -6239,13 +6729,25 @@ mod curved_lights_are_real_lights {
     fn the_lens_tint_follows_the_colour_temperature() {
         let warm = crate::factory::cct_to_linear_rgb(2700);
         let cool = crate::factory::cct_to_linear_rgb(6500);
-        assert!(warm[0] > warm[1] && warm[1] > warm[2], "2700 K must run red > green > blue: {warm:?}");
-        assert!(cool[2] > warm[2], "6500 K must be bluer than 2700 K: {cool:?} vs {warm:?}");
+        assert!(
+            warm[0] > warm[1] && warm[1] > warm[2],
+            "2700 K must run red > green > blue: {warm:?}"
+        );
+        assert!(
+            cool[2] > warm[2],
+            "6500 K must be bluer than 2700 K: {cool:?} vs {warm:?}"
+        );
         // 6500 K is essentially the sRGB white point, so it should come out near neutral.
-        assert!((cool[0] - cool[2]).abs() < 0.05, "6500 K should be close to white: {cool:?}");
+        assert!(
+            (cool[0] - cool[2]).abs() < 0.05,
+            "6500 K should be close to white: {cool:?}"
+        );
         // A halogen fitting is warmer than a sodium one is not; the ordering has to be monotone.
         let mid = crate::factory::cct_to_linear_rgb(4000);
-        assert!(warm[2] < mid[2] && mid[2] < cool[2], "blue must rise with CCT: {warm:?} {mid:?} {cool:?}");
+        assert!(
+            warm[2] < mid[2] && mid[2] < cool[2],
+            "blue must rise with CCT: {warm:?} {mid:?} {cool:?}"
+        );
     }
 }
 
@@ -6276,9 +6778,18 @@ mod the_project_file_describes_the_dialux_room {
         dialux: Option<f64>,
     }
     const CASES: [Case; 3] = [
-        Case { file: "t1 with furniture.simlux.json", dialux: Some(199.0) },
-        Case { file: "t2 with furniture.simlux.json", dialux: Some(336.0) },
-        Case { file: "t3 with furniture.simlux.json", dialux: None },
+        Case {
+            file: "t1 with furniture.simlux.json",
+            dialux: Some(199.0),
+        },
+        Case {
+            file: "t2 with furniture.simlux.json",
+            dialux: Some(336.0),
+        },
+        Case {
+            file: "t3 with furniture.simlux.json",
+            dialux: None,
+        },
     ];
 
     #[test]
@@ -6299,7 +6810,11 @@ mod the_project_file_describes_the_dialux_room {
             f.apply_persist(cfg.factory.clone());
             f.recompute();
             let meshes = meshes_from_factory(&f);
-            assert!(!meshes.is_empty(), "{}: the file produced no geometry at all", case.file);
+            assert!(
+                !meshes.is_empty(),
+                "{}: the file produced no geometry at all",
+                case.file
+            );
 
             // THE GEOMETRY THE FILE DESCRIBES. Check it before checking the light, so a wrong
             // answer says WHICH thing is wrong.
@@ -6313,10 +6828,21 @@ mod the_project_file_describes_the_dialux_room {
                 }
             }
             println!("\n=== {} ===", case.file);
-            println!("  model z {:.3} .. {:.3} m   ({} meshes)", lo[2], hi[2], meshes.len());
-            let furn = meshes.iter().find(|m| m.material == cad_light::MATERIAL_FURNITURE);
+            println!(
+                "  model z {:.3} .. {:.3} m   ({} meshes)",
+                lo[2],
+                hi[2],
+                meshes.len()
+            );
+            let furn = meshes
+                .iter()
+                .find(|m| m.material == cad_light::MATERIAL_FURNITURE);
             let fz = furn.map(|m| m.vertices.iter().fold(f32::MAX, |a, v| a.min(v.z)));
-            println!("  furniture base z {:?}   luminaires {}", fz, cfg.luminaires.len());
+            println!(
+                "  furniture base z {:?}   luminaires {}",
+                fz,
+                cfg.luminaires.len()
+            );
             assert!(
                 fz.is_some_and(|z| z.abs() < 0.02),
                 "{}: the furniture must stand ON the floor, base at z = {:?}",
@@ -6324,7 +6850,9 @@ mod the_project_file_describes_the_dialux_room {
                 fz,
             );
             assert!(
-                cfg.luminaires.iter().all(|l| (l.position.z - 4.0).abs() < 1e-3),
+                cfg.luminaires
+                    .iter()
+                    .all(|l| (l.position.z - 4.0).abs() < 1e-3),
                 "{}: DIALux mounts at 4.000 m",
                 case.file,
             );
@@ -6343,9 +6871,16 @@ mod the_project_file_describes_the_dialux_room {
                 cols: 8,
                 rows: 8,
             };
-            let profiles: HashMap<String, IesProfile> =
-                cfg.ies_library.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            let settings = RaySettings { rays_per_point: 4096, max_bounces: 8, shadows: true };
+            let profiles: HashMap<String, IesProfile> = cfg
+                .ies_library
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let settings = RaySettings {
+                rays_per_point: 4096,
+                max_bounces: 8,
+                shadows: true,
+            };
             let grid = cad_light::calculate_maintained(
                 &meshes,
                 &cfg.luminaires,
@@ -6353,20 +6888,28 @@ mod the_project_file_describes_the_dialux_room {
                 &cfg.materials,
                 &plane,
                 &settings,
-                cfg.maintenance.expect("the file states its maintenance factor"),
+                cfg.maintenance
+                    .expect("the file states its maintenance factor"),
             );
             let avg = grid.values.iter().sum::<f64>() / grid.values.len() as f64;
             for r in 0..8 {
                 println!(
                     "  r{r}  {}",
-                    (0..8).map(|c| format!("{:>6.0}", grid.values[r * 8 + c])).collect::<Vec<_>>().join(""),
+                    (0..8)
+                        .map(|c| format!("{:>6.0}", grid.values[r * 8 + c]))
+                        .collect::<Vec<_>>()
+                        .join(""),
                 );
             }
             match case.dialux {
                 Some(want) => {
                     let err = (avg - want) / want * 100.0;
                     println!("  E average {avg:>8.1} lx   DIALux {want:>6.0}   {err:>+6.2}%");
-                    assert!(err.abs() < 3.0, "{}: {avg:.1} lx against DIALux's {want:.0}", case.file);
+                    assert!(
+                        err.abs() < 3.0,
+                        "{}: {avg:.1} lx against DIALux's {want:.0}",
+                        case.file
+                    );
                 }
                 None => println!("  E average {avg:>8.1} lx   (that report's summary is stale)"),
             }
@@ -6407,7 +6950,10 @@ mod a_fitting_is_bounded_work {
             "753 points came through as {}",
             merged.len(),
         );
-        assert!(merged.len() > 1, "…but it is still sampled as a line, not collapsed to a point");
+        assert!(
+            merged.len() > 1,
+            "…but it is still sampled as a line, not collapsed to a point"
+        );
     }
 
     /// AND THE LIGHT IS ALL STILL THERE. Capping the count must not dim the fitting — the whole
@@ -6424,7 +6970,10 @@ mod a_fitting_is_bounded_work {
             );
             let ww: f64 = src.iter().map(|e| e.watts).sum();
             let gw: f64 = merge_emitters(&src).iter().map(|e| e.watts).sum();
-            assert!((gw - ww).abs() < 1e-9, "n = {n}: the connected load moved too");
+            assert!(
+                (gw - ww).abs() < 1e-9,
+                "n = {n}: the connected load moved too"
+            );
         }
     }
 
@@ -6436,8 +6985,14 @@ mod a_fitting_is_bounded_work {
         let merged = merge_emitters(&src);
         let (lo, hi) = (merged[0].pos[0], merged[merged.len() - 1].pos[0]);
         let span = src[src.len() - 1].pos[0];
-        assert!(lo < span * 0.02, "the first merged point is not near the start: {lo}");
-        assert!(hi > span * 0.98, "the last is not near the end: {hi} of {span}");
+        assert!(
+            lo < span * 0.02,
+            "the first merged point is not near the start: {lo}"
+        );
+        assert!(
+            hi > span * 0.98,
+            "the last is not near the end: {hi} of {span}"
+        );
     }
 
     /// A short run is left completely alone — no merging, no repositioning.
@@ -6460,7 +7015,12 @@ mod a_fitting_is_bounded_work {
         let positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let idx = f.add_furniture_asset(
             "Curved light 1".into(),
-            crate::mesh_io::ObjMesh { positions, normals: vec![[0.0, 0.0, 1.0]; 3], color: None, alpha: Vec::new() },
+            crate::mesh_io::ObjMesh {
+                positions,
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                color: None,
+                alpha: Vec::new(),
+            },
         );
         if let Some(a) = f.furniture_lib.get_mut(idx) {
             a.cct_k = 3000;
@@ -6472,7 +7032,11 @@ mod a_fitting_is_bounded_work {
         let mut s = LightState::new();
         s.refresh_model_fixtures(&f);
         let built = s.generated_luminaires(&f).len();
-        assert_eq!(s.model_fixtures, built, "the strip said {} and Calculate runs {built}", s.model_fixtures);
+        assert_eq!(
+            s.model_fixtures, built,
+            "the strip said {} and Calculate runs {built}",
+            s.model_fixtures
+        );
         assert!(built <= crate::app::MAX_EMITTERS_PER_FIXTURE);
     }
 }
@@ -6498,7 +7062,10 @@ mod the_simlux_view_can_be_read {
         s.cam_yaw = 0.0;
         s.pan(100.0, 0.0);
         let a = s.cam_target;
-        assert!(a[0].abs() < 1e-4, "at yaw 0 a horizontal drag must not move x: {a:?}");
+        assert!(
+            a[0].abs() < 1e-4,
+            "at yaw 0 a horizontal drag must not move x: {a:?}"
+        );
         assert!(a[1].abs() > 1e-3, "…it must move y: {a:?}");
 
         // Turn a quarter turn and the SAME drag has to move the other axis.
@@ -6509,7 +7076,10 @@ mod the_simlux_view_can_be_read {
         s.cam_yaw = std::f32::consts::FRAC_PI_2;
         s.pan(100.0, 0.0);
         let b = s.cam_target;
-        assert!(b[1].abs() < 1e-4, "at yaw 90° the same drag must not move y: {b:?}");
+        assert!(
+            b[1].abs() < 1e-4,
+            "at yaw 90° the same drag must not move y: {b:?}"
+        );
         assert!(b[0].abs() > 1e-3, "…it must move x: {b:?}");
     }
 
@@ -6544,8 +7114,14 @@ mod the_simlux_view_can_be_read {
             assert_eq!(r.color(-5.0), lo, "{:?} does not clamp below", r);
             assert_eq!(r.color(9.0), hi, "{:?} does not clamp above", r);
             // …and monotone in brightness, or "brighter patch" stops meaning "more light".
-            let lum = |c: egui::Color32| c.r() as f32 * 0.299 + c.g() as f32 * 0.587 + c.b() as f32 * 0.114;
-            assert!(lum(hi) > lum(lo), "{:?} runs dark at the top of the scale", r);
+            let lum = |c: egui::Color32| {
+                c.r() as f32 * 0.299 + c.g() as f32 * 0.587 + c.b() as f32 * 0.114
+            };
+            assert!(
+                lum(hi) > lum(lo),
+                "{:?} runs dark at the top of the scale",
+                r
+            );
         }
     }
 
@@ -6577,18 +7153,28 @@ mod the_simlux_view_can_be_read {
         // file — searching forward from the function never found it, so `body` was silently the
         // whole rest of `app.rs` and the two assertions below were close to vacuous. Anchored on
         // the next item instead, so this really does read one function.
-        let a = src.find("fn build_scene3d_static").expect("the SIMLUX scene builder");
-        let b = src[a..].find("\n    /// WHERE EVERY FITTING IS POINTING").map(|e| a + e)
+        let a = src
+            .find("fn build_scene3d_static")
+            .expect("the SIMLUX scene builder");
+        let b = src[a..]
+            .find("\n    /// WHERE EVERY FITTING IS POINTING")
+            .map(|e| a + e)
             .expect("the item that follows it — re-anchor this if either is renamed");
         let body = &src[a..b];
-        assert!(body.len() < 4_000, "the slice must be ONE function, not the rest of the file");
+        assert!(
+            body.len() < 4_000,
+            "the slice must be ONE function, not the rest of the file"
+        );
         // THIS ASSERTION USED TO BE THE WHOLE TEST, and it passed for the entire life of a toggle
         // that did nothing: `build_scene_verts` dropped the ceiling unconditionally over in
         // light3d.rs, which this test cannot see — and could not have observed in any case, because
         // it greps a string instead of running the code. The behaviour is now covered where it
         // belongs: `light3d::the_viewer_draws_what_it_is_given`, proven to fail against the old
         // code, and `hiding_the_ceiling_opens_the_room`, which measures the area of the lid.
-        assert!(body.contains("hide_ceilings"), "the view must still consult the flag");
+        assert!(
+            body.contains("hide_ceilings"),
+            "the view must still consult the flag"
+        );
         // The filter has to be on a COPY for drawing. If `self.light.meshes` itself were pruned,
         // the next Calculate would run on a room with no ceiling.
         assert!(
@@ -6663,7 +7249,10 @@ mod hiding_the_ceiling_opens_the_room {
         let all = meshes_from_factory(&f);
         let by_material: Vec<Mesh> = all.iter().filter(|m| m.material != 2).cloned().collect();
         let before = lid_area(&all);
-        assert!(before > 10.0, "precondition: there is a lid to remove, got {before:.1} m2");
+        assert!(
+            before > 10.0,
+            "precondition: there is a lid to remove, got {before:.1} m2"
+        );
         assert!(
             (lid_area(&by_material) - before).abs() < 1e-6,
             "the material filter removes NONE of the lid — that is the reported bug",
@@ -6690,7 +7279,10 @@ mod hiding_the_ceiling_opens_the_room {
         let all = meshes_from_factory(&f);
         let open = meshes_from_factory_ex(&f, Some(0.8));
         let tris = |m: &[Mesh], mat: u32| {
-            m.iter().filter(|x| x.material == mat).map(|x| x.triangles.len()).sum::<usize>()
+            m.iter()
+                .filter(|x| x.material == mat)
+                .map(|x| x.triangles.len())
+                .sum::<usize>()
         };
         // The walls are what you look INTO the room past, so they must survive. Not bit-identical
         // though: a ceiling slab has vertical edge faces, which are bucketed as wall and go with
@@ -6701,7 +7293,10 @@ mod hiding_the_ceiling_opens_the_room {
             wall_open as f64 > wall_all as f64 * 0.7,
             "the walls must survive: {wall_all} triangles became {wall_open}",
         );
-        assert!(tris(&open, 0) > 0, "the floor must still be there — it is what the result is on");
+        assert!(
+            tris(&open, 0) > 0,
+            "the floor must still be there — it is what the result is on"
+        );
     }
 
     /// THE CALCULATION MUST STILL SEE THE CEILING. It is around 70 % of the interreflection, and a
@@ -6710,8 +7305,15 @@ mod hiding_the_ceiling_opens_the_room {
     fn the_unfiltered_build_is_unchanged() {
         let f = a_building();
         let plain = meshes_from_factory(&f);
-        let ceil = plain.iter().filter(|m| m.material == 2).map(|m| m.triangles.len()).sum::<usize>();
-        assert!(ceil > 0, "the default build must still contain the ceiling for Calculate");
+        let ceil = plain
+            .iter()
+            .filter(|m| m.material == 2)
+            .map(|m| m.triangles.len())
+            .sum::<usize>();
+        assert!(
+            ceil > 0,
+            "the default build must still contain the ceiling for Calculate"
+        );
     }
 }
 
@@ -6750,17 +7352,29 @@ mod the_plane_is_the_room {
     #[test]
     fn the_plane_follows_the_room_not_the_building() {
         let mut f = crate::factory::FactoryState::default();
-        f.add_building_outline(&rect(0.0, 0.0, 10.0, 8.0), 3.0).expect("building");
+        f.add_building_outline(&rect(0.0, 0.0, 10.0, 8.0), 3.0)
+            .expect("building");
         f.add_room(&rect(1.0, 1.0, 9.0, 7.0)).expect("room");
         f.recompute();
 
         let poly = LightState::calc_room_polygon(&f).expect("one room, so no ambiguity");
         let b = poly_bounds(&poly);
-        assert!((b.0 - 1.0).abs() < 1e-4 && (b.2 - 9.0).abs() < 1e-4, "x {:?}", (b.0, b.2));
-        assert!((b.1 - 1.0).abs() < 1e-4 && (b.3 - 7.0).abs() < 1e-4, "y {:?}", (b.1, b.3));
+        assert!(
+            (b.0 - 1.0).abs() < 1e-4 && (b.2 - 9.0).abs() < 1e-4,
+            "x {:?}",
+            (b.0, b.2)
+        );
+        assert!(
+            (b.1 - 1.0).abs() < 1e-4 && (b.3 - 7.0).abs() < 1e-4,
+            "y {:?}",
+            (b.1, b.3)
+        );
         // …and NOT the building, which is what it used to be.
         let (bmn, bmx) = f.cached.bounds().expect("geometry");
-        assert!(bmn[0] < b.0 - 0.5, "the building really is wider than the room");
+        assert!(
+            bmn[0] < b.0 - 0.5,
+            "the building really is wider than the room"
+        );
         assert!(bmx[0] > b.2 + 0.5);
     }
 
@@ -6806,7 +7420,10 @@ mod the_plane_is_the_room {
         let mask = LightState::inside_mask(&plane, &poly);
         assert_eq!(mask.len(), 100);
         let inside = mask.iter().filter(|k| **k).count();
-        assert_eq!(inside, 75, "the L is three quarters of its own bounding box, got {inside}");
+        assert_eq!(
+            inside, 75,
+            "the L is three quarters of its own bounding box, got {inside}"
+        );
     }
 
     /// The mask re-derives the room's figures. The cut-out cells here are bright, so leaving them
@@ -6854,12 +7471,16 @@ mod the_plane_is_the_room {
     #[test]
     fn two_rooms_with_no_selection_is_left_alone() {
         let mut f = crate::factory::FactoryState::default();
-        f.add_building_outline(&rect(0.0, 0.0, 20.0, 8.0), 3.0).expect("building");
+        f.add_building_outline(&rect(0.0, 0.0, 20.0, 8.0), 3.0)
+            .expect("building");
         f.add_room(&rect(1.0, 1.0, 9.0, 7.0)).expect("room a");
         f.add_room(&rect(11.0, 1.0, 19.0, 7.0)).expect("room b");
         f.recompute();
         f.clear_selection();
-        assert!(LightState::calc_room_polygon(&f).is_none(), "ambiguous: fall back to the model");
+        assert!(
+            LightState::calc_room_polygon(&f).is_none(),
+            "ambiguous: fall back to the model"
+        );
     }
 }
 
@@ -6890,7 +7511,10 @@ mod reopening_relinks_fittings_to_their_blocks {
     }
 
     fn map(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
-        pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
     }
 
     fn lum(id: u32, profile: &str, from: Option<u32>) -> Luminaire {
@@ -6916,7 +7540,11 @@ mod reopening_relinks_fittings_to_their_blocks {
         let mut lums = vec![lum(1, "OCULUS 3000K", Some(0))];
         let fixed = repair_from_blocks(&mut lums, &doc, &map(&[("OCULUS", "OCULUS 3000K")]));
         assert_eq!(fixed, 1, "the stale index was not repaired");
-        assert_eq!(lums[0].from_block, Some(1), "the light points at the wrong block");
+        assert_eq!(
+            lums[0].from_block,
+            Some(1),
+            "the light points at the wrong block"
+        );
     }
 
     /// AN INDEX THAT IS ALREADY RIGHT IS LEFT ALONE — and counted as untouched, so the log does
@@ -6944,8 +7572,15 @@ mod reopening_relinks_fittings_to_their_blocks {
             &doc,
             &map(&[("SQUARE", "OCULUS 3000K"), ("ROUND", "OCULUS 3000K")]),
         );
-        assert_eq!(fixed, 0, "a guess was made between two equally good candidates");
-        assert_eq!(lums[0].from_block, None, "a guess was written: {:?}", lums[0].from_block);
+        assert_eq!(
+            fixed, 0,
+            "a guess was made between two equally good candidates"
+        );
+        assert_eq!(
+            lums[0].from_block, None,
+            "a guess was written: {:?}",
+            lums[0].from_block
+        );
     }
 
     /// A BLOCK THE DRAWING NO LONGER HAS resolves to nothing rather than to whatever now sits at
@@ -6962,7 +7597,10 @@ mod reopening_relinks_fittings_to_their_blocks {
             Some(1),
             "an unresolvable link must be left as it was, not pointed at DESK",
         );
-        assert_eq!(lums[0].profile, "OCULUS 3000K", "the photometry must not be disturbed");
+        assert_eq!(
+            lums[0].profile, "OCULUS 3000K",
+            "the photometry must not be disturbed"
+        );
     }
 
     /// EACH LIGHT IS ANSWERED SEPARATELY — a plan has several fittings on it, and repairing the
@@ -6982,7 +7620,11 @@ mod reopening_relinks_fittings_to_their_blocks {
         );
         assert_eq!(fixed, 3);
         assert_eq!(lums[0].from_block, Some(1));
-        assert_eq!(lums[1].from_block, Some(2), "the second fitting took the first one's block");
+        assert_eq!(
+            lums[1].from_block,
+            Some(2),
+            "the second fitting took the first one's block"
+        );
         assert_eq!(lums[2].from_block, Some(1));
     }
 
@@ -7057,10 +7699,24 @@ mod every_room_is_calculated {
     fn two_rooms_produce_two_results() {
         let (f, mut s) = two_rooms();
         s.calculate(&Document::default(), Some(&f));
-        assert_eq!(s.rooms.len(), 2, "a calculation produced {} result(s)", s.rooms.len());
+        assert_eq!(
+            s.rooms.len(),
+            2,
+            "a calculation produced {} result(s)",
+            s.rooms.len()
+        );
         for r in &s.rooms {
-            assert!(r.grid.avg > 1.0, "{} came out at {:.2} lx — it was not lit", r.name, r.grid.avg);
-            assert!(r.plane.cols > 0 && r.plane.rows > 0, "{} has no grid", r.name);
+            assert!(
+                r.grid.avg > 1.0,
+                "{} came out at {:.2} lx — it was not lit",
+                r.name,
+                r.grid.avg
+            );
+            assert!(
+                r.plane.cols > 0 && r.plane.rows > 0,
+                "{} has no grid",
+                r.name
+            );
         }
     }
 
@@ -7082,7 +7738,11 @@ mod every_room_is_calculated {
             "the two planes overlap ({a:?} and {b:?}) — this is one bounding box, not two rooms",
         );
         for (lo, hi) in spans {
-            assert!(hi - lo < 12.0, "a plane spans {:.1} m — wider than either room", hi - lo);
+            assert!(
+                hi - lo < 12.0,
+                "a plane spans {:.1} m — wider than either room",
+                hi - lo
+            );
         }
     }
 
@@ -7093,14 +7753,22 @@ mod every_room_is_calculated {
         let (f, mut s) = two_rooms();
         s.calculate(&Document::default(), Some(&f));
         let total: usize = s.rooms.iter().map(|r| r.fixtures.len()).sum();
-        assert_eq!(total, 4, "the four fittings were counted {total} times between the rooms");
+        assert_eq!(
+            total, 4,
+            "the four fittings were counted {total} times between the rooms"
+        );
         for r in &s.rooms {
-            assert_eq!(r.fixtures.len(), 2, "{} claims {} fittings", r.name, r.fixtures.len());
+            assert_eq!(
+                r.fixtures.len(),
+                2,
+                "{} claims {} fittings",
+                r.name,
+                r.fixtures.len()
+            );
             let i = r.installation.as_ref().expect("an installation summary");
             assert_eq!(i.count, 2, "{}'s load is over {} fittings", r.name, i.count);
         }
     }
-
 
     /// A ROOM'S FIXTURES INCLUDE THE LIGHTS THE MODEL GENERATES.
     ///
@@ -7130,22 +7798,43 @@ mod every_room_is_calculated {
             from_block: None,
         };
         // The id range generated lights use, so one can never collide with a user's.
-        let generated = Luminaire { id: 1_000_000, position: Vertex::new(8.0, 8.0, 2.7), ..placed.clone() };
-        let outside = Luminaire { id: 4, position: Vertex::new(50.0, 50.0, 2.7), ..placed.clone() };
+        let generated = Luminaire {
+            id: 1_000_000,
+            position: Vertex::new(8.0, 8.0, 2.7),
+            ..placed.clone()
+        };
+        let outside = Luminaire {
+            id: 4,
+            position: Vertex::new(50.0, 50.0, 2.7),
+            ..placed.clone()
+        };
 
         let got = LightState::fixtures_in(&poly, &[placed.clone(), generated.clone(), outside]);
-        assert_eq!(got.len(), 2, "the room holds the placed one and the generated one");
-        assert!(got.iter().any(|l| l.id == 3), "the placed fixture is missing");
+        assert_eq!(
+            got.len(),
+            2,
+            "the room holds the placed one and the generated one"
+        );
+        assert!(
+            got.iter().any(|l| l.id == 3),
+            "the placed fixture is missing"
+        );
         assert!(
             got.iter().any(|l| l.id == 1_000_000),
             "the generated fixture was dropped — its record is the only copy there is",
         );
-        assert!(!got.iter().any(|l| l.id == 4), "a fixture outside the room was claimed");
+        assert!(
+            !got.iter().any(|l| l.id == 4),
+            "a fixture outside the room was claimed"
+        );
 
         // The RECORD, not the id — that is the whole point. A schedule built from ids could not
         // describe the generated one, because it is in no list to look up.
         let g = got.iter().find(|l| l.id == 1_000_000).expect("there");
-        assert!((g.position.x - 8.0).abs() < 1e-6, "the record came back wrong");
+        assert!(
+            (g.position.x - 8.0).abs() < 1e-6,
+            "the record came back wrong"
+        );
     }
 
     /// NO FOOTPRINT MEANS EVERY FIXTURE — the whole-model fallback a 2D-only project uses.
@@ -7162,7 +7851,10 @@ mod every_room_is_calculated {
             flux_override: None,
             from_block: None,
         };
-        assert_eq!(LightState::fixtures_in(&[], std::slice::from_ref(&l)).len(), 1);
+        assert_eq!(
+            LightState::fixtures_in(&[], std::slice::from_ref(&l)).len(),
+            1
+        );
     }
 
     /// A SELECTION STILL DECIDES WHICH ROOM THE PANEL SHOWS — the gesture people already have —
@@ -7175,14 +7867,21 @@ mod every_room_is_calculated {
         f.selection = vec![second];
         s.calculate(&Document::default(), Some(&f));
 
-        assert_eq!(s.rooms.len(), 2, "selecting a room narrowed the calculation to it");
+        assert_eq!(
+            s.rooms.len(),
+            2,
+            "selecting a room narrowed the calculation to it"
+        );
         let panel = s.plane.as_ref().expect("a primary plane");
         assert!(
             (panel.origin.x - s.rooms[1].plane.origin.x).abs() < 1e-6,
             "the panel is showing the room that was not selected",
         );
         // …and the rooms stay in drawing order, so a report does not shuffle when one is clicked.
-        assert!(s.rooms[0].plane.origin.x < s.rooms[1].plane.origin.x, "the rooms were reordered");
+        assert!(
+            s.rooms[0].plane.origin.x < s.rooms[1].plane.origin.x,
+            "the rooms were reordered"
+        );
     }
 
     /// A PROJECT WITH NO ROOMS still gets exactly one answer — the whole-model fallback the 2D-only
@@ -7203,10 +7902,12 @@ mod every_room_is_calculated {
             from_block: None,
         });
         let mut doc = Document::default();
-        doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
-            a: cad_kernel::Vec2::new(0.0, 0.0),
-            b: cad_kernel::Vec2::new(4.0, 4.0),
-        })));
+        doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(
+            cad_kernel::Line {
+                a: cad_kernel::Vec2::new(0.0, 0.0),
+                b: cad_kernel::Vec2::new(4.0, 4.0),
+            },
+        )));
         s.calculate(&doc, None);
         assert_eq!(s.rooms.len(), 1);
         assert!(s.grid.is_some(), "the primary result is still filled in");
@@ -7260,7 +7961,9 @@ mod the_calculation_can_leave_the_ui_thread {
         let job = s.prepare(&Document::default(), Some(&f)).expect("a job");
         let p = std::sync::Arc::new(CalcProgress::default());
         let p2 = p.clone();
-        let out = std::thread::spawn(move || job.run(&p2)).join().expect("the worker must finish");
+        let out = std::thread::spawn(move || job.run(&p2))
+            .join()
+            .expect("the worker must finish");
 
         assert!(!out.cancelled);
         assert_eq!(out.rooms.len(), 1);
@@ -7299,7 +8002,11 @@ mod the_calculation_can_leave_the_ui_thread {
             "the job reported {} of the {steps} steps it promised",
             p.done.load(std::sync::atomic::Ordering::Relaxed),
         );
-        assert!((p.fraction() - 1.0).abs() < 1e-6, "the bar finished at {}", p.fraction());
+        assert!(
+            (p.fraction() - 1.0).abs() < 1e-6,
+            "the bar finished at {}",
+            p.fraction()
+        );
         assert!(!p.label().is_empty(), "the last phase left no label");
     }
 
@@ -7339,7 +8046,10 @@ mod the_calculation_can_leave_the_ui_thread {
         let p = CalcProgress::default();
         p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         let out = job.run(&p);
-        assert!(out.cancelled, "the job ran to completion after being cancelled");
+        assert!(
+            out.cancelled,
+            "the job ran to completion after being cancelled"
+        );
         assert!(out.rooms.is_empty(), "a cancelled job returned results");
     }
 
@@ -7362,7 +8072,11 @@ mod the_calculation_can_leave_the_ui_thread {
             "a cancelled run replaced the answer that was already on screen",
         );
         assert_eq!(s.rooms.len(), 1, "and it kept the rooms");
-        assert!(s.last_msg.contains("stopped"), "it must say what happened: {:?}", s.last_msg);
+        assert!(
+            s.last_msg.contains("stopped"),
+            "it must say what happened: {:?}",
+            s.last_msg
+        );
     }
 
     /// NOTHING TO CALCULATE IS NOT A JOB. An empty project must not spawn a worker that returns
@@ -7372,7 +8086,11 @@ mod the_calculation_can_leave_the_ui_thread {
         let mut s = LightState::new();
         s.auto_center_light = false;
         assert!(s.prepare(&Document::default(), None).is_none());
-        assert!(s.last_msg.contains("No geometry"), "it must say why: {:?}", s.last_msg);
+        assert!(
+            s.last_msg.contains("No geometry"),
+            "it must say why: {:?}",
+            s.last_msg
+        );
     }
 }
 
@@ -7428,7 +8146,8 @@ mod a_calculation_is_kept_while_it_is_still_true {
     }
 
     fn fp(s: &mut LightState, f: &crate::factory::FactoryState) -> u64 {
-        s.current_fingerprint(&Document::default(), Some(f)).expect("a scene to fingerprint")
+        s.current_fingerprint(&Document::default(), Some(f))
+            .expect("a scene to fingerprint")
     }
 
     // -----------------------------------------------------------------------------------------
@@ -7446,10 +8165,17 @@ mod a_calculation_is_kept_while_it_is_still_true {
         let (f, mut s) = room();
         let a = fp(&mut s, &f);
         let b = fp(&mut s, &f);
-        assert_eq!(a, b, "the same scene hashed two different ways in one process");
+        assert_eq!(
+            a, b,
+            "the same scene hashed two different ways in one process"
+        );
 
         let (f2, mut s2) = room();
-        assert_eq!(a, fp(&mut s2, &f2), "an identical scene built again hashed differently");
+        assert_eq!(
+            a,
+            fp(&mut s2, &f2),
+            "an identical scene built again hashed differently"
+        );
     }
 
     /// AND IT SURVIVES THE PROFILE TABLE BEING BUILT IN A DIFFERENT ORDER — the `HashMap` case
@@ -7493,7 +8219,11 @@ mod a_calculation_is_kept_while_it_is_still_true {
         // A LIGHT MOVED — by a millimetre, which is the point: this is a hash, not a tolerance.
         let (f1, mut s) = room();
         s.luminaires[0].position.x += 0.001;
-        assert_ne!(was, fp(&mut s, &f1), "a fixture moved and the answer still looked current");
+        assert_ne!(
+            was,
+            fp(&mut s, &f1),
+            "a fixture moved and the answer still looked current"
+        );
 
         // A LIGHT DIMMED.
         let (f2, mut s) = room();
@@ -7503,7 +8233,11 @@ mod a_calculation_is_kept_while_it_is_still_true {
         // A LIGHT ADDED.
         let (f3, mut s) = room();
         let extra = s.luminaires[0].clone();
-        s.luminaires.push(Luminaire { id: 2, position: Vertex::new(1.0, 1.0, 2.7), ..extra });
+        s.luminaires.push(Luminaire {
+            id: 2,
+            position: Vertex::new(1.0, 1.0, 2.7),
+            ..extra
+        });
         assert_ne!(was, fp(&mut s, &f3), "a fixture was added");
 
         // A SURFACE REPAINTED. Reflectance is not a cosmetic setting — five bounces off a lighter
@@ -7575,21 +8309,42 @@ mod a_calculation_is_kept_while_it_is_still_true {
     fn moving_a_light_puts_the_answer_out_of_date() {
         let (f, mut s) = room();
         s.calculate(&Document::default(), Some(&f));
-        assert!(s.results_fingerprint.is_some(), "a calculation left no fingerprint");
-        assert!(!s.results_stale, "a result was stale the moment it was computed");
+        assert!(
+            s.results_fingerprint.is_some(),
+            "a calculation left no fingerprint"
+        );
+        assert!(
+            !s.results_stale,
+            "a result was stale the moment it was computed"
+        );
 
         s.stale_checked = None; // the throttle is not what is under test here
-        assert!(!s.refresh_staleness(&Document::default(), Some(&f)), "an untouched scene moved");
-        assert!(!s.results_stale, "an untouched scene was called out of date");
+        assert!(
+            !s.refresh_staleness(&Document::default(), Some(&f)),
+            "an untouched scene moved"
+        );
+        assert!(
+            !s.results_stale,
+            "an untouched scene was called out of date"
+        );
 
         s.luminaires[0].position.x += 0.4;
         s.stale_checked = None;
-        assert!(s.refresh_staleness(&Document::default(), Some(&f)), "the change was not reported");
-        assert!(s.results_stale, "a fixture moved and the answer still claimed to be current");
+        assert!(
+            s.refresh_staleness(&Document::default(), Some(&f)),
+            "the change was not reported"
+        );
+        assert!(
+            s.results_stale,
+            "a fixture moved and the answer still claimed to be current"
+        );
 
         // AND THE NUMBERS ARE STILL THERE. Wiping them would take away the very thing somebody is
         // comparing the change against — and the change may be the nudge they are about to undo.
-        assert!(s.grid.is_some(), "the result was thrown away rather than marked");
+        assert!(
+            s.grid.is_some(),
+            "the result was thrown away rather than marked"
+        );
         assert_eq!(s.rooms.len(), 1);
     }
 
@@ -7609,7 +8364,10 @@ mod a_calculation_is_kept_while_it_is_still_true {
         s.luminaires[0].position.x = home;
         s.stale_checked = None;
         s.refresh_staleness(&Document::default(), Some(&f));
-        assert!(!s.results_stale, "the change was undone and the answer stayed marked out of date");
+        assert!(
+            !s.results_stale,
+            "the change was undone and the answer stayed marked out of date"
+        );
     }
 
     /// THE EXPENSIVE CHECK RUNS ONCE PER RESULT, AND THE CHANGE IS NOTICED AT ONCE.
@@ -7632,16 +8390,27 @@ mod a_calculation_is_kept_while_it_is_still_true {
         let (f, mut s) = room();
         s.calculate(&Document::default(), Some(&f));
         s.stale_checked = None;
-        assert!(s.stale_ref_sig.is_none(), "a fresh result starts with no reference");
+        assert!(
+            s.stale_ref_sig.is_none(),
+            "a fresh result starts with no reference"
+        );
 
         s.refresh_staleness(&Document::default(), Some(&f));
-        let first = s.stale_checked.expect("the first check ran the expensive path");
-        assert!(s.stale_ref_sig.is_some(), "…and adopted the matching scene as the reference");
+        let first = s
+            .stale_checked
+            .expect("the first check ran the expensive path");
+        assert!(
+            s.stale_ref_sig.is_some(),
+            "…and adopted the matching scene as the reference"
+        );
         assert!(!s.results_stale);
 
         s.luminaires[0].position.x += 5.0;
         s.refresh_staleness(&Document::default(), Some(&f));
-        assert!(s.results_stale, "a fitting moved five metres is stale on the very next look");
+        assert!(
+            s.results_stale,
+            "a fitting moved five metres is stale on the very next look"
+        );
         assert_eq!(
             s.stale_checked,
             Some(first),
@@ -7659,7 +8428,10 @@ mod a_calculation_is_kept_while_it_is_still_true {
         let (f, mut s) = room();
         s.calculate(&Document::default(), Some(&f));
         s.stale_checked = None;
-        assert!(!s.refresh_staleness(&Document::default(), None), "an empty scene was a change");
+        assert!(
+            !s.refresh_staleness(&Document::default(), None),
+            "an empty scene was a change"
+        );
         assert!(!s.results_stale);
     }
 
@@ -7703,7 +8475,10 @@ mod a_calculation_is_kept_while_it_is_still_true {
         let read = crate::light_store::load(&drawing).expect("read back");
         let (f2, mut fresh) = room();
         let current = fp(&mut fresh, &f2);
-        assert!(fresh.restore_results(&read, current), "the result was refused for its own scene");
+        assert!(
+            fresh.restore_results(&read, current),
+            "the result was refused for its own scene"
+        );
 
         // THE FIGURES ARE THE FIGURES, digit for digit. A result that shifts in its last decimal
         // on reload is a result nobody can quote — and rounding the cells to `f32` on the way to
@@ -7716,11 +8491,26 @@ mod a_calculation_is_kept_while_it_is_still_true {
             before.avg,
             after.avg,
         );
-        assert_eq!(after.min.to_bits(), before.min.to_bits(), "the minimum moved");
-        assert_eq!(after.max.to_bits(), before.max.to_bits(), "the maximum moved");
-        assert_eq!(after.u0().to_bits(), before.u0().to_bits(), "the uniformity moved");
+        assert_eq!(
+            after.min.to_bits(),
+            before.min.to_bits(),
+            "the minimum moved"
+        );
+        assert_eq!(
+            after.max.to_bits(),
+            before.max.to_bits(),
+            "the maximum moved"
+        );
+        assert_eq!(
+            after.u0().to_bits(),
+            before.u0().to_bits(),
+            "the uniformity moved"
+        );
         assert_eq!(after.values.len(), before.values.len(), "cells were lost");
-        assert!(!fresh.results_stale, "a restored result was born out of date");
+        assert!(
+            !fresh.results_stale,
+            "a restored result was born out of date"
+        );
         assert!(fresh.results_restored, "it does not say where it came from");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7735,9 +8525,13 @@ mod a_calculation_is_kept_while_it_is_still_true {
         let (f, mut s) = room();
         s.calculate(&Document::default(), Some(&f));
         let before = s.rooms[0].grid.values.clone();
-        assert!(before.len() > 50, "the fixture is too small to prove anything");
+        assert!(
+            before.len() > 50,
+            "the fixture is too small to prove anything"
+        );
 
-        let stored = crate::light_store::StoredResults::of(&s.rooms, &s.surfaces, &[], 7, "test", false);
+        let stored =
+            crate::light_store::StoredResults::of(&s.rooms, &s.surfaces, &[], 7, "test", false);
         let rooms = stored.rooms().expect("rebuilt");
         let after = &rooms[0].grid.values;
         assert_eq!(after.len(), before.len());
@@ -7773,7 +8567,8 @@ mod a_calculation_is_kept_while_it_is_still_true {
             "the fixture is not L-shaped — the mask is all one value",
         );
 
-        let stored = crate::light_store::StoredResults::of(&s.rooms, &s.surfaces, &[], 7, "test", false);
+        let stored =
+            crate::light_store::StoredResults::of(&s.rooms, &s.surfaces, &[], 7, "test", false);
         let rooms = stored.rooms().expect("rebuilt");
         assert_eq!(rooms[0].mask, before, "the room mask did not survive");
     }
@@ -7799,8 +8594,14 @@ mod a_calculation_is_kept_while_it_is_still_true {
         // The same project, with a wall moved.
         let (f2, mut moved) = room_of(&rect(7.0, 5.0));
         let current = fp(&mut moved, &f2);
-        assert!(!moved.restore_results(&stored, current), "a stale result was restored");
-        assert!(moved.rooms.is_empty(), "and it left the results behind anyway");
+        assert!(
+            !moved.restore_results(&stored, current),
+            "a stale result was restored"
+        );
+        assert!(
+            moved.rooms.is_empty(),
+            "and it left the results behind anyway"
+        );
         assert!(moved.grid.is_none());
         assert!(moved.results_fingerprint.is_none());
     }
@@ -7823,22 +8624,33 @@ mod a_calculation_is_kept_while_it_is_still_true {
         // The cells gone, everything else intact — the shape a truncated write leaves.
         let mut torn = good.clone();
         torn.rooms[0].grid.values.clear();
-        assert!(torn.rooms().is_none(), "a room with no cells rebuilt anyway");
+        assert!(
+            torn.rooms().is_none(),
+            "a room with no cells rebuilt anyway"
+        );
 
         // The mask gone, which would silently widen an L-shaped room's average.
         if good.rooms[0].mask_len > 0 {
             let mut unmasked = good.clone();
             unmasked.rooms[0].mask_bits.clear();
-            assert!(unmasked.rooms().is_none(), "a room lost its mask and rebuilt anyway");
+            assert!(
+                unmasked.rooms().is_none(),
+                "a room lost its mask and rebuilt anyway"
+            );
         }
 
         // A file from a future format.
         let mut newer = good.clone();
         newer.version = crate::light_store::VERSION + 1;
-        assert!(newer.rooms().is_none(), "a file from an unknown version was guessed at");
+        assert!(
+            newer.rooms().is_none(),
+            "a file from an unknown version was guessed at"
+        );
 
         // And nothing at all.
-        assert!(crate::light_store::StoredResults::default().rooms().is_none());
+        assert!(crate::light_store::StoredResults::default()
+            .rooms()
+            .is_none());
     }
 
     /// UNREADABLE BYTES ARE "NO SAVED RESULT", not an error in front of somebody opening a
@@ -7848,8 +8660,11 @@ mod a_calculation_is_kept_while_it_is_still_true {
         let dir = std::env::temp_dir().join("simlux_result_rubbish");
         let _ = std::fs::create_dir_all(&dir);
         let drawing = dir.join("project.rsm");
-        std::fs::write(crate::light_store::result_path(&drawing), b"{ not json at all")
-            .expect("write");
+        std::fs::write(
+            crate::light_store::result_path(&drawing),
+            b"{ not json at all",
+        )
+        .expect("write");
         assert!(crate::light_store::load(&drawing).is_none());
         assert!(crate::light_store::load(&dir.join("never-existed.rsm")).is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -7864,9 +8679,13 @@ mod a_calculation_is_kept_while_it_is_still_true {
         s.cell_size = 0.1; // ~3,000 cells: small next to a real plan, enough to show the ratio
         s.calculate(&Document::default(), Some(&f));
         let cells: usize = s.rooms.iter().map(|r| r.grid.values.len()).sum();
-        assert!(cells > 2_000, "only {cells} cells — too few to measure against");
+        assert!(
+            cells > 2_000,
+            "only {cells} cells — too few to measure against"
+        );
 
-        let stored = crate::light_store::StoredResults::of(&s.rooms, &s.surfaces, &[], 7, "test", false);
+        let stored =
+            crate::light_store::StoredResults::of(&s.rooms, &s.surfaces, &[], 7, "test", false);
         let bytes = serde_json::to_string(&stored).expect("serialises").len();
         // MEASURED AGAINST THE ACTUAL ALTERNATIVE, not against a constant chosen to pass. What the
         // packing is INSTEAD OF is these same cells written as JSON numbers, so that is what it is
@@ -7876,9 +8695,15 @@ mod a_calculation_is_kept_while_it_is_still_true {
             .rooms
             .iter()
             .map(|r| {
-                serde_json::to_string(&r.grid.values).unwrap_or_default().len()
-                    + serde_json::to_string(&r.grid.direct).unwrap_or_default().len()
-                    + serde_json::to_string(&r.grid.indirect).unwrap_or_default().len()
+                serde_json::to_string(&r.grid.values)
+                    .unwrap_or_default()
+                    .len()
+                    + serde_json::to_string(&r.grid.direct)
+                        .unwrap_or_default()
+                        .len()
+                    + serde_json::to_string(&r.grid.indirect)
+                        .unwrap_or_default()
+                        .len()
             })
             .sum();
         assert!(
@@ -7919,7 +8744,8 @@ mod a_point_inside_the_furniture_is_not_measured {
             v(b.x, b.y, b.z),
             v(a.x, b.y, b.z),
         ];
-        let q = |i: usize, j: usize, k: usize, l: usize| vec![[c[i], c[j], c[k]], [c[i], c[k], c[l]]];
+        let q =
+            |i: usize, j: usize, k: usize, l: usize| vec![[c[i], c[j], c[k]], [c[i], c[k], c[l]]];
         let mut t = Vec::new();
         t.extend(q(0, 1, 2, 3)); // bottom
         t.extend(q(4, 5, 6, 7)); // top
@@ -7937,8 +8763,14 @@ mod a_point_inside_the_furniture_is_not_measured {
             glam::Vec3::new(2.0, 2.0, 0.0),
             glam::Vec3::new(4.0, 4.0, 1.0),
         ));
-        assert!(o.contains(glam::Vec3::new(3.0, 3.0, 0.5)), "the middle of the box");
-        assert!(o.contains(glam::Vec3::new(2.1, 3.9, 0.9)), "just inside a corner");
+        assert!(
+            o.contains(glam::Vec3::new(3.0, 3.0, 0.5)),
+            "the middle of the box"
+        );
+        assert!(
+            o.contains(glam::Vec3::new(2.1, 3.9, 0.9)),
+            "just inside a corner"
+        );
         assert!(!o.contains(glam::Vec3::new(1.0, 3.0, 0.5)), "beside it");
         assert!(!o.contains(glam::Vec3::new(3.0, 3.0, 1.5)), "above it");
         assert!(!o.contains(glam::Vec3::new(3.0, 3.0, -0.5)), "below it");
@@ -7982,10 +8814,20 @@ mod a_point_inside_the_furniture_is_not_measured {
             glam::Vec3::new(2.0, 2.0, 0.0),
             glam::Vec3::new(4.0, 4.0, 2.0),
         ));
-        let with = LightState::measurable_mask(&plane, &poly, std::slice::from_ref(&cupboard), None, 0.0, &[]);
+        let with = LightState::measurable_mask(
+            &plane,
+            &poly,
+            std::slice::from_ref(&cupboard),
+            None,
+            0.0,
+            &[],
+        );
         let without = LightState::measurable_mask(&plane, &poly, &[], None, 0.0, &[]);
 
-        assert!(without.iter().all(|k| *k), "an empty room lost cells to nothing at all");
+        assert!(
+            without.iter().all(|k| *k),
+            "an empty room lost cells to nothing at all"
+        );
         let dropped = with.iter().filter(|k| !**k).count();
         assert!(dropped > 0, "the cupboard excluded nothing");
         // A 2 x 2 m box in a 6 x 6 m room is a ninth of it; the cells are 0.25 m, so about 64 of
@@ -8002,9 +8844,15 @@ mod a_point_inside_the_furniture_is_not_measured {
             let deep_in = (2.3..3.7).contains(&x) && (2.3..3.7).contains(&y);
             let well_out = x < 1.7 || x > 4.3 || y < 1.7 || y > 4.3;
             if deep_in {
-                assert!(!keep, "a cell at ({x:.2}, {y:.2}) inside the cupboard is still counted");
+                assert!(
+                    !keep,
+                    "a cell at ({x:.2}, {y:.2}) inside the cupboard is still counted"
+                );
             } else if well_out {
-                assert!(keep, "a cell at ({x:.2}, {y:.2}) on open floor was thrown away");
+                assert!(
+                    keep,
+                    "a cell at ({x:.2}, {y:.2}) on open floor was thrown away"
+                );
             }
         }
     }
@@ -8054,13 +8902,18 @@ mod a_point_inside_the_furniture_is_not_measured {
         f.add_building_outline(&cup, 2.0).expect("cupboard");
         f.recompute();
         let obs = obstacles_in(&f, &rect);
-        assert!(!obs.is_empty(), "a cupboard standing in the room was not seen");
         assert!(
-            obs.iter().any(|o| o.contains(glam::Vec3::new(2.5, 2.5, 0.8))),
+            !obs.is_empty(),
+            "a cupboard standing in the room was not seen"
+        );
+        assert!(
+            obs.iter()
+                .any(|o| o.contains(glam::Vec3::new(2.5, 2.5, 0.8))),
             "the cupboard does not enclose its own middle",
         );
         assert!(
-            !obs.iter().any(|o| o.contains(glam::Vec3::new(0.5, 0.5, 0.8))),
+            !obs.iter()
+                .any(|o| o.contains(glam::Vec3::new(0.5, 0.5, 0.8))),
             "open floor across the room reads as inside something",
         );
     }
@@ -8119,7 +8972,6 @@ mod a_point_inside_the_furniture_is_not_measured {
     }
 }
 
-
 /// FORENSIC PROBE — how much detail can the 3D floor's VERTEX colours actually carry?
 ///
 /// `cargo test -p cad_app --lib how_much_detail_the_floor_can_carry -- --ignored --nocapture`
@@ -8149,8 +9001,11 @@ mod floor_detail_probe {
                 m.vertices.len()
             );
         }
-        let floor: usize =
-            meshes.iter().filter(|m| m.material == 0).map(|m| m.triangles.len()).sum();
+        let floor: usize = meshes
+            .iter()
+            .filter(|m| m.material == 0)
+            .map(|m| m.triangles.len())
+            .sum();
         println!("FLOOR triangles: {floor}");
         println!("the report resamples the same room to 38 x 4 = 152 columns of raster");
     }
@@ -8199,7 +9054,9 @@ mod the_engine_is_part_of_the_fingerprint {
     #[test]
     fn a_result_from_an_earlier_epoch_does_not_match() {
         let (mut s, f, doc) = a_lit_room();
-        let now = s.current_fingerprint(&doc, Some(&f)).expect("a room to fingerprint");
+        let now = s
+            .current_fingerprint(&doc, Some(&f))
+            .expect("a room to fingerprint");
         // THE ONE THING THAT CHANGES IS THE ENGINE. Same state, same scene, same everything else
         // the hash covers — so these must differ, and if the epoch never reaches the hash they
         // cannot.
@@ -8229,7 +9086,9 @@ mod the_engine_is_part_of_the_fingerprint {
     #[test]
     fn a_stored_result_from_before_the_fix_is_not_restored() {
         let (mut s, f, doc) = a_lit_room();
-        let current = s.current_fingerprint(&doc, Some(&f)).expect("a room to fingerprint");
+        let current = s
+            .current_fingerprint(&doc, Some(&f))
+            .expect("a room to fingerprint");
         // A file written by the engine as it was — same scene, one epoch earlier. Reconstructed by
         // hashing the same job with the previous epoch, which is exactly what the old build wrote.
         let stale = current ^ 0x9E37_79B9_7F4A_7C15; // any fingerprint that is not this one
@@ -8262,7 +9121,13 @@ mod the_window_and_the_page_share_one_scale {
     fn banded() -> crate::report::Options {
         let mut o = crate::report::Options::default();
         o.scale.bands = vec![50.0, 100.0, 200.0, 300.0];
-        o.band_colours = vec![[10, 11, 12], [20, 21, 22], [30, 31, 32], [40, 41, 42], [50, 51, 52]];
+        o.band_colours = vec![
+            [10, 11, 12],
+            [20, 21, 22],
+            [30, 31, 32],
+            [40, 41, 42],
+            [50, 51, 52],
+        ];
         o
     }
 
@@ -8342,7 +9207,9 @@ mod the_window_and_the_page_share_one_scale {
         );
         // …and NOT in the band colours, which belong to bands.
         assert!(
-            !fills.iter().any(|c| [c.r(), c.g(), c.b()] == o.band_colours[0]),
+            !fills
+                .iter()
+                .any(|c| [c.r(), c.g(), c.b()] == o.band_colours[0]),
             "a gradient took a band colour",
         );
     }
@@ -8451,12 +9318,19 @@ mod express_and_thorough {
     fn the_proxy_is_wound_outward() {
         let f = a_furnished_room();
         let tris = crate::light::furniture_box_tris(&f, 0).expect("a proxy");
-        let c: glam::Vec3 =
-            tris.iter().flatten().copied().fold(glam::Vec3::ZERO, |a, b| a + b) / 36.0;
+        let c: glam::Vec3 = tris
+            .iter()
+            .flatten()
+            .copied()
+            .fold(glam::Vec3::ZERO, |a, b| a + b)
+            / 36.0;
         for t in &tris {
             let n = (t[1] - t[0]).cross(t[2] - t[0]).normalize_or_zero();
             let out = (t[0] + t[1] + t[2]) / 3.0 - c;
-            assert!(n.dot(out) > 0.0, "a face is wound inward: normal {n:?} against {out:?}");
+            assert!(
+                n.dot(out) > 0.0,
+                "a face is wound inward: normal {n:?} against {out:?}"
+            );
         }
     }
 
@@ -8481,7 +9355,11 @@ mod express_and_thorough {
                 .sum()
         };
         assert_eq!(furn(&express), 12, "one box for the one piece");
-        assert_eq!(furn(&thorough), 200, "...against every triangle of the cage");
+        assert_eq!(
+            furn(&thorough),
+            200,
+            "...against every triangle of the cage"
+        );
         assert_eq!(
             building(&express),
             building(&thorough),
@@ -8548,15 +9426,31 @@ mod express_and_thorough {
         s.cell_size = 2.0; // keep the test quick; the grid is not what is under test
 
         s.mode = CalcMode::Thorough;
-        let out = s.prepare(&doc, Some(&f)).expect("a job").run(&CalcProgress::default());
-        assert!(!out.surfaces.is_empty(), "Thorough reports the room surfaces");
-        assert_eq!(out.mode, CalcMode::Thorough, "the outcome carries the mode it ran in");
+        let out = s
+            .prepare(&doc, Some(&f))
+            .expect("a job")
+            .run(&CalcProgress::default());
+        assert!(
+            !out.surfaces.is_empty(),
+            "Thorough reports the room surfaces"
+        );
+        assert_eq!(
+            out.mode,
+            CalcMode::Thorough,
+            "the outcome carries the mode it ran in"
+        );
 
         s.mode = CalcMode::Express;
-        let out = s.prepare(&doc, Some(&f)).expect("a job").run(&CalcProgress::default());
+        let out = s
+            .prepare(&doc, Some(&f))
+            .expect("a job")
+            .run(&CalcProgress::default());
         assert!(out.surfaces.is_empty(), "Express does not");
         assert_eq!(out.mode, CalcMode::Express);
-        assert!(!out.rooms.is_empty(), "…but it still answers the working plane");
+        assert!(
+            !out.rooms.is_empty(),
+            "…but it still answers the working plane"
+        );
     }
 
     /// THE LABEL FOLLOWS THE ANSWER, NOT THE SWITCH.
@@ -8576,7 +9470,10 @@ mod express_and_thorough {
         s.auto_center_light = false;
         s.cell_size = 2.0;
         s.mode = CalcMode::Express;
-        let out = s.prepare(&doc, Some(&f)).expect("a job").run(&CalcProgress::default());
+        let out = s
+            .prepare(&doc, Some(&f))
+            .expect("a job")
+            .run(&CalcProgress::default());
         assert_eq!(out.mode, CalcMode::Express);
 
         s.mode = CalcMode::Thorough; // …while the worker was busy
@@ -8632,7 +9529,9 @@ mod express_and_thorough {
         let mid = glam::Vec3::new(4.0, 3.0, 0.45);
         for m in [CalcMode::Express, CalcMode::Thorough] {
             assert!(
-                obstacles_in_mode(&f, &room, m).iter().any(|o| o.contains(mid)),
+                obstacles_in_mode(&f, &room, m)
+                    .iter()
+                    .any(|o| o.contains(mid)),
                 "{}: a cell sealed inside the frame is not a measurement point",
                 m.label(),
             );
@@ -8686,8 +9585,12 @@ mod express_where_furniture_matters {
             let w = 0.02;
             // Two triangles making a thin upright quad.
             for (dx, dy, z) in [
-                (-w, -w, 0.0), (w, w, 0.0), (w, w, 2.0),
-                (-w, -w, 0.0), (w, w, 2.0), (-w, -w, 2.0),
+                (-w, -w, 0.0),
+                (w, w, 0.0),
+                (w, w, 2.0),
+                (-w, -w, 0.0),
+                (w, w, 2.0),
+                (-w, -w, 2.0),
             ] {
                 pos.push([cx + dx, cy + dy, z]);
             }
@@ -8712,7 +9615,10 @@ mod express_where_furniture_matters {
         s.auto_center_light = false;
         s.cell_size = 0.4;
         s.mode = mode;
-        for (i, (x, y)) in [(2.0, 2.0), (6.0, 2.0), (2.0, 4.0), (6.0, 4.0)].iter().enumerate() {
+        for (i, (x, y)) in [(2.0, 2.0), (6.0, 2.0), (2.0, 4.0), (6.0, 4.0)]
+            .iter()
+            .enumerate()
+        {
             s.luminaires.push(cad_light::Luminaire {
                 id: i as u32 + 1,
                 profile: crate::light::BUILTIN.to_string(),
@@ -8730,8 +9636,16 @@ mod express_where_furniture_matters {
         s.calculate(&doc, Some(&f));
         let secs = t.elapsed().as_secs_f64();
         let r = s.rooms.first().expect("a room");
-        let g = if r.grid_en.values.is_empty() { &r.grid } else { &r.grid_en };
-        let mask = if r.grid_en.values.is_empty() { &r.mask } else { &r.mask_en };
+        let g = if r.grid_en.values.is_empty() {
+            &r.grid
+        } else {
+            &r.grid_en
+        };
+        let mask = if r.grid_en.values.is_empty() {
+            &r.mask
+        } else {
+            &r.mask_en
+        };
         let dropped = mask.iter().filter(|k| !**k).count();
         (g.avg, g.min, g.max, g.u0(), dropped, secs)
     }
@@ -8746,17 +9660,38 @@ mod express_where_furniture_matters {
     fn boxing_an_open_frame_changes_the_answer() {
         let (ea, emin, emax, eu0, edrop, esec) = run(crate::light::CalcMode::Express);
         let (ta, tmin, tmax, tu0, tdrop, tsec) = run(crate::light::CalcMode::Thorough);
-        let pc = |a: f64, b: f64| if b.abs() > 1e-9 { 100.0 * (a - b) / b } else { 0.0 };
+        let pc = |a: f64, b: f64| {
+            if b.abs() > 1e-9 {
+                100.0 * (a - b) / b
+            } else {
+                0.0
+            }
+        };
         println!("\n=== EXPRESS AGAINST THOROUGH, furniture INSIDE the measured room ===");
-        println!("{:<10} {:>9} {:>9} {:>9} {:>8} {:>8} {:>8}", "mode", "avg lx", "min lx", "max lx", "U0", "masked", "seconds");
-        println!("{:<10} {:>9.2} {:>9.2} {:>9.2} {:>8.3} {:>8} {:>8.2}", "Express", ea, emin, emax, eu0, edrop, esec);
-        println!("{:<10} {:>9.2} {:>9.2} {:>9.2} {:>8.3} {:>8} {:>8.2}", "Thorough", ta, tmin, tmax, tu0, tdrop, tsec);
+        println!(
+            "{:<10} {:>9} {:>9} {:>9} {:>8} {:>8} {:>8}",
+            "mode", "avg lx", "min lx", "max lx", "U0", "masked", "seconds"
+        );
+        println!(
+            "{:<10} {:>9.2} {:>9.2} {:>9.2} {:>8.3} {:>8} {:>8.2}",
+            "Express", ea, emin, emax, eu0, edrop, esec
+        );
+        println!(
+            "{:<10} {:>9.2} {:>9.2} {:>9.2} {:>8.3} {:>8} {:>8.2}",
+            "Thorough", ta, tmin, tmax, tu0, tdrop, tsec
+        );
         println!(
             "  Express against Thorough:  avg {:+.1}%   min {:+.1}%   max {:+.1}%   U0 {:+.3}",
-            pc(ea, ta), pc(emin, tmin), pc(emax, tmax), eu0 - tu0,
+            pc(ea, ta),
+            pc(emin, tmin),
+            pc(emax, tmax),
+            eu0 - tu0,
         );
 
-        assert!(ta > 1.0, "the reference run must actually be lit: {ta:.2} lx");
+        assert!(
+            ta > 1.0,
+            "the reference run must actually be lit: {ta:.2} lx"
+        );
         assert!(
             (ea - ta).abs() > 0.01 || edrop != tdrop,
             "boxing an open frame must change SOMETHING — avg {ea:.3} against {ta:.3}, \
@@ -8813,8 +9748,12 @@ mod the_live_mesh_rebuild {
             "stool".into(),
             crate::mesh_io::ObjMesh {
                 positions: vec![
-                    [0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [0.4, 0.4, 0.0],
-                    [0.0, 0.0, 0.0], [0.4, 0.4, 0.0], [0.0, 0.4, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [0.4, 0.0, 0.0],
+                    [0.4, 0.4, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [0.4, 0.4, 0.0],
+                    [0.0, 0.4, 0.0],
                 ],
                 normals: vec![[0.0, 0.0, 1.0]; 6],
                 color: Some([0.6, 0.6, 0.6]),
@@ -8832,7 +9771,10 @@ mod the_live_mesh_rebuild {
         let f = a_furnished_model();
         let s = LightState::new();
         assert_eq!(s.live_mesh_sig_of(Some(&f)), s.live_mesh_sig_of(Some(&f)));
-        assert!(s.live_mesh_sig_of(Some(&f)).is_some(), "a 3D model can be summarised");
+        assert!(
+            s.live_mesh_sig_of(Some(&f)).is_some(),
+            "a 3D model can be summarised"
+        );
     }
 
     /// EVERYTHING `scene_meshes` READS MOVES IT. A miss here is the dangerous direction: the light
@@ -8842,11 +9784,19 @@ mod the_live_mesh_rebuild {
     fn everything_the_live_scene_is_built_from_moves_the_signature() {
         let cases: Vec<(&str, fn(&mut crate::factory::FactoryState, &mut LightState))> = vec![
             ("rebuilding the CSG model", |f, _| f.recompute()),
-            ("moving a piece of furniture", |f, _| f.furniture[0].pos[0] += 0.4),
-            ("rotating a piece of furniture", |f, _| f.furniture[0].rot[2] += 12.0),
-            ("scaling a piece of furniture", |f, _| f.furniture[0].scale *= 1.3),
+            ("moving a piece of furniture", |f, _| {
+                f.furniture[0].pos[0] += 0.4
+            }),
+            ("rotating a piece of furniture", |f, _| {
+                f.furniture[0].rot[2] += 12.0
+            }),
+            ("scaling a piece of furniture", |f, _| {
+                f.furniture[0].scale *= 1.3
+            }),
             ("deleting a piece of furniture", |f, _| f.furniture.clear()),
-            ("switching Express/Thorough", |_, s| s.mode = CalcMode::Express),
+            ("switching Express/Thorough", |_, s| {
+                s.mode = CalcMode::Express
+            }),
         ];
         for (what, change) in cases {
             let mut f = a_furnished_model();
@@ -8869,8 +9819,14 @@ mod the_live_mesh_rebuild {
     fn a_project_with_no_model_declines_to_summarise() {
         let f = crate::factory::FactoryState::default();
         let s = LightState::new();
-        assert!(s.live_mesh_sig_of(Some(&f)).is_none(), "no model, no cheap signature");
-        assert!(s.live_mesh_sig_of(None).is_none(), "and no factory at all is the same answer");
+        assert!(
+            s.live_mesh_sig_of(Some(&f)).is_none(),
+            "no model, no cheap signature"
+        );
+        assert!(
+            s.live_mesh_sig_of(None).is_none(),
+            "and no factory at all is the same answer"
+        );
     }
 
     /// THE GUARD IS AT THE CALL SITE, and it is the whole fix. A grep, because the alternative is
@@ -8881,11 +9837,20 @@ mod the_live_mesh_rebuild {
     fn the_workspace_only_rebuilds_when_the_signature_moves() {
         let src = include_str!("app.rs");
         let needle = |parts: &[&str]| -> String { parts.concat() };
-        let anchor = needle(&["let sig = self.light.live_mesh_", "sig_of(Some(&self.factory));"]);
+        let anchor = needle(&[
+            "let sig = self.light.live_mesh_",
+            "sig_of(Some(&self.factory));",
+        ]);
         let a = src.find(&anchor).expect("the live-rebuild guard is gone");
-        let b = src[a..].find("\n        }").map(|e| a + e).expect("re-anchor if the block moves");
+        let b = src[a..]
+            .find("\n        }")
+            .map(|e| a + e)
+            .expect("re-anchor if the block moves");
         let body = &src[a..b];
-        assert!(body.len() < 2_500, "the slice must be the guard, not half the file");
+        assert!(
+            body.len() < 2_500,
+            "the slice must be the guard, not half the file"
+        );
         for parts in [
             &["if sig.is_none() || self.light.live_mesh_", "sig != sig {"][..],
             &["rebuild_live_meshes_", "with(&plan, Some(&self.factory));"][..],
@@ -8929,8 +9894,12 @@ mod the_staleness_check {
             "stool".into(),
             crate::mesh_io::ObjMesh {
                 positions: vec![
-                    [0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [0.4, 0.4, 0.0],
-                    [0.0, 0.0, 0.0], [0.4, 0.4, 0.0], [0.0, 0.4, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [0.4, 0.0, 0.0],
+                    [0.4, 0.4, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [0.4, 0.4, 0.0],
+                    [0.0, 0.4, 0.0],
                 ],
                 normals: vec![[0.0, 0.0, 1.0]; 6],
                 color: Some([0.6, 0.6, 0.6]),
@@ -8954,7 +9923,10 @@ mod the_staleness_check {
             from_block: None,
         });
         s.calculate(&Document::default(), Some(&f));
-        assert!(s.results_fingerprint.is_some(), "the fixture must have a result");
+        assert!(
+            s.results_fingerprint.is_some(),
+            "the fixture must have a result"
+        );
         (f, s)
     }
 
@@ -8974,7 +9946,10 @@ mod the_staleness_check {
     fn a_settled_project_stops_paying_for_the_check() {
         let (f, mut s) = a_calculated_project();
         let doc = Document::default();
-        assert!(s.stale_ref_sig.is_none(), "a fresh result has no reference yet");
+        assert!(
+            s.stale_ref_sig.is_none(),
+            "a fresh result has no reference yet"
+        );
         s.refresh_staleness(&doc, Some(&f)); // one full fingerprint, establishing the reference
         assert!(
             s.stale_ref_sig.is_some(),
@@ -9002,13 +9977,19 @@ mod the_staleness_check {
                 s.luminaires.push(l);
             }),
             ("deleting every fitting", |_, s| s.luminaires.clear()),
-            ("a surface reflectance", |_, s| s.materials[0].reflectance = 0.11),
+            ("a surface reflectance", |_, s| {
+                s.materials[0].reflectance = 0.11
+            }),
             ("the working plane height", |_, s| s.plane_height += 0.2),
             ("the grid spacing", |_, s| s.cell_size *= 0.5),
             ("the maintenance factor", |_, s| s.maintenance.llmf = 0.55),
             ("the ray settings", |_, s| s.settings.max_bounces += 1),
-            ("switching Express/Thorough", |_, s| s.mode = CalcMode::Express),
-            ("moving a piece of furniture", |f, _| f.furniture[0].pos[0] += 0.5),
+            ("switching Express/Thorough", |_, s| {
+                s.mode = CalcMode::Express
+            }),
+            ("moving a piece of furniture", |f, _| {
+                f.furniture[0].pos[0] += 0.5
+            }),
             ("deleting the furniture", |f, _| f.furniture.clear()),
             ("rebuilding the CSG model", |f, _| f.recompute()),
         ];
@@ -9037,7 +10018,10 @@ mod the_staleness_check {
         s.refresh_staleness(&doc, Some(&f));
         assert!(s.stale_ref_sig.is_some());
         s.calculate(&doc, Some(&f));
-        assert!(s.stale_ref_sig.is_none(), "a fresh answer needs a fresh reference");
+        assert!(
+            s.stale_ref_sig.is_none(),
+            "a fresh answer needs a fresh reference"
+        );
     }
 
     /// A MISMATCHING SCENE IS NEVER ADOPTED AS THE ANSWER'S OWN SCENE. If it were, a stale result
@@ -9095,7 +10079,10 @@ mod a_stale_result_also_stops_paying {
 
         for _ in 0..5 {
             s.refresh_staleness(&doc, Some(&f));
-            assert!(s.results_stale, "and it stays stale, because nothing moved back");
+            assert!(
+                s.results_stale,
+                "and it stays stale, because nothing moved back"
+            );
             assert_eq!(
                 s.stale_checked,
                 Some(judged),
@@ -9163,7 +10150,8 @@ mod the_building_is_its_own_outline {
     /// WITH NO OUTLINE, THE FLOOR IS THE OUTLINE — and the empty corner is left out.
     #[test]
     fn with_no_room_outline_the_floor_decides() {
-        let m = LightState::measurable_mask(&a_plane(), &[], &[], Some(&an_l_shaped_floor), 0.0, &[]);
+        let m =
+            LightState::measurable_mask(&a_plane(), &[], &[], Some(&an_l_shaped_floor), 0.0, &[]);
         assert!(at(&m, 2, 2), "over floor, inside");
         assert!(at(&m, 7, 2), "the low-y arm has floor, so it is inside");
         assert!(
@@ -9184,12 +10172,16 @@ mod the_building_is_its_own_outline {
             glam::Vec2::new(9.0, 9.0),
             glam::Vec2::new(6.0, 9.0),
         ];
-        let m = LightState::measurable_mask(&a_plane(), &poly, &[], Some(&an_l_shaped_floor), 0.0, &[]);
+        let m =
+            LightState::measurable_mask(&a_plane(), &poly, &[], Some(&an_l_shaped_floor), 0.0, &[]);
         assert!(
             at(&m, 7, 7),
             "inside the DRAWN room, so it counts however the floor test would have voted",
         );
-        assert!(!at(&m, 2, 2), "and outside the drawn room it does not, floor or no floor");
+        assert!(
+            !at(&m, 2, 2),
+            "and outside the drawn room it does not, floor or no floor"
+        );
     }
 
     /// NEVER MASK THE WHOLE RESULT AWAY. A plan-only project has no 3D model, so nothing has floor
@@ -9209,7 +10201,10 @@ mod the_building_is_its_own_outline {
     #[test]
     fn without_a_floor_test_it_is_the_outline_test_it_always_was() {
         let m = LightState::measurable_mask(&a_plane(), &[], &[], None, 0.0, &[]);
-        assert!(m.iter().all(|&k| k), "no outline and no floor test means every cell, as before");
+        assert!(
+            m.iter().all(|&k| k),
+            "no outline and no floor test means every cell, as before"
+        );
     }
 }
 
@@ -9265,7 +10260,10 @@ mod the_wall_zone_is_the_users_to_choose {
 
         let mut back = LightState::new();
         back.apply_config(cfg, &Document::default());
-        assert_eq!(back.wall_zone, fresh.wall_zone, "no zone in the file means the default");
+        assert_eq!(
+            back.wall_zone, fresh.wall_zone,
+            "no zone in the file means the default"
+        );
         assert_eq!(back.eye_height, fresh.eye_height);
     }
 
@@ -9298,12 +10296,15 @@ mod the_wall_zone_is_the_users_to_choose {
         let mut a = LightState::new();
         let mut b = LightState::new();
         b.wall_zone = 0.75; // NOT the default, or this compares a value against itself
-        let fa = a.prepare(&Document::default(), Some(&f)).map(|j| j.fingerprint());
-        let fb = b.prepare(&Document::default(), Some(&f)).map(|j| j.fingerprint());
+        let fa = a
+            .prepare(&Document::default(), Some(&f))
+            .map(|j| j.fingerprint());
+        let fb = b
+            .prepare(&Document::default(), Some(&f))
+            .map(|j| j.fingerprint());
         assert!(fa.is_some(), "the fixture must actually produce a job");
         assert_ne!(
-            fa,
-            fb,
+            fa, fb,
             "two zones must not produce the same fingerprint, or a restored result would be \
              adopted for a scene it does not describe",
         );
@@ -9383,7 +10384,10 @@ mod the_wall_zone_follows_the_wall {
             !CalcJob::in_wall_zone(10.0, 0.1, 0.5, &stub),
             "9 m past the end of a 1 m wall must be clear, however close to its LINE it sits",
         );
-        assert!(CalcJob::in_wall_zone(0.5, 0.1, 0.5, &stub), "beside the wall itself it is not");
+        assert!(
+            CalcJob::in_wall_zone(0.5, 0.1, 0.5, &stub),
+            "beside the wall itself it is not"
+        );
     }
 
     /// A ZONE OF ZERO EXCLUDES NOTHING, and an empty boundary cannot exclude anything either —
@@ -9391,8 +10395,14 @@ mod the_wall_zone_follows_the_wall {
     #[test]
     fn nothing_to_measure_from_excludes_nothing() {
         let edges = CalcJob::poly_edges(&[v(0.0, 0.0), v(10.0, 0.0), v(10.0, 10.0), v(0.0, 10.0)]);
-        assert!(!CalcJob::in_wall_zone(0.01, 0.01, 0.0, &edges), "a zero zone keeps the cell");
-        assert!(!CalcJob::in_wall_zone(0.01, 0.01, 0.5, &[]), "no boundary, nothing to be near");
+        assert!(
+            !CalcJob::in_wall_zone(0.01, 0.01, 0.0, &edges),
+            "a zero zone keeps the cell"
+        );
+        assert!(
+            !CalcJob::in_wall_zone(0.01, 0.01, 0.5, &[]),
+            "no boundary, nothing to be near"
+        );
     }
 
     /// AND IT REACHES THE MASK. The distance test is only worth having if the cells actually drop
@@ -9411,7 +10421,11 @@ mod the_wall_zone_follows_the_wall {
         let none = LightState::measurable_mask(&plane, &poly, &[], None, 0.0, &edges);
         let half = LightState::measurable_mask(&plane, &poly, &[], None, 0.5, &edges);
         let kept = |m: &[bool]| m.iter().filter(|k| **k).count();
-        assert_eq!(kept(&none), 20 * 16, "with no zone every cell of a rectangle is measurable");
+        assert_eq!(
+            kept(&none),
+            20 * 16,
+            "with no zone every cell of a rectangle is measurable"
+        );
         assert!(
             kept(&half) < kept(&none),
             "a 0.5 m border must drop the cells beside the walls: {} vs {}",
@@ -9422,7 +10436,11 @@ mod the_wall_zone_follows_the_wall {
         // The border is one 0.25 m cell deep on each side at this resolution, so the survivors are
         // the interior 18 x 14. Stated as a number because "fewer" would pass for a zone that
         // removed nine tenths of the room.
-        assert_eq!(kept(&half), 18 * 14, "the surviving region is the room inset by one cell");
+        assert_eq!(
+            kept(&half),
+            18 * 14,
+            "the surviving region is the room inset by one cell"
+        );
     }
 }
 
@@ -9448,7 +10466,9 @@ mod the_mode_is_reachable_and_survives {
         let src = include_str!("light.rs");
         let n = |p: &[&str]| -> String { p.concat() };
         let anchor = n(&["⚡ Calculate (", "{})"]);
-        let a = src.find(&anchor).expect("the toolbar Calculate button is gone");
+        let a = src
+            .find(&anchor)
+            .expect("the toolbar Calculate button is gone");
         let head = &src[a.saturating_sub(1_800)..a];
         for needle in [
             n(&["selectable_value(&mut self.mode, CalcMode::", "Express"]),
@@ -9496,7 +10516,10 @@ mod the_mode_is_reachable_and_survives {
         let mut src = LightState::new();
         src.cell_size = 2.0;
         src.calculate(&Document::default(), Some(&f));
-        assert!(!src.rooms.is_empty(), "the fixture must actually have rooms to restore");
+        assert!(
+            !src.rooms.is_empty(),
+            "the fixture must actually have rooms to restore"
+        );
 
         for (express, want) in [(true, CalcMode::Express), (false, CalcMode::Thorough)] {
             let stored = crate::light_store::StoredResults::of(
@@ -9604,7 +10627,10 @@ mod rooms_are_one_list_in_factory_state {
         let mut f = crate::factory::FactoryState::default();
         f.import_layer_as_room(&doc, 0);
         assert_eq!(f.rooms.len(), 1);
-        assert!(f.rooms[0].footprint.is_empty(), "no closed ring → scene only");
+        assert!(
+            f.rooms[0].footprint.is_empty(),
+            "no closed ring → scene only"
+        );
         assert_eq!(
             LightState::calc_targets(Some(&f)).len(),
             1,

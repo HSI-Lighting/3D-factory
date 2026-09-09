@@ -9,7 +9,7 @@ use crate::math::*;
 pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
     use Geom::*;
     match (a, b) {
-        (Line(l1),   Line(l2))   => intersect_line_line(*l1, *l2),
+        (Line(l1), Line(l2)) => intersect_line_line(*l1, *l2),
         // Xline ∩ anything — the infinite line as a very long finite
         // segment (±1e6). Exact enough for any CAD-scale intersection;
         // nearly-parallel pairs yield a hit far away that the caller
@@ -18,7 +18,7 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
             let seg = Geom::Line(x.line_segment(1e6));
             match other {
                 Xline(x2) => intersect(&seg, &Geom::Line(x2.line_segment(1e6))),
-                _         => intersect(&seg, other),
+                _ => intersect(&seg, other),
             }
         }
         // Ray ∩ anything — the ray as a long finite segment from the base
@@ -27,15 +27,21 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
             let seg = Geom::Line(r.ray_segment(1e6));
             match other {
                 Ray(r2) => intersect(&seg, &Geom::Line(r2.ray_segment(1e6))),
-                _       => intersect(&seg, other),
+                _ => intersect(&seg, other),
             }
         }
         // Donut ∩ anything — the ring's two circles (outer + hole).
         (Donut(d), other) | (other, Donut(d)) => {
-            let outer = crate::geom::Circle { center: d.center, radius: d.outer_radius };
+            let outer = crate::geom::Circle {
+                center: d.center,
+                radius: d.outer_radius,
+            };
             let mut hits = intersect(&Geom::Circle(outer), other);
             if d.inner_radius > 1e-9 {
-                let inner = crate::geom::Circle { center: d.center, radius: d.inner_radius };
+                let inner = crate::geom::Circle {
+                    center: d.center,
+                    radius: d.inner_radius,
+                };
                 hits.extend(intersect(&Geom::Circle(inner), other));
             }
             hits
@@ -59,33 +65,36 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
             }
             hits
         }
-        (Line(l),    Circle(c))  | (Circle(c), Line(l))  => intersect_line_circle(*l, *c),
-        (Line(l),    Arc(ar))    | (Arc(ar),   Line(l))  => intersect_line_arc(*l, *ar),
+        (Line(l), Circle(c)) | (Circle(c), Line(l)) => intersect_line_circle(*l, *c),
+        (Line(l), Arc(ar)) | (Arc(ar), Line(l)) => intersect_line_arc(*l, *ar),
         (Circle(c1), Circle(c2)) => intersect_circle_circle(*c1, *c2),
-        (Circle(c),  Arc(ar))    | (Arc(ar),   Circle(c)) => intersect_arc_circle(*ar, *c),
-        (Arc(a1),    Arc(a2))    => intersect_arc_arc(*a1, *a2),
+        (Circle(c), Arc(ar)) | (Arc(ar), Circle(c)) => intersect_arc_circle(*ar, *c),
+        (Arc(a1), Arc(a2)) => intersect_arc_arc(*a1, *a2),
 
         // ---- Ellipse pairs ----
-        (Line(l),   Ellipse(e)) | (Ellipse(e), Line(l))  => intersect_line_ellipse(*l, *e),
+        (Line(l), Ellipse(e)) | (Ellipse(e), Line(l)) => intersect_line_ellipse(*l, *e),
         (Circle(c), Ellipse(e)) | (Ellipse(e), Circle(c)) => intersect_circle_ellipse(*c, *e),
-        (Arc(ar),   Ellipse(e)) | (Ellipse(e), Arc(ar))  => intersect_arc_ellipse(*ar, *e),
+        (Arc(ar), Ellipse(e)) | (Ellipse(e), Arc(ar)) => intersect_arc_ellipse(*ar, *e),
         (Ellipse(e1), Ellipse(e2)) => intersect_ellipse_ellipse(*e1, *e2),
 
         // ---- EllipseArc pairs: each reduces to the full-ellipse case + sweep filter
-        (Line(l),    EllipseArc(ea)) | (EllipseArc(ea), Line(l))  =>
-            filter_by_ellipse_arc(intersect_line_ellipse(*l, ea.ellipse), ea),
-        (Circle(c),  EllipseArc(ea)) | (EllipseArc(ea), Circle(c)) =>
-            filter_by_ellipse_arc(intersect_circle_ellipse(*c, ea.ellipse), ea),
-        (Arc(ar),    EllipseArc(ea)) | (EllipseArc(ea), Arc(ar))  =>
-            filter_by_arc(filter_by_ellipse_arc(
-                intersect_arc_ellipse(*ar, ea.ellipse), ea), ar),
-        (Ellipse(e), EllipseArc(ea)) | (EllipseArc(ea), Ellipse(e)) =>
-            filter_by_ellipse_arc(intersect_ellipse_ellipse(*e, ea.ellipse), ea),
-        (EllipseArc(ea1), EllipseArc(ea2)) =>
-            filter_by_ellipse_arc(
-                filter_by_ellipse_arc(
-                    intersect_ellipse_ellipse(ea1.ellipse, ea2.ellipse), ea1),
-                ea2),
+        (Line(l), EllipseArc(ea)) | (EllipseArc(ea), Line(l)) => {
+            filter_by_ellipse_arc(intersect_line_ellipse(*l, ea.ellipse), ea)
+        }
+        (Circle(c), EllipseArc(ea)) | (EllipseArc(ea), Circle(c)) => {
+            filter_by_ellipse_arc(intersect_circle_ellipse(*c, ea.ellipse), ea)
+        }
+        (Arc(ar), EllipseArc(ea)) | (EllipseArc(ea), Arc(ar)) => filter_by_arc(
+            filter_by_ellipse_arc(intersect_arc_ellipse(*ar, ea.ellipse), ea),
+            ar,
+        ),
+        (Ellipse(e), EllipseArc(ea)) | (EllipseArc(ea), Ellipse(e)) => {
+            filter_by_ellipse_arc(intersect_ellipse_ellipse(*e, ea.ellipse), ea)
+        }
+        (EllipseArc(ea1), EllipseArc(ea2)) => filter_by_ellipse_arc(
+            filter_by_ellipse_arc(intersect_ellipse_ellipse(ea1.ellipse, ea2.ellipse), ea1),
+            ea2,
+        ),
 
         // Polyline ∩ X — per-segment dispatch. Each Polyline segment is
         // either a Line (bulge == 0) or an Arc (bulge != 0). Intersect each
@@ -109,9 +118,12 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
         // polyline arm and terminates (both sides tessellate).
         (Spline(sp), other) | (other, Spline(sp)) => {
             let samples = sp.tessellate(64);
-            if samples.len() < 2 { return Vec::new(); }
+            if samples.len() < 2 {
+                return Vec::new();
+            }
             let pl = Geom::Polyline(crate::geom::Polyline {
-                vertices: samples.into_iter()
+                vertices: samples
+                    .into_iter()
                     .map(|p| PolyVertex { pos: p, bulge: 0.0 })
                     .collect(),
                 closed: false,
@@ -131,7 +143,7 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
             let cl = Geom::Line(w.centerline());
             match other {
                 Wall(w2) => intersect(&cl, &Geom::Line(w2.centerline())),
-                _        => intersect(&cl, other),
+                _ => intersect(&cl, other),
             }
         }
 
@@ -147,14 +159,28 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
         // per segment so cutters can find the callout's landing line.
         (Leader(l), other) | (other, Leader(l)) => {
             let pl = Geom::Polyline(crate::geom::Polyline {
-                vertices: l.pts.iter().map(|p| PolyVertex { pos: *p, bulge: 0.0 }).collect(),
+                vertices: l
+                    .pts
+                    .iter()
+                    .map(|p| PolyVertex {
+                        pos: *p,
+                        bulge: 0.0,
+                    })
+                    .collect(),
                 closed: false,
                 widths: Vec::new(),
             });
             match other {
                 Leader(l2) => {
                     let pl2 = Geom::Polyline(crate::geom::Polyline {
-                        vertices: l2.pts.iter().map(|p| PolyVertex { pos: *p, bulge: 0.0 }).collect(),
+                        vertices: l2
+                            .pts
+                            .iter()
+                            .map(|p| PolyVertex {
+                                pos: *p,
+                                bulge: 0.0,
+                            })
+                            .collect(),
                         closed: false,
                         widths: Vec::new(),
                     });
@@ -171,13 +197,25 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
         // intersect against each arm so cutters/boundaries can meet them.
         (CenterMark(cm), other) | (other, CenterMark(cm)) => {
             let arms = cm.segments();
-            let l1 = Geom::Line(crate::geom::Line { a: arms[0].0, b: arms[0].1 });
-            let l2 = Geom::Line(crate::geom::Line { a: arms[1].0, b: arms[1].1 });
+            let l1 = Geom::Line(crate::geom::Line {
+                a: arms[0].0,
+                b: arms[0].1,
+            });
+            let l2 = Geom::Line(crate::geom::Line {
+                a: arms[1].0,
+                b: arms[1].1,
+            });
             match other {
                 CenterMark(cm2) => {
                     let arms2 = cm2.segments();
-                    let l3 = Geom::Line(crate::geom::Line { a: arms2[0].0, b: arms2[0].1 });
-                    let l4 = Geom::Line(crate::geom::Line { a: arms2[1].0, b: arms2[1].1 });
+                    let l3 = Geom::Line(crate::geom::Line {
+                        a: arms2[0].0,
+                        b: arms2[0].1,
+                    });
+                    let l4 = Geom::Line(crate::geom::Line {
+                        a: arms2[1].0,
+                        b: arms2[1].1,
+                    });
                     let mut out = intersect(&l1, &l3);
                     out.extend(intersect(&l1, &l4));
                     out.extend(intersect(&l2, &l3));
@@ -226,22 +264,29 @@ fn filter_by_arc(hits: Vec<Vec2>, arc: &Arc) -> Vec<Vec2> {
 /// between the last and first vertex.
 fn intersect_polyline_other(p: &Polyline, other: &Geom) -> Vec<Vec2> {
     let n = p.vertices.len();
-    if n < 2 { return Vec::new(); }
+    if n < 2 {
+        return Vec::new();
+    }
     let mut out: Vec<Vec2> = Vec::new();
     let seg_count = if p.closed { n } else { n - 1 };
     for i in 0..seg_count {
-        let v_i  = p.vertices[i];
-        let v_n  = p.vertices[(i + 1) % n];
+        let v_i = p.vertices[i];
+        let v_n = p.vertices[(i + 1) % n];
         // bulge of segment i lives on v_i per DXF convention.
         if v_i.bulge.abs() < EPS {
-            let seg = Geom::Line(Line { a: v_i.pos, b: v_n.pos });
+            let seg = Geom::Line(Line {
+                a: v_i.pos,
+                b: v_n.pos,
+            });
             out.extend(intersect(&seg, other));
         } else {
             // Bulge → Arc. Math: chord length L, sagitta s = L·bulge/2,
             // radius r = L·(1 + bulge²) / (4·|bulge|); sign(bulge) ⇒ CCW/CW.
             let chord = v_n.pos - v_i.pos;
             let l = chord.len();
-            if l < EPS { continue; }
+            if l < EPS {
+                continue;
+            }
             let b = v_i.bulge;
             let r = l * (1.0 + b * b) / (4.0 * b.abs());
             // Center is perpendicular to chord midpoint, distance d from
@@ -253,18 +298,26 @@ fn intersect_polyline_other(p: &Polyline, other: &Geom) -> Vec<Vec2> {
             let d = r * (1.0 - b * b) / (1.0 + b * b);
             let center = mid + perp * (d * b.signum());
             let start_angle = (v_i.pos - center).angle().rem_euclid(std::f64::consts::TAU);
-            let end_angle   = (v_n.pos - center).angle().rem_euclid(std::f64::consts::TAU);
+            let end_angle = (v_n.pos - center).angle().rem_euclid(std::f64::consts::TAU);
             // Sweep is always positive (CCW). For bulge < 0, the SHORTER
             // path is CW from v_i to v_n; reparameterise so the Arc still
             // represents the same swept curve in our CCW convention.
             let raw_sweep = (end_angle - start_angle).rem_euclid(std::f64::consts::TAU);
             let arc = if b > 0.0 {
-                Arc { center, radius: r, start_angle,
-                      sweep_angle: raw_sweep }
+                Arc {
+                    center,
+                    radius: r,
+                    start_angle,
+                    sweep_angle: raw_sweep,
+                }
             } else {
                 let rev_sweep = std::f64::consts::TAU - raw_sweep;
-                Arc { center, radius: r, start_angle: end_angle,
-                      sweep_angle: rev_sweep }
+                Arc {
+                    center,
+                    radius: r,
+                    start_angle: end_angle,
+                    sweep_angle: rev_sweep,
+                }
             };
             out.extend(intersect(&Geom::Arc(arc), other));
         }
@@ -293,7 +346,7 @@ pub fn intersect_line_line(a: Line, b: Line) -> Vec<Vec2> {
     // candidate set. `len_sq()` is a bare dot, no sqrt.
     const PARALLEL_SIN_EPS_SQ: f64 = PARALLEL_SIN_EPS * PARALLEL_SIN_EPS;
     if denom * denom <= PARALLEL_SIN_EPS_SQ * d1.len_sq() * d2.len_sq() {
-        return vec![];                        // parallel or collinear
+        return vec![]; // parallel or collinear
     }
     let diff = b.a - a.a;
     let t = diff.cross(d2) / denom;
@@ -317,28 +370,34 @@ pub fn intersect_line_circle(line: Line, c: Circle) -> Vec<Vec2> {
     // and the tangent was wrongly rejected (a TTR-tangent line wouldn't extend
     // to its circle). Working from the perpendicular distance is stable
     // regardless of the line's length.
-    let d  = line.b - line.a;
+    let d = line.b - line.a;
     let aa = d.dot(d);
-    if approx_zero(aa) { return vec![]; }
+    if approx_zero(aa) {
+        return vec![];
+    }
     let len = aa.sqrt();
-    let t0   = (c.center - line.a).dot(d) / aa;   // param of the perpendicular foot
+    let t0 = (c.center - line.a).dot(d) / aa; // param of the perpendicular foot
     let foot = line.a + d * t0;
-    let pd   = foot.dist(c.center);               // perpendicular distance to centre
-    let r    = c.radius;
+    let pd = foot.dist(c.center); // perpendicular distance to centre
+    let r = c.radius;
     // Tangent tolerance relative to the radius (geometric, length-independent).
     // WP0.2: this is the exemplar `scaled_tol` generalizes — same value.
-    let tol  = scaled_tol(r);
-    if pd > r + tol { return vec![]; }            // genuine miss
+    let tol = scaled_tol(r);
+    if pd > r + tol {
+        return vec![];
+    } // genuine miss
     let half = (r * r - pd * pd).max(0.0).sqrt(); // half-chord length
     let ts: [f64; 2] = if half <= tol {
-        [t0, f64::NAN]                            // tangent — single point
+        [t0, f64::NAN] // tangent — single point
     } else {
         let dt = half / len;
         [t0 - dt, t0 + dt]
     };
     let mut out = Vec::with_capacity(2);
     for t in ts {
-        if t.is_nan() { continue; }
+        if t.is_nan() {
+            continue;
+        }
         if t >= -EPS && t <= 1.0 + EPS {
             out.push(line.a + d * t);
         }
@@ -365,23 +424,23 @@ pub fn intersect_circle_circle(c1: Circle, c2: Circle) -> Vec<Vec2> {
     let tol = scaled_tol(c1.radius.max(c2.radius));
 
     if approx_zero(d) {
-        return vec![];                        // concentric: ignore (coincident or none)
+        return vec![]; // concentric: ignore (coincident or none)
     }
     if d > c1.radius + c2.radius + tol {
-        return vec![];                        // too far apart
+        return vec![]; // too far apart
     }
     if d < (c1.radius - c2.radius).abs() - tol {
-        return vec![];                        // one inside the other
+        return vec![]; // one inside the other
     }
 
-    let a   = (c1.radius * c1.radius - c2.radius * c2.radius + d * d) / (2.0 * d);
-    let h2  = (c1.radius * c1.radius - a * a).max(0.0);
-    let h   = h2.sqrt();
+    let a = (c1.radius * c1.radius - c2.radius * c2.radius + d * d) / (2.0 * d);
+    let h2 = (c1.radius * c1.radius - a * a).max(0.0);
+    let h = h2.sqrt();
     let dir = (c2.center - c1.center) / d;
     let mid = c1.center + dir * a;
 
     if h < tol {
-        return vec![mid];                     // tangent
+        return vec![mid]; // tangent
     }
     let off = dir.perp() * h;
     vec![mid + off, mid - off]
@@ -393,7 +452,10 @@ pub fn intersect_circle_circle(c1: Circle, c2: Circle) -> Vec<Vec2> {
 // hit points by whether their angle falls in each arc's swept range.
 
 pub fn intersect_line_arc(line: Line, arc: Arc) -> Vec<Vec2> {
-    let c = Circle { center: arc.center, radius: arc.radius };
+    let c = Circle {
+        center: arc.center,
+        radius: arc.radius,
+    };
     intersect_line_circle(line, c)
         .into_iter()
         .filter(|p| arc.contains_angle((*p - arc.center).angle()))
@@ -401,7 +463,10 @@ pub fn intersect_line_arc(line: Line, arc: Arc) -> Vec<Vec2> {
 }
 
 pub fn intersect_arc_circle(arc: Arc, circle: Circle) -> Vec<Vec2> {
-    let ac = Circle { center: arc.center, radius: arc.radius };
+    let ac = Circle {
+        center: arc.center,
+        radius: arc.radius,
+    };
     intersect_circle_circle(ac, circle)
         .into_iter()
         .filter(|p| arc.contains_angle((*p - arc.center).angle()))
@@ -409,8 +474,14 @@ pub fn intersect_arc_circle(arc: Arc, circle: Circle) -> Vec<Vec2> {
 }
 
 pub fn intersect_arc_arc(a: Arc, b: Arc) -> Vec<Vec2> {
-    let ca = Circle { center: a.center, radius: a.radius };
-    let cb = Circle { center: b.center, radius: b.radius };
+    let ca = Circle {
+        center: a.center,
+        radius: a.radius,
+    };
+    let cb = Circle {
+        center: b.center,
+        radius: b.radius,
+    };
     intersect_circle_circle(ca, cb)
         .into_iter()
         .filter(|p| {
@@ -458,12 +529,14 @@ fn ellipse_implicit_grad(el: &Ellipse, p: Vec2) -> Vec2 {
 pub fn intersect_line_ellipse(line: Line, el: Ellipse) -> Vec<Vec2> {
     let a = el.semi_major();
     let b = el.semi_minor();
-    if a < EPS || b < EPS { return Vec::new(); }
+    if a < EPS || b < EPS {
+        return Vec::new();
+    }
     // Project both A and D onto the ellipse axes.
     let u = el.u_hat();
     let v = el.v_hat();
     let a0 = line.a - el.center;
-    let d  = line.b - line.a;
+    let d = line.b - line.a;
     let au = a0.dot(u);
     let av = a0.dot(v);
     let du = d.dot(u);
@@ -472,9 +545,13 @@ pub fn intersect_line_ellipse(line: Line, el: Ellipse) -> Vec<Vec2> {
     let aa = (du * du) / (a * a) + (dv * dv) / (b * b);
     let bb = 2.0 * (au * du / (a * a) + av * dv / (b * b));
     let cc = (au * au) / (a * a) + (av * av) / (b * b) - 1.0;
-    if aa.abs() < EPS { return Vec::new(); }
+    if aa.abs() < EPS {
+        return Vec::new();
+    }
     let disc = bb * bb - 4.0 * aa * cc;
-    if disc < -EPS { return Vec::new(); }
+    if disc < -EPS {
+        return Vec::new();
+    }
     let disc = disc.max(0.0);
     let sq = disc.sqrt();
     let mut out = Vec::with_capacity(2);
@@ -483,14 +560,18 @@ pub fn intersect_line_ellipse(line: Line, el: Ellipse) -> Vec<Vec2> {
             out.push(line.a + d * s);
         }
     }
-    if out.len() == 2 && out[0].dist(out[1]) < EPS { out.pop(); }
+    if out.len() == 2 && out[0].dist(out[1]) < EPS {
+        out.pop();
+    }
     out
 }
 
 /// Circle ∩ Ellipse — find all `t ∈ [0, 2π)` such that the ellipse point
 /// `E(t)` is at distance `r` from the circle's centre. Up to 4 hits.
 pub fn intersect_circle_ellipse(circle: Circle, el: Ellipse) -> Vec<Vec2> {
-    if el.semi_major() < EPS { return Vec::new(); }
+    if el.semi_major() < EPS {
+        return Vec::new();
+    }
     let f = |t: f64| {
         let p = el.point_at(t);
         let d = p - circle.center;
@@ -510,13 +591,19 @@ pub fn intersect_circle_ellipse(circle: Circle, el: Ellipse) -> Vec<Vec2> {
     // (≈ el.semi_major()). Independent of residual_tol. semi_major ≥ EPS (guarded).
     let dedup_tol = scaled_tol(el.semi_major()) / el.semi_major();
     crate::math::newton_roots_periodic(f, fd, 16, residual_tol, dedup_tol)
-        .into_iter().map(|t| el.point_at(t)).collect()
+        .into_iter()
+        .map(|t| el.point_at(t))
+        .collect()
 }
 
 /// Arc ∩ Ellipse — circle ∩ ellipse, filtered by the arc's swept range.
 pub fn intersect_arc_ellipse(arc: Arc, el: Ellipse) -> Vec<Vec2> {
-    let c = Circle { center: arc.center, radius: arc.radius };
-    intersect_circle_ellipse(c, el).into_iter()
+    let c = Circle {
+        center: arc.center,
+        radius: arc.radius,
+    };
+    intersect_circle_ellipse(c, el)
+        .into_iter()
         .filter(|p| arc.contains_angle((*p - arc.center).angle()))
         .collect()
 }
@@ -524,7 +611,9 @@ pub fn intersect_arc_ellipse(arc: Arc, el: Ellipse) -> Vec<Vec2> {
 /// Ellipse ∩ Ellipse — parametrize one ellipse and find all `t` where the
 /// implicit form of the other vanishes. Up to 4 hits.
 pub fn intersect_ellipse_ellipse(a: Ellipse, b: Ellipse) -> Vec<Vec2> {
-    if a.semi_major() < EPS || b.semi_major() < EPS { return Vec::new(); }
+    if a.semi_major() < EPS || b.semi_major() < EPS {
+        return Vec::new();
+    }
     // f(t)  = F_b(E_a(t)) - 1
     // f'(t) = ∇F_b(E_a(t)) · E_a'(t)
     let f = |t: f64| ellipse_implicit(&b, a.point_at(t)) - 1.0;
@@ -542,7 +631,9 @@ pub fn intersect_ellipse_ellipse(a: Ellipse, b: Ellipse) -> Vec<Vec2> {
     // Conflating this with the fixed 1e-6 residual is the easy mistake.
     let dedup_tol = scaled_tol(a.semi_major()) / a.semi_major();
     crate::math::newton_roots_periodic(f, fd, 16, 1e-6, dedup_tol)
-        .into_iter().map(|t| a.point_at(t)).collect()
+        .into_iter()
+        .map(|t| a.point_at(t))
+        .collect()
 }
 
 // ---------- tests -----------------------------------------------------------
@@ -569,11 +660,20 @@ mod tests {
         let s2 = 2.0_f64.sqrt();
         for s in [1.0, 1e3, 1e6] {
             let r = 60.0 * s;
-            let c1 = Circle { center: Vec2::new(0.0, 0.0), radius: r };
-            let c2 = Circle { center: Vec2::new(r * s2, r * s2), radius: r };
+            let c1 = Circle {
+                center: Vec2::new(0.0, 0.0),
+                radius: r,
+            };
+            let c2 = Circle {
+                center: Vec2::new(r * s2, r * s2),
+                radius: r,
+            };
             let hits = intersect_circle_circle(c1, c2);
-            assert_eq!(hits.len(), 1,
-                "external tangency must give exactly ONE point at scale {s} (r={r})");
+            assert_eq!(
+                hits.len(),
+                1,
+                "external tangency must give exactly ONE point at scale {s} (r={r})"
+            );
         }
     }
 
@@ -584,12 +684,21 @@ mod tests {
         let s2 = 2.0_f64.sqrt();
         for s in [1.0, 1e3, 1e6] {
             let (rb, rs) = (120.0 * s, 60.0 * s);
-            let off = (rb - rs) / s2;   // centre separation rb-rs along 45°
-            let c1 = Circle { center: Vec2::new(0.0, 0.0),        radius: rb };
-            let c2 = Circle { center: Vec2::new(off, off),        radius: rs };
+            let off = (rb - rs) / s2; // centre separation rb-rs along 45°
+            let c1 = Circle {
+                center: Vec2::new(0.0, 0.0),
+                radius: rb,
+            };
+            let c2 = Circle {
+                center: Vec2::new(off, off),
+                radius: rs,
+            };
             let hits = intersect_circle_circle(c1, c2);
-            assert_eq!(hits.len(), 1,
-                "internal tangency must give exactly ONE point at scale {s}");
+            assert_eq!(
+                hits.len(),
+                1,
+                "internal tangency must give exactly ONE point at scale {s}"
+            );
         }
     }
 
@@ -599,20 +708,29 @@ mod tests {
         // number of intersections must be the SAME at 1×, 1e3×, 1e6× — pre-fix
         // the squared-distance Newton residual rejected every root at scale.
         fn hits(s: f64) -> usize {
-            let circle = Circle { center: Vec2::new(10.0 * s, 10.0 * s), radius: 50.0 * s };
+            let circle = Circle {
+                center: Vec2::new(10.0 * s, 10.0 * s),
+                radius: 50.0 * s,
+            };
             let el = Ellipse {
                 center: Vec2::new(40.0 * s, 40.0 * s),
-                major:  Vec2::new(40.0 * s, 0.0),
-                ratio:  0.5,
+                major: Vec2::new(40.0 * s, 0.0),
+                ratio: 0.5,
             };
             intersect_circle_ellipse(circle, el).len()
         }
         let base = hits(1.0);
-        assert!(base > 0, "sanity: circle∩ellipse must intersect at 1× (got {base})");
+        assert!(
+            base > 0,
+            "sanity: circle∩ellipse must intersect at 1× (got {base})"
+        );
         for s in [1e3, 1e6] {
-            assert_eq!(hits(s), base,
+            assert_eq!(
+                hits(s),
+                base,
                 "circle∩ellipse hit count must be scale-invariant (scale {s}: {} vs {base})",
-                hits(s));
+                hits(s)
+            );
         }
     }
 
@@ -622,21 +740,42 @@ mod tests {
         // FIXED 1e-6 (not char²), so it must stay correct AND not admit false
         // roots at scale. Two crossing ellipses → same count at 1× and 1e6×.
         fn hits(s: f64) -> usize {
-            let a = Ellipse { center: Vec2::new(0.0, 0.0), major: Vec2::new(60.0 * s, 0.0), ratio: 0.5 };
-            let b = Ellipse { center: Vec2::new(20.0 * s, 0.0), major: Vec2::new(0.0, 60.0 * s), ratio: 0.5 };
+            let a = Ellipse {
+                center: Vec2::new(0.0, 0.0),
+                major: Vec2::new(60.0 * s, 0.0),
+                ratio: 0.5,
+            };
+            let b = Ellipse {
+                center: Vec2::new(20.0 * s, 0.0),
+                major: Vec2::new(0.0, 60.0 * s),
+                ratio: 0.5,
+            };
             intersect_ellipse_ellipse(a, b).len()
         }
         let base = hits(1.0);
-        assert!(base > 0, "sanity: ellipse∩ellipse must intersect at 1× (got {base})");
-        assert_eq!(hits(1e6), base,
-            "ellipse∩ellipse hit count must be scale-invariant (1e6×: {} vs {base})", hits(1e6));
+        assert!(
+            base > 0,
+            "sanity: ellipse∩ellipse must intersect at 1× (got {base})"
+        );
+        assert_eq!(
+            hits(1e6),
+            base,
+            "ellipse∩ellipse hit count must be scale-invariant (1e6×: {} vs {base})",
+            hits(1e6)
+        );
     }
 
     #[test]
     fn line_line_cross() {
         let pts = intersect_line_line(
-            Line { a: Vec2::new(0.0, 0.0),  b: Vec2::new(10.0, 0.0) },
-            Line { a: Vec2::new(5.0, -5.0), b: Vec2::new(5.0,  5.0) },
+            Line {
+                a: Vec2::new(0.0, 0.0),
+                b: Vec2::new(10.0, 0.0),
+            },
+            Line {
+                a: Vec2::new(5.0, -5.0),
+                b: Vec2::new(5.0, 5.0),
+            },
         );
         assert_eq!(pts.len(), 1);
         assert!(approx_pt(pts[0], 5.0, 0.0));
@@ -645,8 +784,14 @@ mod tests {
     #[test]
     fn line_line_parallel() {
         let pts = intersect_line_line(
-            Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 0.0) },
-            Line { a: Vec2::new(0.0, 1.0), b: Vec2::new(10.0, 1.0) },
+            Line {
+                a: Vec2::new(0.0, 0.0),
+                b: Vec2::new(10.0, 0.0),
+            },
+            Line {
+                a: Vec2::new(0.0, 1.0),
+                b: Vec2::new(10.0, 1.0),
+            },
         );
         assert!(pts.is_empty());
     }
@@ -654,8 +799,14 @@ mod tests {
     #[test]
     fn line_line_outside_segment() {
         let pts = intersect_line_line(
-            Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(2.0, 0.0) },
-            Line { a: Vec2::new(5.0, -1.0), b: Vec2::new(5.0, 1.0) },
+            Line {
+                a: Vec2::new(0.0, 0.0),
+                b: Vec2::new(2.0, 0.0),
+            },
+            Line {
+                a: Vec2::new(5.0, -1.0),
+                b: Vec2::new(5.0, 1.0),
+            },
         );
         assert!(pts.is_empty());
     }
@@ -663,8 +814,14 @@ mod tests {
     #[test]
     fn line_circle_two_points() {
         let pts = intersect_line_circle(
-            Line { a: Vec2::new(-10.0, 0.0), b: Vec2::new(10.0, 0.0) },
-            Circle { center: Vec2::new(0.0, 0.0), radius: 5.0 },
+            Line {
+                a: Vec2::new(-10.0, 0.0),
+                b: Vec2::new(10.0, 0.0),
+            },
+            Circle {
+                center: Vec2::new(0.0, 0.0),
+                radius: 5.0,
+            },
         );
         assert_eq!(pts.len(), 2);
         assert!(approx_pt(pts[0], -5.0, 0.0) || approx_pt(pts[0], 5.0, 0.0));
@@ -673,8 +830,14 @@ mod tests {
     #[test]
     fn line_circle_tangent() {
         let pts = intersect_line_circle(
-            Line { a: Vec2::new(-10.0, 5.0), b: Vec2::new(10.0, 5.0) },
-            Circle { center: Vec2::new(0.0, 0.0), radius: 5.0 },
+            Line {
+                a: Vec2::new(-10.0, 5.0),
+                b: Vec2::new(10.0, 5.0),
+            },
+            Circle {
+                center: Vec2::new(0.0, 0.0),
+                radius: 5.0,
+            },
         );
         assert_eq!(pts.len(), 1);
         assert!(approx_pt(pts[0], 0.0, 5.0));
@@ -691,17 +854,36 @@ mod tests {
         // Horizontal line tangent to the bottom of the circle (y = cy - r),
         // lengthened far past the drawing like extended_for_edgemode does.
         let y = cy - r;
-        let line = Line { a: Vec2::new(cx - 1.0e6, y), b: Vec2::new(cx + 1.0e6, y) };
-        let pts = intersect_line_circle(line, Circle { center: Vec2::new(cx, cy), radius: r });
-        assert_eq!(pts.len(), 1, "tangent must yield exactly one point, got {pts:?}");
+        let line = Line {
+            a: Vec2::new(cx - 1.0e6, y),
+            b: Vec2::new(cx + 1.0e6, y),
+        };
+        let pts = intersect_line_circle(
+            line,
+            Circle {
+                center: Vec2::new(cx, cy),
+                radius: r,
+            },
+        );
+        assert_eq!(
+            pts.len(),
+            1,
+            "tangent must yield exactly one point, got {pts:?}"
+        );
         assert!(approx_pt(pts[0], cx, y), "tangent point was {:?}", pts[0]);
     }
 
     #[test]
     fn line_circle_miss() {
         let pts = intersect_line_circle(
-            Line { a: Vec2::new(-10.0, 10.0), b: Vec2::new(10.0, 10.0) },
-            Circle { center: Vec2::new(0.0, 0.0), radius: 5.0 },
+            Line {
+                a: Vec2::new(-10.0, 10.0),
+                b: Vec2::new(10.0, 10.0),
+            },
+            Circle {
+                center: Vec2::new(0.0, 0.0),
+                radius: 5.0,
+            },
         );
         assert!(pts.is_empty());
     }
@@ -709,8 +891,14 @@ mod tests {
     #[test]
     fn circle_circle_two_points() {
         let pts = intersect_circle_circle(
-            Circle { center: Vec2::new(0.0, 0.0), radius: 5.0 },
-            Circle { center: Vec2::new(8.0, 0.0), radius: 5.0 },
+            Circle {
+                center: Vec2::new(0.0, 0.0),
+                radius: 5.0,
+            },
+            Circle {
+                center: Vec2::new(8.0, 0.0),
+                radius: 5.0,
+            },
         );
         assert_eq!(pts.len(), 2);
         assert!(approx_eq(pts[0].x, 4.0) && approx_eq(pts[1].x, 4.0));
@@ -720,8 +908,14 @@ mod tests {
     #[test]
     fn circle_circle_tangent_external() {
         let pts = intersect_circle_circle(
-            Circle { center: Vec2::new(0.0, 0.0), radius: 5.0 },
-            Circle { center: Vec2::new(10.0, 0.0), radius: 5.0 },
+            Circle {
+                center: Vec2::new(0.0, 0.0),
+                radius: 5.0,
+            },
+            Circle {
+                center: Vec2::new(10.0, 0.0),
+                radius: 5.0,
+            },
         );
         assert_eq!(pts.len(), 1);
         assert!(approx_pt(pts[0], 5.0, 0.0));
@@ -732,10 +926,15 @@ mod tests {
         // Quarter arc 0°→90°, line crosses the full circle but only
         // the upper-right intersection should survive.
         let arc = Arc {
-            center: Vec2::ZERO, radius: 5.0,
-            start_angle: 0.0, sweep_angle: TAU / 4.0,
+            center: Vec2::ZERO,
+            radius: 5.0,
+            start_angle: 0.0,
+            sweep_angle: TAU / 4.0,
         };
-        let line = Line { a: Vec2::new(-10.0, 3.0), b: Vec2::new(10.0, 3.0) };
+        let line = Line {
+            a: Vec2::new(-10.0, 3.0),
+            b: Vec2::new(10.0, 3.0),
+        };
         let pts = intersect_line_arc(line, arc);
         assert_eq!(pts.len(), 1);
         assert!(pts[0].x > 0.0 && approx_eq(pts[0].y, 3.0));
@@ -745,13 +944,14 @@ mod tests {
     fn arc_contains_angle_wrap() {
         // Arc from 350° to 10° (sweep 20°, crosses 0)
         let arc = Arc {
-            center: Vec2::ZERO, radius: 1.0,
+            center: Vec2::ZERO,
+            radius: 1.0,
             start_angle: (350.0_f64).to_radians(),
             sweep_angle: (20.0_f64).to_radians(),
         };
-        assert!( arc.contains_angle((0.0_f64).to_radians()));
-        assert!( arc.contains_angle((355.0_f64).to_radians()));
-        assert!( arc.contains_angle((5.0_f64).to_radians()));
+        assert!(arc.contains_angle((0.0_f64).to_radians()));
+        assert!(arc.contains_angle((355.0_f64).to_radians()));
+        assert!(arc.contains_angle((5.0_f64).to_radians()));
         assert!(!arc.contains_angle((90.0_f64).to_radians()));
     }
 
@@ -761,8 +961,15 @@ mod tests {
     fn line_ellipse_two_points_on_major_axis() {
         // Axis-aligned ellipse a=5, b=2. Horizontal line through centre at
         // y=0 must cross at (±5, 0).
-        let el = Ellipse { center: Vec2::ZERO, major: Vec2::new(5.0, 0.0), ratio: 0.4 };
-        let line = Line { a: Vec2::new(-10.0, 0.0), b: Vec2::new(10.0, 0.0) };
+        let el = Ellipse {
+            center: Vec2::ZERO,
+            major: Vec2::new(5.0, 0.0),
+            ratio: 0.4,
+        };
+        let line = Line {
+            a: Vec2::new(-10.0, 0.0),
+            b: Vec2::new(10.0, 0.0),
+        };
         let pts = intersect_line_ellipse(line, el);
         assert_eq!(pts.len(), 2);
         let xs: Vec<f64> = pts.iter().map(|p| p.x).collect();
@@ -773,8 +980,15 @@ mod tests {
     #[test]
     fn line_ellipse_tangent() {
         // Line y=2 is tangent to the same ellipse at (0, 2).
-        let el = Ellipse { center: Vec2::ZERO, major: Vec2::new(5.0, 0.0), ratio: 0.4 };
-        let line = Line { a: Vec2::new(-10.0, 2.0), b: Vec2::new(10.0, 2.0) };
+        let el = Ellipse {
+            center: Vec2::ZERO,
+            major: Vec2::new(5.0, 0.0),
+            ratio: 0.4,
+        };
+        let line = Line {
+            a: Vec2::new(-10.0, 2.0),
+            b: Vec2::new(10.0, 2.0),
+        };
         let pts = intersect_line_ellipse(line, el);
         assert_eq!(pts.len(), 1);
         assert!(approx_eq(pts[0].x, 0.0));
@@ -783,8 +997,15 @@ mod tests {
 
     #[test]
     fn line_ellipse_miss() {
-        let el = Ellipse { center: Vec2::ZERO, major: Vec2::new(5.0, 0.0), ratio: 0.4 };
-        let line = Line { a: Vec2::new(-10.0, 5.0), b: Vec2::new(10.0, 5.0) };
+        let el = Ellipse {
+            center: Vec2::ZERO,
+            major: Vec2::new(5.0, 0.0),
+            ratio: 0.4,
+        };
+        let line = Line {
+            a: Vec2::new(-10.0, 5.0),
+            b: Vec2::new(10.0, 5.0),
+        };
         assert!(intersect_line_ellipse(line, el).is_empty());
     }
 
@@ -792,8 +1013,15 @@ mod tests {
     fn circle_ellipse_four_points() {
         // Circle of radius 3 centred at origin intersects the same ellipse
         // (a=5, b=2) at exactly 4 points (symmetric across both axes).
-        let el = Ellipse { center: Vec2::ZERO, major: Vec2::new(5.0, 0.0), ratio: 0.4 };
-        let c  = Circle { center: Vec2::ZERO, radius: 3.0 };
+        let el = Ellipse {
+            center: Vec2::ZERO,
+            major: Vec2::new(5.0, 0.0),
+            ratio: 0.4,
+        };
+        let c = Circle {
+            center: Vec2::ZERO,
+            radius: 3.0,
+        };
         let pts = intersect_circle_ellipse(c, el);
         assert_eq!(pts.len(), 4);
         // Each must satisfy both x² + y² = 9 and x²/25 + y²/4 = 1.
@@ -807,8 +1035,16 @@ mod tests {
     fn ellipse_ellipse_four_points_rotated() {
         // Same axis-aligned ellipse, plus a 90°-rotated copy of itself —
         // they intersect at four symmetric points.
-        let a = Ellipse { center: Vec2::ZERO, major: Vec2::new(5.0, 0.0), ratio: 0.4 };
-        let b = Ellipse { center: Vec2::ZERO, major: Vec2::new(0.0, 5.0), ratio: 0.4 };
+        let a = Ellipse {
+            center: Vec2::ZERO,
+            major: Vec2::new(5.0, 0.0),
+            ratio: 0.4,
+        };
+        let b = Ellipse {
+            center: Vec2::ZERO,
+            major: Vec2::new(0.0, 5.0),
+            ratio: 0.4,
+        };
         let pts = intersect_ellipse_ellipse(a, b);
         assert_eq!(pts.len(), 4, "got {} hits", pts.len());
         // Each must lie on both ellipses (implicit value = 1).
@@ -832,11 +1068,26 @@ mod tests {
         // both call this parallel → empty. The relative 1e-9·|d1||d2| = 4e-19
         // threshold finds the intersection. (Fails-before vs BOTH.)
         let l = 1.0e-5;
-        let a = Line { a: Vec2::new(-l, 0.0), b: Vec2::new(l, 0.0) };
-        let b = Line { a: Vec2::new(0.0, -l), b: Vec2::new(0.0, l) };
+        let a = Line {
+            a: Vec2::new(-l, 0.0),
+            b: Vec2::new(l, 0.0),
+        };
+        let b = Line {
+            a: Vec2::new(0.0, -l),
+            b: Vec2::new(0.0, l),
+        };
         let pts = intersect_line_line(a, b);
-        assert_eq!(pts.len(), 1, "short ⟂ segments must intersect, got {}", pts.len());
-        assert!(pts[0].len() < 1e-9, "intersection should be ~origin, got {:?}", pts[0]);
+        assert_eq!(
+            pts.len(),
+            1,
+            "short ⟂ segments must intersect, got {}",
+            pts.len()
+        );
+        assert!(
+            pts[0].len() < 1e-9,
+            "intersection should be ~origin, got {:?}",
+            pts[0]
+        );
     }
 
     #[test]
@@ -845,18 +1096,36 @@ mod tests {
         // handled this (4e-8 > 1e-9), but bdd2319's floored scaled_tol (1e-6)
         // called it parallel → empty. Pins that specific regression.
         let l = 1.0e-4;
-        let a = Line { a: Vec2::new(-l, 0.0), b: Vec2::new(l, 0.0) };
-        let b = Line { a: Vec2::new(0.0, -l), b: Vec2::new(0.0, l) };
-        assert_eq!(intersect_line_line(a, b).len(), 1,
-            "L=1e-4 ⟂ segments must intersect (bdd2319 regression)");
+        let a = Line {
+            a: Vec2::new(-l, 0.0),
+            b: Vec2::new(l, 0.0),
+        };
+        let b = Line {
+            a: Vec2::new(0.0, -l),
+            b: Vec2::new(0.0, l),
+        };
+        assert_eq!(
+            intersect_line_line(a, b).len(),
+            1,
+            "L=1e-4 ⟂ segments must intersect (bdd2319 regression)"
+        );
     }
 
     #[test]
     fn line_line_truly_parallel_still_empty() {
         // Relative threshold must still reject genuinely parallel lines.
-        let a = Line { a: Vec2::new(-1.0e7, 0.0), b: Vec2::new(1.0e7, 0.0) };
-        let b = Line { a: Vec2::new(-1.0e7, 5.0), b: Vec2::new(1.0e7, 5.0) };
-        assert!(intersect_line_line(a, b).is_empty(), "parallel lines must not intersect");
+        let a = Line {
+            a: Vec2::new(-1.0e7, 0.0),
+            b: Vec2::new(1.0e7, 0.0),
+        };
+        let b = Line {
+            a: Vec2::new(-1.0e7, 5.0),
+            b: Vec2::new(1.0e7, 5.0),
+        };
+        assert!(
+            intersect_line_line(a, b).is_empty(),
+            "parallel lines must not intersect"
+        );
     }
 
     // ---- FIX 2 (G7): circle∩ellipse finds all 4 roots at large scale --------
@@ -867,14 +1136,27 @@ mod tests {
         // scale-aware (param-space), so distinct roots are not merged, and the
         // char²-residual accepts them. Count must match unit scale.
         fn hits(s: f64) -> usize {
-            let el = Ellipse { center: Vec2::ZERO, major: Vec2::new(60.0 * s, 0.0), ratio: 0.5 };
-            let c  = Circle { center: Vec2::ZERO, radius: 40.0 * s };
+            let el = Ellipse {
+                center: Vec2::ZERO,
+                major: Vec2::new(60.0 * s, 0.0),
+                ratio: 0.5,
+            };
+            let c = Circle {
+                center: Vec2::ZERO,
+                radius: 40.0 * s,
+            };
             intersect_circle_ellipse(c, el).len()
         }
         let base = hits(1.0);
-        assert!(base >= 4, "sanity: circle∩ellipse should hit 4 at 1× (got {base})");
-        assert_eq!(hits(1e6), base,
-            "hit count must be scale-invariant (1e6×: {} vs {base})", hits(1e6));
+        assert!(
+            base >= 4,
+            "sanity: circle∩ellipse should hit 4 at 1× (got {base})"
+        );
+        assert_eq!(
+            hits(1e6),
+            base,
+            "hit count must be scale-invariant (1e6×: {} vs {base})",
+            hits(1e6)
+        );
     }
 }
-

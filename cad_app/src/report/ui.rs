@@ -42,7 +42,9 @@ pub fn paint_page(
     page: usize,
     tex: &[Option<egui::TextureHandle>],
 ) {
-    let Some(pg) = doc.pages.get(page) else { return };
+    let Some(pg) = doc.pages.get(page) else {
+        return;
+    };
     let k = (rect.width() / doc.width as f32).min(rect.height() / doc.height as f32);
     let pw = doc.width as f32 * k;
     let ph = doc.height as f32 * k;
@@ -50,7 +52,11 @@ pub fn paint_page(
     let paper = egui::Rect::from_min_size(org, egui::vec2(pw, ph));
 
     painter.rect_filled(paper, 2.0, egui::Color32::WHITE);
-    painter.rect_stroke(paper, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(120)));
+    painter.rect_stroke(
+        paper,
+        2.0,
+        egui::Stroke::new(1.0, egui::Color32::from_gray(120)),
+    );
     let clip = painter.with_clip_rect(paper);
 
     let at = |x: f64, y: f64| egui::pos2(org.x + x as f32 * k, org.y + y as f32 * k);
@@ -111,20 +117,42 @@ pub fn paint_page(
                     clip.add(egui::Shape::Mesh(mesh));
                 }
             }
-            Item::Frame { x, y, w, h, rgb, width } => {
+            Item::Frame {
+                x,
+                y,
+                w,
+                h,
+                rgb,
+                width,
+            } => {
                 clip.rect_stroke(
                     egui::Rect::from_min_size(at(*x, *y), egui::vec2(*w as f32 * k, *h as f32 * k)),
                     0.0,
                     egui::Stroke::new((*width as f32 * k).max(0.5), c32(*rgb)),
                 );
             }
-            Item::Line { x1, y1, x2, y2, rgb, width } => {
+            Item::Line {
+                x1,
+                y1,
+                x2,
+                y2,
+                rgb,
+                width,
+            } => {
                 clip.line_segment(
                     [at(*x1, *y1), at(*x2, *y2)],
                     egui::Stroke::new((*width as f32 * k).max(0.4), c32(*rgb)),
                 );
             }
-            Item::Text { x, y, size, font, rgb, align, text } => {
+            Item::Text {
+                x,
+                y,
+                size,
+                font,
+                rgb,
+                align,
+                text,
+            } => {
                 let px = *size as f32 * k;
                 // Below about four pixels a glyph is a smudge that costs a lot to lay out and
                 // says nothing. The page still shows WHERE the text is, via everything around it.
@@ -143,10 +171,8 @@ pub fn paint_page(
                 clip.text(at(*x, *y), anchor, text, fid, c32(*rgb));
             }
             Item::Image { x, y, w, h, idx } => {
-                let r = egui::Rect::from_min_size(
-                    at(*x, *y),
-                    egui::vec2(*w as f32 * k, *h as f32 * k),
-                );
+                let r =
+                    egui::Rect::from_min_size(at(*x, *y), egui::vec2(*w as f32 * k, *h as f32 * k));
                 match tex.get(*idx).and_then(|t| t.as_ref()) {
                     Some(t) => {
                         clip.image(
@@ -158,7 +184,11 @@ pub fn paint_page(
                     }
                     None => {
                         clip.rect_filled(r, 0.0, egui::Color32::from_gray(225));
-                        clip.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_gray(160)));
+                        clip.rect_stroke(
+                            r,
+                            0.0,
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(160)),
+                        );
                     }
                 }
             }
@@ -211,112 +241,119 @@ pub fn window_ui(
                 // ---- left: what goes in it ----
                 ui.vertical(|ui| {
                     ui.set_width(330.0);
-                    egui::ScrollArea::vertical().id_salt("report_opts").show(ui, |ui| {
-                        ui.label(egui::RichText::new("Format").strong());
-                        ui.horizontal(|ui| {
-                            for f in [Format::Pdf, Format::Html] {
-                                if ui.selectable_label(opt.format == f, f.label()).clicked() {
-                                    opt.format = f;
-                                }
-                            }
-                            ui.add_space(10.0);
-                            ui.add_enabled_ui(opt.format == Format::Pdf, |ui| {
-                                for p in [PageSize::A4, PageSize::Letter] {
-                                    if ui.selectable_label(opt.page == p, p.label()).clicked() {
-                                        opt.page = p;
+                    egui::ScrollArea::vertical()
+                        .id_salt("report_opts")
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("Format").strong());
+                            ui.horizontal(|ui| {
+                                for f in [Format::Pdf, Format::Html] {
+                                    if ui.selectable_label(opt.format == f, f.label()).clicked() {
+                                        opt.format = f;
                                     }
                                 }
-                            });
-                        });
-                        if opt.format == Format::Html {
-                            ui.label(
-                                egui::RichText::new(
-                                    "HTML has no pages — the cover, header, footer and page \
-                                     numbers below apply to the PDF.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                        }
-
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new("Cover").strong());
-                        ui.checkbox(&mut opt.cover, "Cover page");
-                        ui.add_enabled_ui(opt.cover, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("Project").small().weak());
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut opt.title)
-                                        .desired_width(220.0)
-                                        .hint_text("project name"),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("Line 2").small().weak());
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut opt.subtitle)
-                                        .desired_width(220.0)
-                                        .hint_text("optional second line"),
-                                );
-                            });
-                            // ITS OWN LIST, AND ITS OWN BUTTON. Reported as "the cover page image
-                            // doesnt have a dedicated add image option. it taken from render, it
-                            // also needs a dedicated add option" — the same complaint the logos
-                            // got. Choosing a cover meant adding the picture as a RENDER first,
-                            // where it then appeared full width on the renders page whether it
-                            // belonged there or not.
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("Image").small().weak());
-                                let cur = opt
-                                    .cover_image
-                                    .and_then(|i| opt.covers.get(i))
-                                    .map(|i| i.caption_or_file())
-                                    .unwrap_or_else(|| "none".to_string());
-                                egui::ComboBox::from_id_salt("cover_img")
-                                    .selected_text(cur)
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut opt.cover_image, None, "none");
-                                        for i in 0..opt.covers.len() {
-                                            let label = opt.covers[i].caption_or_file();
-                                            ui.selectable_value(&mut opt.cover_image, Some(i), label);
+                                ui.add_space(10.0);
+                                ui.add_enabled_ui(opt.format == Format::Pdf, |ui| {
+                                    for p in [PageSize::A4, PageSize::Letter] {
+                                        if ui.selectable_label(opt.page == p, p.label()).clicked() {
+                                            opt.page = p;
                                         }
-                                    });
-                                if ui.small_button("＋ Add…").clicked() {
-                                    act.add_cover = true;
-                                }
-                                if let Some(i) = opt.cover_image {
-                                    if ui.small_button("✕").on_hover_text("Drop it").clicked() {
-                                        act.remove_cover = Some(i);
                                     }
-                                }
+                                });
                             });
-                            if opt.covers.is_empty() {
+                            if opt.format == Format::Html {
                                 ui.label(
                                     egui::RichText::new(
-                                        "No cover image yet — Add… puts one here, not on the \
-                                         renders page.",
+                                        "HTML has no pages — the cover, header, footer and page \
+                                     numbers below apply to the PDF.",
                                     )
                                     .small()
                                     .weak(),
                                 );
                             }
-                        });
 
-                        // THE SAME EDITOR THE SIMLUX WINDOW SHOWS — see `scale_editor_ui`.
-                        scale_editor_ui(ui, opt, room_max, ramp, num_parse);
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Cover").strong());
+                            ui.checkbox(&mut opt.cover, "Cover page");
+                            ui.add_enabled_ui(opt.cover, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Project").small().weak());
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut opt.title)
+                                            .desired_width(220.0)
+                                            .hint_text("project name"),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Line 2").small().weak());
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut opt.subtitle)
+                                            .desired_width(220.0)
+                                            .hint_text("optional second line"),
+                                    );
+                                });
+                                // ITS OWN LIST, AND ITS OWN BUTTON. Reported as "the cover page image
+                                // doesnt have a dedicated add image option. it taken from render, it
+                                // also needs a dedicated add option" — the same complaint the logos
+                                // got. Choosing a cover meant adding the picture as a RENDER first,
+                                // where it then appeared full width on the renders page whether it
+                                // belonged there or not.
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Image").small().weak());
+                                    let cur = opt
+                                        .cover_image
+                                        .and_then(|i| opt.covers.get(i))
+                                        .map(|i| i.caption_or_file())
+                                        .unwrap_or_else(|| "none".to_string());
+                                    egui::ComboBox::from_id_salt("cover_img")
+                                        .selected_text(cur)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut opt.cover_image, None, "none");
+                                            for i in 0..opt.covers.len() {
+                                                let label = opt.covers[i].caption_or_file();
+                                                ui.selectable_value(
+                                                    &mut opt.cover_image,
+                                                    Some(i),
+                                                    label,
+                                                );
+                                            }
+                                        });
+                                    if ui.small_button("＋ Add…").clicked() {
+                                        act.add_cover = true;
+                                    }
+                                    if let Some(i) = opt.cover_image {
+                                        if ui.small_button("✕").on_hover_text("Drop it").clicked()
+                                        {
+                                            act.remove_cover = Some(i);
+                                        }
+                                    }
+                                });
+                                if opt.covers.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "No cover image yet — Add… puts one here, not on the \
+                                         renders page.",
+                                        )
+                                        .small()
+                                        .weak(),
+                                    );
+                                }
+                            });
 
-                        // ---- TEXT SIZE ----------------------------------------------------
-                        //
-                        // Asked for as: *"for the report i want font size controls."* ONE number
-                        // for the whole document: the report has six type sizes and they are a
-                        // hierarchy — cover over chapter over heading over row over note — which is
-                        // what a reader navigates by. Six independent boxes is six chances to end
-                        // up with a heading smaller than its body text.
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new("Text size").strong());
-                        ui.horizontal(|ui| {
-                            let mut pct = opt.text_scale * 100.0;
-                            if ui
+                            // THE SAME EDITOR THE SIMLUX WINDOW SHOWS — see `scale_editor_ui`.
+                            scale_editor_ui(ui, opt, room_max, ramp, num_parse);
+
+                            // ---- TEXT SIZE ----------------------------------------------------
+                            //
+                            // Asked for as: *"for the report i want font size controls."* ONE number
+                            // for the whole document: the report has six type sizes and they are a
+                            // hierarchy — cover over chapter over heading over row over note — which is
+                            // what a reader navigates by. Six independent boxes is six chances to end
+                            // up with a heading smaller than its body text.
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Text size").strong());
+                            ui.horizontal(|ui| {
+                                let mut pct = opt.text_scale * 100.0;
+                                if ui
                                 .add(
                                     egui::DragValue::new(&mut pct)
                                         .update_while_editing(false)
@@ -337,46 +374,46 @@ pub fn window_ui(
                             {
                                 opt.text_scale = pct / 100.0;
                             }
-                            if ui
-                                .small_button("reset")
-                                .on_hover_text("Back to the report as designed")
-                                .clicked()
-                            {
-                                opt.text_scale = 1.0;
-                            }
-                        });
-                        // WHAT THE NUMBER MEANS IN POINTS, because a percentage is not something a
-                        // print shop or a client specification talks in.
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "body {:.1} pt · headings {:.1} pt · notes {:.1} pt",
-                                9.0 * opt.text_scale,
-                                12.0 * opt.text_scale,
-                                8.0 * opt.text_scale,
-                            ))
-                            .small()
-                            .weak(),
-                        );
+                                if ui
+                                    .small_button("reset")
+                                    .on_hover_text("Back to the report as designed")
+                                    .clicked()
+                                {
+                                    opt.text_scale = 1.0;
+                                }
+                            });
+                            // WHAT THE NUMBER MEANS IN POINTS, because a percentage is not something a
+                            // print shop or a client specification talks in.
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "body {:.1} pt · headings {:.1} pt · notes {:.1} pt",
+                                    9.0 * opt.text_scale,
+                                    12.0 * opt.text_scale,
+                                    8.0 * opt.text_scale,
+                                ))
+                                .small()
+                                .weak(),
+                            );
 
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new("Header & footer").strong());
-                        ui.add(
-                            egui::TextEdit::singleline(&mut opt.header)
-                                .desired_width(300.0)
-                                .hint_text("header — practice, project, revision…"),
-                        );
-                        ui.add(
-                            egui::TextEdit::singleline(&mut opt.footer)
-                                .desired_width(300.0)
-                                .hint_text("footer"),
-                        );
-                        ui.checkbox(&mut opt.page_numbers, "Page numbers");
-                        // THE SIZE IS STATED, because a logo is prepared before it is chosen and
-                        // "it came out tiny" is the alternative to saying so. It is a BOX: the
-                        // image keeps its proportions inside it, so a tall logo is 24 pt high and
-                        // narrow rather than squashed.
-                        ui.label(
-                            egui::RichText::new(format!(
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Header & footer").strong());
+                            ui.add(
+                                egui::TextEdit::singleline(&mut opt.header)
+                                    .desired_width(300.0)
+                                    .hint_text("header — practice, project, revision…"),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut opt.footer)
+                                    .desired_width(300.0)
+                                    .hint_text("footer"),
+                            );
+                            ui.checkbox(&mut opt.page_numbers, "Page numbers");
+                            // THE SIZE IS STATED, because a logo is prepared before it is chosen and
+                            // "it came out tiny" is the alternative to saying so. It is a BOX: the
+                            // image keeps its proportions inside it, so a tall logo is 24 pt high and
+                            // narrow rather than squashed.
+                            ui.label(
+                                egui::RichText::new(format!(
                                 "Logos fit a {:.0} × {:.0} pt box ({:.0} × {:.0} mm, about {} × {} \
                                  px at 150 dpi). Wider or taller is scaled down, never stretched.",
                                 crate::report::layout::LOGO_W,
@@ -386,142 +423,148 @@ pub fn window_ui(
                                 (crate::report::layout::LOGO_W * 150.0 / 72.0) as i32,
                                 (crate::report::layout::LOGO_H * 150.0 / 72.0) as i32,
                             ))
-                            .small()
-                            .weak(),
-                        );
-                        for (label, slot) in [("Header logo", 0usize), ("Footer logo", 1usize)] {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(label).small().weak());
-                                let cur = if slot == 0 { opt.header_image } else { opt.footer_image };
-                                let text = cur
-                                    .and_then(|i| opt.logos.get(i))
-                                    .map(|i| i.caption_or_file())
-                                    .unwrap_or_else(|| "none".to_string());
-                                let mut pick = cur;
-                                egui::ComboBox::from_id_salt(("logo", slot))
-                                    .selected_text(text)
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut pick, None, "none");
-                                        for i in 0..opt.logos.len() {
-                                            let l = opt.logos[i].caption_or_file();
-                                            ui.selectable_value(&mut pick, Some(i), l);
-                                        }
-                                    });
-                                if slot == 0 {
-                                    opt.header_image = pick;
-                                } else {
-                                    opt.footer_image = pick;
-                                }
-                            });
-                        }
-                        // THE LOGOS ARE THEIR OWN LIST. They used to share the renders list, so a
-                        // header logo had to be added as a render first — where it then appeared,
-                        // full width, on the renders page.
-                        ui.horizontal(|ui| {
-                            if ui.button("＋ Add logo…").clicked() {
-                                act.add_logos = true;
-                            }
-                            if opt.logos.is_empty() {
-                                ui.label(
-                                    egui::RichText::new("no logos loaded").small().weak(),
-                                );
-                            }
-                        });
-                        for i in 0..opt.logos.len() {
-                            ui.horizontal(|ui| {
-                                if ui.small_button("✕").clicked() {
-                                    act.remove_logo = Some(i);
-                                }
-                                let hint = short(&opt.logos[i].path);
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut opt.logos[i].caption)
-                                        .desired_width(180.0)
-                                        .hint_text(hint),
-                                );
-                            });
-                        }
-
-
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Sections").strong());
-                            ui.label(
-                                egui::RichText::new("— tick to include, ▲▼ to reorder")
-                                    .small()
-                                    .weak(),
+                                .small()
+                                .weak(),
                             );
-                        });
-                        // Listed in the DOCUMENT's order, with the off ones after, so the list
-                        // reads as the report reads.
-                        let mut order: Vec<Section> = opt.sections.clone();
-                        for s in Section::all() {
-                            if !order.contains(&s) {
-                                order.push(s);
+                            for (label, slot) in [("Header logo", 0usize), ("Footer logo", 1usize)]
+                            {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(label).small().weak());
+                                    let cur = if slot == 0 {
+                                        opt.header_image
+                                    } else {
+                                        opt.footer_image
+                                    };
+                                    let text = cur
+                                        .and_then(|i| opt.logos.get(i))
+                                        .map(|i| i.caption_or_file())
+                                        .unwrap_or_else(|| "none".to_string());
+                                    let mut pick = cur;
+                                    egui::ComboBox::from_id_salt(("logo", slot))
+                                        .selected_text(text)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut pick, None, "none");
+                                            for i in 0..opt.logos.len() {
+                                                let l = opt.logos[i].caption_or_file();
+                                                ui.selectable_value(&mut pick, Some(i), l);
+                                            }
+                                        });
+                                    if slot == 0 {
+                                        opt.header_image = pick;
+                                    } else {
+                                        opt.footer_image = pick;
+                                    }
+                                });
                             }
-                        }
-                        let mut mv: Option<(Section, i32)> = None;
-                        for s in order {
+                            // THE LOGOS ARE THEIR OWN LIST. They used to share the renders list, so a
+                            // header logo had to be added as a render first — where it then appeared,
+                            // full width, on the renders page.
                             ui.horizontal(|ui| {
-                                let mut on = opt.has(s);
-                                if ui.checkbox(&mut on, s.label()).changed() {
-                                    opt.set(s, on);
+                                if ui.button("＋ Add logo…").clicked() {
+                                    act.add_logos = true;
                                 }
+                                if opt.logos.is_empty() {
+                                    ui.label(egui::RichText::new("no logos loaded").small().weak());
+                                }
+                            });
+                            for i in 0..opt.logos.len() {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("✕").clicked() {
+                                        act.remove_logo = Some(i);
+                                    }
+                                    let hint = short(&opt.logos[i].path);
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut opt.logos[i].caption)
+                                            .desired_width(180.0)
+                                            .hint_text(hint),
+                                    );
+                                });
+                            }
+
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Sections").strong());
+                                ui.label(
+                                    egui::RichText::new("— tick to include, ▲▼ to reorder")
+                                        .small()
+                                        .weak(),
+                                );
+                            });
+                            // Listed in the DOCUMENT's order, with the off ones after, so the list
+                            // reads as the report reads.
+                            let mut order: Vec<Section> = opt.sections.clone();
+                            for s in Section::all() {
+                                if !order.contains(&s) {
+                                    order.push(s);
+                                }
+                            }
+                            let mut mv: Option<(Section, i32)> = None;
+                            for s in order {
+                                ui.horizontal(|ui| {
+                                    let mut on = opt.has(s);
+                                    if ui.checkbox(&mut on, s.label()).changed() {
+                                        opt.set(s, on);
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.add_enabled_ui(opt.has(s), |ui| {
+                                                if ui.small_button("▼").clicked() {
+                                                    mv = Some((s, 1));
+                                                }
+                                                if ui.small_button("▲").clicked() {
+                                                    mv = Some((s, -1));
+                                                }
+                                            });
+                                        },
+                                    );
+                                });
+                            }
+                            if let Some((s, d)) = mv {
+                                opt.move_section(s, d);
+                            }
+
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Renders").strong());
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        ui.add_enabled_ui(opt.has(s), |ui| {
-                                            if ui.small_button("▼").clicked() {
-                                                mv = Some((s, 1));
-                                            }
-                                            if ui.small_button("▲").clicked() {
-                                                mv = Some((s, -1));
-                                            }
-                                        });
-                                    },
-                                );
-                            });
-                        }
-                        if let Some((s, d)) = mv {
-                            opt.move_section(s, d);
-                        }
-
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Renders").strong());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("＋ Add…").clicked() {
-                                    act.add_images = true;
-                                }
-                                if can_capture && ui.button("Capture").on_hover_text(
+                                        if ui.button("＋ Add…").clicked() {
+                                            act.add_images = true;
+                                        }
+                                        if can_capture && ui.button("Capture").on_hover_text(
                                     "Take the current path-traced render as a report image",
                                 ).clicked() {
                                     act.capture_render = true;
                                 }
-                            });
-                        });
-                        if opt.images.is_empty() {
-                            ui.label(
-                                egui::RichText::new("No images. Add PNG/JPG renders to fill the \
-                                                     Renders page.")
-                                    .small()
-                                    .weak(),
-                            );
-                        }
-                        for i in 0..opt.images.len() {
-                            ui.horizontal(|ui| {
-                                if ui.small_button("✕").clicked() {
-                                    act.remove_image = Some(i);
-                                }
-                                let hint = short(&opt.images[i].path);
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut opt.images[i].caption)
-                                        .desired_width(200.0)
-                                        .hint_text(hint),
+                                    },
                                 );
                             });
-                        }
-
-                    });
+                            if opt.images.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "No images. Add PNG/JPG renders to fill the \
+                                                     Renders page.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                            for i in 0..opt.images.len() {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("✕").clicked() {
+                                        act.remove_image = Some(i);
+                                    }
+                                    let hint = short(&opt.images[i].path);
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut opt.images[i].caption)
+                                            .desired_width(200.0)
+                                            .hint_text(hint),
+                                    );
+                                });
+                            }
+                        });
                 });
 
                 ui.separator();
@@ -543,7 +586,9 @@ pub fn window_ui(
                         }
                         if opt.format == Format::Html {
                             ui.label(
-                                egui::RichText::new("(the PDF layout — HTML flows)").small().weak(),
+                                egui::RichText::new("(the PDF layout — HTML flows)")
+                                    .small()
+                                    .weak(),
                             );
                         }
                     });
@@ -574,7 +619,11 @@ pub fn window_ui(
                     // should have anyway — a page letterboxed inside a box shaped by leftover space
                     // shows a band of nothing that reads as part of the document — and the SCREEN,
                     // which decides how much of it a preview may reasonably take.
-                    let aspect = if doc.width > 0.0 { doc.height / doc.width } else { 1.414 };
+                    let aspect = if doc.width > 0.0 {
+                        doc.height / doc.width
+                    } else {
+                        1.414
+                    };
                     let screen = ui.ctx().screen_rect().size();
                     // Height first, because a page is taller than it is wide and height is the
                     // scarcer dimension; then the width that height implies, pulled back if it
@@ -589,8 +638,8 @@ pub fn window_ui(
                     // certain to happen eventually; this makes it impossible however tall the
                     // preview would otherwise want to be.
                     const BELOW: f64 = 190.0;
-                    let ph =
-                        ((screen.y as f64 * 0.72).min(screen.y as f64 - BELOW)).clamp(220.0, 1100.0);
+                    let ph = ((screen.y as f64 * 0.72).min(screen.y as f64 - BELOW))
+                        .clamp(220.0, 1100.0);
                     let pw = (ph / aspect).min(screen.x as f64 * 0.42).max(180.0);
                     let (resp, painter) = ui.allocate_painter(
                         egui::vec2(pw as f32, (pw * aspect) as f32),
@@ -622,7 +671,6 @@ pub fn window_ui(
                         );
                     });
                     ui.horizontal(|ui| {
-
                         let ready = !opt.out_dir.trim().is_empty();
                         ui.add_enabled_ui(ready, |ui| {
                             if ui
@@ -683,7 +731,11 @@ mod tests {
         };
         assert_eq!(im.caption_or_file(), "from the door.png");
         im.caption = "  Entrance  ".into();
-        assert_eq!(im.caption_or_file(), "Entrance", "the caption wins, trimmed");
+        assert_eq!(
+            im.caption_or_file(),
+            "Entrance",
+            "the caption wins, trimmed"
+        );
     }
 }
 
@@ -718,7 +770,8 @@ pub(crate) fn ear_clip(pts: &[egui::Pos2]) -> Vec<[egui::Pos2; 3]> {
     // the room outline itself, which is the band-zero fill under the entire plot.
     let mut v: Vec<egui::Pos2> = Vec::with_capacity(pts.len());
     for p in pts {
-        if v.last().is_none_or(|q: &egui::Pos2| (q.x - p.x).abs() > 1e-6 || (q.y - p.y).abs() > 1e-6)
+        if v.last()
+            .is_none_or(|q: &egui::Pos2| (q.x - p.x).abs() > 1e-6 || (q.y - p.y).abs() > 1e-6)
         {
             v.push(*p);
         }
@@ -760,10 +813,12 @@ pub(crate) fn ear_clip(pts: &[egui::Pos2]) -> Vec<[egui::Pos2; 3]> {
             // handed are rectilinear run-merges, which are full of collinear points. When no ear
             // can be found anywhere the loop gives up and emits a PARTIAL fill. Measured on the
             // reference report: one ring in 1,879 hit it and lost two of its three triangles.
-            let inside = (0..n).filter(|k| ![(i + n - 1) % n, i, (i + 1) % n].contains(k)).any(|k| {
-                let p = v[k];
-                area2(a, b, p) > 0.0 && area2(b, c, p) > 0.0 && area2(c, a, p) > 0.0
-            });
+            let inside = (0..n)
+                .filter(|k| ![(i + n - 1) % n, i, (i + 1) % n].contains(k))
+                .any(|k| {
+                    let p = v[k];
+                    area2(a, b, p) > 0.0 && area2(b, c, p) > 0.0 && area2(c, a, p) > 0.0
+                });
             if inside {
                 continue;
             }
@@ -803,161 +858,165 @@ pub fn scale_editor_ui(
     ramp: fn(f32) -> (f32, f32, f32),
     num_parse: &dyn Fn(&str) -> Option<f64>,
 ) {
-ui.label(egui::RichText::new("False-colour scale").strong());
-ui.horizontal(|ui| {
-    let mut pinned = opt.scale.top.is_some();
-    if ui.checkbox(&mut pinned, "Pin top").changed() {
-        // Pinning starts from whatever the room reached, so the first
-        // click changes nothing and the number can be edited from there.
-        opt.scale.top = if pinned { Some(room_max.max(1.0)) } else { None };
-    }
-    if let Some(t) = opt.scale.top.as_mut() {
-        ui.add(
-            egui::DragValue::new(t)
-                .speed(10.0)
-                .range(1.0..=100_000.0)
-                .suffix(" lx")
-                .custom_parser(|s| num_parse(s)),
-        );
-    } else {
-        ui.label(
-            egui::RichText::new(format!("auto — {room_max:.0} lx"))
+    ui.label(egui::RichText::new("False-colour scale").strong());
+    ui.horizontal(|ui| {
+        let mut pinned = opt.scale.top.is_some();
+        if ui.checkbox(&mut pinned, "Pin top").changed() {
+            // Pinning starts from whatever the room reached, so the first
+            // click changes nothing and the number can be edited from there.
+            opt.scale.top = if pinned {
+                Some(room_max.max(1.0))
+            } else {
+                None
+            };
+        }
+        if let Some(t) = opt.scale.top.as_mut() {
+            ui.add(
+                egui::DragValue::new(t)
+                    .speed(10.0)
+                    .range(1.0..=100_000.0)
+                    .suffix(" lx")
+                    .custom_parser(|s| num_parse(s)),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(format!("auto — {room_max:.0} lx"))
+                    .small()
+                    .weak(),
+            );
+        }
+    });
+    ui.horizontal(|ui| {
+        let mut banded = !opt.scale.bands.is_empty();
+        if ui
+            .checkbox(&mut banded, "Bands")
+            .on_hover_text(
+                "Discrete steps rather than a gradient — which parts of the \
+             room meet which requirement",
+            )
+            .changed()
+        {
+            opt.scale.bands = if banded {
+                vec![25.0, 100.0, 300.0, 500.0]
+            } else {
+                Vec::new()
+            };
+        }
+        if !opt.scale.bands.is_empty() && ui.small_button("＋").clicked() {
+            let last = opt.scale.bands.last().copied().unwrap_or(0.0);
+            opt.scale.bands.push(last * 2.0 + 1.0);
+        }
+    });
+    // A COLOUR PER BAND, from a wheel, kept with the settings.
+    //
+    // Asked for as "in the band add a band color picker … so this color band
+    // will come for all future report generation."
+    //
+    // The list is filled from the PALETTE the first time it is touched, not
+    // left blank: a swatch that does not show the colour the report will
+    // actually use is a picker that lies, and the first thing anybody does is
+    // compare it against the plot beside it.
+    //
+    // NOTHING IS WRITTEN UNTIL SOMEBODY PICKS A COLOUR. The obvious
+    // implementation fills the list from the palette as soon as the dialog
+    // opens, so the swatches have something to point at — and then merely
+    // LOOKING at the dialog has silently made every band an explicit choice,
+    // saved it to the settings, and cut the report off from the palette for
+    // ever. Changing the app's colour scheme afterwards would do nothing and
+    // nothing would say why.
+    //
+    // So each swatch shows the colour the report will actually use, edits a
+    // COPY, and only writes back when it changed.
+    let top = opt.scale.top_lx(room_max);
+    let edges = opt.scale.edges(room_max);
+    let n_bands = edges.len().saturating_sub(1);
+    let shown = |opt: &Options, k: usize| -> [u8; 3] {
+        if let Some(c) = opt.band_colours.get(k) {
+            return *c;
+        }
+        let mid = match edges.get(k..k + 2) {
+            Some(p) => (p[0] + p[1]) * 0.5,
+            None => top,
+        };
+        let (r, g, b) = ramp((mid / top).clamp(0.0, 1.0) as f32);
+        [
+            (r * 255.0).round() as u8,
+            (g * 255.0).round() as u8,
+            (b * 255.0).round() as u8,
+        ]
+    };
+    // Writing one band's colour has to make the others explicit too, or the
+    // list would be short and every band past the end would silently fall back
+    // to the palette — which is not what "I chose this one" means.
+    let mut set_band: Option<(usize, [u8; 3])> = None;
+    if !opt.scale.bands.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Band colours").small().weak());
+            if ui
+                .small_button("reset")
+                .on_hover_text("Back to the palette")
+                .clicked()
+            {
+                opt.band_colours.clear();
+            }
+        });
+        // Band 0 has no threshold row of its own — it is everything BELOW the
+        // first step — so it gets a row here, or it could never be recoloured.
+        ui.horizontal(|ui| {
+            let mut c = shown(opt, 0);
+            if ui.color_edit_button_srgb(&mut c).changed() {
+                set_band = Some((0, c));
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "0 – {:.0} lx",
+                    opt.scale.bands.first().copied().unwrap_or(top),
+                ))
                 .small()
                 .weak(),
-        );
+            );
+        });
     }
-});
-ui.horizontal(|ui| {
-    let mut banded = !opt.scale.bands.is_empty();
-    if ui
-        .checkbox(&mut banded, "Bands")
-        .on_hover_text(
-            "Discrete steps rather than a gradient — which parts of the \
-             room meet which requirement",
-        )
-        .changed()
-    {
-        opt.scale.bands =
-            if banded { vec![25.0, 100.0, 300.0, 500.0] } else { Vec::new() };
+    let mut drop_band: Option<usize> = None;
+    for i in 0..opt.scale.bands.len() {
+        ui.horizontal(|ui| {
+            if ui.small_button("✕").clicked() {
+                drop_band = Some(i);
+            }
+            // The band STARTING at this threshold, so the swatch sits beside
+            // the number that is its floor.
+            let mut c = shown(opt, i + 1);
+            if ui.color_edit_button_srgb(&mut c).changed() {
+                set_band = Some((i + 1, c));
+            }
+            ui.add(
+                egui::DragValue::new(&mut opt.scale.bands[i])
+                    .speed(5.0)
+                    .range(1.0..=100_000.0)
+                    .suffix(" lx")
+                    .custom_parser(|s| num_parse(s)),
+            );
+        });
     }
-    if !opt.scale.bands.is_empty() && ui.small_button("＋").clicked() {
-        let last = opt.scale.bands.last().copied().unwrap_or(0.0);
-        opt.scale.bands.push(last * 2.0 + 1.0);
+    if let Some((k, c)) = set_band {
+        let mut all: Vec<[u8; 3]> = (0..n_bands.max(k + 1)).map(|j| shown(opt, j)).collect();
+        all[k] = c;
+        opt.band_colours = all;
     }
-});
-// A COLOUR PER BAND, from a wheel, kept with the settings.
-//
-// Asked for as "in the band add a band color picker … so this color band
-// will come for all future report generation."
-//
-// The list is filled from the PALETTE the first time it is touched, not
-// left blank: a swatch that does not show the colour the report will
-// actually use is a picker that lies, and the first thing anybody does is
-// compare it against the plot beside it.
-//
-// NOTHING IS WRITTEN UNTIL SOMEBODY PICKS A COLOUR. The obvious
-// implementation fills the list from the palette as soon as the dialog
-// opens, so the swatches have something to point at — and then merely
-// LOOKING at the dialog has silently made every band an explicit choice,
-// saved it to the settings, and cut the report off from the palette for
-// ever. Changing the app's colour scheme afterwards would do nothing and
-// nothing would say why.
-//
-// So each swatch shows the colour the report will actually use, edits a
-// COPY, and only writes back when it changed.
-let top = opt.scale.top_lx(room_max);
-let edges = opt.scale.edges(room_max);
-let n_bands = edges.len().saturating_sub(1);
-let shown = |opt: &Options, k: usize| -> [u8; 3] {
-    if let Some(c) = opt.band_colours.get(k) {
-        return *c;
-    }
-    let mid = match edges.get(k..k + 2) {
-        Some(p) => (p[0] + p[1]) * 0.5,
-        None => top,
-    };
-    let (r, g, b) = ramp((mid / top).clamp(0.0, 1.0) as f32);
-    [
-        (r * 255.0).round() as u8,
-        (g * 255.0).round() as u8,
-        (b * 255.0).round() as u8,
-    ]
-};
-// Writing one band's colour has to make the others explicit too, or the
-// list would be short and every band past the end would silently fall back
-// to the palette — which is not what "I chose this one" means.
-let mut set_band: Option<(usize, [u8; 3])> = None;
-if !opt.scale.bands.is_empty() {
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Band colours").small().weak());
-        if ui
-            .small_button("reset")
-            .on_hover_text("Back to the palette")
-            .clicked()
-        {
-            opt.band_colours.clear();
+    if let Some(i) = drop_band {
+        opt.scale.bands.remove(i);
+        // The colour of the band that has just lost its floor goes with it, or
+        // every colour above the gap would shift down by one.
+        if i + 1 < opt.band_colours.len() {
+            opt.band_colours.remove(i + 1);
         }
-    });
-    // Band 0 has no threshold row of its own — it is everything BELOW the
-    // first step — so it gets a row here, or it could never be recoloured.
-    ui.horizontal(|ui| {
-        let mut c = shown(opt, 0);
-        if ui.color_edit_button_srgb(&mut c).changed() {
-            set_band = Some((0, c));
-        }
-        ui.label(
-            egui::RichText::new(format!(
-                "0 – {:.0} lx",
-                opt.scale.bands.first().copied().unwrap_or(top),
-            ))
-            .small()
-            .weak(),
-        );
-    });
-}
-let mut drop_band: Option<usize> = None;
-for i in 0..opt.scale.bands.len() {
-    ui.horizontal(|ui| {
-        if ui.small_button("✕").clicked() {
-            drop_band = Some(i);
-        }
-        // The band STARTING at this threshold, so the swatch sits beside
-        // the number that is its floor.
-        let mut c = shown(opt, i + 1);
-        if ui.color_edit_button_srgb(&mut c).changed() {
-            set_band = Some((i + 1, c));
-        }
-        ui.add(
-            egui::DragValue::new(&mut opt.scale.bands[i])
-                .speed(5.0)
-                .range(1.0..=100_000.0)
-                .suffix(" lx")
-                .custom_parser(|s| num_parse(s)),
-        );
-    });
-}
-if let Some((k, c)) = set_band {
-    let mut all: Vec<[u8; 3]> =
-        (0..n_bands.max(k + 1)).map(|j| shown(opt, j)).collect();
-    all[k] = c;
-    opt.band_colours = all;
-}
-if let Some(i) = drop_band {
-    opt.scale.bands.remove(i);
-    // The colour of the band that has just lost its floor goes with it, or
-    // every colour above the gap would shift down by one.
-    if i + 1 < opt.band_colours.len() {
-        opt.band_colours.remove(i + 1);
     }
+    // Out of order the bands would draw as overlapping blocks with their
+    // labels crossing, so they are kept sorted rather than validated later.
+    opt.scale
+        .bands
+        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 }
-// Out of order the bands would draw as overlapping blocks with their
-// labels crossing, so they are kept sorted rather than validated later.
-opt.scale
-    .bands
-    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-}
-
 
 /// THE PREVIEW IS THE DOCUMENT — including where its edges are.
 ///
@@ -974,7 +1033,7 @@ mod the_preview_does_not_show_its_own_seams {
     fn run_merged_ring() -> Vec<egui::Pos2> {
         vec![
             egui::pos2(0.0, 0.0),
-            egui::pos2(10.0, 0.0),  // collinear with the next
+            egui::pos2(10.0, 0.0), // collinear with the next
             egui::pos2(20.0, 0.0),
             egui::pos2(20.0, 10.0),
             egui::pos2(10.0, 10.0), // and here
@@ -1000,7 +1059,8 @@ mod the_preview_does_not_show_its_own_seams {
         let area: f32 = tris
             .iter()
             .map(|t| {
-                ((t[1].x - t[0].x) * (t[2].y - t[0].y) - (t[2].x - t[0].x) * (t[1].y - t[0].y)).abs()
+                ((t[1].x - t[0].x) * (t[2].y - t[0].y) - (t[2].x - t[0].x) * (t[1].y - t[0].y))
+                    .abs()
                     * 0.5
             })
             .sum();
@@ -1024,16 +1084,24 @@ mod the_preview_does_not_show_its_own_seams {
             egui::pos2(0.0, 15.0),
         ];
         let tris = ear_clip(&ring);
-        assert_eq!(tris.len(), ring.len() - 2, "the L came out incompletely triangulated");
+        assert_eq!(
+            tris.len(),
+            ring.len() - 2,
+            "the L came out incompletely triangulated"
+        );
         let area: f32 = tris
             .iter()
             .map(|t| {
-                ((t[1].x - t[0].x) * (t[2].y - t[0].y) - (t[2].x - t[0].x) * (t[1].y - t[0].y)).abs()
+                ((t[1].x - t[0].x) * (t[2].y - t[0].y) - (t[2].x - t[0].x) * (t[1].y - t[0].y))
+                    .abs()
                     * 0.5
             })
             .sum();
         // 20 x 5 plus 5 x 10.
-        assert!((area - 150.0).abs() < 1e-3, "the L's triangles cover {area:.2} of 150.00");
+        assert!(
+            (area - 150.0).abs() < 1e-3,
+            "the L's triangles cover {area:.2} of 150.00"
+        );
     }
 
     /// ONE RING BECOMES ONE SHAPE. This is what removes the seams: triangles inside a single
@@ -1051,7 +1119,10 @@ mod the_preview_does_not_show_its_own_seams {
             images: Vec::new(),
             pages: vec![super::super::pdf::Page {
                 items: vec![Item::Poly {
-                    rings: vec![ring.iter().map(|p| (p.x as f64 + 20.0, p.y as f64 + 20.0)).collect()],
+                    rings: vec![ring
+                        .iter()
+                        .map(|p| (p.x as f64 + 20.0, p.y as f64 + 20.0))
+                        .collect()],
                     fill: [10, 20, 30],
                 }],
             }],
@@ -1079,7 +1150,10 @@ mod the_preview_does_not_show_its_own_seams {
             .iter()
             .filter(|cp| matches!(cp.shape, egui::epaint::Shape::Path(_)))
             .count();
-        assert_eq!(meshes, 1, "the ring was painted as {meshes} meshes, expected exactly one");
+        assert_eq!(
+            meshes, 1,
+            "the ring was painted as {meshes} meshes, expected exactly one"
+        );
         assert_eq!(
             polys, 0,
             "{polys} path shapes were emitted — a shape per triangle is what feathers every \
@@ -1109,7 +1183,8 @@ mod a_closed_ring_is_triangulated_completely {
     fn area_of(tris: &[[egui::Pos2; 3]]) -> f32 {
         tris.iter()
             .map(|t| {
-                ((t[1].x - t[0].x) * (t[2].y - t[0].y) - (t[2].x - t[0].x) * (t[1].y - t[0].y)).abs()
+                ((t[1].x - t[0].x) * (t[2].y - t[0].y) - (t[2].x - t[0].x) * (t[1].y - t[0].y))
+                    .abs()
                     * 0.5
             })
             .sum()
@@ -1149,7 +1224,15 @@ mod a_closed_ring_is_triangulated_completely {
             egui::pos2(0.0, 10.0),
         ];
         let tris = ear_clip(&ring);
-        assert_eq!(tris.len(), 2, "an open rectangle should still be two triangles");
-        assert!((area_of(&tris) - 200.0).abs() < 1e-3, "covers {:.2} of 200.00", area_of(&tris));
+        assert_eq!(
+            tris.len(),
+            2,
+            "an open rectangle should still be two triangles"
+        );
+        assert!(
+            (area_of(&tris) - 200.0).abs() < 1e-3,
+            "covers {:.2} of 200.00",
+            area_of(&tris)
+        );
     }
 }

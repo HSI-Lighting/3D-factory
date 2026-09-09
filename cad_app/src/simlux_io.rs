@@ -339,7 +339,9 @@ pub struct ProcRec {
     pub bump: f32,
 }
 
-fn one() -> f32 { 1.0 }
+fn one() -> f32 {
+    1.0
+}
 
 fn half2() -> [f32; 2] {
     [0.5, 0.5]
@@ -737,7 +739,11 @@ mod a_failed_replace_keeps_the_data {
 
         replace_file(&tmp, &dest).expect("an unlocked destination must be replaceable");
 
-        assert_eq!(std::fs::read(&dest).unwrap(), b"new work", "the new bytes are in place");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"new work",
+            "the new bytes are in place"
+        );
         assert!(!tmp.exists(), "and the temp is consumed");
     }
 

@@ -42,8 +42,20 @@ fn wall_model(n: usize) -> (Model, f32) {
     m.push(
         BoolOp::Union,
         Plane::default(),
-        Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
-        Primitive::Extrusion { profile, h: 3.0, w, d },
+        Placement {
+            u: centre.x,
+            v: centre.y,
+            lift: 0.0,
+            spin_deg: 0.0,
+            pitch_deg: 0.0,
+            roll_deg: 0.0,
+        },
+        Primitive::Extrusion {
+            profile,
+            h: 3.0,
+            w,
+            d,
+        },
     );
     (m, 12.0)
 }
@@ -55,10 +67,18 @@ fn add_window(m: &mut Model, radius: f32, t: f32) {
         BoolOp::Difference,
         Plane::default(),
         Placement {
-            u: radius * c, v: radius * s, lift: 1.0,
-            spin_deg: s.atan2(c).to_degrees(), pitch_deg: 0.0, roll_deg: 0.0,
+            u: radius * c,
+            v: radius * s,
+            lift: 1.0,
+            spin_deg: s.atan2(c).to_degrees(),
+            pitch_deg: 0.0,
+            roll_deg: 0.0,
         },
-        Primitive::Box { w: 1.2, d: 1.0, h: 1.4 },
+        Primitive::Box {
+            w: 1.2,
+            d: 1.0,
+            h: 1.4,
+        },
     );
 }
 
@@ -78,9 +98,16 @@ fn report(label: &str, m: &Model) {
 fn what_a_boolean_costs() {
     println!(
         "\nmesh-bbopt: {}\n",
-        if cfg!(feature = "bbopt") { "ON (measured)" } else { "OFF" },
+        if cfg!(feature = "bbopt") {
+            "ON (measured)"
+        } else {
+            "OFF"
+        },
     );
-    println!("{:<44} {:>12}   {:>8}   {:>4}", "case", "eval", "tris", "feat");
+    println!(
+        "{:<44} {:>12}   {:>8}   {:>4}",
+        "case", "eval", "tris", "feat"
+    );
     println!("{}", "-".repeat(78));
 
     // THE SHAPE THE PLAN NAMES: one small cutter against a large wall. The wall's polygon count
@@ -130,7 +157,10 @@ fn the_bounding_box_optimisation_does_not_change_the_solid() {
         assert!(
             (cmn[k] - pmn[k]).abs() < 1e-3 && (cmx[k] - pmx[k]).abs() < 1e-3,
             "axis {k}: the cut changed the wall's extents, {:?}..{:?} -> {:?}..{:?}",
-            pmn, pmx, cmn, cmx,
+            pmn,
+            pmx,
+            cmn,
+            cmx,
         );
     }
 
@@ -140,22 +170,36 @@ fn the_bounding_box_optimisation_does_not_change_the_solid() {
     let dir = glam::Vec3::new(-(0.4_f32).cos(), -(0.4_f32).sin(), 0.0);
     let at = glam::Vec3::new(20.0 * (0.4_f32).cos(), 20.0 * (0.4_f32).sin(), 1.7);
     let crossings = |mesh: &cad_solid::SolidMesh| {
-        mesh.positions.chunks_exact(3).filter(|c| {
-            cad_solid::ray_triangle(
-                at, dir,
-                glam::Vec3::from(c[0]), glam::Vec3::from(c[1]), glam::Vec3::from(c[2]),
-            ).is_some()
-        }).count()
+        mesh.positions
+            .chunks_exact(3)
+            .filter(|c| {
+                cad_solid::ray_triangle(
+                    at,
+                    dir,
+                    glam::Vec3::from(c[0]),
+                    glam::Vec3::from(c[1]),
+                    glam::Vec3::from(c[2]),
+                )
+                .is_some()
+            })
+            .count()
     };
     let (before, after) = (crossings(&plain), crossings(&cut));
-    assert!(before > 0, "the probe ray must hit the uncut wall, or it proves nothing");
-    assert_ne!(after, before, "the window cut left the wall unchanged along the probe");
+    assert!(
+        before > 0,
+        "the probe ray must hit the uncut wall, or it proves nothing"
+    );
+    assert_ne!(
+        after, before,
+        "the window cut left the wall unchanged along the probe"
+    );
 
     // 3. AND THE SOLID IS STILL CLOSED. Every triangle count is a multiple of one triangle;
     //    what matters is that the cut produced MORE surface, not less — a hole adds reveals.
     assert!(
         cut.tri_count() > plain.tri_count(),
         "cutting a window removed surface instead of adding reveals: {} -> {}",
-        plain.tri_count(), cut.tri_count(),
+        plain.tri_count(),
+        cut.tri_count(),
     );
 }

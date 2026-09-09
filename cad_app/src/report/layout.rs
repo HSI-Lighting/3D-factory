@@ -131,7 +131,11 @@ impl<'a> RoomInput<'a> {
     /// while the summary two rows above says 108 lx. That is the same defect the buried-cell fix
     /// removed from the headline figures, reappearing one section lower down.
     pub fn reported_mask(&self) -> &'a [bool] {
-        if self.grid_en.is_some() { self.mask_en } else { self.mask }
+        if self.grid_en.is_some() {
+            self.mask_en
+        } else {
+            self.mask
+        }
     }
 }
 
@@ -230,7 +234,12 @@ impl<'a> Input<'a> {
         h.u64(apertures.len() as u64);
         let mut ext = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
         for s in walls.iter().flatten() {
-            ext = (ext.0.min(s.x), ext.1.min(s.y), ext.2.max(s.x), ext.3.max(s.y));
+            ext = (
+                ext.0.min(s.x),
+                ext.1.min(s.y),
+                ext.2.max(s.x),
+                ext.3.max(s.y),
+            );
         }
         if !walls.is_empty() {
             h.f32(ext.0);
@@ -409,7 +418,11 @@ fn scale_note(k: f64) -> String {
     const SERIES: [f64; 14] = [
         1.0, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 250.0, 500.0, 1000.0, 2000.0, 5000.0,
     ];
-    let pick = SERIES.iter().copied().find(|s| *s >= denom).unwrap_or(10_000.0);
+    let pick = SERIES
+        .iter()
+        .copied()
+        .find(|s| *s >= denom)
+        .unwrap_or(10_000.0);
     format!("1:{pick:.0}")
 }
 
@@ -475,9 +488,23 @@ impl Cursor {
     /// ONE KIND OF TEXT IS EXEMPT, through [`push_unscaled`](Self::push_unscaled).
     fn push(&mut self, it: Item) {
         let it = match it {
-            Item::Text { x, y, size, font, rgb, align, text } => {
-                Item::Text { x, y, size: size * self.text_scale, font, rgb, align, text }
-            }
+            Item::Text {
+                x,
+                y,
+                size,
+                font,
+                rgb,
+                align,
+                text,
+            } => Item::Text {
+                x,
+                y,
+                size: size * self.text_scale,
+                font,
+                rgb,
+                align,
+                text,
+            },
             other => other,
         };
         self.page.items.push(it);
@@ -509,7 +536,15 @@ impl Cursor {
     }
 
     fn text(&mut self, x: f64, size: f64, font: Font, align: Align, rgb: [u8; 3], s: &str) {
-        self.push(Item::Text { x, y: self.y, size, font, rgb, align, text: s.to_string() });
+        self.push(Item::Text {
+            x,
+            y: self.y,
+            size,
+            font,
+            rgb,
+            align,
+            text: s.to_string(),
+        });
     }
 
     /// A section heading, with the rule under it.
@@ -519,7 +554,14 @@ impl Cursor {
         self.text(self.left, 12.0, Font::Bold, Align::Left, INK, s);
         self.y += self.lh(5.0);
         let (l, r, y) = (self.left, self.right, self.y);
-        self.push(Item::Line { x1: l, y1: y, x2: r, y2: y, rgb: RULE, width: 0.6 });
+        self.push(Item::Line {
+            x1: l,
+            y1: y,
+            x2: r,
+            y2: y,
+            rgb: RULE,
+            width: 0.6,
+        });
         self.y += self.lh(14.0);
     }
 
@@ -531,7 +573,14 @@ impl Cursor {
         self.text(self.right, 9.0, Font::Regular, Align::Right, INK, v);
         self.y += self.lh(4.0);
         let (l, r, y) = (self.left, self.right, self.y);
-        self.push(Item::Line { x1: l, y1: y, x2: r, y2: y, rgb: [235, 235, 235], width: 0.4 });
+        self.push(Item::Line {
+            x1: l,
+            y1: y,
+            x2: r,
+            y2: y,
+            rgb: [235, 235, 235],
+            width: 0.4,
+        });
     }
 
     fn note(&mut self, s: &str) {
@@ -577,17 +626,25 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
     // things chosen from different buttons, and mixing them is what the reports were about: "i
     // have to add image at the render image addition then add them in the logo", and later the
     // same of the cover. Kept together HERE because the file format has one place to put them.
-    for im in opt.images.iter().chain(opt.logos.iter()).chain(opt.covers.iter()) {
+    for im in opt
+        .images
+        .iter()
+        .chain(opt.logos.iter())
+        .chain(opt.covers.iter())
+    {
         if let Some((bytes, iw, ih)) = &im.jpeg {
-            doc.images.push(Jpeg { bytes: bytes.clone(), w: *iw, h: *ih });
+            doc.images.push(Jpeg {
+                bytes: bytes.clone(),
+                w: *iw,
+                h: *ih,
+            });
         }
     }
     let logo_base = opt.images.iter().filter(|i| i.jpeg.is_some()).count();
     let cover_base = logo_base + opt.logos.iter().filter(|i| i.jpeg.is_some()).count();
 
     let has_head = !opt.header.trim().is_empty() || opt.header_image.is_some();
-    let has_foot =
-        !opt.footer.trim().is_empty() || opt.page_numbers || opt.footer_image.is_some();
+    let has_foot = !opt.footer.trim().is_empty() || opt.page_numbers || opt.footer_image.is_some();
 
     let mut cover_pages = Vec::new();
     if opt.cover {
@@ -615,13 +672,30 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
     // A BUILDING-WIDE SECTION KEEPS ITS PLACE relative to the room chapters. The order IS the
     // document, so a report with Surfaces listed first prints Surfaces first — the chapters go
     // where the first per-room section sits in the list, not always at the top.
-    let first_room_at = opt.sections.iter().position(|s| is_per_room(*s)).unwrap_or(usize::MAX);
-    for s in opt.sections.iter().enumerate().filter(|(i, s)| *i < first_room_at && !is_per_room(**s)).map(|(_, s)| s) {
+    let first_room_at = opt
+        .sections
+        .iter()
+        .position(|s| is_per_room(*s))
+        .unwrap_or(usize::MAX);
+    for s in opt
+        .sections
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| *i < first_room_at && !is_per_room(**s))
+        .map(|(_, s)| s)
+    {
         building_wide(&mut c, inp, opt, &doc, *s, many);
     }
     for room in &inp.rooms {
         if many || !room.name.trim().is_empty() {
-            chapter(&mut c, if room.name.trim().is_empty() { "Results" } else { room.name.trim() });
+            chapter(
+                &mut c,
+                if room.name.trim().is_empty() {
+                    "Results"
+                } else {
+                    room.name.trim()
+                },
+            );
         }
         for s in opt.sections.iter().filter(|s| is_per_room(**s)) {
             match s {
@@ -774,7 +848,11 @@ fn cover(inp: &Input, opt: &Options, w: f64, h: f64, doc: &Doc, cover_base: usiz
         }
     }
 
-    let title = if opt.title.trim().is_empty() { "Lighting report" } else { opt.title.trim() };
+    let title = if opt.title.trim().is_empty() {
+        "Lighting report"
+    } else {
+        opt.title.trim()
+    };
     p.items.push(Item::Text {
         x: w * 0.5,
         y,
@@ -830,7 +908,6 @@ fn fit(iw: f64, ih: f64, bw: f64, bh: f64) -> (f64, f64) {
     (iw * k, ih * k)
 }
 
-
 /// Sections that describe ONE room, and so repeat inside each room's chapter.
 /// Emit one BUILDING-WIDE section, wherever the list has put it.
 ///
@@ -882,7 +959,14 @@ fn chapter(c: &mut Cursor, name: &str) {
     c.text(c.left, 17.0, Font::Bold, Align::Left, INK, name);
     c.y += c.lh(7.0);
     let (l, r, y) = (c.left, c.right, c.y);
-    c.push(Item::Line { x1: l, y1: y, x2: r, y2: y, rgb: [120, 120, 120], width: 1.2 });
+    c.push(Item::Line {
+        x1: l,
+        y1: y,
+        x2: r,
+        y2: y,
+        rgb: [120, 120, 120],
+        width: 1.2,
+    });
     c.y += c.lh(10.0);
 }
 
@@ -896,14 +980,27 @@ fn summary(c: &mut Cursor, room: &RoomInput, unassigned: usize) {
     c.row("Maximum E", &format!("{:.0} lx", g.max));
     c.row(
         "Uniformity U0 = Emin/E",
-        &if g.avg > 0.0 { format!("{:.2}", g.min / g.avg) } else { "—".into() },
+        &if g.avg > 0.0 {
+            format!("{:.2}", g.min / g.avg)
+        } else {
+            "—".into()
+        },
     );
     // WHICH GRID, ON THE ROW ITSELF. A lux figure without its grid is ambiguous — the maximum
     // especially, which is the brightest cell CENTRE and moves with spacing — and naming it here
     // costs a reader nothing while answering the question this whole change came from.
     c.row(
-        if room.grid_en.is_some() { "Grid (EN 12464-1)" } else { "Grid" },
-        &format!("{} x {} points at {:.2} m", g.cols, g.rows, spacing_of(p, g)),
+        if room.grid_en.is_some() {
+            "Grid (EN 12464-1)"
+        } else {
+            "Grid"
+        },
+        &format!(
+            "{} x {} points at {:.2} m",
+            g.cols,
+            g.rows,
+            spacing_of(p, g)
+        ),
     );
     // ON THE SAME PAGE AS THE FIGURES IT QUALIFIES. A caveat on a different page is a caveat that
     // travels separately from the number, and these pages are read one at a time.
@@ -954,16 +1051,25 @@ fn installation(c: &mut Cursor, room: &RoomInput, m: Maintenance, inp: &Input) {
             .map(|l| format!("{:.2} m", l.position.z))
             .unwrap_or_else(|| "—".into()),
     );
-    c.row("Working plane height", &format!("{:.2} m", room.plane.origin.z));
+    c.row(
+        "Working plane height",
+        &format!("{:.2} m", room.plane.origin.z),
+    );
     c.row("Room height", &format!("{:.2} m", inp.room_height));
     c.row("Maintenance factor", &format!("{:.2}", m.factor()));
-    c.row("Luminaire luminous flux", &format!("{:.0} lm", i.total_lumens));
+    c.row(
+        "Luminaire luminous flux",
+        &format!("{:.0} lm", i.total_lumens),
+    );
     c.row("Total power", &format!("{:.1} W", i.total_watts));
     // W/m² AND W/m² PER 100 LX. The second is what a scheme is actually judged on: 10 W/m² holding
     // a room at 200 lx and 10 W/m² holding one at 600 lx are not comparable installations, and
     // regulations are written against the normalised figure for exactly that reason.
     let per_100 = if room.reported().avg > 0.0 {
-        format!("   ({:.2} W/m2 per 100 lx)", i.power_density * 100.0 / room.reported().avg)
+        format!(
+            "   ({:.2} W/m2 per 100 lx)",
+            i.power_density * 100.0 / room.reported().avg
+        )
     } else {
         String::new()
     };
@@ -979,10 +1085,16 @@ fn installation(c: &mut Cursor, room: &RoomInput, m: Maintenance, inp: &Input) {
     // chapter should not have to leaf back to a page at the front to learn what reflectance the
     // walls were given. They are the stated conditions of THIS room's figures.
     c.heading("Room & materials");
-    c.row("Room size", &format!("{:.2} × {:.2} m", room.plane.width, room.plane.depth));
+    c.row(
+        "Room size",
+        &format!("{:.2} × {:.2} m", room.plane.width, room.plane.depth),
+    );
     c.row("Floor area", &format!("{:.2} m2", i.area_m2));
     for (name, r) in &inp.materials {
-        c.row(&format!("Reflectance — {name}"), &format!("{:.0} %", r * 100.0));
+        c.row(
+            &format!("Reflectance — {name}"),
+            &format!("{:.0} %", r * 100.0),
+        );
     }
 
     // ---- and the detail ----------------------------------------------------------------------
@@ -1082,7 +1194,11 @@ fn schedule(c: &mut Cursor, rows: &[ScheduleRow], title: &str) {
     .into_iter()
     .enumerate()
     {
-        let x = if a == Align::Right { at(cols[i]) } else { at(if i == 0 { 0.0 } else { cols[i - 1] }) };
+        let x = if a == Align::Right {
+            at(cols[i])
+        } else {
+            at(if i == 0 { 0.0 } else { cols[i - 1] })
+        };
         c.push(Item::Text {
             x,
             y: c.y,
@@ -1095,7 +1211,14 @@ fn schedule(c: &mut Cursor, rows: &[ScheduleRow], title: &str) {
     }
     c.y += 4.0;
     let (l, r, y) = (c.left, c.right, c.y);
-    c.push(Item::Line { x1: l, y1: y, x2: r, y2: y, rgb: RULE, width: 0.6 });
+    c.push(Item::Line {
+        x1: l,
+        y1: y,
+        x2: r,
+        y2: y,
+        rgb: RULE,
+        width: 0.6,
+    });
 
     for row in rows {
         c.need(24.0);
@@ -1108,7 +1231,7 @@ fn schedule(c: &mut Cursor, rows: &[ScheduleRow], title: &str) {
             }
         };
         // WHAT EACH TEXT COLUMN ACTUALLY HAS. The two left-aligned cells are the only ones that
-            // can overrun -- every other column is right-aligned against a number of known size.
+        // can overrun -- every other column is right-aligned against a number of known size.
         // The name starts 6 pt in and must stop before the manufacturer; the manufacturer must
         // stop before the right-aligned Watts figure, with a gap so the two never touch.
         const GAP: f64 = 8.0;
@@ -1125,19 +1248,38 @@ fn schedule(c: &mut Cursor, rows: &[ScheduleRow], title: &str) {
         let sub_w = (watts_left - (at(cols[0]) + 6.0) - GAP).max(0.0);
         let cells: [(f64, Align, String); 7] = [
             (at(cols[0]), Align::Right, format!("{}", row.count)),
-            (at(cols[0]), Align::Left, fit_to(&row.profile, name_w, 8.0, Font::Bold)),
-            (at(cols[1]), Align::Left, if row.manufacturer.trim().is_empty() {
-                "—".into()
-            } else {
-                fit_to(row.manufacturer.trim(), maker_w, 8.0, Font::Regular)
-            }),
+            (
+                at(cols[0]),
+                Align::Left,
+                fit_to(&row.profile, name_w, 8.0, Font::Bold),
+            ),
+            (
+                at(cols[1]),
+                Align::Left,
+                if row.manufacturer.trim().is_empty() {
+                    "—".into()
+                } else {
+                    fit_to(row.manufacturer.trim(), maker_w, 8.0, Font::Regular)
+                },
+            ),
             (at(cols[3]), Align::Right, watts_s.clone()),
             (at(cols[4]), Align::Right, dash(row.lumens, " lm", 0)),
-            (at(cols[5]), Align::Right, row.efficacy().map(|e| format!("{e:.0}")).unwrap_or_else(|| "—".into())),
+            (
+                at(cols[5]),
+                Align::Right,
+                row.efficacy()
+                    .map(|e| format!("{e:.0}"))
+                    .unwrap_or_else(|| "—".into()),
+            ),
             (at(cols[6]), Align::Right, {
                 let (l, w2, h2) = row.size_m;
                 if l > 0.0 || w2 > 0.0 {
-                    format!("{:.0} × {:.0} × {:.0}", l * 1000.0, w2 * 1000.0, h2 * 1000.0)
+                    format!(
+                        "{:.0} × {:.0} × {:.0}",
+                        l * 1000.0,
+                        w2 * 1000.0,
+                        h2 * 1000.0
+                    )
                 } else {
                     "—".into()
                 }
@@ -1182,13 +1324,27 @@ fn schedule(c: &mut Cursor, rows: &[ScheduleRow], title: &str) {
         }
         c.y += 3.0;
         let (l, r, y) = (c.left, c.right, c.y);
-        c.push(Item::Line { x1: l, y1: y, x2: r, y2: y, rgb: [235, 235, 235], width: 0.4 });
+        c.push(Item::Line {
+            x1: l,
+            y1: y,
+            x2: r,
+            y2: y,
+            rgb: [235, 235, 235],
+            width: 0.4,
+        });
     }
 
     let total_w: f64 = rows.iter().map(|r| r.total_watts()).sum();
     let total_n: usize = rows.iter().map(|r| r.count).sum();
     c.y += 10.0;
-    c.text(c.left, 8.0, Font::Bold, Align::Left, INK, &format!("{total_n} fitting(s)"));
+    c.text(
+        c.left,
+        8.0,
+        Font::Bold,
+        Align::Left,
+        INK,
+        &format!("{total_n} fitting(s)"),
+    );
     c.push(Item::Text {
         x: c.right,
         y: c.y,
@@ -1208,7 +1364,10 @@ fn materials(c: &mut Cursor, inp: &Input) {
     c.heading("Room & materials");
     c.row("Room height", &format!("{:.2} m", inp.room_height));
     for (name, r) in &inp.materials {
-        c.row(&format!("Reflectance — {name}"), &format!("{:.0} %", r * 100.0));
+        c.row(
+            &format!("Reflectance — {name}"),
+            &format!("{:.0} %", r * 100.0),
+        );
     }
 }
 
@@ -1223,8 +1382,13 @@ fn working_plane(c: &mut Cursor, room: &RoomInput, eye_height: f32) {
     // A pre-existing defect, and the same one that made a room's minimum 0 lx.
     let mask = room.reported_mask();
     let keep = |i: usize| mask.get(i).copied().unwrap_or(true);
-    let mut v: Vec<f64> =
-        g.values.iter().enumerate().filter(|(i, _)| keep(*i)).map(|(_, v)| *v).collect();
+    let mut v: Vec<f64> = g
+        .values
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep(*i))
+        .map(|(_, v)| *v)
+        .collect();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let pct = |p: f64| -> f64 {
         if v.is_empty() {
@@ -1233,13 +1397,23 @@ fn working_plane(c: &mut Cursor, room: &RoomInput, eye_height: f32) {
         v[(((v.len() - 1) as f64) * p).round() as usize]
     };
     c.row("Median", &format!("{:.0} lx", pct(0.5)));
-    c.row("10th / 90th percentile", &format!("{:.0} / {:.0} lx", pct(0.1), pct(0.9)));
+    c.row(
+        "10th / 90th percentile",
+        &format!("{:.0} / {:.0} lx", pct(0.1), pct(0.9)),
+    );
     c.row(
         "Diversity Ud = Emin/Emax",
-        &if g.max > 0.0 { format!("{:.2}", g.min / g.max) } else { "—".into() },
+        &if g.max > 0.0 {
+            format!("{:.2}", g.min / g.max)
+        } else {
+            "—".into()
+        },
     );
     if let Some(cy) = room.cylindrical_avg {
-        c.row(&format!("Cylindrical E at {eye_height:.1} m"), &format!("{cy:.0} lx"));
+        c.row(
+            &format!("Cylindrical E at {eye_height:.1} m"),
+            &format!("{cy:.0} lx"),
+        );
     }
 }
 
@@ -1347,7 +1521,9 @@ fn results_body(
     const SMOOTH_LEVELS: usize = 48;
     let edges: Vec<f64> = if opt.scale.bands.is_empty() {
         let top = opt.scale.top_lx(room_max);
-        (0..=SMOOTH_LEVELS).map(|k| top * k as f64 / SMOOTH_LEVELS as f64).collect()
+        (0..=SMOOTH_LEVELS)
+            .map(|k| top * k as f64 / SMOOTH_LEVELS as f64)
+            .collect()
     } else {
         opt.scale.edges(room_max)
     };
@@ -1381,8 +1557,11 @@ fn results_body(
             for i in 0..nx {
                 let gx = ((i as f64 + 0.5) / nx as f64 * gc as f64) as usize;
                 let gy = ((1.0 - (j as f64 + 0.5) / ny as f64) * gr as f64) as usize;
-                v[j * nx + i] =
-                    room.mask.get(gy.min(gr - 1) * gc + gx.min(gc - 1)).copied().unwrap_or(true);
+                v[j * nx + i] = room
+                    .mask
+                    .get(gy.min(gr - 1) * gc + gx.min(gc - 1))
+                    .copied()
+                    .unwrap_or(true);
             }
         }
         v
@@ -1394,8 +1573,7 @@ fn results_body(
                 let wx = p.origin.x as f64 + (i as f64 + 0.5) / nx as f64 * p.width as f64;
                 // Flipped like the field itself: raster row 0 is the top of the page, which is the
                 // room's MAXIMUM y.
-                let wy =
-                    p.origin.y as f64 + (1.0 - (j as f64 + 0.5) / ny as f64) * p.depth as f64;
+                let wy = p.origin.y as f64 + (1.0 - (j as f64 + 0.5) / ny as f64) * p.depth as f64;
                 // BOTH tests: in the room, AND somewhere a reading could be taken.
                 v[j * nx + i] = crate::factory::point_in_poly(room.poly, wx as f32, wy as f32)
                     && measurable[j * nx + i];
@@ -1415,8 +1593,11 @@ fn results_body(
                 // Flipped like everything else here: raster row 0 is the top of the page, which is
                 // the room's maximum y and so the LAST grid row.
                 let gy = ((1.0 - (j as f64 + 0.5) / ny as f64) * gr as f64) as usize;
-                v[j * nx + i] =
-                    room.mask.get(gy.min(gr - 1) * gc + gx.min(gc - 1)).copied().unwrap_or(true);
+                v[j * nx + i] = room
+                    .mask
+                    .get(gy.min(gr - 1) * gc + gx.min(gc - 1))
+                    .copied()
+                    .unwrap_or(true);
             }
         }
         v
@@ -1447,7 +1628,13 @@ fn results_body(
                 // mask says the room is and nowhere else.
                 paint_above(c, &f, &inside, nx, ny, f64::NEG_INFINITY, fill, &at);
             } else {
-                c.push(Item::Rect { x: x0, y: y0, w: plot_w, h: plot_h, fill });
+                c.push(Item::Rect {
+                    x: x0,
+                    y: y0,
+                    w: plot_w,
+                    h: plot_h,
+                    fill,
+                });
             }
             continue;
         }
@@ -1481,7 +1668,16 @@ fn results_body(
         if blocked.iter().any(|b| *b) {
             // Every blocked cell is "above" minus infinity, so this fills exactly them.
             let flat = vec![0.0_f64; (nx + 1) * (ny + 1)];
-            paint_above(c, &flat, &blocked, nx, ny, f64::NEG_INFINITY, OBJECT_FILL, &at);
+            paint_above(
+                c,
+                &flat,
+                &blocked,
+                nx,
+                ny,
+                f64::NEG_INFINITY,
+                OBJECT_FILL,
+                &at,
+            );
         }
     }
 
@@ -1534,9 +1730,10 @@ fn results_body(
         let (u, w) = (v.x as f64 - px0, v.y as f64 - py0);
         u >= -1e-6 && u <= pw + 1e-6 && w >= -1e-6 && w <= pd + 1e-6
     };
-    for (segs, ink, wide) in
-        [(&inp.apertures, [110u8, 110, 110], 0.45f64), (&inp.walls, [25, 25, 25], 0.9)]
-    {
+    for (segs, ink, wide) in [
+        (&inp.apertures, [110u8, 110, 110], 0.45f64),
+        (&inp.walls, [25, 25, 25], 0.9),
+    ] {
         for s in segs {
             // CLIPPED TO THE PLOT. The cut is of the whole building and each plot is a window onto
             // part of it, so a segment from the room next door would straddle this room's frame.
@@ -1545,7 +1742,14 @@ fn results_body(
             }
             let (ax, ay) = to_page(&s[0]);
             let (bx, by) = to_page(&s[1]);
-            c.push(Item::Line { x1: ax, y1: ay, x2: bx, y2: by, rgb: ink, width: wide });
+            c.push(Item::Line {
+                x1: ax,
+                y1: ay,
+                x2: bx,
+                y2: by,
+                rgb: ink,
+                width: wide,
+            });
         }
     }
 
@@ -1557,7 +1761,9 @@ fn results_body(
     if values_shown {
         for j in 0..gr {
             for i in 0..gc {
-                let Some(v) = g.values.get(j * gc + i) else { continue };
+                let Some(v) = g.values.get(j * gc + i) else {
+                    continue;
+                };
                 let Some(fill) = sample(inp, room, opt, i as f64, j as f64, room_max) else {
                     continue;
                 };
@@ -1572,7 +1778,11 @@ fn results_body(
                     y: y0 + plot_h - (j as f64 + 0.5) * cell_h + 2.0,
                     size: (cell_w.min(cell_h) * 0.26).clamp(4.0, 8.0),
                     font: Font::Regular,
-                    rgb: if lum > 140.0 { [20, 20, 20] } else { [245, 245, 245] },
+                    rgb: if lum > 140.0 {
+                        [20, 20, 20]
+                    } else {
+                        [245, 245, 245]
+                    },
                     align: Align::Centre,
                     text: format!("{v:.0}"),
                 });
@@ -1580,7 +1790,14 @@ fn results_body(
         }
     }
 
-    c.push(Item::Frame { x: x0, y: y0, w: plot_w, h: plot_h, rgb: [140, 140, 140], width: 0.7 });
+    c.push(Item::Frame {
+        x: x0,
+        y: y0,
+        w: plot_w,
+        h: plot_h,
+        rgb: [140, 140, 140],
+        width: 0.7,
+    });
     c.push(Item::Text {
         x: x0 + plot_w * 0.5,
         y: y0 + plot_h + 11.0,
@@ -1696,12 +1913,19 @@ fn paint_above(
                     // Where the edge crosses. Guarded against a zero denominator, which happens
                     // when two corners hold exactly the same value straddling the threshold.
                     let d = bv - av;
-                    let s = if d.abs() > 1e-12 { ((t - av) / d).clamp(0.0, 1.0) } else { 0.5 };
+                    let s = if d.abs() > 1e-12 {
+                        ((t - av) / d).clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    };
                     poly.push(at(ax + (bx - ax) * s, ay + (by - ay) * s));
                 }
             }
             if poly.len() >= 3 {
-                c.push(Item::Poly { rings: vec![poly], fill });
+                c.push(Item::Poly {
+                    rings: vec![poly],
+                    fill,
+                });
             }
         }
         close(&mut run, nx, c);
@@ -1814,8 +2038,11 @@ fn layout_page(c: &mut Cursor, room: &RoomInput) {
 
     // The room outline, or the plane's own rectangle when there is none.
     if room.poly.len() >= 3 {
-        let pts: Vec<(f64, f64)> =
-            room.poly.iter().map(|v| to_page(v.x as f64, v.y as f64)).collect();
+        let pts: Vec<(f64, f64)> = room
+            .poly
+            .iter()
+            .map(|v| to_page(v.x as f64, v.y as f64))
+            .collect();
         for w in pts.windows(2) {
             c.push(Item::Line {
                 x1: w[0].0,
@@ -1828,10 +2055,24 @@ fn layout_page(c: &mut Cursor, room: &RoomInput) {
         }
         // Closed, in case the footprint does not repeat its first point.
         if let (Some(a), Some(b)) = (pts.first(), pts.last()) {
-            c.push(Item::Line { x1: b.0, y1: b.1, x2: a.0, y2: a.1, rgb: [190, 40, 40], width: 1.4 });
+            c.push(Item::Line {
+                x1: b.0,
+                y1: b.1,
+                x2: a.0,
+                y2: a.1,
+                rgb: [190, 40, 40],
+                width: 1.4,
+            });
         }
     } else {
-        c.push(Item::Frame { x: x0, y: y0, w: dw, h: dh, rgb: [190, 40, 40], width: 1.4 });
+        c.push(Item::Frame {
+            x: x0,
+            y: y0,
+            w: dw,
+            h: dh,
+            rgb: [190, 40, 40],
+            width: 1.4,
+        });
     }
 
     // EVERY FITTING, AT ITS OWN SIZE AND FACING THE WAY IT FACES.
@@ -1927,7 +2168,14 @@ fn layout_page(c: &mut Cursor, room: &RoomInput) {
         }
     }
 
-    c.push(Item::Frame { x: x0, y: y0, w: dw, h: dh, rgb: [215, 215, 215], width: 0.5 });
+    c.push(Item::Frame {
+        x: x0,
+        y: y0,
+        w: dw,
+        h: dh,
+        rgb: [215, 215, 215],
+        width: 0.5,
+    });
     c.y = y0 + dh + 12.0;
     c.text(
         c.left,
@@ -1991,7 +2239,14 @@ fn legend(c: &mut Cursor, inp: &Input, opt: &Options, room_max: f64) {
                 fill: ramp_rgb(inp.ramp, t),
             });
         }
-        c.push(Item::Frame { x, y, w, h, rgb: [150, 150, 150], width: 0.5 });
+        c.push(Item::Frame {
+            x,
+            y,
+            w,
+            h,
+            rgb: [150, 150, 150],
+            width: 0.5,
+        });
         c.y = y + h + 11.0;
         c.text(x, 7.5, Font::Regular, Align::Left, FAINT, "0 lx");
         c.push(Item::Text {
@@ -2012,9 +2267,22 @@ fn legend(c: &mut Cursor, inp: &Input, opt: &Options, room_max: f64) {
         for i in 0..n {
             let mid = (edges[i] + edges[i + 1]) * 0.5;
             let t = (mid / opt.scale.top_lx(room_max)).clamp(0.0, 1.0) as f32;
-            c.push(Item::Rect { x: x + bw * i as f64, y, w: bw, h, fill: band_fill(inp, opt, i, t) });
+            c.push(Item::Rect {
+                x: x + bw * i as f64,
+                y,
+                w: bw,
+                h,
+                fill: band_fill(inp, opt, i, t),
+            });
         }
-        c.push(Item::Frame { x, y, w, h, rgb: [150, 150, 150], width: 0.5 });
+        c.push(Item::Frame {
+            x,
+            y,
+            w,
+            h,
+            rgb: [150, 150, 150],
+            width: 0.5,
+        });
         c.y = y + h + 10.0;
         for (i, e) in edges.iter().enumerate() {
             // THE TOP BAND IS OPEN-ENDED, and its label says so rather than naming the room's peak.
@@ -2149,7 +2417,11 @@ fn numeric_grid(c: &mut Cursor, room: &RoomInput) {
                 font: Font::Regular,
                 rgb: if inside { INK } else { [190, 190, 190] },
                 align: Align::Right,
-                text: if inside { format!("{v:.0}") } else { "-".into() },
+                text: if inside {
+                    format!("{v:.0}")
+                } else {
+                    "-".into()
+                },
             });
         }
     }
@@ -2202,11 +2474,19 @@ fn extremes(c: &mut Cursor, room: &RoomInput) {
             hi = Some((i, *v));
         }
     }
-    let (Some((li, lv)), Some((hi_i, hv))) = (lo, hi) else { return };
+    let (Some((li, lv)), Some((hi_i, hv))) = (lo, hi) else {
+        return;
+    };
     let (lx, ly) = at(li);
     let (hx, hy) = at(hi_i);
-    c.row("Minimum over the whole grid", &format!("{lv:.0} lx at ({lx:.2}, {ly:.2}) m"));
-    c.row("Maximum over the whole grid", &format!("{hv:.0} lx at ({hx:.2}, {hy:.2}) m"));
+    c.row(
+        "Minimum over the whole grid",
+        &format!("{lv:.0} lx at ({lx:.2}, {ly:.2}) m"),
+    );
+    c.row(
+        "Maximum over the whole grid",
+        &format!("{hv:.0} lx at ({hx:.2}, {hy:.2}) m"),
+    );
 }
 
 fn surfaces(c: &mut Cursor, inp: &Input) {
@@ -2217,7 +2497,10 @@ fn surfaces(c: &mut Cursor, inp: &Input) {
     for s in inp.surfaces {
         c.row(
             &s.name,
-            &format!("{:.0} lx avg · {:.0} min · U0 {:.2} · {:.0} m2", s.e_avg, s.e_min, s.u0, s.area_m2),
+            &format!(
+                "{:.0} lx avg · {:.0} min · U0 {:.2} · {:.0} m2",
+                s.e_avg, s.e_min, s.u0, s.area_m2
+            ),
         );
     }
 }
@@ -2256,10 +2539,18 @@ fn renders(c: &mut Cursor, opt: &Options, doc: &Doc) {
         let row_y = c.y;
         let mut tallest: f64 = 0.0;
         for (k, (idx, im)) in chunk.iter().enumerate() {
-            let Some(j) = doc.images.get(*idx) else { continue };
+            let Some(j) = doc.images.get(*idx) else {
+                continue;
+            };
             let (iw, ih) = fit(j.w as f64, j.h as f64, cw, box_h);
             let x = c.left + k as f64 * (cw + gap) + (cw - iw) * 0.5;
-            c.push(Item::Image { x, y: row_y, w: iw, h: ih, idx: *idx });
+            c.push(Item::Image {
+                x,
+                y: row_y,
+                w: iw,
+                h: ih,
+                idx: *idx,
+            });
             tallest = tallest.max(ih);
             if !im.caption.trim().is_empty() {
                 c.push(Item::Text {
@@ -2336,7 +2627,12 @@ mod tests {
             // is what every test here is about.
             walls: Vec::new(),
             apertures: Vec::new(),
-            maintenance: Maintenance { llmf: 0.8, lsf: 1.0, lmf: 1.0, rsmf: 1.0 },
+            maintenance: Maintenance {
+                llmf: 0.8,
+                lsf: 1.0,
+                lmf: 1.0,
+                rsmf: 1.0,
+            },
             surfaces: &[],
             eye_height: 1.2,
             room_height: 3.0,
@@ -2348,7 +2644,11 @@ mod tests {
     }
 
     fn opts() -> Options {
-        Options { format: Format::Pdf, page: PageSize::A4, ..Default::default() }
+        Options {
+            format: Format::Pdf,
+            page: PageSize::A4,
+            ..Default::default()
+        }
     }
 
     fn rects(d: &Doc) -> Vec<(f64, f64, f64, f64)> {
@@ -2430,9 +2730,9 @@ mod tests {
             .iter()
             .flat_map(|p| p.items.iter())
             .filter_map(|i| match i {
-                Item::Frame { x, y, w, h, rgb, .. } if *rgb == [140, 140, 140] => {
-                    Some((*x, *y, *w, *h))
-                }
+                Item::Frame {
+                    x, y, w, h, rgb, ..
+                } if *rgb == [140, 140, 140] => Some((*x, *y, *w, *h)),
                 _ => None,
             })
             .collect()
@@ -2483,7 +2783,13 @@ mod tests {
         for pg in &d.pages {
             for it in &pg.items {
                 match it {
-                    Item::Rect { x: rx, y: ry, w, h, fill } => {
+                    Item::Rect {
+                        x: rx,
+                        y: ry,
+                        w,
+                        h,
+                        fill,
+                    } => {
                         if x >= *rx && x <= rx + w && y >= *ry && y <= ry + h {
                             seen = Some(*fill);
                         }
@@ -2544,7 +2850,11 @@ mod tests {
                 w <= pw * TWO_THIRDS + 1.0 && h <= ph * TWO_THIRDS + 1.0,
                 "{cols}x{rows}: too big",
             );
-            assert!(x >= 0.0 && x + w <= pw, "{cols}x{rows}: spans {x:.1}..{:.1}", x + w);
+            assert!(
+                x >= 0.0 && x + w <= pw,
+                "{cols}x{rows}: spans {x:.1}..{:.1}",
+                x + w
+            );
             // THE FIELD IS THE SHAPE OF THE ROOM — the plane's proportions, whatever grid it
             // happened to be sampled on.
             //
@@ -2579,7 +2889,10 @@ mod tests {
         let mut o = opts();
         o.cover = false;
         o.sections = vec![Section::Results];
-        o.scale = crate::report::options::Scale { top: Some(500.0), bands: vec![100.0, 300.0] };
+        o.scale = crate::report::options::Scale {
+            top: Some(500.0),
+            bands: vec![100.0, 300.0],
+        };
 
         // Three bands: 0–100, 100–300, 300–500. Colours nothing a palette would produce.
         let mine = [[7u8, 11, 13], [201, 17, 19], [23, 197, 29]];
@@ -2635,12 +2948,17 @@ mod tests {
         let dim = o.band_colours[0];
         let bright = *o.band_colours.last().expect("a top band");
         let lum = |c: [u8; 3]| 0.299 * c[0] as f64 + 0.587 * c[1] as f64 + 0.114 * c[2] as f64;
-        assert!(lum(bright) > lum(dim) + 60.0, "{bright:?} is not clearly paler than {dim:?}");
+        assert!(
+            lum(bright) > lum(dim) + 60.0,
+            "{bright:?} is not clearly paler than {dim:?}"
+        );
 
         // A ROOM AT 305 LX RESOLVES ACROSS SEVERAL BANDS, which is the whole complaint.
         let room_max = 1802.0;
-        let bands: std::collections::BTreeSet<usize> =
-            [120.0, 210.0, 260.0, 305.0, 340.0, 420.0].iter().map(|v| o.scale.band_index(*v, room_max)).collect();
+        let bands: std::collections::BTreeSet<usize> = [120.0, 210.0, 260.0, 305.0, 340.0, 420.0]
+            .iter()
+            .map(|v| o.scale.band_index(*v, room_max))
+            .collect();
         assert!(
             bands.len() >= 3,
             "readings from 120 to 420 lx land in only {} band(s) — the drawing cannot show where \
@@ -2660,24 +2978,36 @@ mod tests {
         let mut o = opts();
         o.cover = false;
         o.sections = vec![Section::Results];
-        o.scale = crate::report::options::Scale { top: None, bands: vec![50.0, 100.0, 200.0, 300.0] };
+        o.scale = crate::report::options::Scale {
+            top: None,
+            bands: vec![50.0, 100.0, 200.0, 300.0],
+        };
         let t = texts(&layout(&input(&g, &p), &o));
-        assert!(t.iter().any(|s| s == "300+"), "the legend does not say 300+: {t:?}");
-        // The CAPTION names the steps rather than the room's brightest cell. Checked here rather
-            // than by looking for the number anywhere on the page, which the first version did — and
-            // which caught a printed point value instead.
         assert!(
-            t.iter().any(|s| s.contains("banded at 50 · 100 · 200 · 300 lx")),
+            t.iter().any(|s| s == "300+"),
+            "the legend does not say 300+: {t:?}"
+        );
+        // The CAPTION names the steps rather than the room's brightest cell. Checked here rather
+        // than by looking for the number anywhere on the page, which the first version did — and
+        // which caught a printed point value instead.
+        assert!(
+            t.iter()
+                .any(|s| s.contains("banded at 50 · 100 · 200 · 300 lx")),
             "the caption does not say where the steps are: {t:?}",
         );
 
         // PINNED, the number is the number — somebody who set a ceiling means it.
         o.scale.top = Some(600.0);
         let t = texts(&layout(&input(&g, &p), &o));
-        assert!(t.iter().any(|s| s == "600"), "a pinned ceiling must be stated: {t:?}");
-        assert!(!t.iter().any(|s| s == "300+"), "a pinned scale is not open-ended: {t:?}");
+        assert!(
+            t.iter().any(|s| s == "600"),
+            "a pinned ceiling must be stated: {t:?}"
+        );
+        assert!(
+            !t.iter().any(|s| s == "300+"),
+            "a pinned scale is not open-ended: {t:?}"
+        );
     }
-
 
     /// AN EMPTY LIST MEANS THE PALETTE — so a project made before the picker existed, and a
     /// settings file that never held one, both draw exactly as they did.
@@ -2707,7 +3037,10 @@ mod tests {
         // And a SHORT list falls back for the bands past its end rather than running off it.
         o.band_colours = vec![[1, 2, 3]];
         let short = field_fills(&layout(&input(&g, &p), &o));
-        assert!(short.contains(&[1, 2, 3]), "the one chosen colour was not used");
+        assert!(
+            short.contains(&[1, 2, 3]),
+            "the one chosen colour was not used"
+        );
         assert!(
             short.iter().any(|c| palette.contains(c)),
             "a short list threw away the palette for every other band",
@@ -2722,7 +3055,10 @@ mod tests {
         src.band_colours = vec![[9, 8, 7], [6, 5, 4]];
         let mut back = Options::default();
         crate::report::Prefs::of(&src).apply(&mut back);
-        assert_eq!(back.band_colours, src.band_colours, "the band colours were not kept");
+        assert_eq!(
+            back.band_colours, src.band_colours,
+            "the band colours were not kept"
+        );
     }
 
     /// THE NUMERIC GRID IS THE SHAPE OF THE ROOM TOO, at the same scale as the field above it.
@@ -2748,7 +3084,10 @@ mod tests {
         o.sections = vec![Section::Results, Section::NumericGrid];
         let d = layout(&input(&g, &p), &o);
 
-        let (field_x, field_w) = plot_frames(&d).first().map(|f| (f.0, f.2)).expect("a field");
+        let (field_x, field_w) = plot_frames(&d)
+            .first()
+            .map(|f| (f.0, f.2))
+            .expect("a field");
 
         // The cells are the right-aligned items that read as a plain lux figure — the heading, the
         // note and the extremes rows all carry words.
@@ -2757,18 +3096,22 @@ mod tests {
             .iter()
             .flat_map(|pg| pg.items.iter())
             .filter_map(|i| match i {
-                Item::Text { x, text, align: Align::Right, .. }
-                    if text.parse::<u32>().is_ok() || text == "-" =>
-                {
-                    Some(*x)
-                }
+                Item::Text {
+                    x,
+                    text,
+                    align: Align::Right,
+                    ..
+                } if text.parse::<u32>().is_ok() || text == "-" => Some(*x),
                 _ => None,
             })
             .collect();
         assert!(xs.len() > 8, "only {} grid cells were printed", xs.len());
         xs.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
         xs.dedup_by(|a, b| (*a - *b).abs() < 0.01);
-        assert!(xs.len() >= 2, "the table has one column — nothing to measure");
+        assert!(
+            xs.len() >= 2,
+            "the table has one column — nothing to measure"
+        );
 
         // Reconstruct the table's box from the column pitch, and hold it against the field's.
         let colw = (xs[xs.len() - 1] - xs[0]) / (xs.len() - 1) as f64;
@@ -2835,25 +3178,40 @@ mod tests {
             .flat_map(|pg| pg.items.iter())
             .filter(|i| matches!(i, Item::Frame { rgb, .. } if *rgb == [200, 150, 40]))
             .count();
-        assert_eq!(gold_frames, 0, "the fitting was still drawn as the little square marker");
+        assert_eq!(
+            gold_frames, 0,
+            "the fitting was still drawn as the little square marker"
+        );
 
         let lines: Vec<(f64, f64, f64, f64)> = d
             .pages
             .iter()
             .flat_map(|pg| pg.items.iter())
             .filter_map(|i| match i {
-                Item::Line { x1, y1, x2, y2, rgb, .. } if *rgb == [200, 150, 40] => {
-                    Some((*x1, *y1, *x2, *y2))
-                }
+                Item::Line {
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    rgb,
+                    ..
+                } if *rgb == [200, 150, 40] => Some((*x1, *y1, *x2, *y2)),
                 _ => None,
             })
             .collect();
-        assert_eq!(lines.len(), 4, "expected a four-sided outline, got {} lines", lines.len());
+        assert_eq!(
+            lines.len(),
+            4,
+            "expected a four-sided outline, got {} lines",
+            lines.len()
+        );
 
         let xs: Vec<f64> = lines.iter().flat_map(|l| [l.0, l.2]).collect();
         let ys: Vec<f64> = lines.iter().flat_map(|l| [l.1, l.3]).collect();
         let span = |v: &[f64]| {
-            let (lo, hi) = v.iter().fold((f64::MAX, f64::MIN), |(a, b), x| (a.min(*x), b.max(*x)));
+            let (lo, hi) = v
+                .iter()
+                .fold((f64::MAX, f64::MIN), |(a, b), x| (a.min(*x), b.max(*x)));
             hi - lo
         };
         // The report's own scale, from the room that set it — the same number the drawing used.
@@ -2921,9 +3279,14 @@ mod tests {
             .iter()
             .flat_map(|pg| pg.items.iter())
             .find_map(|i| match i {
-                Item::Line { x1, y1, x2, y2, rgb, width } if *rgb == [30, 30, 30] && *width < 0.7 => {
-                    Some((*x1, *y1, *x2, *y2))
-                }
+                Item::Line {
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    rgb,
+                    width,
+                } if *rgb == [30, 30, 30] && *width < 0.7 => Some((*x1, *y1, *x2, *y2)),
                 _ => None,
             })
             .expect("the fitting drew no centre tick");
@@ -2992,7 +3355,10 @@ mod tests {
             .flat_map(|pg| pg.items.iter())
             .filter(|i| matches!(i, Item::Frame { rgb, .. } if *rgb == [200, 150, 40]))
             .count();
-        assert_eq!(gold_frames, 1, "a 60 mm downlight lost its marker and drew nothing readable");
+        assert_eq!(
+            gold_frames, 1,
+            "a 60 mm downlight lost its marker and drew nothing readable"
+        );
     }
 
     /// AND A FITTING WHOSE FILE DECLARES NO SIZE KEEPS IT TOO — rather than being drawn at some
@@ -3034,7 +3400,10 @@ mod tests {
             .flat_map(|pg| pg.items.iter())
             .filter(|i| matches!(i, Item::Frame { rgb, .. } if *rgb == [200, 150, 40]))
             .count();
-        assert_eq!(gold_frames, 1, "a fitting with no declared size was drawn at a made-up one");
+        assert_eq!(
+            gold_frames, 1,
+            "a fitting with no declared size was drawn at a made-up one"
+        );
     }
 
     /// EVERY ROOM AT ONE SCALE, so two rooms in one report can be compared.
@@ -3054,7 +3423,11 @@ mod tests {
             cols: 8,
             rows: 6,
         };
-        let big = CalcPlane { width: 8.0, depth: 6.0, ..small };
+        let big = CalcPlane {
+            width: 8.0,
+            depth: 6.0,
+            ..small
+        };
         let g = grid(8, 6);
         let mut o = opts();
         o.cover = false;
@@ -3076,8 +3449,14 @@ mod tests {
         );
         // And the LARGER one is the one that fills the page — the scale is set by the room that
         // needs the most, so nothing is drawn off the edge.
-        assert!(w_big >= pw * 0.66 - 1.0 || h_big >= ph * 0.66 - 1.0, "the big room is not filling");
-        assert!(w_big <= pw * TWO_THIRDS + 1.0 && h_big <= ph * TWO_THIRDS + 1.0, "and not more");
+        assert!(
+            w_big >= pw * 0.66 - 1.0 || h_big >= ph * 0.66 - 1.0,
+            "the big room is not filling"
+        );
+        assert!(
+            w_big <= pw * TWO_THIRDS + 1.0 && h_big <= ph * TWO_THIRDS + 1.0,
+            "and not more"
+        );
     }
 
     /// THE LAYOUT PAGE AND THE RESULTS PAGE ARE THE SAME ROOM AT THE SAME SIZE.
@@ -3102,7 +3481,11 @@ mod tests {
             cols: 37,
             rows: 11,
         };
-        let big = CalcPlane { width: 30.0, depth: 22.0, ..p };
+        let big = CalcPlane {
+            width: 30.0,
+            depth: 22.0,
+            ..p
+        };
         let mut o = opts();
         o.cover = false;
         o.sections = vec![Section::Layout, Section::Results];
@@ -3168,7 +3551,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(!polys.is_empty(), "the band edges are not being traced at all");
+        assert!(
+            !polys.is_empty(),
+            "the band edges are not being traced at all"
+        );
         let cell_h = ph / 8.0;
         let mut longest = 0.0_f64;
         // THE DIVERSITY OF EDGE DIRECTIONS is what tells a traced contour from a stepped one.
@@ -3211,10 +3597,13 @@ mod tests {
         // …and the rows cover the plot from top to bottom.
         let top = r.iter().map(|x| x.1).fold(f64::MAX, f64::min);
         let bot = r.iter().map(|x| x.1 + x.3).fold(f64::MIN, f64::max);
-        assert!(bot - top > ph * 0.9, "the field covers {:.0} of {ph:.0} pt", bot - top);
+        assert!(
+            bot - top > ph * 0.9,
+            "the field covers {:.0} of {ph:.0} pt",
+            bot - top
+        );
         assert!(pw > 0.0);
     }
-
 
     /// THE FIELD IS INTERPOLATED, not merely drawn at a finer pitch.
     ///
@@ -3307,7 +3696,11 @@ mod tests {
             colours.len(),
         );
         // One rectangle per sample would be hundreds of thousands; merged runs are far fewer.
-        assert!(r.len() < 20_000, "{} rectangles is not a merged field", r.len());
+        assert!(
+            r.len() < 20_000,
+            "{} rectangles is not a merged field",
+            r.len()
+        );
     }
 
     /// EVERY ROOM CARRIES ITS OWN CONDITIONS.
@@ -3386,7 +3779,9 @@ mod tests {
         }
         // The area is written into the label, so this one is matched by its stem.
         assert_eq!(
-            t.iter().filter(|s| s.starts_with("Total power per area")).count(),
+            t.iter()
+                .filter(|s| s.starts_with("Total power per area"))
+                .count(),
             2,
             "the power density is not stated in each room's chapter",
         );
@@ -3396,7 +3791,10 @@ mod tests {
             "the power density is not given per 100 lx: {t:?}",
         );
         // The luminaire plane is the FITTINGS' height, not the working plane's.
-        assert!(t.iter().any(|s| s == "2.90 m"), "the mounting height is not stated: {t:?}");
+        assert!(
+            t.iter().any(|s| s == "2.90 m"),
+            "the mounting height is not stated: {t:?}"
+        );
     }
 
     /// THE FIELD AND THE LAYOUT SHOW THE ROOM THE SAME WAY UP.
@@ -3416,8 +3814,9 @@ mod tests {
     fn the_field_is_the_same_way_up_as_the_layout() {
         let (cols, rows) = (8u32, 8u32);
         // Row 0 is the minimum y — the SOUTH edge — so brightness must rise with the row index.
-        let vals: Vec<f64> =
-            (0..(cols * rows)).map(|i| 10.0 + (i / cols) as f64 * 120.0).collect();
+        let vals: Vec<f64> = (0..(cols * rows))
+            .map(|i| 10.0 + (i / cols) as f64 * 120.0)
+            .collect();
         let g = LuxGrid::from_values(cols, rows, vals);
         let p = plane();
         // A fitting hard against the north edge, so the layout page is asymmetric the same way.
@@ -3445,7 +3844,10 @@ mod tests {
         let (fx, fy, fw, fh) = field;
         let top = colour_at(&d, fx + fw * 0.5, fy + fh * 0.12).expect("the top of the field");
         let bottom = colour_at(&d, fx + fw * 0.5, fy + fh * 0.88).expect("the bottom of the field");
-        assert_ne!(top, bottom, "the fixture is not asymmetric enough to tell either way up");
+        assert_ne!(
+            top, bottom,
+            "the fixture is not asymmetric enough to tell either way up"
+        );
 
         // BY BAND INDEX, not by how warm the colour looks.
         //
@@ -3455,9 +3857,15 @@ mod tests {
         // pale. The oracle was inverted overnight while the thing it tests was untouched. Which
         // band a colour is answers the question in any palette.
         let band_of = |c: [u8; 3]| {
-            o.band_colours.iter().position(|x| *x == c).unwrap_or_else(|| {
-                panic!("{c:?} is not one of the scale's band colours: {:?}", o.band_colours)
-            })
+            o.band_colours
+                .iter()
+                .position(|x| *x == c)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{c:?} is not one of the scale's band colours: {:?}",
+                        o.band_colours
+                    )
+                })
         };
         assert!(
             band_of(top) > band_of(bottom),
@@ -3536,14 +3944,16 @@ mod tests {
             })
             .max()
             .unwrap_or(0);
-        assert!(worst > 0, "nothing was drawn as a polygon at all — the fixture proves nothing");
+        assert!(
+            worst > 0,
+            "nothing was drawn as a polygon at all — the fixture proves nothing"
+        );
         assert_eq!(
             worst, 1,
             "an item carries {worst} rings, so the PDF and the on-screen preview will fill it \
              differently",
         );
     }
-
 
     /// GROUND OUTSIDE THE ROOM IS NOT COLOURED — colouring it reports illuminance where the room
     /// is not.
@@ -3608,12 +4018,18 @@ mod tests {
         // A CONTINUOUS SCALE, so the only "100" on the page can be a point value. With the default
         // bands the legend writes "100" under itself, and this test would pass on that instead —
         // which is a test that cannot fail for the reason it names.
-        o.scale = crate::report::options::Scale { top: None, bands: Vec::new() };
+        o.scale = crate::report::options::Scale {
+            top: None,
+            bands: Vec::new(),
+        };
 
         let small = grid(4, 4);
         let p = plane();
         let t = texts(&layout(&input(&small, &p), &o));
-        assert!(t.iter().any(|s| s == "100"), "a 4x4 plot has room for its values: {t:?}");
+        assert!(
+            t.iter().any(|s| s == "100"),
+            "a 4x4 plot has room for its values: {t:?}"
+        );
 
         let big = grid(60, 60);
         let t = texts(&layout(&input(&big, &p), &o));
@@ -3636,15 +4052,26 @@ mod tests {
         o.cover = false;
         o.sections = vec![Section::Results];
 
-        o.scale = crate::report::options::Scale { top: None, bands: Vec::new() };
+        o.scale = crate::report::options::Scale {
+            top: None,
+            bands: Vec::new(),
+        };
         let auto: Vec<[u8; 3]> = field_fills(&layout(&input(&g, &p), &o));
 
-        o.scale = crate::report::options::Scale { top: Some(5000.0), bands: Vec::new() };
+        o.scale = crate::report::options::Scale {
+            top: Some(5000.0),
+            bands: Vec::new(),
+        };
         let pinned: Vec<[u8; 3]> = field_fills(&layout(&input(&g, &p), &o));
 
-        assert_ne!(auto, pinned, "pinning the top to 5000 lx left every colour unchanged");
+        assert_ne!(
+            auto, pinned,
+            "pinning the top to 5000 lx left every colour unchanged"
+        );
         let mean = |v: &[[u8; 3]]| -> u64 {
-            v.iter().map(|p| p[0] as u64 + p[1] as u64 + p[2] as u64).sum::<u64>()
+            v.iter()
+                .map(|p| p[0] as u64 + p[1] as u64 + p[2] as u64)
+                .sum::<u64>()
                 / v.len().max(1) as u64
         };
         assert!(
@@ -3693,8 +4120,14 @@ mod tests {
         let d = layout(&i, &o);
         let t = texts(&d);
 
-        assert!(t.iter().any(|s| s == "Lighting layout"), "no heading: {t:?}");
-        assert!(t.iter().any(|s| s.contains("3 fitting(s)")), "the count is missing: {t:?}");
+        assert!(
+            t.iter().any(|s| s == "Lighting layout"),
+            "no heading: {t:?}"
+        );
+        assert!(
+            t.iter().any(|s| s.contains("3 fitting(s)")),
+            "the count is missing: {t:?}"
+        );
         // A marker per fitting.
         let boxes = d.pages[0]
             .items
@@ -3777,17 +4210,25 @@ mod tests {
             o.page_numbers = false;
             o.sections = vec![Section::NumericGrid];
             let d = layout(&input(&g, &p), &o);
-            assert_eq!(d.pages.len(), 1, "{cols}x{rows}: the grid took {} pages", d.pages.len());
+            assert_eq!(
+                d.pages.len(),
+                1,
+                "{cols}x{rows}: the grid took {} pages",
+                d.pages.len()
+            );
             let t = texts(&d);
-            assert!(!t.iter().any(|s| s.starts_with("Columns ")), "{cols}x{rows}: still in blocks");
+            assert!(
+                !t.iter().any(|s| s.starts_with("Columns ")),
+                "{cols}x{rows}: still in blocks"
+            );
         }
     }
 
-
-
     /// Rough "how far up the ramp" — brighter ramp positions are lighter overall.
     fn t_sum(c: &[[u8; 3]]) -> u32 {
-        c.iter().map(|p| p[0] as u32 + p[1] as u32 + p[2] as u32).sum()
+        c.iter()
+            .map(|p| p[0] as u32 + p[1] as u32 + p[2] as u32)
+            .sum()
     }
 
     /// A BANDED SCALE DRAWS A BANDED LEGEND, with its edges written out — which is the thing that
@@ -3799,13 +4240,22 @@ mod tests {
         let mut o = opts();
         o.cover = false;
         o.sections = vec![Section::Results];
-        o.scale = crate::report::options::Scale { top: Some(500.0), bands: vec![25.0, 100.0, 300.0] };
+        o.scale = crate::report::options::Scale {
+            top: Some(500.0),
+            bands: vec![25.0, 100.0, 300.0],
+        };
         let d = layout(&input(&g, &p), &o);
         let t = texts(&d);
         for e in ["0", "25", "100", "300", "500"] {
-            assert!(t.iter().any(|s| s == e), "band edge {e} is not written under the legend: {t:?}");
+            assert!(
+                t.iter().any(|s| s == e),
+                "band edge {e} is not written under the legend: {t:?}"
+            );
         }
-        assert!(t.iter().any(|s| s.contains("Illuminance [lx]")), "the legend is unlabelled");
+        assert!(
+            t.iter().any(|s| s.contains("Illuminance [lx]")),
+            "the legend is unlabelled"
+        );
     }
 
     /// A LOGO GOES IN THE HEADER AND THE FOOTER, fitted to a stated box and never stretched.
@@ -3838,12 +4288,16 @@ mod tests {
             .collect();
         assert_eq!(imgs.len(), 2, "a header logo and a footer logo");
         for (w, h) in imgs {
-            assert!(w <= LOGO_W + 1e-6 && h <= LOGO_H + 1e-6, "logo {w}x{h} escapes its box");
-            assert!((w / h - 4.0).abs() < 1e-6, "logo {w}x{h} was stretched from 4:1");
+            assert!(
+                w <= LOGO_W + 1e-6 && h <= LOGO_H + 1e-6,
+                "logo {w}x{h} escapes its box"
+            );
+            assert!(
+                (w / h - 4.0).abs() < 1e-6,
+                "logo {w}x{h} was stretched from 4:1"
+            );
         }
     }
-
-
 
     /// A HUGE GRID IS COARSENED, not dropped and not spread over pages.
     ///
@@ -3862,15 +4316,22 @@ mod tests {
 
         assert_eq!(d.pages.len(), 1, "the grid took {} pages", d.pages.len());
         let t = texts(&d);
-        assert!(t.iter().any(|s| s == "Illuminance grid (lx)"), "the section went missing: {t:?}");
         assert!(
-            t.iter().any(|s| s.contains("point of the 125 × 38 grid") && s.contains("spacing")),
+            t.iter().any(|s| s == "Illuminance grid (lx)"),
+            "the section went missing: {t:?}"
+        );
+        assert!(
+            t.iter()
+                .any(|s| s.contains("point of the 125 × 38 grid") && s.contains("spacing")),
             "the page must say what spacing it printed at: {t:?}",
         );
         // Coarsened, so far fewer figures than the grid holds — but not none.
         let numbers = t.iter().filter(|s| s.parse::<f64>().is_ok()).count();
         assert!(numbers > 20, "only {numbers} figures were printed");
-        assert!(numbers < 4750 / 4, "{numbers} figures is not a coarsened grid");
+        assert!(
+            numbers < 4750 / 4,
+            "{numbers} figures is not a coarsened grid"
+        );
     }
 
     /// A GRID THAT FITS IS NOT COARSENED, and says nothing about spacing — every point is there.
@@ -3938,7 +4399,10 @@ mod tests {
             !t.iter().any(|s| s == "7"),
             "precondition: the dark point must have been stepped over by the decimation",
         );
-        assert!(t.iter().any(|s| s.contains("Minimum over the whole grid")), "no minimum: {t:?}");
+        assert!(
+            t.iter().any(|s| s.contains("Minimum over the whole grid")),
+            "no minimum: {t:?}"
+        );
         assert!(
             t.iter().any(|s| s.starts_with("7 lx at (")),
             "the true minimum is missing — the report stepped over the darkest point: {t:?}",
@@ -3967,7 +4431,10 @@ mod tests {
         o.sections = vec![Section::NumericGrid];
         let t = texts(&layout(&i, &o));
         // Values are 100 and 150; the second is outside, so both extremes are 100.
-        assert!(t.iter().any(|s| s.starts_with("100 lx at (")), "the minimum is wrong: {t:?}");
+        assert!(
+            t.iter().any(|s| s.starts_with("100 lx at (")),
+            "the minimum is wrong: {t:?}"
+        );
         assert!(
             !t.iter().any(|s| s.starts_with("150 lx at (")),
             "a point outside the room was reported as the maximum: {t:?}",
@@ -4016,7 +4483,11 @@ mod tests {
         let d = layout(&input(&g, &p), &o);
 
         // The logo is on the page furniture…
-        let body_imgs = d.pages[1].items.iter().filter(|i| matches!(i, Item::Image { .. })).count();
+        let body_imgs = d.pages[1]
+            .items
+            .iter()
+            .filter(|i| matches!(i, Item::Image { .. }))
+            .count();
         assert_eq!(body_imgs, 1, "the header logo is not on the body page");
         // …and there is NO renders page, because no render was added.
         assert!(
@@ -4058,7 +4529,11 @@ mod tests {
                 _ => None,
             })
             .expect("a header image");
-        assert_eq!(header.2, 1, "the header points at image {} — the render", header.2);
+        assert_eq!(
+            header.2, 1,
+            "the header points at image {} — the render",
+            header.2
+        );
         assert!(
             (header.0 / header.1 - 4.0).abs() < 1e-6,
             "the header image is {:.0}x{:.0}, which is the render's shape",
@@ -4104,7 +4579,11 @@ mod tests {
         let d = layout(&input(&g, &p), &o);
         let t = texts(&d);
         assert!(t.iter().any(|s| s == "Summary"));
-        assert_eq!(d.pages.len(), 1, "a one-room summary should not need a chapter page");
+        assert_eq!(
+            d.pages.len(),
+            1,
+            "a one-room summary should not need a chapter page"
+        );
     }
 
     /// THE SCHEDULE SAYS WHAT THE ROOM IS LIT WITH — by type, with the manufacturer the file
@@ -4143,22 +4622,46 @@ mod tests {
         let d = layout(&i, &o);
         let t = texts(&d);
 
-        assert!(t.iter().any(|s| s == "OCULUS GRANDE 2.0"), "the fitting is not named: {t:?}");
+        assert!(
+            t.iter().any(|s| s == "OCULUS GRANDE 2.0"),
+            "the fitting is not named: {t:?}"
+        );
         assert!(t.iter().any(|s| s == "12"), "the quantity is missing");
-        assert!(t.iter().any(|s| s == "HSI Lighting"), "the manufacturer is missing");
-        assert!(t.iter().any(|s| s.contains("OG20-36")), "the catalogue number is missing");
-        assert!(t.iter().any(|s| s.contains("CRI 90")), "the lamp description is missing");
+        assert!(
+            t.iter().any(|s| s == "HSI Lighting"),
+            "the manufacturer is missing"
+        );
+        assert!(
+            t.iter().any(|s| s.contains("OG20-36")),
+            "the catalogue number is missing"
+        );
+        assert!(
+            t.iter().any(|s| s.contains("CRI 90")),
+            "the lamp description is missing"
+        );
         assert!(t.iter().any(|s| s == "22.0 W"), "the wattage is missing");
         assert!(t.iter().any(|s| s == "2400 lm"), "the flux is missing");
-        assert!(t.iter().any(|s| s == "109"), "the efficacy is missing (2400/22)");
-        assert!(t.iter().any(|s| s.contains("95 × 95 × 60")), "the size is missing: {t:?}");
+        assert!(
+            t.iter().any(|s| s == "109"),
+            "the efficacy is missing (2400/22)"
+        );
+        assert!(
+            t.iter().any(|s| s.contains("95 × 95 × 60")),
+            "the size is missing: {t:?}"
+        );
 
         // A FILE THAT DECLARES NO MANUFACTURER SHOWS A DASH — that is the file's omission, not the
         // report's, and inventing one would be worse than saying nothing.
-        assert!(t.iter().any(|s| s == "—"), "a missing manufacturer must read as absent");
+        assert!(
+            t.iter().any(|s| s == "—"),
+            "a missing manufacturer must read as absent"
+        );
 
         // The totals, which is what a schedule is read for.
-        assert!(t.iter().any(|s| s == "15 fitting(s)"), "no total count: {t:?}");
+        assert!(
+            t.iter().any(|s| s == "15 fitting(s)"),
+            "no total count: {t:?}"
+        );
         assert!(
             t.iter().any(|s| s.starts_with("420.0 W")),
             "no connected load — 12×22 + 3×52 = 420 W: {t:?}",
@@ -4196,7 +4699,10 @@ mod tests {
         // could be neither switched off nor moved.
         o.sections = vec![Section::Schedule, Section::WholeScheme];
         let t = texts(&layout(&i, &o));
-        assert!(t.iter().any(|s| s == "10"), "the combined quantity is not on the page: {t:?}");
+        assert!(
+            t.iter().any(|s| s == "10"),
+            "the combined quantity is not on the page: {t:?}"
+        );
         assert!(
             t.iter().any(|s| s.contains("all rooms")),
             "the combined schedule is not labelled as such",
@@ -4228,7 +4734,10 @@ mod tests {
         };
         let total = page_of("all rooms").expect("the whole-scheme page");
         let first_room = page_of("15 fitting(s)").or_else(|| page_of("4 fitting(s)"));
-        assert_eq!(total, 0, "listed first, the whole-scheme total is on page {total}");
+        assert_eq!(
+            total, 0,
+            "listed first, the whole-scheme total is on page {total}"
+        );
         if let Some(r) = first_room {
             assert!(
                 total <= r,
@@ -4261,7 +4770,10 @@ mod tests {
         i.surfaces = &surf;
         let t = texts(&layout(&i, &o));
         let at = |s: &str| t.iter().position(|x| x == s).unwrap_or(usize::MAX);
-        assert!(at("Surfaces") < at("Summary"), "Surfaces was swept behind the rooms: {t:?}");
+        assert!(
+            at("Surfaces") < at("Summary"),
+            "Surfaces was swept behind the rooms: {t:?}"
+        );
     }
 
     /// THE SECTION ORDER IS THE DOCUMENT'S ORDER. Moving the renders page is the whole reason the
@@ -4289,8 +4801,14 @@ mod tests {
         let d = layout(&i, &o);
         let t = texts(&d);
         let at = |s: &str| t.iter().position(|x| x == s).unwrap_or(usize::MAX);
-        assert!(at("Surfaces") < at("Summary"), "Surfaces was not first: {t:?}");
-        assert!(at("Summary") < at("Working plane"), "Summary was not second: {t:?}");
+        assert!(
+            at("Surfaces") < at("Summary"),
+            "Surfaces was not first: {t:?}"
+        );
+        assert!(
+            at("Summary") < at("Working plane"),
+            "Summary was not second: {t:?}"
+        );
     }
 
     /// A SECTION THAT WAS SWITCHED OFF IS ABSENT.
@@ -4329,10 +4847,22 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(cover.iter().any(|s| s == "Gym · Level 2"), "the title is not on the cover");
-        assert!(cover.iter().any(|s| s == "Issued for tender"), "the extra line is not there");
-        assert!(!cover.iter().any(|s| s == "HSI Lighting"), "the header ran on the cover");
-        assert!(!cover.iter().any(|s| s == "confidential"), "the footer ran on the cover");
+        assert!(
+            cover.iter().any(|s| s == "Gym · Level 2"),
+            "the title is not on the cover"
+        );
+        assert!(
+            cover.iter().any(|s| s == "Issued for tender"),
+            "the extra line is not there"
+        );
+        assert!(
+            !cover.iter().any(|s| s == "HSI Lighting"),
+            "the header ran on the cover"
+        );
+        assert!(
+            !cover.iter().any(|s| s == "confidential"),
+            "the footer ran on the cover"
+        );
 
         // …and the body pages DO carry them.
         let body: Vec<String> = d.pages[1]
@@ -4343,8 +4873,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(body.iter().any(|s| s == "HSI Lighting"), "no header on the body");
-        assert!(body.iter().any(|s| s == "confidential"), "no footer on the body");
+        assert!(
+            body.iter().any(|s| s == "HSI Lighting"),
+            "no header on the body"
+        );
+        assert!(
+            body.iter().any(|s| s == "confidential"),
+            "no footer on the body"
+        );
     }
 
     /// THE PAGE NUMBER KNOWS THE TOTAL. "1 / 7" cannot be written while it is still being decided
@@ -4400,8 +4936,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(t.iter().any(|s| s == "Renders"), "the page is not headed Renders");
-        assert!(t.iter().any(|s| s == "View from the entrance"), "the caption is missing");
+        assert!(
+            t.iter().any(|s| s == "Renders"),
+            "the page is not headed Renders"
+        );
+        assert!(
+            t.iter().any(|s| s == "View from the entrance"),
+            "the caption is missing"
+        );
         assert!(
             !t.iter().any(|s| s == "Summary"),
             "the renders were squeezed onto the summary page rather than given one",
@@ -4414,7 +4956,11 @@ mod tests {
     fn a_render_is_not_stretched() {
         assert_eq!(fit(1600.0, 900.0, 400.0, 400.0), (400.0, 225.0));
         assert_eq!(fit(900.0, 1600.0, 400.0, 400.0), (225.0, 400.0));
-        assert_eq!(fit(0.0, 0.0, 400.0, 400.0), (0.0, 0.0), "a zero image is not a division by it");
+        assert_eq!(
+            fit(0.0, 0.0, 400.0, 400.0),
+            (0.0, 0.0),
+            "a zero image is not a division by it"
+        );
     }
 
     /// A RENDER SECTION WITH NO IMAGES PRINTS NOTHING — not an empty page with a heading on it.
@@ -4426,10 +4972,12 @@ mod tests {
         o.cover = false;
         o.sections = vec![Section::Renders];
         let d = layout(&input(&g, &p), &o);
-        assert!(!texts(&d).iter().any(|s| s == "Renders"), "an empty renders page was produced");
+        assert!(
+            !texts(&d).iter().any(|s| s == "Renders"),
+            "an empty renders page was produced"
+        );
     }
 }
-
 
 /// ONE GRID IS QUOTED, AND IT IS THE STANDARD'S.
 ///
@@ -4454,7 +5002,17 @@ mod every_figure_comes_from_the_standards_grid {
         let min = vals.iter().cloned().fold(f64::MAX, f64::min);
         let max = vals.iter().cloned().fold(f64::MIN, f64::max);
         let avg = vals.iter().sum::<f64>() / vals.len() as f64;
-        LuxGrid { cols, rows, values: vals, min, max, avg, maintenance: 0.8, direct: Vec::new(), indirect: Vec::new() }
+        LuxGrid {
+            cols,
+            rows,
+            values: vals,
+            min,
+            max,
+            avg,
+            maintenance: 0.8,
+            direct: Vec::new(),
+            indirect: Vec::new(),
+        }
     }
 
     fn texts(d: &Doc) -> Vec<String> {
@@ -4486,13 +5044,24 @@ mod every_figure_comes_from_the_standards_grid {
         let has = |s: &str| t.iter().any(|x| x.contains(s));
 
         assert!(
-            (g.max - eg.max).abs() > 1.0 && (g.avg - eg.avg).abs() > 1.0 && (g.min - eg.min).abs() > 1.0,
+            (g.max - eg.max).abs() > 1.0
+                && (g.avg - eg.avg).abs() > 1.0
+                && (g.min - eg.min).abs() > 1.0,
             "the fixture does not discriminate — the two grids report the same statistics",
         );
-        assert!(has(&format!("{:.0} lx", eg.max)), "the standard's maximum is missing");
-        assert!(has(&format!("{:.0} lx", eg.avg)), "the standard's average is missing");
+        assert!(
+            has(&format!("{:.0} lx", eg.max)),
+            "the standard's maximum is missing"
+        );
+        assert!(
+            has(&format!("{:.0} lx", eg.avg)),
+            "the standard's average is missing"
+        );
         assert!(has("4 x 3 points"), "the standard's grid shape is missing");
-        assert!(has("Grid (EN 12464-1)"), "the page does not say which grid it is quoting");
+        assert!(
+            has("Grid (EN 12464-1)"),
+            "the page does not say which grid it is quoting"
+        );
 
         assert!(
             !has(&format!("{:.0} lx", g.max)),
@@ -4512,8 +5081,16 @@ mod every_figure_comes_from_the_standards_grid {
     fn the_field_is_still_drawn_from_the_calculated_grid() {
         let (g, p, eg) = (grid(16, 12), plane(), en_grid());
         let i = with_en(&g, &p, &eg);
-        assert_eq!(i.rooms[0].drawn().cols, 16, "the drawing dropped to the standard's grid");
-        assert_eq!(i.rooms[0].reported().cols, 4, "the figures came off the fine grid");
+        assert_eq!(
+            i.rooms[0].drawn().cols,
+            16,
+            "the drawing dropped to the standard's grid"
+        );
+        assert_eq!(
+            i.rooms[0].reported().cols,
+            4,
+            "the figures came off the fine grid"
+        );
     }
 
     /// A ROOM WITH NO EN GRID FALLS BACK TO THE ONE IT HAS. Older stored results and the
@@ -4522,7 +5099,11 @@ mod every_figure_comes_from_the_standards_grid {
     fn a_room_with_no_en_grid_reports_its_working_one() {
         let (g, p) = (grid(16, 12), plane());
         let i = input(&g, &p);
-        assert_eq!(i.rooms[0].reported().cols, 16, "a room with no EN grid reported nothing");
+        assert_eq!(
+            i.rooms[0].reported().cols,
+            16,
+            "a room with no EN grid reported nothing"
+        );
         let t = texts(&layout(&i, &Options::default()));
         assert!(
             t.iter().any(|x| x.contains("16 x 12 points")),
@@ -4561,7 +5142,13 @@ mod every_figure_comes_from_the_standards_grid {
     #[test]
     fn spacing_is_quoted_from_the_coarser_axis() {
         // 8 m over 4 columns is 2.00 m; 6 m over 12 rows is 0.50 m.
-        let p = CalcPlane { origin: cad_light::Vertex::new(0.0, 0.0, 0.8), width: 8.0, depth: 6.0, cols: 4, rows: 12 };
+        let p = CalcPlane {
+            origin: cad_light::Vertex::new(0.0, 0.0, 0.8),
+            width: 8.0,
+            depth: 6.0,
+            cols: 4,
+            rows: 12,
+        };
         let g = grid(4, 12);
         assert!(
             (spacing_of(&p, &g) - 2.0).abs() < 1e-6,
@@ -4570,7 +5157,6 @@ mod every_figure_comes_from_the_standards_grid {
         );
     }
 }
-
 
 /// AND THE CELLS THE STATISTICS EXCLUDE STAY EXCLUDED FURTHER DOWN THE PAGE.
 ///
@@ -4594,8 +5180,11 @@ mod the_mask_reaches_the_sections_that_walk_cells {
         let mut mask = vec![true; 12];
         mask[5] = false;
         // The statistics as the engine would leave them: over the KEPT cells only.
-        let kept: Vec<f64> =
-            vals.iter().zip(&mask).filter_map(|(v, k)| k.then_some(*v)).collect();
+        let kept: Vec<f64> = vals
+            .iter()
+            .zip(&mask)
+            .filter_map(|(v, k)| k.then_some(*v))
+            .collect();
         let g = LuxGrid {
             cols,
             rows,
@@ -4635,7 +5224,9 @@ mod the_mask_reaches_the_sections_that_walk_cells {
         assert!(
             t.iter().any(|s| s.starts_with("100 lx at (")),
             "the minimum should be the 100 lx cell; got {:?}",
-            t.iter().filter(|s| s.contains(" lx at (")).collect::<Vec<_>>(),
+            t.iter()
+                .filter(|s| s.contains(" lx at ("))
+                .collect::<Vec<_>>(),
         );
         assert!(
             !t.iter().any(|s| s.starts_with("0 lx at (")),
@@ -4765,7 +5356,10 @@ mod objects_are_not_painted_as_darkness {
     #[test]
     fn a_cell_the_calculation_excluded_is_drawn_as_an_object() {
         let (g, p, poly, mask) = fixture();
-        let d = layout(&room_with_a_block(&g, &p, &poly, &mask), &Options::default());
+        let d = layout(
+            &room_with_a_block(&g, &p, &poly, &mask),
+            &Options::default(),
+        );
         let f = fills(&d);
         assert!(
             f.contains(&OBJECT_FILL),
@@ -4785,10 +5379,14 @@ mod objects_are_not_painted_as_darkness {
     #[test]
     fn the_page_explains_the_object_colour() {
         let (g, p, poly, mask) = fixture();
-        let d = layout(&room_with_a_block(&g, &p, &poly, &mask), &Options::default());
+        let d = layout(
+            &room_with_a_block(&g, &p, &poly, &mask),
+            &Options::default(),
+        );
         let t = texts(&d);
         assert!(
-            t.iter().any(|s| s.contains("inside objects standing in the room")),
+            t.iter()
+                .any(|s| s.contains("inside objects standing in the room")),
             "the drawing carries a colour the legend does not explain",
         );
         assert!(
@@ -4810,7 +5408,9 @@ mod objects_are_not_painted_as_darkness {
             "an empty room was given an object block",
         );
         assert!(
-            !texts(&d).iter().any(|s| s.contains("inside objects standing")),
+            !texts(&d)
+                .iter()
+                .any(|s| s.contains("inside objects standing")),
             "an empty room was given the object note",
         );
     }
@@ -4867,17 +5467,27 @@ mod the_text_size_control {
         let k = 1.4;
         let base = text_items(&doc_at(1.0));
         let big = text_items(&doc_at(k));
-        assert!(base.len() > 20, "the fixture is too small to say anything: {} items", base.len());
+        assert!(
+            base.len() > 20,
+            "the fixture is too small to say anything: {} items",
+            base.len()
+        );
 
         let distinct = |v: &[(f64, f64, String)]| {
-            let mut s: Vec<i64> = v.iter().map(|(sz, _, _)| (sz * 1000.0).round() as i64).collect();
+            let mut s: Vec<i64> = v
+                .iter()
+                .map(|(sz, _, _)| (sz * 1000.0).round() as i64)
+                .collect();
             s.sort_unstable();
             s.dedup();
             s
         };
         let a = distinct(&base);
         let b = distinct(&big);
-        assert!(a.len() >= 4, "the report should use at least four sizes; found {a:?}");
+        assert!(
+            a.len() >= 4,
+            "the report should use at least four sizes; found {a:?}"
+        );
         assert_eq!(
             a.len(),
             b.len(),
@@ -4914,7 +5524,11 @@ mod the_text_size_control {
                     _ => None,
                 })
                 .collect();
-            let mut steps: Vec<f64> = ys.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 1.0).collect();
+            let mut steps: Vec<f64> = ys
+                .windows(2)
+                .map(|w| w[1] - w[0])
+                .filter(|d| *d > 1.0)
+                .collect();
             steps.sort_by(|a, b| a.partial_cmp(b).unwrap());
             assert!(!steps.is_empty(), "no row spacing to measure at {scale}x");
             steps[steps.len() / 2]
@@ -4961,7 +5575,11 @@ mod the_text_size_control {
                 .filter(|t| t.contains("1:"))
                 .collect()
         };
-        assert_eq!(note_at(1.0), note_at(1.4), "the stated drawing scale changed with the type size");
+        assert_eq!(
+            note_at(1.0),
+            note_at(1.4),
+            "the stated drawing scale changed with the type size"
+        );
     }
 
     /// AN ABSURD SETTING IS CLAMPED rather than producing a document nobody can use. The dialog
@@ -4969,8 +5587,14 @@ mod the_text_size_control {
     #[test]
     fn a_setting_from_outside_the_dialog_is_still_bounded() {
         for absurd in [0.0, -3.0, 40.0, f64::INFINITY] {
-            let sizes: Vec<f64> = text_items(&doc_at(absurd)).into_iter().map(|(s, _, _)| s).collect();
-            assert!(!sizes.is_empty(), "a text_scale of {absurd} produced no text at all");
+            let sizes: Vec<f64> = text_items(&doc_at(absurd))
+                .into_iter()
+                .map(|(s, _, _)| s)
+                .collect();
+            assert!(
+                !sizes.is_empty(),
+                "a text_scale of {absurd} produced no text at all"
+            );
             for s in sizes {
                 assert!(
                     s.is_finite() && s > 3.0 && s < 80.0,
@@ -4986,11 +5610,19 @@ mod the_text_size_control {
     fn the_default_is_the_report_as_it_was() {
         assert_eq!(Options::default().text_scale, 1.0);
         let d = doc_at(1.0);
-        let sizes: Vec<i64> =
-            text_items(&d).into_iter().map(|(s, _, _)| (s * 100.0).round() as i64).collect();
+        let sizes: Vec<i64> = text_items(&d)
+            .into_iter()
+            .map(|(s, _, _)| (s * 100.0).round() as i64)
+            .collect();
         // The sizes the report is designed at, unrounded and unscaled.
-        assert!(sizes.contains(&900), "the 9 pt table row is missing at 100%: {sizes:?}");
-        assert!(sizes.contains(&1200), "the 12 pt heading is missing at 100%");
+        assert!(
+            sizes.contains(&900),
+            "the 9 pt table row is missing at 100%: {sizes:?}"
+        );
+        assert!(
+            sizes.contains(&1200),
+            "the 12 pt heading is missing at 100%"
+        );
         assert!(sizes.contains(&800), "the 8 pt note is missing at 100%");
     }
 }
@@ -5013,9 +5645,7 @@ mod the_point_values_keep_fitting_their_cells {
             .iter()
             .flat_map(|p| p.items.iter())
             .filter_map(|i| match i {
-                Item::Text { size, rgb, .. }
-                    if *rgb == [20, 20, 20] || *rgb == [245, 245, 245] =>
-                {
+                Item::Text { size, rgb, .. } if *rgb == [20, 20, 20] || *rgb == [245, 245, 245] => {
                     Some(*size)
                 }
                 _ => None,
@@ -5031,7 +5661,10 @@ mod the_point_values_keep_fitting_their_cells {
     #[test]
     fn the_point_values_stay_the_size_that_fits_their_cell() {
         let small = in_cell_sizes(&doc_with_point_values(1.0));
-        assert!(!small.is_empty(), "the coarse fixture printed no point values to check");
+        assert!(
+            !small.is_empty(),
+            "the coarse fixture printed no point values to check"
+        );
         let big = in_cell_sizes(&doc_with_point_values(1.5));
         assert_eq!(
             small.len(),
@@ -5077,7 +5710,14 @@ mod the_walls_are_drawn_on_the_plan {
             .flat_map(|p| p.items.iter())
             .filter_map(|i| match i {
                 // The wall ink, distinguished from the grid rules (150) and the hairlines (235).
-                Item::Line { x1, y1, x2, y2, rgb, .. } if rgb[0] < 60 => Some((*x1, *y1, *x2, *y2)),
+                Item::Line {
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    rgb,
+                    ..
+                } if rgb[0] < 60 => Some((*x1, *y1, *x2, *y2)),
                 _ => None,
             })
             .collect()
@@ -5108,7 +5748,10 @@ mod the_walls_are_drawn_on_the_plan {
     #[test]
     fn no_model_means_no_wall_ink() {
         let d = doc_with_walls(Vec::new());
-        assert!(dark_lines(&d).is_empty(), "nothing to cut, so nothing to draw");
+        assert!(
+            dark_lines(&d).is_empty(),
+            "nothing to cut, so nothing to draw"
+        );
     }
 
     /// SEGMENTS OUTSIDE THIS ROOM'S PLOT ARE DROPPED. The cut is of the WHOLE building and each
@@ -5189,7 +5832,10 @@ mod the_walls_are_drawn_on_the_plan {
                 };
                 ok(x1, y1) && ok(x2, y2)
             });
-            assert!(in_a_frame, "a wall stroke landed outside every plot: {x1},{y1} {x2},{y2}");
+            assert!(
+                in_a_frame,
+                "a wall stroke landed outside every plot: {x1},{y1} {x2},{y2}"
+            );
         }
     }
 }
@@ -5236,7 +5882,15 @@ mod schedule_cells_do_not_collide {
             .enumerate()
             .flat_map(|(pi, p)| p.items.iter().map(move |i| (pi, i)))
             .filter_map(|(pi, i)| match i {
-                Item::Text { x, y, size, font, align, text, .. } => {
+                Item::Text {
+                    x,
+                    y,
+                    size,
+                    font,
+                    align,
+                    text,
+                    ..
+                } => {
                     let w = crate::report::pdf::text_width(text, *size, *font);
                     let x0 = match align {
                         Align::Left => *x,
@@ -5269,7 +5923,10 @@ mod schedule_cells_do_not_collide {
             assert!(
                 b.1 >= a.2 - 0.01,
                 "'{}' ends at {:.1} and '{}' starts at {:.1} on the same line — they overprint",
-                a.4, a.2, b.4, b.1,
+                a.4,
+                a.2,
+                b.4,
+                b.1,
             );
         }
     }
@@ -5280,9 +5937,15 @@ mod schedule_cells_do_not_collide {
     fn a_short_name_is_printed_whole() {
         let d = doc_with(vec![row("DL-90", "HSI")]);
         let texts: Vec<String> = spans(&d).into_iter().map(|s| s.4).collect();
-        assert!(texts.iter().any(|t| t == "DL-90"), "a short name must survive intact: {texts:?}");
+        assert!(
+            texts.iter().any(|t| t == "DL-90"),
+            "a short name must survive intact: {texts:?}"
+        );
         assert!(texts.iter().any(|t| t == "HSI"));
-        assert!(!texts.iter().any(|t| t.contains('…')), "and nothing should be cut: {texts:?}");
+        assert!(
+            !texts.iter().any(|t| t.contains('…')),
+            "and nothing should be cut: {texts:?}"
+        );
     }
 
     /// A NAME THAT DOES NOT FIT IS MARKED AS CUT. Silently dropping the tail would read as the
@@ -5290,9 +5953,15 @@ mod schedule_cells_do_not_collide {
     #[test]
     fn a_long_name_is_marked_where_it_was_cut() {
         let d = doc_with(vec![row(LONG, "HSI")]);
-        let cut: Vec<String> =
-            spans(&d).into_iter().map(|s| s.4).filter(|t| t.contains('…')).collect();
-        assert!(!cut.is_empty(), "a name too long for its column must show that it was cut");
+        let cut: Vec<String> = spans(&d)
+            .into_iter()
+            .map(|s| s.4)
+            .filter(|t| t.contains('…'))
+            .collect();
+        assert!(
+            !cut.is_empty(),
+            "a name too long for its column must show that it was cut"
+        );
         assert!(
             cut.iter().any(|t| t.starts_with("OCULUS")),
             "and must still start with the name it stands for: {cut:?}",
@@ -5311,6 +5980,10 @@ mod schedule_cells_do_not_collide {
         }
         // Too narrow for even one character: an empty cell, never a bare ellipsis, which would
         // read as data that had been there.
-        assert_eq!(fit_to(LONG, 1.0, 8.0, Font::Bold), "", "a lone ellipsis says nothing");
+        assert_eq!(
+            fit_to(LONG, 1.0, 8.0, Font::Bold),
+            "",
+            "a lone ellipsis says nothing"
+        );
     }
 }

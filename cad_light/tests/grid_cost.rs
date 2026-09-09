@@ -11,7 +11,15 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 /// A room the size of the owner's gym, with a realistic number of fittings in it.
-fn gym(cols: u32, rows: u32) -> (Vec<Mesh>, Vec<Luminaire>, HashMap<String, IesProfile>, CalcPlane) {
+fn gym(
+    cols: u32,
+    rows: u32,
+) -> (
+    Vec<Mesh>,
+    Vec<Luminaire>,
+    HashMap<String, IesProfile>,
+    CalcPlane,
+) {
     let (w, d, h) = (33.0_f32, 13.0_f32, 3.3_f32);
     let meshes = extrude::box_room(w, d, h);
     let profile = downlight();
@@ -51,7 +59,10 @@ fn gym(cols: u32, rows: u32) -> (Vec<Mesh>, Vec<Luminaire>, HashMap<String, IesP
 #[test]
 #[ignore = "benchmark — run with --release --ignored --nocapture"]
 fn what_a_grid_point_costs() {
-    println!("\n{:>12} {:>10} {:>12} {:>14}", "grid", "points", "elapsed", "per point");
+    println!(
+        "\n{:>12} {:>10} {:>12} {:>14}",
+        "grid", "points", "elapsed", "per point"
+    );
     println!("{}", "-".repeat(52));
     let materials = default_materials();
     let settings = RaySettings::default();
@@ -63,7 +74,12 @@ fn what_a_grid_point_costs() {
         let n = (c as u64) * (r as u64);
         println!(
             "{:>5} x {:<4} {:>10} {:>9.1} ms {:>11.4} ms   avg {:.0} lx",
-            c, r, n, ms, ms / n as f64, g.avg,
+            c,
+            r,
+            n,
+            ms,
+            ms / n as f64,
+            g.avg,
         );
     }
     println!();
@@ -73,8 +89,10 @@ fn what_a_grid_point_costs() {
 /// the timing is against a realistic photometric lookup rather than a constant.
 fn downlight() -> IesProfile {
     let vertical_angles: Vec<f64> = (0..=18).map(|i| i as f64 * 5.0).collect();
-    let candela: Vec<f64> =
-        vertical_angles.iter().map(|g| 1000.0 * g.to_radians().cos().max(0.0)).collect();
+    let candela: Vec<f64> = vertical_angles
+        .iter()
+        .map(|g| 1000.0 * g.to_radians().cos().max(0.0))
+        .collect();
     IesProfile {
         manufacturer: String::new(),
         catalogue: String::new(),
@@ -102,7 +120,10 @@ fn downlight() -> IesProfile {
 #[test]
 #[ignore = "benchmark — run with --release --ignored --nocapture"]
 fn what_the_scene_costs_on_top_of_the_grid() {
-    println!("\n{:>12} {:>12} {:>12} {:>14}", "scene tris", "points", "elapsed", "per point");
+    println!(
+        "\n{:>12} {:>12} {:>12} {:>14}",
+        "scene tris", "points", "elapsed", "per point"
+    );
     println!("{}", "-".repeat(54));
     let materials = default_materials();
     let settings = RaySettings::default();

@@ -71,7 +71,12 @@ pub enum Support {
 }
 
 impl Support {
-    pub const ALL: [Support; 4] = [Support::Legs, Support::Drawers, Support::Panel, Support::None];
+    pub const ALL: [Support; 4] = [
+        Support::Legs,
+        Support::Drawers,
+        Support::Panel,
+        Support::None,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             Support::Legs => "Λ legs",
@@ -131,7 +136,11 @@ pub struct Grommet {
 
 impl Grommet {
     pub fn rear_at(x: f32) -> Self {
-        Self { x, y: 0.0, rear: true }
+        Self {
+            x,
+            y: 0.0,
+            rear: true,
+        }
     }
     fn xy(self, w: f32) -> (f32, f32) {
         (self.x, if self.rear { w / 2.0 - GR_REAR } else { self.y })
@@ -209,7 +218,13 @@ pub enum Preset {
 }
 
 impl Preset {
-    pub const ALL: [Preset; 5] = [Preset::Bench, Preset::Single, Preset::Combo, Preset::Exec, Preset::Minimal];
+    pub const ALL: [Preset; 5] = [
+        Preset::Bench,
+        Preset::Single,
+        Preset::Combo,
+        Preset::Exec,
+        Preset::Minimal,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             Preset::Bench => "Bench (reference)",
@@ -249,11 +264,25 @@ impl Preset {
                 part_h: 0.25,
                 sup_r: Support::Drawers,
                 ped_face: PedFace::End,
-                grommets: vec![Grommet { x: 0.70, y: 0.0, rear: false }],
+                grommets: vec![Grommet {
+                    x: 0.70,
+                    y: 0.0,
+                    rear: false,
+                }],
                 ..base
             },
-            Preset::Single => DeskInput { length: 1.60, width: 0.80, part_w: 1.40, part_h: 0.35, ..base },
-            Preset::Combo => DeskInput { sup_r: Support::Drawers, grommets: vec![Grommet::rear_at(0.45)], ..base },
+            Preset::Single => DeskInput {
+                length: 1.60,
+                width: 0.80,
+                part_w: 1.40,
+                part_h: 0.35,
+                ..base
+            },
+            Preset::Combo => DeskInput {
+                sup_r: Support::Drawers,
+                grommets: vec![Grommet::rear_at(0.45)],
+                ..base
+            },
             Preset::Exec => DeskInput {
                 length: 2.00,
                 width: 1.00,
@@ -265,7 +294,14 @@ impl Preset {
                 grommets: vec![Grommet::rear_at(-0.55), Grommet::rear_at(0.55)],
                 ..base
             },
-            Preset::Minimal => DeskInput { length: 1.40, width: 0.70, height: 0.74, partition: false, grommets: Vec::new(), ..base },
+            Preset::Minimal => DeskInput {
+                length: 1.40,
+                width: 0.70,
+                height: 0.74,
+                partition: false,
+                grommets: Vec::new(),
+                ..base
+            },
         }
     }
 }
@@ -305,7 +341,15 @@ fn push_tri(mesh: &mut SolidMesh, part: u32, a: [f32; 3], b: [f32; 3], c: [f32; 
 }
 
 /// One flat quad `a→b→c→d` (already wound to match `n`).
-fn push_quad(mesh: &mut SolidMesh, part: u32, a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3], n: [f32; 3]) {
+fn push_quad(
+    mesh: &mut SolidMesh,
+    part: u32,
+    a: [f32; 3],
+    b: [f32; 3],
+    c: [f32; 3],
+    d: [f32; 3],
+    n: [f32; 3],
+) {
     push_tri(mesh, part, a, b, c, n);
     push_tri(mesh, part, a, c, d, n);
 }
@@ -318,7 +362,16 @@ fn push_box(mesh: &mut SolidMesh, part: u32, x: [f32; 2], y: [f32; 2], z: [f32; 
     if (x1 - x0) < 1e-6 || (y1 - y0) < 1e-6 || (z1 - z0) < 1e-6 {
         return;
     }
-    let c = [[x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0], [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]];
+    let c = [
+        [x0, y0, z0],
+        [x1, y0, z0],
+        [x1, y1, z0],
+        [x0, y1, z0],
+        [x0, y0, z1],
+        [x1, y0, z1],
+        [x1, y1, z1],
+        [x0, y1, z1],
+    ];
     let quads: [([usize; 4], [f32; 3]); 6] = [
         ([0, 3, 2, 1], [0.0, 0.0, -1.0]),
         ([4, 5, 6, 7], [0.0, 0.0, 1.0]),
@@ -365,8 +418,14 @@ fn earclip(poly: &[[f32; 2]]) -> Vec<[usize; 3]> {
     if n < 3 {
         return Vec::new();
     }
-    let mut ring: Vec<usize> = if signed_area(poly) < 0.0 { (0..n).rev().collect() } else { (0..n).collect() };
-    let cross = |o: [f32; 2], a: [f32; 2], b: [f32; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let mut ring: Vec<usize> = if signed_area(poly) < 0.0 {
+        (0..n).rev().collect()
+    } else {
+        (0..n).collect()
+    };
+    let cross = |o: [f32; 2], a: [f32; 2], b: [f32; 2]| {
+        (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    };
     let in_tri = |p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]| {
         let (d1, d2, d3) = (cross(a, b, p), cross(b, c, p), cross(c, a, p));
         let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
@@ -385,7 +444,10 @@ fn earclip(poly: &[[f32; 2]]) -> Vec<[usize; 3]> {
             if cross(a, b, c) <= 0.0 {
                 continue;
             }
-            if ring.iter().any(|&iv| iv != ia && iv != ib && iv != ic && in_tri(poly[iv], a, b, c)) {
+            if ring
+                .iter()
+                .any(|&iv| iv != ia && iv != ib && iv != ic && in_tri(poly[iv], a, b, c))
+            {
                 continue;
             }
             out.push([ia, ib, ic]);
@@ -419,7 +481,11 @@ fn push_prism(mesh: &mut SolidMesh, part: u32, poly: &[[f32; 2]], plane: Plane, 
     let mut tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
         let (va, vb, vc) = (Vec3::from(a), Vec3::from(b), Vec3::from(c));
         let out = (va + vb + vc) / 3.0 - centroid;
-        let (p, q, r) = if (vb - va).cross(vc - va).dot(out) < 0.0 { (va, vc, vb) } else { (va, vb, vc) };
+        let (p, q, r) = if (vb - va).cross(vc - va).dot(out) < 0.0 {
+            (va, vc, vb)
+        } else {
+            (va, vb, vc)
+        };
         let nrm = (q - p).cross(r - p).normalize_or_zero();
         push_tri(mesh, part, p.into(), q.into(), r.into(), nrm.into());
     };
@@ -448,7 +514,12 @@ fn push_prism(mesh: &mut SolidMesh, part: u32, poly: &[[f32; 2]], plane: Plane, 
 /// bottom and rounded on top, which is exactly what makes it read as a screen rather than a board.
 fn rrect(w: f32, h: f32, r: [f32; 4], seg: usize) -> Vec<[f32; 2]> {
     let (hw, hh) = (w / 2.0, h / 2.0);
-    let corners = [(-hw, -hh, r[0], 180.0f32), (hw, -hh, r[1], 270.0), (hw, hh, r[2], 0.0), (-hw, hh, r[3], 90.0)];
+    let corners = [
+        (-hw, -hh, r[0], 180.0f32),
+        (hw, -hh, r[1], 270.0),
+        (hw, hh, r[2], 0.0),
+        (-hw, hh, r[3], 90.0),
+    ];
     let mut out = Vec::with_capacity(4 * (seg + 1));
     for (cx, cy, rad, a0) in corners {
         let rad = rad.min(hw).min(hh).max(0.0);
@@ -496,7 +567,11 @@ fn ring_at(p: Vec3, u: Vec3, v: Vec3, r: f32, n: usize) -> Vec<Vec3> {
 fn push_cap(mesh: &mut SolidMesh, part: u32, c: Vec3, ring: &[Vec3], n: Vec3) {
     for k in 0..ring.len() {
         let (a, b) = (ring[k], ring[(k + 1) % ring.len()]);
-        let (a, b) = if (b - a).cross(c - a).dot(n) < 0.0 { (b, a) } else { (a, b) };
+        let (a, b) = if (b - a).cross(c - a).dot(n) < 0.0 {
+            (b, a)
+        } else {
+            (a, b)
+        };
         push_tri(mesh, part, c.into(), a.into(), b.into(), n.into());
     }
 }
@@ -521,8 +596,14 @@ fn push_ring_strip(mesh: &mut SolidMesh, part: u32, a: &[Vec3], b: &[Vec3], ca: 
     let n = a.len();
     for i in 0..n {
         let j = (i + 1) % n;
-        let (na, nb) = ((a[i] - ca).normalize_or_zero(), (a[j] - ca).normalize_or_zero());
-        let (ma, mb) = ((b[i] - cb).normalize_or_zero(), (b[j] - cb).normalize_or_zero());
+        let (na, nb) = (
+            (a[i] - ca).normalize_or_zero(),
+            (a[j] - ca).normalize_or_zero(),
+        );
+        let (ma, mb) = (
+            (b[i] - cb).normalize_or_zero(),
+            (b[j] - cb).normalize_or_zero(),
+        );
         for v in [a[i], a[j], b[j]] {
             mesh.positions.push(v.into());
         }
@@ -557,7 +638,10 @@ fn push_sphere(mesh: &mut SolidMesh, part: u32, c: Vec3, r: f32, nu: usize, nv: 
     let (top, bot) = (c + Vec3::Z * r, c - Vec3::Z * r);
     for i in 0..nu {
         let j = (i + 1) % nu;
-        for (a, b, d) in [(top, rings[0][i], rings[0][j]), (bot, rings[nv - 2][j], rings[nv - 2][i])] {
+        for (a, b, d) in [
+            (top, rings[0][i], rings[0][j]),
+            (bot, rings[nv - 2][j], rings[nv - 2][i]),
+        ] {
             for v in [a, b, d] {
                 mesh.positions.push(v.into());
                 mesh.normals.push((v - c).normalize_or_zero().into());
@@ -576,7 +660,15 @@ fn push_sphere(mesh: &mut SolidMesh, part: u32, c: Vec3, r: f32, nu: usize, nv: 
 
 /// A polyline with a circular fillet at each interior corner, swept with a circle using
 /// parallel-transport frames (spec §B2: "enough — the paths are near-planar").
-fn push_tube(mesh: &mut SolidMesh, part: u32, pts: &[Vec3], fillet: f32, r: f32, n: usize, seg: usize) {
+fn push_tube(
+    mesh: &mut SolidMesh,
+    part: u32,
+    pts: &[Vec3],
+    fillet: f32,
+    r: f32,
+    n: usize,
+    seg: usize,
+) {
     if pts.len() < 2 {
         return;
     }
@@ -589,7 +681,9 @@ fn push_tube(mesh: &mut SolidMesh, part: u32, pts: &[Vec3], fillet: f32, r: f32,
             path.push(k);
             continue;
         }
-        let d = (fillet * (ang / 2.0).tan()).min((k - a).length() * 0.5).min((b - k).length() * 0.5);
+        let d = (fillet * (ang / 2.0).tan())
+            .min((k - a).length() * 0.5)
+            .min((b - k).length() * 0.5);
         let (p1, p2) = (k - t1 * d, k + t2 * d);
         path.push(p1);
         // Quadratic Bézier through the corner — the de Casteljau form, so the blend is tangent to
@@ -726,12 +820,28 @@ fn build_top(mesh: &mut SolidMesh, part: u32, l: f32, w: f32, h: f32, t: f32, ho
         let j = (i + 1) % 4;
         let (a, b) = (outer[i], outer[j]);
         let n = Vec3::new(b.1 - a.1, a.0 - b.0, 0.0).normalize_or_zero();
-        push_quad(mesh, part, [a.0, a.1, under + ch], [b.0, b.1, under + ch], [b.0, b.1, h], [a.0, a.1, h], n.into());
+        push_quad(
+            mesh,
+            part,
+            [a.0, a.1, under + ch],
+            [b.0, b.1, under + ch],
+            [b.0, b.1, h],
+            [a.0, a.1, h],
+            n.into(),
+        );
         let (c, d) = (inner[i], inner[j]);
         let e0 = Vec3::new(b.0 - a.0, b.1 - a.1, 0.0);
         let e1 = Vec3::new(c.0 - a.0, c.1 - a.1, -ch);
         let cn = e0.cross(e1).normalize_or_zero();
-        push_quad(mesh, part, [a.0, a.1, under + ch], [c.0, c.1, under], [d.0, d.1, under], [b.0, b.1, under + ch], (-cn).into());
+        push_quad(
+            mesh,
+            part,
+            [a.0, a.1, under + ch],
+            [c.0, c.1, under],
+            [d.0, d.1, under],
+            [b.0, b.1, under + ch],
+            (-cn).into(),
+        );
     }
     // Opening walls. The solid lies OUTSIDE the hole, so each wall's outward normal points INTO the
     // opening — and the winding has to run the other way round from the slab's outer perimeter.
@@ -743,7 +853,15 @@ fn build_top(mesh: &mut SolidMesh, part: u32, l: f32, w: f32, h: f32, t: f32, ho
             ([b, d], [b, c], [-1.0, 0.0, 0.0]),
             ([a, c], [a, d], [1.0, 0.0, 0.0]),
         ] {
-            push_quad(mesh, part, [p[0], p[1], under], [q[0], q[1], under], [q[0], q[1], h], [p[0], p[1], h], n);
+            push_quad(
+                mesh,
+                part,
+                [p[0], p[1], under],
+                [q[0], q[1], under],
+                [q[0], q[1], h],
+                [p[0], p[1], h],
+                n,
+            );
         }
     }
 }
@@ -762,28 +880,65 @@ fn build_partition(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &DeskInp
     let shell = alloc(mats, Material::White);
     // Profile is authored centred on the origin, then mapped to (x, z) with the extrusion along y —
     // so the polygon's own y is the desk's z. `cz` re-centres it above the top surface.
-    let poly: Vec<[f32; 2]> = rrect(pw, ph, [0.0, 0.0, pr, pr], 10).iter().map(|p| [p[0], p[1] + cz]).collect();
+    let poly: Vec<[f32; 2]> = rrect(pw, ph, [0.0, 0.0, pr, pr], 10)
+        .iter()
+        .map(|p| [p[0], p[1] + cz])
+        .collect();
     push_prism(mesh, shell, &poly, Plane::Xz, py - pt / 2.0, py + pt / 2.0);
 
     let ins = PART_INSET.min(pw * 0.25).min(ph * 0.25);
     let r_in = (pr - ins).max(0.02);
     let shift = |p: &[[f32; 2]]| -> Vec<[f32; 2]> { p.iter().map(|q| [q[0], q[1] + cz]).collect() };
-    let pan = shift(&rrect(pw - 2.0 * ins, ph - 2.0 * ins, [r_in * 0.4, r_in * 0.4, r_in, r_in], 10));
-    let trim = shift(&rrect(pw - 2.0 * ins + 0.006, ph - 2.0 * ins + 0.006, [r_in * 0.4, r_in * 0.4, r_in, r_in], 10));
+    let pan = shift(&rrect(
+        pw - 2.0 * ins,
+        ph - 2.0 * ins,
+        [r_in * 0.4, r_in * 0.4, r_in, r_in],
+        10,
+    ));
+    let trim = shift(&rrect(
+        pw - 2.0 * ins + 0.006,
+        ph - 2.0 * ins + 0.006,
+        [r_in * 0.4, r_in * 0.4, r_in, r_in],
+        10,
+    ));
     let trim_p = alloc(mats, Material::Dark);
     let fab_p = alloc(mats, Material::Fabric);
     for s in [-1.0f32, 1.0] {
-        push_prism(mesh, trim_p, &trim, Plane::Xz, py + s * (pt / 2.0 + 0.001), py + s * (pt / 2.0 + 0.004));
-        push_prism(mesh, fab_p, &pan, Plane::Xz, py + s * (pt / 2.0 + 0.002), py + s * (pt / 2.0 + 0.007));
+        push_prism(
+            mesh,
+            trim_p,
+            &trim,
+            Plane::Xz,
+            py + s * (pt / 2.0 + 0.001),
+            py + s * (pt / 2.0 + 0.004),
+        );
+        push_prism(
+            mesh,
+            fab_p,
+            &pan,
+            Plane::Xz,
+            py + s * (pt / 2.0 + 0.002),
+            py + s * (pt / 2.0 + 0.007),
+        );
     }
     if inp.part_band {
         let band = alloc(mats, Material::Alu);
         let bw = (pw - 0.14).min(0.90);
         if bw > 0.05 {
             let bz = h + 0.010 + BAND_H / 2.0;
-            let poly: Vec<[f32; 2]> = rrect(bw, BAND_H, [0.01; 4], 4).iter().map(|p| [p[0], p[1] + bz]).collect();
+            let poly: Vec<[f32; 2]> = rrect(bw, BAND_H, [0.01; 4], 4)
+                .iter()
+                .map(|p| [p[0], p[1] + bz])
+                .collect();
             for s in [-1.0f32, 1.0] {
-                push_prism(mesh, band, &poly, Plane::Xz, py + s * (pt / 2.0 + 0.007), py + s * (pt / 2.0 + 0.012));
+                push_prism(
+                    mesh,
+                    band,
+                    &poly,
+                    Plane::Xz,
+                    py + s * (pt / 2.0 + 0.007),
+                    py + s * (pt / 2.0 + 0.012),
+                );
             }
         }
     }
@@ -793,7 +948,12 @@ fn build_partition(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &DeskInp
 ///
 /// The stance is deliberately **wider than the top** — that is the product's signature, and per §A1
 /// it only shows in a front ortho, never from the side.
-fn build_legs(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &DeskInput, s: f32) -> (f32, f32) {
+fn build_legs(
+    mesh: &mut SolidMesh,
+    mats: &mut Vec<Material>,
+    inp: &DeskInput,
+    s: f32,
+) -> (f32, f32) {
     let (l, w) = (inp.length, inp.width);
     let under = inp.height - inp.top_t;
     let xe = s * (l / 2.0 - LEG_INSET);
@@ -808,20 +968,36 @@ fn build_legs(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &DeskInput, s
         push_tube(
             mesh,
             metal,
-            &[Vec3::new(xe, yb, hub_z), Vec3::new(xf, yf, 0.115), Vec3::new(xf, yf, 0.010)],
+            &[
+                Vec3::new(xe, yb, hub_z),
+                Vec3::new(xf, yf, 0.115),
+                Vec3::new(xf, yf, 0.010),
+            ],
             FILLET_R,
             LEG_R,
             12,
             8,
         );
-        push_cyl(mesh, cap, Vec3::new(xf, yf, 0.0), Vec3::new(xf, yf, FOOT_H), LEG_R + 0.002, 12);
+        push_cyl(
+            mesh,
+            cap,
+            Vec3::new(xf, yf, 0.0),
+            Vec3::new(xf, yf, FOOT_H),
+            LEG_R + 0.002,
+            12,
+        );
     }
     (xe, hub_z)
 }
 
 /// The drawer pedestal at end `s` (spec §B2). Every drawer front is its own part so a single drawer
 /// can be selected and re-painted in the app. Returns the rail attachment `(x, z)`.
-fn build_pedestal(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &DeskInput, s: f32) -> (f32, f32) {
+fn build_pedestal(
+    mesh: &mut SolidMesh,
+    mats: &mut Vec<Material>,
+    inp: &DeskInput,
+    s: f32,
+) -> (f32, f32) {
     let (l, w) = (inp.length, inp.width);
     let under = inp.height - inp.top_t;
     let n = inp.ped_n.max(1) as usize;
@@ -831,17 +1007,33 @@ fn build_pedestal(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &DeskInpu
     let x_in = x_out - s * inp.ped_w;
     let (x0, x1) = (x_out.min(x_in), x_out.max(x_in));
     let y0 = -(w / 2.0 - 0.020);
-    let y1 = if end_face { w / 2.0 - 0.020 } else { w / 2.0 - 0.060 };
+    let y1 = if end_face {
+        w / 2.0 - 0.020
+    } else {
+        w / 2.0 - 0.060
+    };
 
     let dark = alloc(mats, Material::Dark);
     let white = alloc(mats, Material::White);
     let ins = 0.045;
     for fx in [x0 + ins, x1 - ins - 0.06] {
         for fy in [y0 + ins, y1 - ins - 0.06] {
-            push_box(mesh, dark, [fx, fx + 0.06], [fy, fy + 0.06], [0.0, PLINTH_Z]);
+            push_box(
+                mesh,
+                dark,
+                [fx, fx + 0.06],
+                [fy, fy + 0.06],
+                [0.0, PLINTH_Z],
+            );
         }
     }
-    push_box(mesh, white, [x0, x1], [y0, y1], [PLINTH_Z, PLINTH_Z + 0.020]);
+    push_box(
+        mesh,
+        white,
+        [x0, x1],
+        [y0, y1],
+        [PLINTH_Z, PLINTH_Z + 0.020],
+    );
     let c0 = PLINTH_Z + 0.020;
     push_box(mesh, white, [x0, x1], [y0, y1], [c0, under - 0.002]);
 
@@ -857,10 +1049,28 @@ fn build_pedestal(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &DeskInpu
             let fx0 = if s > 0.0 { x1 } else { x0 - 0.004 };
             let fx1 = fx0 + 0.004;
             push_box(mesh, front, [fx0, fx1], [y0 + 0.004, y1 - 0.004], [z0, z1]);
-            push_box(mesh, handle, [fx0 - 0.0005, fx1 + 0.0008], [y0 + 0.030, y1 - 0.030], [gz, z1 - 0.004]);
+            push_box(
+                mesh,
+                handle,
+                [fx0 - 0.0005, fx1 + 0.0008],
+                [y0 + 0.030, y1 - 0.030],
+                [gz, z1 - 0.004],
+            );
         } else {
-            push_box(mesh, front, [x0 + 0.004, x1 - 0.004], [y0 - 0.004, y0], [z0, z1]);
-            push_box(mesh, handle, [x0 + 0.030, x1 - 0.030], [y0 - 0.0048, y0 + 0.0005], [gz, z1 - 0.004]);
+            push_box(
+                mesh,
+                front,
+                [x0 + 0.004, x1 - 0.004],
+                [y0 - 0.004, y0],
+                [z0, z1],
+            );
+            push_box(
+                mesh,
+                handle,
+                [x0 + 0.030, x1 - 0.030],
+                [y0 - 0.0048, y0 + 0.0005],
+                [gz, z1 - 0.004],
+            );
         }
     }
     // fingerprint lock on the top drawer
@@ -868,20 +1078,45 @@ fn build_pedestal(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &DeskInpu
     let zc = c0 + n as f32 * fh - 0.045;
     if end_face {
         let fx = if s > 0.0 { x1 + 0.004 } else { x0 - 0.004 };
-        push_cyl(mesh, lock, Vec3::new(fx, y0 + 0.050, zc), Vec3::new(fx + s * 0.002, y0 + 0.050, zc), 0.009, 12);
+        push_cyl(
+            mesh,
+            lock,
+            Vec3::new(fx, y0 + 0.050, zc),
+            Vec3::new(fx + s * 0.002, y0 + 0.050, zc),
+            0.009,
+            12,
+        );
     } else {
-        push_cyl(mesh, lock, Vec3::new(x1 - 0.050, y0 - 0.004, zc), Vec3::new(x1 - 0.050, y0 - 0.006, zc), 0.009, 12);
+        push_cyl(
+            mesh,
+            lock,
+            Vec3::new(x1 - 0.050, y0 - 0.004, zc),
+            Vec3::new(x1 - 0.050, y0 - 0.006, zc),
+            0.009,
+            12,
+        );
     }
     (x_in, under - RAIL_SINK)
 }
 
 /// A plain end panel (spec §B2). Returns the rail attachment `(x, z)`.
-fn build_panel(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &DeskInput, s: f32) -> (f32, f32) {
+fn build_panel(
+    mesh: &mut SolidMesh,
+    mats: &mut Vec<Material>,
+    inp: &DeskInput,
+    s: f32,
+) -> (f32, f32) {
     let (l, w) = (inp.length, inp.width);
     let under = inp.height - inp.top_t;
     let xe = s * (l / 2.0 - 0.020);
     let white = alloc(mats, Material::White);
-    push_box(mesh, white, [xe, xe - s * 0.025], [-(w / 2.0 - 0.050), w / 2.0 - 0.050], [0.008, under - 0.001]);
+    push_box(
+        mesh,
+        white,
+        [xe, xe - s * 0.025],
+        [-(w / 2.0 - 0.050), w / 2.0 - 0.050],
+        [0.008, under - 0.001],
+    );
     (xe - s * 0.025, under - RAIL_SINK)
 }
 
@@ -892,13 +1127,22 @@ fn build_panel(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &DeskInput, 
 /// per part id.
 pub fn build(inp: &DeskInput) -> Result<(DeskMetrics, SolidMesh, Vec<Material>), String> {
     let (l, w, h, t) = (inp.length, inp.width, inp.height, inp.top_t);
-    for (name, v) in [("length", l), ("depth", w), ("height", h), ("top thickness", t)] {
+    for (name, v) in [
+        ("length", l),
+        ("depth", w),
+        ("height", h),
+        ("top thickness", t),
+    ] {
         if !(v > 0.0) || !v.is_finite() {
             return Err(format!("{name} must be greater than 0"));
         }
     }
     if t >= h {
-        return Err(format!("top thickness {:.0} mm cannot reach the {:.0} mm surface height", t * 1000.0, h * 1000.0));
+        return Err(format!(
+            "top thickness {:.0} mm cannot reach the {:.0} mm surface height",
+            t * 1000.0,
+            h * 1000.0
+        ));
     }
 
     let mut warnings: Vec<String> = Vec::new();
@@ -907,7 +1151,10 @@ pub fn build(inp: &DeskInput) -> Result<(DeskMetrics, SolidMesh, Vec<Material>),
     let mut pw = inp.part_w;
     if inp.partition {
         if pw > l - 0.10 {
-            warnings.push(format!("screen span {:.0} mm clamped to the top length − 100 mm", pw * 1000.0));
+            warnings.push(format!(
+                "screen span {:.0} mm clamped to the top length − 100 mm",
+                pw * 1000.0
+            ));
             pw = l - 0.10;
         }
         if pw <= 0.05 {
@@ -921,9 +1168,15 @@ pub fn build(inp: &DeskInput) -> Result<(DeskMetrics, SolidMesh, Vec<Material>),
         }
     }
     if !(0.66..=0.82).contains(&h) {
-        warnings.push(format!("top surface {:.0} mm is outside the ergonomic 660–820 mm band", h * 1000.0));
+        warnings.push(format!(
+            "top surface {:.0} mm is outside the ergonomic 660–820 mm band",
+            h * 1000.0
+        ));
     }
-    let peds = [inp.sup_l, inp.sup_r].iter().filter(|s| **s == Support::Drawers).count();
+    let peds = [inp.sup_l, inp.sup_r]
+        .iter()
+        .filter(|s| **s == Support::Drawers)
+        .count();
     if peds > 0 {
         if inp.ped_w <= 0.10 || inp.ped_w >= l / 2.0 {
             return Err(format!(
@@ -933,15 +1186,27 @@ pub fn build(inp: &DeskInput) -> Result<(DeskMetrics, SolidMesh, Vec<Material>),
             ));
         }
         if peds == 2 && 2.0 * inp.ped_w > l - 0.45 {
-            warnings.push(format!("two pedestals leave {:.0} mm of knee space — under 450 mm", (l - 2.0 * inp.ped_w) * 1000.0));
+            warnings.push(format!(
+                "two pedestals leave {:.0} mm of knee space — under 450 mm",
+                (l - 2.0 * inp.ped_w) * 1000.0
+            ));
         }
     }
-    let front_h = if peds > 0 { (h - t - 0.060) / inp.ped_n.max(1) as f32 } else { 0.0 };
+    let front_h = if peds > 0 {
+        (h - t - 0.060) / inp.ped_n.max(1) as f32
+    } else {
+        0.0
+    };
     if peds > 0 && front_h < 0.130 {
-        warnings.push(format!("drawer fronts are {:.0} mm tall — under 130 mm is unusable", front_h * 1000.0));
+        warnings.push(format!(
+            "drawer fronts are {:.0} mm tall — under 130 mm is unusable",
+            front_h * 1000.0
+        ));
     }
     match (inp.sup_l, inp.sup_r) {
-        (Support::None, Support::None) => warnings.push("both supports deleted — the top has nothing to stand on".into()),
+        (Support::None, Support::None) => {
+            warnings.push("both supports deleted — the top has nothing to stand on".into())
+        }
         (Support::None, _) | (_, Support::None) => {
             warnings.push("one support deleted — the top cantilevers from the other end".into())
         }
@@ -954,8 +1219,17 @@ pub fn build(inp: &DeskInput) -> Result<(DeskMetrics, SolidMesh, Vec<Material>),
     let margin = EDGE_CH + 0.010;
     for (i, g) in inp.grommets.iter().enumerate() {
         let (gx, gy) = g.xy(w);
-        let hle = [gx - GR_L / 2.0, gx + GR_L / 2.0, gy - GR_D / 2.0, gy + GR_D / 2.0];
-        if hle[0] < -l / 2.0 + margin || hle[1] > l / 2.0 - margin || hle[2] < -w / 2.0 + margin || hle[3] > w / 2.0 - margin {
+        let hle = [
+            gx - GR_L / 2.0,
+            gx + GR_L / 2.0,
+            gy - GR_D / 2.0,
+            gy + GR_D / 2.0,
+        ];
+        if hle[0] < -l / 2.0 + margin
+            || hle[1] > l / 2.0 - margin
+            || hle[2] < -w / 2.0 + margin
+            || hle[3] > w / 2.0 - margin
+        {
             return Err(format!(
                 "cable port {} at ({:.0}, {:.0}) mm breaks the edge of the top — keep it {:.0} mm clear",
                 i + 1,
@@ -982,7 +1256,10 @@ pub fn build(inp: &DeskInput) -> Result<(DeskMetrics, SolidMesh, Vec<Material>),
 
     let mut rail_ends: Vec<(f32, f32)> = Vec::new();
     let mut leg_stance = 0.0f32;
-    for (side, kind, s) in [("support_L", inp.sup_l, -1.0f32), ("support_R", inp.sup_r, 1.0)] {
+    for (side, kind, s) in [
+        ("support_L", inp.sup_l, -1.0f32),
+        ("support_R", inp.sup_r, 1.0),
+    ] {
         let end = match kind {
             Support::Legs => {
                 leg_stance = 2.0 * ((w / 2.0 + LEG_STANCE) * 0.985 + LEG_R + 0.002);
@@ -1005,7 +1282,14 @@ pub fn build(inp: &DeskInput) -> Result<(DeskMetrics, SolidMesh, Vec<Material>),
     if inp.rail {
         let rail = alloc(&mut mats, Material::Metal);
         let ((xa, za), (xb, zb)) = (rail_ends[0], rail_ends[1]);
-        push_cyl(&mut mesh, rail, Vec3::new(xa, 0.0, za), Vec3::new(xb, 0.0, zb), RAIL_R, 12);
+        push_cyl(
+            &mut mesh,
+            rail,
+            Vec3::new(xa, 0.0, za),
+            Vec3::new(xb, 0.0, zb),
+            RAIL_R,
+            12,
+        );
         features.push("rail".into());
     }
 
@@ -1014,10 +1298,22 @@ pub fn build(inp: &DeskInput) -> Result<(DeskMetrics, SolidMesh, Vec<Material>),
         let liner = alloc(&mut mats, Material::Dark);
         for g in &inp.grommets {
             let (gx, gy) = g.xy(w);
-            let shift = |p: Vec<[f32; 2]>| -> Vec<[f32; 2]> { p.into_iter().map(|q| [q[0] + gx, q[1] + gy]).collect() };
-            let ring = shift(rrect(GR_L + 0.012, GR_D + 0.012, [(GR_D + 0.012) / 2.0; 4], 8));
+            let shift = |p: Vec<[f32; 2]>| -> Vec<[f32; 2]> {
+                p.into_iter().map(|q| [q[0] + gx, q[1] + gy]).collect()
+            };
+            let ring = shift(rrect(
+                GR_L + 0.012,
+                GR_D + 0.012,
+                [(GR_D + 0.012) / 2.0; 4],
+                8,
+            ));
             push_prism(&mut mesh, collar, &ring, Plane::Xy, h - 0.004, h + 0.003);
-            let sleeve = shift(rrect(GR_L - 0.006, GR_D - 0.006, [(GR_D - 0.006) / 2.0; 4], 8));
+            let sleeve = shift(rrect(
+                GR_L - 0.006,
+                GR_D - 0.006,
+                [(GR_D - 0.006) / 2.0; 4],
+                8,
+            ));
             push_prism(&mut mesh, liner, &sleeve, Plane::Xy, h - 0.030, h - 0.006);
         }
         features.push(format!("grommets ×{}", inp.grommets.len()));
@@ -1051,7 +1347,9 @@ mod tests {
     fn top_surface_area(mesh: &SolidMesh, h: f32) -> f32 {
         let mut a = 0.0;
         for t in 0..mesh.tri_count() {
-            let p: Vec<Vec3> = (0..3).map(|i| Vec3::from(mesh.positions[t * 3 + i])).collect();
+            let p: Vec<Vec3> = (0..3)
+                .map(|i| Vec3::from(mesh.positions[t * 3 + i]))
+                .collect();
             if p.iter().any(|v| (v.z - h).abs() > 1e-5) || mesh.normals[t * 3][2] < 0.99 {
                 continue;
             }
@@ -1071,11 +1369,24 @@ mod tests {
             assert!(p.iter().all(|v| v.is_finite()), "non-finite vertex {p:?}");
         }
         let (lo, hi) = bbox(&mesh);
-        assert!((hi[0] - lo[0] - m.length).abs() < 0.02, "length {}", hi[0] - lo[0]);
+        assert!(
+            (hi[0] - lo[0] - m.length).abs() < 0.02,
+            "length {}",
+            hi[0] - lo[0]
+        );
         assert!(lo[2].abs() < 1e-4, "desk floats: z0 = {}", lo[2]);
         // The screen top is the highest thing in the model.
-        assert!((hi[2] - m.partition_top).abs() < 0.02, "screen top {} vs bbox {}", m.partition_top, hi[2]);
-        assert!(m.warnings.is_empty(), "unexpected warnings: {:?}", m.warnings);
+        assert!(
+            (hi[2] - m.partition_top).abs() < 0.02,
+            "screen top {} vs bbox {}",
+            m.partition_top,
+            hi[2]
+        );
+        assert!(
+            m.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            m.warnings
+        );
     }
 
     /// §A4 — the `bench` preset reproduces the reference FBX. Same tolerances the generator prints.
@@ -1087,14 +1398,32 @@ mod tests {
         assert!((m.length - 1.600).abs() < 0.001);
         assert!((m.width - 1.240).abs() < 0.001);
         assert!((m.height - 0.780).abs() < 0.001);
-        assert!((m.partition_top - 1.028).abs() < 0.005, "screen top {}", m.partition_top);
+        assert!(
+            (m.partition_top - 1.028).abs() < 0.005,
+            "screen top {}",
+            m.partition_top
+        );
         // The Λ stance is WIDER than the top (§A1) — that is the whole point of the compass leg.
         // NB the reference generator *reports* 1.350 here but *builds* 1.330: its printed formula
         // omits the 0.985 the feet are actually pulled in by. We port the built geometry and report
         // what was built, so this sits ~2% under the reference's 1.359 rather than the quoted 0.7%.
-        assert!((m.leg_stance - 1.359).abs() < 0.04, "stance {}", m.leg_stance);
-        assert!(m.leg_stance > m.width, "stance {} should exceed depth {}", m.leg_stance, m.width);
-        assert!((hi[1] - lo[1] - m.leg_stance).abs() < 0.02, "bbox depth {} vs stance {}", hi[1] - lo[1], m.leg_stance);
+        assert!(
+            (m.leg_stance - 1.359).abs() < 0.04,
+            "stance {}",
+            m.leg_stance
+        );
+        assert!(
+            m.leg_stance > m.width,
+            "stance {} should exceed depth {}",
+            m.leg_stance,
+            m.width
+        );
+        assert!(
+            (hi[1] - lo[1] - m.leg_stance).abs() < 0.02,
+            "bbox depth {} vs stance {}",
+            hi[1] - lo[1],
+            m.leg_stance
+        );
     }
 
     /// The grommet openings are genuinely missing from the slab, not merely covered by the collar.
@@ -1104,13 +1433,19 @@ mod tests {
         inp.grommets.clear();
         let (_, solid, _) = build(&inp).unwrap();
         let full = top_surface_area(&solid, inp.height);
-        assert!((full - inp.length * inp.width).abs() < 1e-4, "uncut top area {full}");
+        assert!(
+            (full - inp.length * inp.width).abs() < 1e-4,
+            "uncut top area {full}"
+        );
 
         inp.grommets = vec![Grommet::rear_at(-0.3), Grommet::rear_at(0.3)];
         let (m, holed, _) = build(&inp).unwrap();
         let cut = top_surface_area(&holed, inp.height);
         let expect = full - 2.0 * GR_L * GR_D;
-        assert!((cut - expect).abs() < 1e-4, "cut area {cut}, expected {expect}");
+        assert!(
+            (cut - expect).abs() < 1e-4,
+            "cut area {cut}, expected {expect}"
+        );
         assert_eq!(m.grommets, 2);
         // Deleting the grommets takes their holes with them (§B0).
         inp.grommets.clear();
@@ -1127,17 +1462,33 @@ mod tests {
         let (_, mesh, _) = build(&inp).unwrap();
         let cut = top_surface_area(&mesh, inp.height);
         let union = (GR_L + 0.05) * GR_D; // the two lozenges overlap in x
-        assert!((cut - (inp.length * inp.width - union)).abs() < 1e-4, "area {cut}");
+        assert!(
+            (cut - (inp.length * inp.width - union)).abs() < 1e-4,
+            "area {cut}"
+        );
         // A port hanging off the edge is refused outright.
-        inp.grommets = vec![Grommet { x: inp.length / 2.0, y: 0.0, rear: false }];
+        inp.grommets = vec![Grommet {
+            x: inp.length / 2.0,
+            y: 0.0,
+            rear: false,
+        }];
         assert!(build(&inp).is_err());
     }
 
     #[test]
     fn rect_minus_holes_tiles_without_overlap() {
-        let rs = rect_minus_holes(-1.0, 1.0, -0.5, 0.5, &[[-0.2, 0.2, -0.1, 0.1], [0.5, 0.7, 0.0, 0.2]]);
+        let rs = rect_minus_holes(
+            -1.0,
+            1.0,
+            -0.5,
+            0.5,
+            &[[-0.2, 0.2, -0.1, 0.1], [0.5, 0.7, 0.0, 0.2]],
+        );
         let area: f32 = rs.iter().map(|r| (r[1] - r[0]) * (r[3] - r[2])).sum();
-        assert!((area - (2.0 * 1.0 - 0.4 * 0.2 - 0.2 * 0.2)).abs() < 1e-5, "area {area}");
+        assert!(
+            (area - (2.0 * 1.0 - 0.4 * 0.2 - 0.2 * 0.2)).abs() < 1e-5,
+            "area {area}"
+        );
         for (i, a) in rs.iter().enumerate() {
             for b in rs.iter().skip(i + 1) {
                 let ox = a[1].min(b[1]) - a[0].max(b[0]);
@@ -1159,10 +1510,24 @@ mod tests {
         inp.sup_r = Support::None;
         inp.grommets.clear();
         let (m, mesh, mats) = build(&inp).unwrap();
-        assert!(mesh.tri_count() < full.1.tri_count(), "stripping features should shrink the mesh");
-        assert!(m.features.iter().any(|f| f == "top"), "the top survived: {:?}", m.features);
-        assert!(!m.features.iter().any(|f| f.contains("partition") || f.contains("rail") || f.contains("grommet")));
-        assert!(m.warnings.iter().any(|w| w.contains("cantilever")), "{:?}", m.warnings);
+        assert!(
+            mesh.tri_count() < full.1.tri_count(),
+            "stripping features should shrink the mesh"
+        );
+        assert!(
+            m.features.iter().any(|f| f == "top"),
+            "the top survived: {:?}",
+            m.features
+        );
+        assert!(!m
+            .features
+            .iter()
+            .any(|f| f.contains("partition") || f.contains("rail") || f.contains("grommet")));
+        assert!(
+            m.warnings.iter().any(|w| w.contains("cantilever")),
+            "{:?}",
+            m.warnings
+        );
         // Still a valid, paintable mesh after the deletions.
         assert_eq!(mesh.face_ids.len(), mesh.tri_count());
         assert!((*mesh.face_ids.iter().max().unwrap() as usize) < mats.len());
@@ -1175,7 +1540,9 @@ mod tests {
         inp.ped_n = 4;
         let (_, mesh, mats) = build(&inp).unwrap();
         assert_eq!(mats.iter().filter(|m| **m == Material::Oak).count(), 4);
-        let oak_tris = (0..mesh.tri_count()).filter(|t| mats[mesh.face_ids[*t] as usize] == Material::Oak).count();
+        let oak_tris = (0..mesh.tri_count())
+            .filter(|t| mats[mesh.face_ids[*t] as usize] == Material::Oak)
+            .count();
         assert!(oak_tris >= 4 * 12, "{oak_tris} oak triangles for 4 fronts");
     }
 
@@ -1202,10 +1569,18 @@ mod tests {
         let mut inp = Preset::Combo.input();
         inp.ped_face = PedFace::End;
         let (_, hi_end) = extent(&inp);
-        assert!(hi_end[0] > inp.length / 2.0 - 0.011, "end fronts should reach the outer x face: {}", hi_end[0]);
+        assert!(
+            hi_end[0] > inp.length / 2.0 - 0.011,
+            "end fronts should reach the outer x face: {}",
+            hi_end[0]
+        );
         inp.ped_face = PedFace::Front;
         let (lo_front, _) = extent(&inp);
-        assert!(lo_front[1] < -(inp.width / 2.0 - 0.021), "front fronts should sit proud at −y: {}", lo_front[1]);
+        assert!(
+            lo_front[1] < -(inp.width / 2.0 - 0.021),
+            "front fronts should sit proud at −y: {}",
+            lo_front[1]
+        );
     }
 
     #[test]
@@ -1214,28 +1589,60 @@ mod tests {
         let mut inp = Preset::Single.input();
         inp.part_w = 5.0;
         let (m, _, _) = build(&inp).unwrap();
-        assert!(m.warnings.iter().any(|w| w.contains("clamped")), "{:?}", m.warnings);
+        assert!(
+            m.warnings.iter().any(|w| w.contains("clamped")),
+            "{:?}",
+            m.warnings
+        );
         // two pedestals with no knee space
         let mut inp = Preset::Exec.input();
         inp.ped_w = 0.80;
         let (m, _, _) = build(&inp).unwrap();
-        assert!(m.warnings.iter().any(|w| w.contains("knee space")), "{:?}", m.warnings);
+        assert!(
+            m.warnings.iter().any(|w| w.contains("knee space")),
+            "{:?}",
+            m.warnings
+        );
         // ergonomics + unusable drawer fronts
         let mut inp = Preset::Combo.input();
         inp.height = 0.55;
         inp.ped_n = 4;
         let (m, _, _) = build(&inp).unwrap();
-        assert!(m.warnings.iter().any(|w| w.contains("ergonomic")), "{:?}", m.warnings);
-        assert!(m.warnings.iter().any(|w| w.contains("unusable")), "{:?}", m.warnings);
+        assert!(
+            m.warnings.iter().any(|w| w.contains("ergonomic")),
+            "{:?}",
+            m.warnings
+        );
+        assert!(
+            m.warnings.iter().any(|w| w.contains("unusable")),
+            "{:?}",
+            m.warnings
+        );
         // a centre screen on a shallow top
         let mut inp = Preset::Single.input();
         inp.part_pos = PartPos::Center;
         let (m, _, _) = build(&inp).unwrap();
-        assert!(m.warnings.iter().any(|w| w.contains("face to face")), "{:?}", m.warnings);
+        assert!(
+            m.warnings.iter().any(|w| w.contains("face to face")),
+            "{:?}",
+            m.warnings
+        );
         // hard errors
-        assert!(build(&DeskInput { length: 0.0, ..Preset::Combo.input() }).is_err());
-        assert!(build(&DeskInput { top_t: 1.0, ..Preset::Combo.input() }).is_err());
-        assert!(build(&DeskInput { ped_w: 1.9, ..Preset::Combo.input() }).is_err());
+        assert!(build(&DeskInput {
+            length: 0.0,
+            ..Preset::Combo.input()
+        })
+        .is_err());
+        assert!(build(&DeskInput {
+            top_t: 1.0,
+            ..Preset::Combo.input()
+        })
+        .is_err());
+        assert!(build(&DeskInput {
+            ped_w: 1.9,
+            ..Preset::Combo.input()
+        })
+        .is_err());
     }
 
     /// §B4 — rebuild all five presets; a regression in shared code shows up in whichever uses it.
@@ -1244,15 +1651,39 @@ mod tests {
         for p in Preset::ALL {
             let inp = p.input();
             let (m, mesh, mats) = build(&inp).unwrap_or_else(|e| panic!("{}: {e}", p.label()));
-            assert!(mesh.tri_count() > 200, "{}: {} tris", p.label(), mesh.tri_count());
-            assert!(mesh.tri_count() < 20_000, "{}: {} tris is far past the reference budget", p.label(), mesh.tri_count());
+            assert!(
+                mesh.tri_count() > 200,
+                "{}: {} tris",
+                p.label(),
+                mesh.tri_count()
+            );
+            assert!(
+                mesh.tri_count() < 20_000,
+                "{}: {} tris is far past the reference budget",
+                p.label(),
+                mesh.tri_count()
+            );
             assert_eq!(mesh.face_ids.len(), mesh.tri_count(), "{}", p.label());
-            assert!((*mesh.face_ids.iter().max().unwrap() as usize) < mats.len(), "{}", p.label());
+            assert!(
+                (*mesh.face_ids.iter().max().unwrap() as usize) < mats.len(),
+                "{}",
+                p.label()
+            );
             let (lo, hi) = bbox(&mesh);
-            assert!(lo[2].abs() < 1e-4 && hi[2] >= m.height - 1e-4, "{}: z {}..{}", p.label(), lo[2], hi[2]);
+            assert!(
+                lo[2].abs() < 1e-4 && hi[2] >= m.height - 1e-4,
+                "{}: z {}..{}",
+                p.label(),
+                lo[2],
+                hi[2]
+            );
             for n in &mesh.normals {
                 let len = Vec3::from(*n).length();
-                assert!((len - 1.0).abs() < 1e-3, "{}: normal length {len}", p.label());
+                assert!(
+                    (len - 1.0).abs() < 1e-3,
+                    "{}: normal length {len}",
+                    p.label()
+                );
             }
         }
     }
@@ -1267,7 +1698,9 @@ mod tests {
         for p in Preset::ALL {
             let (_, mesh, _) = build(&p.input()).unwrap();
             for t in 0..mesh.tri_count() {
-                let v: Vec<Vec3> = (0..3).map(|i| Vec3::from(mesh.positions[t * 3 + i])).collect();
+                let v: Vec<Vec3> = (0..3)
+                    .map(|i| Vec3::from(mesh.positions[t * 3 + i]))
+                    .collect();
                 let face = (v[1] - v[0]).cross(v[2] - v[0]);
                 if face.length() < 1e-9 {
                     panic!("{}: degenerate triangle {t} at {:?}", p.label(), v[0]);
@@ -1298,6 +1731,10 @@ mod tests {
                 lowest = lowest.min(mesh.positions[t * 3 + i][2]);
             }
         }
-        assert!(lowest >= inp.height - 1e-4, "screen panel dips to {lowest}, below the {} surface", inp.height);
+        assert!(
+            lowest >= inp.height - 1e-4,
+            "screen panel dips to {lowest}, below the {} surface",
+            inp.height
+        );
     }
 }

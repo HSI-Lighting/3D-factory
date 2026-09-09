@@ -31,7 +31,7 @@ use std::collections::HashMap;
 
 use cad_light::{
     box_room, calculate_maintained, default_materials, parse_ldt, CalcPlane, IesProfile, Luminaire,
-    Maintenance, Mesh, Material, RaySettings, Vertex,
+    Maintenance, Material, Mesh, RaySettings, Vertex,
 };
 
 // ---- what all three reports state, identically --------------------------------------------------
@@ -118,7 +118,13 @@ fn plane_at(cols: u32, rows: u32) -> CalcPlane {
     // 15.84 m² against the room's 16.00, and each report's own two power densities (5.05 against
     // 5.00 W/m², say) confirm it: 80 W / 5.05 = 15.84 m².
     let span = ROOM - 2.0 * WALL_ZONE;
-    CalcPlane { origin: Vertex::new(WALL_ZONE, WALL_ZONE, WORK_PLANE), width: span, depth: span, cols, rows }
+    CalcPlane {
+        origin: Vertex::new(WALL_ZONE, WALL_ZONE, WORK_PLANE),
+        width: span,
+        depth: span,
+        cols,
+        rows,
+    }
 }
 
 fn load_photometry(dir: &str) -> IesProfile {
@@ -148,14 +154,26 @@ fn simlux_against_dialux_on_three_fully_specified_rooms() {
 
     let prof = load_photometry(&dir);
     println!("\n=== photometry: FONDO.ldt ===");
-    println!("  flux {:.1} lm (report: {FLUX:.1})   watts {WATTS:.1} W", prof.lumens);
+    println!(
+        "  flux {:.1} lm (report: {FLUX:.1})   watts {WATTS:.1} W",
+        prof.lumens
+    );
     let mut profiles = HashMap::new();
     profiles.insert("FONDO".to_string(), prof);
 
     let (meshes, materials) = scene();
-    let settings = RaySettings { rays_per_point: 4096, max_bounces: 8, ..RaySettings::default() };
+    let settings = RaySettings {
+        rays_per_point: 4096,
+        max_bounces: 8,
+        ..RaySettings::default()
+    };
     // "0.80 (fixed)" — one number, not the four CIE 97 sub-factors, so it goes in whole.
-    let maint = Maintenance { llmf: MF, lsf: 1.0, lmf: 1.0, rsmf: 1.0 };
+    let maint = Maintenance {
+        llmf: MF,
+        lsf: 1.0,
+        lmf: 1.0,
+        rsmf: 1.0,
+    };
 
     let mut worst_avg_err = 0.0_f64;
     for case in &CASES {
@@ -169,19 +187,29 @@ fn simlux_against_dialux_on_three_fully_specified_rooms() {
                 position: Vertex::new(*x, *y, MOUNT_Z),
                 rotation_deg: 0.0,
                 tilt_deg: 0.0,
-                dimming: 1.0, watts_override: None, flux_override: None, from_block: None })
+                dimming: 1.0,
+                watts_override: None,
+                flux_override: None,
+                from_block: None,
+            })
             .collect();
 
         let plane = plane_at(8, 8);
-        let grid =
-            calculate_maintained(&meshes, &lums, &profiles, &materials, &plane, &settings, maint);
+        let grid = calculate_maintained(
+            &meshes, &lums, &profiles, &materials, &plane, &settings, maint,
+        );
 
         println!("\n================ {} ================", case.name);
         println!("      {:>34}   {:>34}", "SIMLUX", "DIALux");
         let (mut sum_abs_pct, mut worst) = (0.0, (0.0_f64, 0usize, 0usize));
         for r in 0..8usize {
             let ours: Vec<f64> = (0..8).map(|c| grid.values[r * 8 + c]).collect();
-            let fmt = |v: &[f64]| v.iter().map(|x| format!("{x:>6.0}")).collect::<Vec<_>>().join("");
+            let fmt = |v: &[f64]| {
+                v.iter()
+                    .map(|x| format!("{x:>6.0}"))
+                    .collect::<Vec<_>>()
+                    .join("")
+            };
             println!("  r{r}  {}   {}", fmt(&ours), fmt(&case.grid[r]));
             for c in 0..8 {
                 let pct = (ours[c] - case.grid[r][c]) / case.grid[r][c] * 100.0;
@@ -200,10 +228,20 @@ fn simlux_against_dialux_on_three_fully_specified_rooms() {
         worst_avg_err = worst_avg_err.max(avg_err.abs());
 
         println!("  ---");
-        println!("  E average   {our_avg:>8.1} lx   DIALux {:>6.0}    {avg_err:>6.2}%", case.e_avg);
+        println!(
+            "  E average   {our_avg:>8.1} lx   DIALux {:>6.0}    {avg_err:>6.2}%",
+            case.e_avg
+        );
         println!("  E min/max   {our_min:>8.1} /{our_max:>7.1} lx");
-        println!("  LPD         {our_lpd:>8.2} W/m2  DIALux {:>6.2}", case.lpd);
-        println!("  U0 (8x8)    {:>8.3}      DIALux {:>6.3}", our_min / our_avg, case.u0);
+        println!(
+            "  LPD         {our_lpd:>8.2} W/m2  DIALux {:>6.2}",
+            case.lpd
+        );
+        println!(
+            "  U0 (8x8)    {:>8.3}      DIALux {:>6.3}",
+            our_min / our_avg,
+            case.u0
+        );
         println!(
             "  field: mean |error| {:.1}% over 64 points, worst {:.1}% at r{} c{}",
             sum_abs_pct / 64.0,
@@ -255,12 +293,23 @@ fn simlux_against_dialux_on_three_fully_specified_rooms() {
 #[test]
 #[ignore = "needs IDENTICAL_DIR=<folder holding FONDO.ldt>"]
 fn refining_the_grid_lowers_the_minimum_but_not_the_average() {
-    let Ok(dir) = std::env::var("IDENTICAL_DIR") else { return };
+    let Ok(dir) = std::env::var("IDENTICAL_DIR") else {
+        return;
+    };
     let mut profiles = HashMap::new();
     profiles.insert("FONDO".to_string(), load_photometry(&dir));
     let (meshes, materials) = scene();
-    let settings = RaySettings { rays_per_point: 2048, max_bounces: 8, ..RaySettings::default() };
-    let maint = Maintenance { llmf: MF, lsf: 1.0, lmf: 1.0, rsmf: 1.0 };
+    let settings = RaySettings {
+        rays_per_point: 2048,
+        max_bounces: 8,
+        ..RaySettings::default()
+    };
+    let maint = Maintenance {
+        llmf: MF,
+        lsf: 1.0,
+        lmf: 1.0,
+        rsmf: 1.0,
+    };
 
     for case in &CASES {
         let lums: Vec<Luminaire> = case
@@ -273,10 +322,20 @@ fn refining_the_grid_lowers_the_minimum_but_not_the_average() {
                 position: Vertex::new(*x, *y, MOUNT_Z),
                 rotation_deg: 0.0,
                 tilt_deg: 0.0,
-                dimming: 1.0, watts_override: None, flux_override: None, from_block: None })
+                dimming: 1.0,
+                watts_override: None,
+                flux_override: None,
+                from_block: None,
+            })
             .collect();
-        println!("\n=== {} — U0 vs calculation grid (DIALux says {:.3}) ===", case.name, case.u0);
-        println!("  {:>7}  {:>9}  {:>9}  {:>6}", "grid", "E min", "E avg", "U0");
+        println!(
+            "\n=== {} — U0 vs calculation grid (DIALux says {:.3}) ===",
+            case.name, case.u0
+        );
+        println!(
+            "  {:>7}  {:>9}  {:>9}  {:>6}",
+            "grid", "E min", "E avg", "U0"
+        );
         let (mut prev_min, mut prev_avg) = (f64::MAX, 0.0);
         for n in [8u32, 16, 32, 64] {
             let p = plane_at(n, n);
@@ -311,7 +370,13 @@ fn refining_the_grid_lowers_the_minimum_but_not_the_average() {
         // the direction that matters: it is the one that passes a failing installation.
         let coarse = {
             let g = calculate_maintained(
-                &meshes, &lums, &profiles, &materials, &plane_at(8, 8), &settings, maint,
+                &meshes,
+                &lums,
+                &profiles,
+                &materials,
+                &plane_at(8, 8),
+                &settings,
+                maint,
             );
             let mn = g.values.iter().cloned().fold(f64::MAX, f64::min);
             mn / (g.values.iter().sum::<f64>() / g.values.len() as f64)
@@ -340,7 +405,9 @@ fn refining_the_grid_lowers_the_minimum_but_not_the_average() {
 #[test]
 #[ignore = "needs IDENTICAL_DIR=<folder holding FONDO.ldt>"]
 fn ugr_from_the_seated_observer() {
-    let Ok(dir) = std::env::var("IDENTICAL_DIR") else { return };
+    let Ok(dir) = std::env::var("IDENTICAL_DIR") else {
+        return;
+    };
     let mut profiles = HashMap::new();
     profiles.insert("FONDO".to_string(), load_photometry(&dir));
     let prof = &profiles["FONDO"];
@@ -378,16 +445,31 @@ fn ugr_from_the_seated_observer() {
                 position: Vertex::new(*x, *y, MOUNT_Z),
                 rotation_deg: 0.0,
                 tilt_deg: 0.0,
-                dimming: 1.0, watts_override: None, flux_override: None, from_block: None })
+                dimming: 1.0,
+                watts_override: None,
+                flux_override: None,
+                from_block: None,
+            })
             .collect();
 
         // Background: the indirect illuminance on a vertical plane at the eye. Taken from the
         // working-plane result's indirect share, which is the field the fittings are seen against.
         let plane = plane_at(8, 8);
-        let settings = RaySettings { rays_per_point: 2048, max_bounces: 8, ..RaySettings::default() };
-        let maint = Maintenance { llmf: MF, lsf: 1.0, lmf: 1.0, rsmf: 1.0 };
+        let settings = RaySettings {
+            rays_per_point: 2048,
+            max_bounces: 8,
+            ..RaySettings::default()
+        };
+        let maint = Maintenance {
+            llmf: MF,
+            lsf: 1.0,
+            lmf: 1.0,
+            rsmf: 1.0,
+        };
         let (meshes, materials) = scene();
-        let g = calculate_maintained(&meshes, &lums, &profiles, &materials, &plane, &settings, maint);
+        let g = calculate_maintained(
+            &meshes, &lums, &profiles, &materials, &plane, &settings, maint,
+        );
         let e_ind = g.indirect.iter().sum::<f64>() / g.indirect.len().max(1) as f64;
         let bg = cad_light::background_from_indirect(e_ind);
 
@@ -416,6 +498,10 @@ fn ugr_from_the_seated_observer() {
         // `f64::MIN` is FINITE, so a sentinel would have sailed through a liveness check while
         // printing 1.8e308 as the answer — which is exactly what the first run of this did. An
         // Option cannot do that.
-        assert!(worst.is_some(), "{}: no direction produced a rating", case.name);
+        assert!(
+            worst.is_some(),
+            "{}: no direction produced a rating",
+            case.name
+        );
     }
 }

@@ -59,10 +59,20 @@ impl ExportTri {
     /// A plain diffuse surface (the common case; Principled extras at their defaults).
     pub fn plain(verts: [[f32; 3]; 3], rgb: [f32; 3], roughness: f32, opacity: f32) -> Self {
         Self {
-            verts, rgb, roughness, opacity,
-            metallic: 0.0, ior: 1.5, emission: [0.0; 3], material: None,
-            clearcoat: 0.0, clearcoat_rough: 0.1, sheen: 0.0, sheen_tint: [1.0; 3],
-            uv: [[0.0; 2]; 3], has_uv: false,
+            verts,
+            rgb,
+            roughness,
+            opacity,
+            metallic: 0.0,
+            ior: 1.5,
+            emission: [0.0; 3],
+            material: None,
+            clearcoat: 0.0,
+            clearcoat_rough: 0.1,
+            sheen: 0.0,
+            sheen_tint: [1.0; 3],
+            uv: [[0.0; 2]; 3],
+            has_uv: false,
         }
     }
 }
@@ -74,7 +84,13 @@ fn q(x: f32) -> i32 {
 /// A de-dup key so identical-looking surfaces share one material definition.
 fn mat_key(t: &ExportTri) -> (i32, i32, i32, i32, bool) {
     let glass = t.opacity < 0.99;
-    (q(t.rgb[0]), q(t.rgb[1]), q(t.rgb[2]), (t.roughness.clamp(0.0, 1.0) * 20.0).round() as i32, glass)
+    (
+        q(t.rgb[0]),
+        q(t.rgb[1]),
+        q(t.rgb[2]),
+        (t.roughness.clamp(0.0, 1.0) * 20.0).round() as i32,
+        glass,
+    )
 }
 
 /// The material primitive block for a bucket.
@@ -83,7 +99,9 @@ fn material_block(name: &str, t: &ExportTri) -> String {
         // Radiance glass: transmissivity ≈ colour (a light tint through it).
         format!(
             "void glass {name}\n0\n0\n3 {:.4} {:.4} {:.4}\n\n",
-            t.rgb[0].max(0.02), t.rgb[1].max(0.02), t.rgb[2].max(0.02)
+            t.rgb[0].max(0.02),
+            t.rgb[1].max(0.02),
+            t.rgb[2].max(0.02)
         )
     } else {
         // Radiance plastic: 5 = R G B specular roughness. Dielectric spec 0.05; our 0..1 roughness
@@ -129,7 +147,14 @@ pub fn scene_rad(tris: &[ExportTri]) -> String {
 
 /// Build `sky.rad`: an inline `!gensky` sun+sky matched to the location/date/time, plus glow.
 /// `lon_deg` is +east and `utc_offset` +east — converted to gensky's west-positive `-o`/`-m`.
-pub fn sky_rad(lat_deg: f32, lon_deg: f32, utc_offset: f32, month: u32, day: u32, hour: f32) -> String {
+pub fn sky_rad(
+    lat_deg: f32,
+    lon_deg: f32,
+    utc_offset: f32,
+    month: u32,
+    day: u32,
+    hour: f32,
+) -> String {
     let lon_west = -lon_deg;
     let meridian_west = -15.0 * utc_offset;
     format!(
@@ -211,7 +236,12 @@ mod tests {
     use super::*;
 
     fn tri(rgb: [f32; 3], rough: f32, op: f32) -> ExportTri {
-        ExportTri::plain([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], rgb, rough, op)
+        ExportTri::plain(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            rgb,
+            rough,
+            op,
+        )
     }
 
     #[test]
@@ -222,7 +252,11 @@ mod tests {
             tri([0.2, 0.2, 0.8], 0.5, 1.0),
         ];
         let s = scene_rad(&tris);
-        assert_eq!(s.matches("void plastic").count(), 2, "two distinct materials");
+        assert_eq!(
+            s.matches("void plastic").count(),
+            2,
+            "two distinct materials"
+        );
         assert_eq!(s.matches("polygon face_").count(), 3, "three polygons");
     }
 
@@ -250,11 +284,17 @@ mod tests {
         assert!(b.contains("oconv sky.rad scene.rad"));
         assert!(b.contains("-vp 5.0000 -5.0000 2.0000"));
         assert!(b.contains("rpict"));
-        assert!(b.contains("-x 1280 -y 960"), "chosen resolution reaches rpict");
+        assert!(
+            b.contains("-x 1280 -y 960"),
+            "chosen resolution reaches rpict"
+        );
         // Same framing as the path tracer: 45° vertical; horizontal widened by the 4:3 aspect
         // (2·atan(tan 22.5°·4/3) ≈ 57.8°).
         assert!(b.contains("-vv 45.00"), "45° vertical fov: {b}");
-        assert!(b.contains("-vh 57.7") || b.contains("-vh 57.8"), "aspect-matched horizontal fov: {b}");
+        assert!(
+            b.contains("-vh 57.7") || b.contains("-vh 57.8"),
+            "aspect-matched horizontal fov: {b}"
+        );
         // pfilt must NOT downscale — the picked size is the delivered size.
         assert!(!b.contains("-x /2"), "no half-size pfilt");
     }

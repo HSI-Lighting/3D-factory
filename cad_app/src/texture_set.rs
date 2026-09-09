@@ -79,15 +79,28 @@ pub fn classify(filename: &str) -> Option<MapKind> {
     let stem = stem.rsplit_once('.').map(|(s, _)| s).unwrap_or(stem);
     let s = stem.to_ascii_lowercase();
     // Split on the separators these libraries use, so a suffix is matched as a WHOLE token.
-    let toks: Vec<&str> = s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|t| !t.is_empty()).collect();
+    let toks: Vec<&str> = s
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
     let has = |t: &str| toks.iter().any(|x| *x == t);
     let ends = |t: &str| s.ends_with(t);
 
     // DirectX normals first — "normaldx" also contains "normal".
-    if has("normaldx") || has("nrmdx") || ends("normal_dx") || has("dx") && (has("normal") || has("nrm")) {
+    if has("normaldx")
+        || has("nrmdx")
+        || ends("normal_dx")
+        || has("dx") && (has("normal") || has("nrm"))
+    {
         return Some(MapKind::NormalDx);
     }
-    if has("normalgl") || has("normal") || has("nrm") || has("norm") || has("nor") || has("normalmap") {
+    if has("normalgl")
+        || has("normal")
+        || has("nrm")
+        || has("norm")
+        || has("nor")
+        || has("normalmap")
+    {
         return Some(MapKind::Normal);
     }
     // Packed AO/rough/metal — before the individual names, since "arm" is its own token and the
@@ -115,7 +128,16 @@ pub fn classify(filename: &str) -> Option<MapKind> {
     }
     // Base colour last: "color" is the least specific token and appears in names like
     // "…_Color.png" but never as a qualifier on another map.
-    if has("basecolor") || has("basecolour") || has("albedo") || has("diffuse") || has("color") || has("colour") || has("col") || has("diff") || has("base") {
+    if has("basecolor")
+        || has("basecolour")
+        || has("albedo")
+        || has("diffuse")
+        || has("color")
+        || has("colour")
+        || has("col")
+        || has("diff")
+        || has("base")
+    {
         return Some(MapKind::BaseColor);
     }
     None
@@ -123,7 +145,10 @@ pub fn classify(filename: &str) -> Option<MapKind> {
 
 /// A file with an image extension this build can decode.
 pub fn is_image_file(filename: &str) -> bool {
-    let e = filename.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    let e = filename
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
     matches!(e.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff")
 }
 
@@ -152,12 +177,16 @@ pub fn load_folder(dir: &std::path::Path) -> Result<Vec<LoadedMap>, String> {
         if !path.is_file() {
             continue;
         }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         if !is_image_file(name) {
             continue;
         }
         let Some(kind) = classify(name) else { continue };
-        let Ok(img) = image::open(&path) else { continue };
+        let Ok(img) = image::open(&path) else {
+            continue;
+        };
         let rgba = img.to_rgba8();
         let (w, h) = (rgba.width(), rgba.height());
         let mut buf = rgba.into_raw();
@@ -181,7 +210,13 @@ pub fn load_folder(dir: &std::path::Path) -> Result<Vec<LoadedMap>, String> {
             k => k,
         };
 
-        let cand = LoadedMap { kind, name: name.to_string(), w, h, rgba: buf };
+        let cand = LoadedMap {
+            kind,
+            name: name.to_string(),
+            w,
+            h,
+            rgba: buf,
+        };
         match best.get(&kind) {
             // Between two files for the same slot, take the larger — sets often ship 1K and 2K
             // side by side.
@@ -196,7 +231,11 @@ pub fn load_folder(dir: &std::path::Path) -> Result<Vec<LoadedMap>, String> {
     // did not already provide one: a standalone Roughness map is higher quality than the green
     // channel of a packed one, so it wins.
     if let Some(arm) = best.remove(&MapKind::Arm) {
-        for (kind, chan) in [(MapKind::AmbientOcclusion, 0usize), (MapKind::Roughness, 1), (MapKind::Metallic, 2)] {
+        for (kind, chan) in [
+            (MapKind::AmbientOcclusion, 0usize),
+            (MapKind::Roughness, 1),
+            (MapKind::Metallic, 2),
+        ] {
             if best.contains_key(&kind) {
                 continue;
             }
@@ -207,7 +246,16 @@ pub fn load_folder(dir: &std::path::Path) -> Result<Vec<LoadedMap>, String> {
                 dst[1] = v;
                 dst[2] = v;
             }
-            best.insert(kind, LoadedMap { kind, name: format!("{} [{}]", arm.name, kind.label()), w: arm.w, h: arm.h, rgba });
+            best.insert(
+                kind,
+                LoadedMap {
+                    kind,
+                    name: format!("{} [{}]", arm.name, kind.label()),
+                    w: arm.w,
+                    h: arm.h,
+                    rgba,
+                },
+            );
         }
     }
 
@@ -242,7 +290,10 @@ mod tests {
             ("Bricks075A_2K-PNG_NormalGL.png", MapKind::Normal),
             ("Bricks075A_2K-PNG_NormalDX.png", MapKind::NormalDx),
             ("Bricks075A_2K-PNG_Roughness.png", MapKind::Roughness),
-            ("Bricks075A_2K-PNG_AmbientOcclusion.png", MapKind::AmbientOcclusion),
+            (
+                "Bricks075A_2K-PNG_AmbientOcclusion.png",
+                MapKind::AmbientOcclusion,
+            ),
             ("Bricks075A_2K-PNG_Displacement.png", MapKind::Height),
             ("Metal046A_2K-PNG_Metalness.png", MapKind::Metallic),
             ("Metal046A_2K-PNG_Opacity.png", MapKind::Opacity),
@@ -265,7 +316,10 @@ mod tests {
             ("oak-diffuse.png", MapKind::BaseColor),
             ("oak-bump.png", MapKind::Height),
             // Full paths must work too — the loader hands over whatever the OS gives it.
-            (r"C:\tex\Bricks075A\Bricks075A_2K_Color.png", MapKind::BaseColor),
+            (
+                r"C:\tex\Bricks075A\Bricks075A_2K_Color.png",
+                MapKind::BaseColor,
+            ),
             ("/home/x/tex/oak_nor_gl_1k.png", MapKind::Normal),
         ];
         for (name, want) in cases {
@@ -278,7 +332,12 @@ mod tests {
     /// bump is lit from the wrong side — which reads as "the lighting is a bit odd", not as a bug.
     #[test]
     fn directx_normals_are_never_read_as_opengl() {
-        for n in ["x_NormalDX.png", "x_normal_dx.png", "x_nrmDX.jpg", "Wood_2K_NormalDX.png"] {
+        for n in [
+            "x_NormalDX.png",
+            "x_normal_dx.png",
+            "x_nrmDX.jpg",
+            "Wood_2K_NormalDX.png",
+        ] {
             assert_eq!(classify(n), Some(MapKind::NormalDx), "{n}");
         }
         for n in ["x_NormalGL.png", "x_normal.png", "x_nor_gl_2k.jpg"] {
@@ -295,11 +354,15 @@ mod tests {
             "preview.usdc",
             "LICENSE",
             "Bricks075A.mtlx",
-            "chao.png",            // contains "ao" but is not an occlusion map
-            "rainbow.png",         // contains "bow", "rain" — no token matches
+            "chao.png",    // contains "ao" but is not an occlusion map
+            "rainbow.png", // contains "bow", "rain" — no token matches
             "render_preview_2k.exe",
         ] {
-            assert!(classify(n).is_none() || !is_image_file(n), "{n} should not be taken as a map: {:?}", classify(n));
+            assert!(
+                classify(n).is_none() || !is_image_file(n),
+                "{n} should not be taken as a map: {:?}",
+                classify(n)
+            );
         }
         // A preview render IS a png and DOES contain no map token — it must simply not classify.
         assert_eq!(classify("preview.png"), None);
@@ -310,7 +373,15 @@ mod tests {
     /// display curve is wrong in a way that looks like a subtle material bug rather than an error.
     #[test]
     fn only_base_colour_is_srgb() {
-        for k in [MapKind::Normal, MapKind::Roughness, MapKind::Metallic, MapKind::AmbientOcclusion, MapKind::Height, MapKind::Opacity, MapKind::Arm] {
+        for k in [
+            MapKind::Normal,
+            MapKind::Roughness,
+            MapKind::Metallic,
+            MapKind::AmbientOcclusion,
+            MapKind::Height,
+            MapKind::Opacity,
+            MapKind::Arm,
+        ] {
             assert!(!k.is_srgb(), "{:?} must upload linear", k);
         }
         assert!(MapKind::BaseColor.is_srgb());

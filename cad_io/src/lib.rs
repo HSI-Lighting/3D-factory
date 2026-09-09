@@ -21,6 +21,4 @@ pub mod plot_table;
 pub mod rsm;
 
 pub use pat::{parse_pat, PatLine, PatParse, PatPattern};
-pub use plot_table::{
-    load_plot_table, plot_table_from_json, plot_table_to_json, save_plot_table,
-};
+pub use plot_table::{load_plot_table, plot_table_from_json, plot_table_to_json, save_plot_table};

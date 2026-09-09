@@ -13,8 +13,8 @@ use crate::math::Vec2;
 /// A named user coordinate system.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ucs {
-    pub name:     String,
-    pub origin:   Vec2,
+    pub name: String,
+    pub origin: Vec2,
     /// Rotation in radians, CCW (the UCS x-axis direction).
     pub rotation: f64,
 }
@@ -52,21 +52,33 @@ mod tests {
 
     #[test]
     fn origin_only_translates() {
-        let u = Ucs { name: "O".into(), origin: Vec2::new(100.0, 200.0), rotation: 0.0 };
+        let u = Ucs {
+            name: "O".into(),
+            origin: Vec2::new(100.0, 200.0),
+            rotation: 0.0,
+        };
         assert!((u.to_world(Vec2::new(1.0, 2.0)) - Vec2::new(101.0, 202.0)).len() < 1e-9);
         assert!((u.to_ucs(Vec2::new(101.0, 202.0)) - Vec2::new(1.0, 2.0)).len() < 1e-9);
     }
 
     #[test]
     fn identity_ucs_is_world() {
-        let u = Ucs { name: "W".into(), origin: Vec2::ZERO, rotation: 0.0 };
+        let u = Ucs {
+            name: "W".into(),
+            origin: Vec2::ZERO,
+            rotation: 0.0,
+        };
         assert!((u.to_world(Vec2::new(3.0, 4.0)) - Vec2::new(3.0, 4.0)).len() < 1e-12);
     }
 
     #[test]
     fn ninety_degree_rotation_swaps_axes() {
         // UCS x-axis pointing +Y: UCS (1,0) lands at world (0,1).
-        let u = Ucs { name: "R90".into(), origin: Vec2::ZERO, rotation: std::f64::consts::FRAC_PI_2 };
+        let u = Ucs {
+            name: "R90".into(),
+            origin: Vec2::ZERO,
+            rotation: std::f64::consts::FRAC_PI_2,
+        };
         let w = u.to_world(Vec2::new(1.0, 0.0));
         assert!((w - Vec2::new(0.0, 1.0)).len() < 1e-9);
     }

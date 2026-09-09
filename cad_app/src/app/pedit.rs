@@ -12,12 +12,15 @@ use super::*;
 
 impl CadApp {
     pub(crate) fn pedit_menu_prompt(&self, h: u64) -> String {
-        let closed = self.idx_of_handle(h)
+        let closed = self
+            .idx_of_handle(h)
             .and_then(|i| self.doc.dobjects.get(i))
             .map(|d| matches!(&d.geom, Geom::Polyline(p) if p.closed))
             .unwrap_or(false);
-        format!("pedit: [{} / Join / Width / Undo / eXit]",
-            if closed { "Open" } else { "Close" })
+        format!(
+            "pedit: [{} / Join / Width / Undo / eXit]",
+            if closed { "Open" } else { "Close" }
+        )
     }
 
     /// `pedit` — start editing the selected polyline. A single selected Line or
@@ -38,7 +41,8 @@ impl CadApp {
             // a fresh "command:" line. Picking nothing + Enter is caught by the
             // queued-op "nothing selected" guard and cancels cleanly.
             if self.selection.len() > 1 {
-                self.history.push("  ! pedit: select only ONE object".into());
+                self.history
+                    .push("  ! pedit: select only ONE object".into());
             }
             self.begin_selection(SelectMode::ForSelect);
             self.queued_op = QueuedOp::PeditStart;
@@ -52,24 +56,36 @@ impl CadApp {
             Geom::Polyline(_) => None,
             Geom::Line(l) => Some(Geom::Polyline(Polyline {
                 vertices: vec![
-                    PolyVertex { pos: l.a, bulge: 0.0 },
-                    PolyVertex { pos: l.b, bulge: 0.0 }],
+                    PolyVertex {
+                        pos: l.a,
+                        bulge: 0.0,
+                    },
+                    PolyVertex {
+                        pos: l.b,
+                        bulge: 0.0,
+                    },
+                ],
                 closed: false,
                 widths: Vec::new(),
             })),
             Geom::Arc(a) => {
-                let s = Vec2::new(a.center.x + a.radius * a.start_angle.cos(),
-                                  a.center.y + a.radius * a.start_angle.sin());
+                let s = Vec2::new(
+                    a.center.x + a.radius * a.start_angle.cos(),
+                    a.center.y + a.radius * a.start_angle.sin(),
+                );
                 let e_ang = a.start_angle + a.sweep_angle;
-                let e = Vec2::new(a.center.x + a.radius * e_ang.cos(),
-                                  a.center.y + a.radius * e_ang.sin());
+                let e = Vec2::new(
+                    a.center.x + a.radius * e_ang.cos(),
+                    a.center.y + a.radius * e_ang.sin(),
+                );
                 // Sign the bulge by the centre side (not just sweep) so the
                 // converted polyline keeps the arc's true curve direction.
                 let bulge = cad_kernel::bulge_from_arc(s, e, a.center, a.sweep_angle);
                 Some(Geom::Polyline(Polyline {
                     vertices: vec![
                         PolyVertex { pos: s, bulge },
-                        PolyVertex { pos: e, bulge: 0.0 }],
+                        PolyVertex { pos: e, bulge: 0.0 },
+                    ],
                     closed: false,
                     widths: Vec::new(),
                 }))
@@ -77,11 +93,14 @@ impl CadApp {
             // Elliptical arc / spline can't be a polyline exactly (bulges are
             // circular). Tessellate to a faceted polyline so PEDIT can edit /
             // join them — matches how pedit_join treats secondary picks.
-            g @ (Geom::EllipseArc(_) | Geom::Spline(_)) =>
-                tessellated_polyline(g).map(Geom::Polyline),
+            g @ (Geom::EllipseArc(_) | Geom::Spline(_)) => {
+                tessellated_polyline(g).map(Geom::Polyline)
+            }
             _ => {
                 self.history.push(
-                    "  ! pedit: that object isn't a polyline / line / arc / ellipse-arc / spline".into());
+                    "  ! pedit: that object isn't a polyline / line / arc / ellipse-arc / spline"
+                        .into(),
+                );
                 return;
             }
         };
@@ -100,29 +119,38 @@ impl CadApp {
     }
 
     pub(crate) fn pedit_set_closed(&mut self, h: u64, closed: bool) {
-        let Some(i) = self.idx_of_handle(h) else { return; };
+        let Some(i) = self.idx_of_handle(h) else {
+            return;
+        };
         if let Geom::Polyline(p) = &self.doc.dobjects[i].geom {
             if p.closed == closed {
                 self.history.push(format!(
-                    "  pedit: already {}", if closed { "closed" } else { "open" }));
+                    "  pedit: already {}",
+                    if closed { "closed" } else { "open" }
+                ));
                 return;
             }
-        } else { return; }
+        } else {
+            return;
+        }
         self.snapshot_doc();
         if let Geom::Polyline(p) = &mut self.doc.dobjects[i].geom {
             p.closed = closed;
         }
-        self.history.push(format!("  pedit: polyline {}",
-            if closed { "closed" } else { "opened" }));
+        self.history.push(format!(
+            "  pedit: polyline {}",
+            if closed { "closed" } else { "opened" }
+        ));
         self.index_dirty = true;
         self.gpu_dirty = true;
     }
 
     pub(crate) fn pedit_set_width(&mut self, h: u64, mm: f64) {
-        let Some(i) = self.idx_of_handle(h) else { return; };
+        let Some(i) = self.idx_of_handle(h) else {
+            return;
+        };
         self.snapshot_doc();
-        self.doc.dobjects[i].style.lineweight =
-            cad_kernel::Lineweight::Custom(mm as f32);
+        self.doc.dobjects[i].style.lineweight = cad_kernel::Lineweight::Custom(mm as f32);
         self.history.push(format!("  pedit: width → {} mm", mm));
         self.gpu_dirty = true;
     }
@@ -132,16 +160,22 @@ impl CadApp {
     /// segments first. Called from the queued-op dispatch after the selection
     /// session ends. Re-enters the PEDIT menu on the merged result.
     pub(crate) fn pedit_join_selected(&mut self, h: u64) {
-        let Some(ti) = self.idx_of_handle(h) else { self.pedit_exit(); return; };
+        let Some(ti) = self.idx_of_handle(h) else {
+            self.pedit_exit();
+            return;
+        };
         // Target + the picked objects (deduped).
         let mut idxs: Vec<usize> = vec![ti];
         for &i in &self.selection {
-            if i != ti && i < self.doc.dobjects.len() { idxs.push(i); }
+            if i != ti && i < self.doc.dobjects.len() {
+                idxs.push(i);
+            }
         }
         idxs.sort_unstable();
         idxs.dedup();
         if idxs.len() < 2 {
-            self.history.push("  pedit join: pick at least one object to join".into());
+            self.history
+                .push("  pedit join: pick at least one object to join".into());
             self.pedit_state = PeditState::Menu(h);
             self.pedit_reprompt(h);
             return;
@@ -153,7 +187,9 @@ impl CadApp {
         // tessellated; polylines/rectangles become their Line/Arc segments.
         let mut prims: Vec<Geom> = Vec::new();
         for &i in &idxs {
-            let Some(d) = self.doc.dobjects.get(i) else { continue; };
+            let Some(d) = self.doc.dobjects.get(i) else {
+                continue;
+            };
             match &d.geom {
                 Geom::Polyline(p) => prims.extend(explode_polyline(p)),
                 // Ellipse arc / spline → tessellated to straight segments
@@ -165,11 +201,12 @@ impl CadApp {
                     }
                 }
                 Geom::Line(_) | Geom::Arc(_) => prims.push(d.geom.clone()),
-                _ => {}   // non-chainable (full circle/ellipse, text, …) → skipped
+                _ => {} // non-chainable (full circle/ellipse, text, …) → skipped
             }
         }
         if prims.len() < 2 {
-            self.history.push("  pedit join: nothing chainable was picked".into());
+            self.history
+                .push("  pedit join: nothing chainable was picked".into());
             self.pedit_state = PeditState::Menu(h);
             self.pedit_reprompt(h);
             return;
@@ -177,8 +214,8 @@ impl CadApp {
         let items: Vec<(usize, Geom)> = prims.iter().cloned().enumerate().collect();
         let out = cad_kernel::join_geoms(&items);
         if out.merged.is_empty() {
-            self.history.push(
-                "  pedit join: picked objects don't connect end-to-end".into());
+            self.history
+                .push("  pedit join: picked objects don't connect end-to-end".into());
             // DIAGNOSTIC: print every exploded segment's true endpoints so we can
             // see whether (and by how much) the chain ends actually miss.
             for (k, g) in prims.iter().enumerate() {
@@ -187,11 +224,13 @@ impl CadApp {
                     Geom::Arc(ar) => {
                         let s = Vec2::new(
                             ar.center.x + ar.radius * ar.start_angle.cos(),
-                            ar.center.y + ar.radius * ar.start_angle.sin());
+                            ar.center.y + ar.radius * ar.start_angle.sin(),
+                        );
                         let ea = ar.start_angle + ar.sweep_angle;
                         let e = Vec2::new(
                             ar.center.x + ar.radius * ea.cos(),
-                            ar.center.y + ar.radius * ea.sin());
+                            ar.center.y + ar.radius * ea.sin(),
+                        );
                         Some((s, e))
                     }
                     _ => None,
@@ -204,7 +243,8 @@ impl CadApp {
                     };
                     self.history.push(format!(
                         "    seg[{}] {} ({:.4},{:.4}) → ({:.4},{:.4})",
-                        k, kind, a.x, a.y, b.x, b.y));
+                        k, kind, a.x, a.y, b.x, b.y
+                    ));
                 }
             }
             self.pedit_state = PeditState::Menu(h);
@@ -217,7 +257,9 @@ impl CadApp {
             out.consumed_indices.iter().copied().collect();
         let mut result: Vec<Geom> = out.merged.clone();
         for (k, g) in prims.iter().enumerate() {
-            if !consumed.contains(&k) { result.push(g.clone()); }
+            if !consumed.contains(&k) {
+                result.push(g.clone());
+            }
         }
         // DIAGNOSTIC: dump source arcs and the resulting polyline bulges so we
         // can verify the stored curvature matches the original arc direction.
@@ -236,7 +278,8 @@ impl CadApp {
                 for (vi, v) in pl.vertices.iter().enumerate() {
                     self.history.push(format!(
                         "    pl v[{}] ({:.3},{:.3}) bulge={:.4}",
-                        vi, v.pos.x, v.pos.y, v.bulge));
+                        vi, v.pos.x, v.pos.y, v.bulge
+                    ));
                 }
             }
         }
@@ -245,7 +288,9 @@ impl CadApp {
         let mut rem = idxs.clone();
         rem.sort_unstable_by(|a, b| b.cmp(a));
         for i in rem {
-            if i < self.doc.dobjects.len() { self.doc.dobjects.remove(i); }
+            if i < self.doc.dobjects.len() {
+                self.doc.dobjects.remove(i);
+            }
         }
         let mut new_handle = None;
         for g in result {
@@ -253,12 +298,15 @@ impl CadApp {
             let d = DObject::with_style(g, style);
             let nh = d.handle;
             self.doc.push(d);
-            if is_poly && new_handle.is_none() { new_handle = Some(nh); }
+            if is_poly && new_handle.is_none() {
+                new_handle = Some(nh);
+            }
         }
         self.selection.clear();
         self.index_dirty = true;
         self.gpu_dirty = true;
-        self.history.push("  pedit join: merged into polyline".into());
+        self.history
+            .push("  pedit join: merged into polyline".into());
         let nh = new_handle.unwrap_or(h);
         self.pedit_state = PeditState::Menu(nh);
         self.pedit_reprompt(nh);
@@ -279,9 +327,15 @@ impl CadApp {
             PeditState::Off => {}
             PeditState::Menu(h) => {
                 match s.as_str() {
-                    "c" | "close" => { self.pedit_set_closed(h, true); self.pedit_reprompt(h); }
-                    "o" | "open"  => { self.pedit_set_closed(h, false); self.pedit_reprompt(h); }
-                    "j" | "join"  => {
+                    "c" | "close" => {
+                        self.pedit_set_closed(h, true);
+                        self.pedit_reprompt(h);
+                    }
+                    "o" | "open" => {
+                        self.pedit_set_closed(h, false);
+                        self.pedit_reprompt(h);
+                    }
+                    "j" | "join" => {
                         // Interactive: open a selection session to pick the
                         // objects to join; the queued PeditJoin fires on Enter.
                         self.pedit_state = PeditState::Off;
@@ -296,14 +350,21 @@ impl CadApp {
                         self.set_prompt("pedit width: enter width in mm  [Esc=cancel]");
                         self.refocus_cmd = true;
                     }
-                    "u" | "undo"  => { self.do_undo(); self.pedit_reprompt(h); }
+                    "u" | "undo" => {
+                        self.do_undo();
+                        self.pedit_reprompt(h);
+                    }
                     "x" | "exit" | "" => self.pedit_exit(),
-                    _ => self.history.push(
-                        "  ! pedit: type C/O, J, W, U, or X".into()),
+                    _ => self
+                        .history
+                        .push("  ! pedit: type C/O, J, W, U, or X".into()),
                 }
             }
             PeditState::Width(h) => {
-                if s.is_empty() { self.pedit_state = PeditState::Menu(h); self.pedit_reprompt(h); }
+                if s.is_empty() {
+                    self.pedit_state = PeditState::Menu(h);
+                    self.pedit_reprompt(h);
+                }
                 // Evaluate the ORIGINAL case (`s` is lowercased; variables
                 // are case-sensitive).
                 else if let Ok(mm) = self.eval_number(raw) {
@@ -315,7 +376,8 @@ impl CadApp {
                     self.pedit_state = PeditState::Menu(h);
                     self.pedit_reprompt(h);
                 } else {
-                    self.history.push("  ! pedit width: enter a number (mm)".into());
+                    self.history
+                        .push("  ! pedit width: enter a number (mm)".into());
                 }
             }
         }
@@ -346,18 +408,29 @@ impl CadApp {
 fn tessellated_polyline(g: &Geom) -> Option<Polyline> {
     match g {
         Geom::EllipseArc(ea) => {
-            let frac = (ea.sweep_param.abs()
-                / std::f64::consts::TAU).clamp(0.0, 1.0);
+            let frac = (ea.sweep_param.abs() / std::f64::consts::TAU).clamp(0.0, 1.0);
             let n = (96.0 * frac).ceil().max(12.0) as usize;
-            let vertices = (0..=n).map(|i| {
-                let t = ea.start_param + ea.sweep_param * (i as f64 / n as f64);
-                PolyVertex { pos: ea.ellipse.point_at(t), bulge: 0.0 }
-            }).collect();
-            Some(Polyline { vertices, closed: false, widths: Vec::new() })
+            let vertices = (0..=n)
+                .map(|i| {
+                    let t = ea.start_param + ea.sweep_param * (i as f64 / n as f64);
+                    PolyVertex {
+                        pos: ea.ellipse.point_at(t),
+                        bulge: 0.0,
+                    }
+                })
+                .collect();
+            Some(Polyline {
+                vertices,
+                closed: false,
+                widths: Vec::new(),
+            })
         }
         Geom::Spline(s) => Some(Polyline {
-            vertices: s.tessellate(64).into_iter()
-                .map(|p| PolyVertex { pos: p, bulge: 0.0 }).collect(),
+            vertices: s
+                .tessellate(64)
+                .into_iter()
+                .map(|p| PolyVertex { pos: p, bulge: 0.0 })
+                .collect(),
             closed: false,
             widths: Vec::new(),
         }),

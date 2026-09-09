@@ -12,14 +12,22 @@ fn assert_solid(m: &cad_solid::SolidMesh) {
     assert!(m.tri_count() > 0, "mesh has triangles");
     let (mn, mx) = m.bounds().expect("mesh has a bounding box");
     for k in 0..3 {
-        assert!(mx[k] - mn[k] > 1e-4, "axis {k} has measurable extent ({} .. {})", mn[k], mx[k]);
+        assert!(
+            mx[k] - mn[k] > 1e-4,
+            "axis {k} has measurable extent ({} .. {})",
+            mn[k],
+            mx[k]
+        );
     }
     assert!(mesh_volume(m) > 0.0, "solid has positive volume");
 }
 
 #[test]
 fn straight_staircase_is_a_valid_solid() {
-    let p = StairParams { layout: StairLayout::Straight, ..Default::default() };
+    let p = StairParams {
+        layout: StairLayout::Straight,
+        ..Default::default()
+    };
     assert_solid(&build_stairs(&p).unwrap());
 }
 
@@ -44,7 +52,10 @@ fn ushape_staircase_has_correct_step_split_and_is_solid() {
     let m = build_stairs(&p).unwrap();
     assert_solid(&m);
     let (_mn, mx) = m.bounds().unwrap();
-    assert!((mx[2] - 3.6).abs() < 1e-3, "reaches the floor-to-floor height");
+    assert!(
+        (mx[2] - 3.6).abs() < 1e-3,
+        "reaches the floor-to-floor height"
+    );
 }
 
 #[test]
@@ -73,12 +84,19 @@ fn landing_shorter_than_width_is_rejected() {
         landing_depth: 0.9,
         ..Default::default()
     };
-    assert!(matches!(plan_stairs(&p), Err(ArchError::LandingTooShort { .. })));
+    assert!(matches!(
+        plan_stairs(&p),
+        Err(ArchError::LandingTooShort { .. })
+    ));
 }
 
 #[test]
 fn spiral_staircase_is_a_valid_solid() {
-    let p = SpiralParams { steps_per_turn: 14, total_turns: 2.0, ..Default::default() };
+    let p = SpiralParams {
+        steps_per_turn: 14,
+        total_turns: 2.0,
+        ..Default::default()
+    };
     let plan = plan_spiral(&p).unwrap();
     assert_eq!(plan.num_steps, 28);
     assert_solid(&build_spiral(&p).unwrap());
@@ -86,14 +104,25 @@ fn spiral_staircase_is_a_valid_solid() {
 
 #[test]
 fn ramp_is_a_valid_solid() {
-    let p = RampParams { vertical_height: 1.2, horizontal_length: 5.0, width: 1.5, thickness: 0.15 };
+    let p = RampParams {
+        vertical_height: 1.2,
+        horizontal_length: 5.0,
+        width: 1.5,
+        thickness: 0.15,
+    };
     assert_solid(&build_ramp(&p).unwrap());
 }
 
 #[test]
 fn invalid_inputs_are_rejected() {
-    let bad = StairParams { total_height: 0.0, ..Default::default() };
+    let bad = StairParams {
+        total_height: 0.0,
+        ..Default::default()
+    };
     assert!(matches!(plan_stairs(&bad), Err(ArchError::NonPositive(_))));
-    let bad_ramp = RampParams { width: 0.0, ..Default::default() };
+    let bad_ramp = RampParams {
+        width: 0.0,
+        ..Default::default()
+    };
     assert!(build_ramp(&bad_ramp).is_err());
 }

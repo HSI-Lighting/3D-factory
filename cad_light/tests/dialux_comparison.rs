@@ -162,7 +162,11 @@ fn layout(profiles: &HashMap<String, IesProfile>) -> Vec<Luminaire> {
             position: Vertex::new(x, y, z),
             rotation_deg: 0.0,
             tilt_deg: 0.0,
-            dimming: 1.0, watts_override: None, flux_override: None, from_block: None });
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        });
     };
 
     // 32 track spots: 16 per run, insets matching the render's track position.
@@ -182,7 +186,13 @@ fn layout(profiles: &HashMap<String, IesProfile>) -> Vec<Luminaire> {
     // 10 pendants, also on the centre line but lower.
     for i in 0..10 {
         let x = ROOM_W * (i as f32 + 0.5) / 10.0;
-        push(x, ROOM_D * 0.5, SCHEDULE[2].4, "LINEA CIRCULAR FLEXIBLE.ldt", &mut id);
+        push(
+            x,
+            ROOM_D * 0.5,
+            SCHEDULE[2].4,
+            "LINEA CIRCULAR FLEXIBLE.ldt",
+            &mut id,
+        );
     }
     assert_eq!(lums.len(), 46, "the report lists 32 + 4 + 10 fittings");
     assert!(profiles.len() >= 3);
@@ -232,9 +242,24 @@ fn simlux_against_the_dialux_report() {
     // ---- the room -----------------------------------------------------------------------------
     let meshes = box_room(ROOM_W, ROOM_D, ROOM_H);
     let materials = vec![
-        Material { id: 0, name: "Floor".into(), reflectance: RHO_FLOOR, color: [1.0; 3] },
-        Material { id: 1, name: "Wall".into(), reflectance: RHO_WALLS, color: [1.0; 3] },
-        Material { id: 2, name: "Ceiling".into(), reflectance: RHO_CEILING, color: [1.0; 3] },
+        Material {
+            id: 0,
+            name: "Floor".into(),
+            reflectance: RHO_FLOOR,
+            color: [1.0; 3],
+        },
+        Material {
+            id: 1,
+            name: "Wall".into(),
+            reflectance: RHO_WALLS,
+            color: [1.0; 3],
+        },
+        Material {
+            id: 2,
+            name: "Ceiling".into(),
+            reflectance: RHO_CEILING,
+            color: [1.0; 3],
+        },
     ];
     let lums = layout(&profiles);
 
@@ -246,24 +271,63 @@ fn simlux_against_the_dialux_report() {
         cols: 64,
         rows: 32,
     };
-    let maintenance = Maintenance { llmf: MF, lsf: 1.0, lmf: 1.0, rsmf: 1.0 };
-    let settings = RaySettings { rays_per_point: 256, max_bounces: 6, shadows: true };
+    let maintenance = Maintenance {
+        llmf: MF,
+        lsf: 1.0,
+        lmf: 1.0,
+        rsmf: 1.0,
+    };
+    let settings = RaySettings {
+        rays_per_point: 256,
+        max_bounces: 6,
+        shadows: true,
+    };
 
     println!("\n=== calculating ===");
     let t = std::time::Instant::now();
-    let grid = calculate_maintained(&meshes, &lums, &profiles, &materials, &plane, &settings, maintenance);
-    println!("  {:.1} s for {} points", t.elapsed().as_secs_f64(), grid.values.len());
+    let grid = calculate_maintained(
+        &meshes,
+        &lums,
+        &profiles,
+        &materials,
+        &plane,
+        &settings,
+        maintenance,
+    );
+    println!(
+        "  {:.1} s for {} points",
+        t.elapsed().as_secs_f64(),
+        grid.values.len()
+    );
 
     let d = |ours: f64, theirs: f64| (ours - theirs) / theirs * 100.0;
     println!("\n=== SIMLUX vs DIALux ===");
     println!("                 SIMLUX      DIALux     diff");
-    println!("  E_avg      {:9.0} {:11.0} {:+8.1}%", grid.avg, DIALUX_E_AVG, d(grid.avg, DIALUX_E_AVG));
-    println!("  E_min      {:9.0} {:11.0} {:+8.1}%", grid.min, DIALUX_E_MIN, d(grid.min, DIALUX_E_MIN));
-    println!("  E_max      {:9.0} {:11.0} {:+8.1}%", grid.max, DIALUX_E_MAX, d(grid.max, DIALUX_E_MAX));
+    println!(
+        "  E_avg      {:9.0} {:11.0} {:+8.1}%",
+        grid.avg,
+        DIALUX_E_AVG,
+        d(grid.avg, DIALUX_E_AVG)
+    );
+    println!(
+        "  E_min      {:9.0} {:11.0} {:+8.1}%",
+        grid.min,
+        DIALUX_E_MIN,
+        d(grid.min, DIALUX_E_MIN)
+    );
+    println!(
+        "  E_max      {:9.0} {:11.0} {:+8.1}%",
+        grid.max,
+        DIALUX_E_MAX,
+        d(grid.max, DIALUX_E_MAX)
+    );
     println!("  U0         {:9.2} {:11.2}", grid.u0(), DIALUX_U0);
     println!("  MF         {:9.2} {:11.2}", grid.maintenance, MF);
     if let Some(f) = grid.direct_fraction() {
-        println!("  direct     {:8.0}%          -   (DIALux does not report this)", f * 100.0);
+        println!(
+            "  direct     {:8.0}%          -   (DIALux does not report this)",
+            f * 100.0
+        );
     }
 
     // ---- where the difference comes from -------------------------------------------------------
@@ -275,18 +339,50 @@ fn simlux_against_the_dialux_report() {
     println!("\n=== sensitivity: what the empty box is worth ===");
     println!("  bounces   E_avg      vs DIALux");
     for b in [0u32, 1, 2, 4, 6] {
-        let s = RaySettings { max_bounces: b, ..settings };
-        let g = calculate_maintained(&meshes, &lums, &profiles, &materials, &plane, &s, maintenance);
-        println!("  {b:>5}   {:8.0} lx   {:+7.1}%", g.avg, d(g.avg, DIALUX_E_AVG));
+        let s = RaySettings {
+            max_bounces: b,
+            ..settings
+        };
+        let g = calculate_maintained(
+            &meshes,
+            &lums,
+            &profiles,
+            &materials,
+            &plane,
+            &s,
+            maintenance,
+        );
+        println!(
+            "  {b:>5}   {:8.0} lx   {:+7.1}%",
+            g.avg,
+            d(g.avg, DIALUX_E_AVG)
+        );
     }
     println!("\n  effective reflectance (all surfaces equal, 6 bounces)");
     println!("  rho       E_avg      vs DIALux");
     for rho in [0.0f32, 0.10, 0.20, 0.30, 0.50, 0.75] {
         let mats: Vec<Material> = (0..3)
-            .map(|id| Material { id, name: format!("s{id}"), reflectance: rho, color: [1.0; 3] })
+            .map(|id| Material {
+                id,
+                name: format!("s{id}"),
+                reflectance: rho,
+                color: [1.0; 3],
+            })
             .collect();
-        let g = calculate_maintained(&meshes, &lums, &profiles, &mats, &plane, &settings, maintenance);
-        println!("  {rho:>4.2}   {:8.0} lx   {:+7.1}%", g.avg, d(g.avg, DIALUX_E_AVG));
+        let g = calculate_maintained(
+            &meshes,
+            &lums,
+            &profiles,
+            &mats,
+            &plane,
+            &settings,
+            maintenance,
+        );
+        println!(
+            "  {rho:>4.2}   {:8.0} lx   {:+7.1}%",
+            g.avg,
+            d(g.avg, DIALUX_E_AVG)
+        );
     }
 
     // ---- what this test actually asserts --------------------------------------------------------
@@ -308,9 +404,19 @@ fn simlux_against_the_dialux_report() {
     //
     // 20% on a layout inferred from photographs is a real result. Tightening it needs the fixture
     // coordinates, not a change to the engine.
-    let direct_only = RaySettings { max_bounces: 0, ..settings };
-    let g_direct =
-        calculate_maintained(&meshes, &lums, &profiles, &materials, &plane, &direct_only, maintenance);
+    let direct_only = RaySettings {
+        max_bounces: 0,
+        ..settings
+    };
+    let g_direct = calculate_maintained(
+        &meshes,
+        &lums,
+        &profiles,
+        &materials,
+        &plane,
+        &direct_only,
+        maintenance,
+    );
     let err = (g_direct.avg - DIALUX_E_AVG).abs() / DIALUX_E_AVG;
     println!("\n=== the assertable part ===");
     println!(

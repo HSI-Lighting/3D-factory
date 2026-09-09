@@ -138,9 +138,15 @@ const CASES: [Case; 3] = [
 /// The object, posed where it stands: raw little-endian f32, 9 per triangle, local frame.
 fn furniture_mesh(path: &str) -> Mesh {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    assert!(bytes.len() % 36 == 0, "{path}: {} bytes is not a whole number of triangles", bytes.len());
-    let floats: Vec<f32> =
-        bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    assert!(
+        bytes.len() % 36 == 0,
+        "{path}: {} bytes is not a whole number of triangles",
+        bytes.len()
+    );
+    let floats: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
 
     let mut vertices = Vec::with_capacity(floats.len() / 3);
     for p in floats.chunks_exact(3) {
@@ -148,14 +154,29 @@ fn furniture_mesh(path: &str) -> Mesh {
         // translation onto the room centre with the base left on the floor.
         vertices.push(Vertex::new(p[0] + FURN_XY.0, p[1] + FURN_XY.1, p[2]));
     }
-    let triangles =
-        (0..vertices.len() as u32 / 3).map(|t| Triangle { a: t * 3, b: t * 3 + 1, c: t * 3 + 2 }).collect();
-    Mesh { vertices, triangles, material: MATERIAL_FURNITURE }
+    let triangles = (0..vertices.len() as u32 / 3)
+        .map(|t| Triangle {
+            a: t * 3,
+            b: t * 3 + 1,
+            c: t * 3 + 2,
+        })
+        .collect();
+    Mesh {
+        vertices,
+        triangles,
+        material: MATERIAL_FURNITURE,
+    }
 }
 
 fn plane_at(cols: u32, rows: u32) -> CalcPlane {
     let span = ROOM - 2.0 * WALL_ZONE;
-    CalcPlane { origin: Vertex::new(WALL_ZONE, WALL_ZONE, WORK_PLANE), width: span, depth: span, cols, rows }
+    CalcPlane {
+        origin: Vertex::new(WALL_ZONE, WALL_ZONE, WORK_PLANE),
+        width: span,
+        depth: span,
+        cols,
+        rows,
+    }
 }
 
 fn load_photometry(dir: &str) -> IesProfile {
@@ -163,7 +184,11 @@ fn load_photometry(dir: &str) -> IesProfile {
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
     let mut prof = parse_ldt(&text).expect("FONDO.ldt parses");
     let ratio = prof.lumens / FLUX;
-    assert!((ratio - 1.0).abs() < 0.02, "flux {:.1} lm against DIALux's {FLUX:.1}", prof.lumens);
+    assert!(
+        (ratio - 1.0).abs() < 0.02,
+        "flux {:.1} lm against DIALux's {FLUX:.1}",
+        prof.lumens
+    );
     prof.watts = WATTS;
     prof
 }
@@ -178,7 +203,11 @@ fn luminaires(case: &Case) -> Vec<Luminaire> {
             position: Vertex::new(*x, *y, MOUNT_Z),
             rotation_deg: 0.0,
             tilt_deg: 0.0,
-            dimming: 1.0, watts_override: None, flux_override: None, from_block: None })
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        })
         .collect()
 }
 
@@ -189,7 +218,12 @@ fn run(
     profiles: &HashMap<String, IesProfile>,
     settings: &RaySettings,
 ) -> Vec<f64> {
-    let maint = Maintenance { llmf: MF, lsf: 1.0, lmf: 1.0, rsmf: 1.0 };
+    let maint = Maintenance {
+        llmf: MF,
+        lsf: 1.0,
+        lmf: 1.0,
+        rsmf: 1.0,
+    };
     calculate_maintained(
         meshes,
         &luminaires(case),
@@ -209,9 +243,10 @@ fn mean(v: &[f64]) -> f64 {
 #[test]
 #[ignore = "needs IDENTICAL_DIR (FONDO.ldt) and IDENTICAL_FURNITURE (furniture.bin)"]
 fn simlux_against_dialux_with_the_furniture_in_the_room() {
-    let (Ok(dir), Ok(furn)) =
-        (std::env::var("IDENTICAL_DIR"), std::env::var("IDENTICAL_FURNITURE"))
-    else {
+    let (Ok(dir), Ok(furn)) = (
+        std::env::var("IDENTICAL_DIR"),
+        std::env::var("IDENTICAL_FURNITURE"),
+    ) else {
         println!(
             "set IDENTICAL_DIR to the folder holding FONDO.ldt and IDENTICAL_FURNITURE to the \
              furniture blob (raw le f32, 9 per triangle — furniture_lib[0].pos_b64 inflated)"
@@ -222,7 +257,11 @@ fn simlux_against_dialux_with_the_furniture_in_the_room() {
     let mut profiles = HashMap::new();
     profiles.insert("FONDO".to_string(), load_photometry(&dir));
     let materials = default_materials();
-    let settings = RaySettings { rays_per_point: 4096, max_bounces: 8, ..RaySettings::default() };
+    let settings = RaySettings {
+        rays_per_point: 4096,
+        max_bounces: 8,
+        ..RaySettings::default()
+    };
 
     let empty = box_room(ROOM, ROOM, ROOM_H);
     let piece = furniture_mesh(&furn);
@@ -235,9 +274,19 @@ fn simlux_against_dialux_with_the_furniture_in_the_room() {
             hi[k] = hi[k].max(c);
         }
     }
-    println!("  world AABB  x {:.3}..{:.3}   y {:.3}..{:.3}   z {:.3}..{:.3}", lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
-    assert!(lo[2] > -1e-3 && lo[2] < 1e-3, "it must stand ON the floor, not float or sink: z starts at {:.3}", lo[2]);
-    assert!(hi[2] > WORK_PLANE, "an object entirely under the working plane could not shade it at all");
+    println!(
+        "  world AABB  x {:.3}..{:.3}   y {:.3}..{:.3}   z {:.3}..{:.3}",
+        lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]
+    );
+    assert!(
+        lo[2] > -1e-3 && lo[2] < 1e-3,
+        "it must stand ON the floor, not float or sink: z starts at {:.3}",
+        lo[2]
+    );
+    assert!(
+        hi[2] > WORK_PLANE,
+        "an object entirely under the working plane could not shade it at all"
+    );
 
     let mut furnished = empty.clone();
     furnished.push(piece);
@@ -248,18 +297,25 @@ fn simlux_against_dialux_with_the_furniture_in_the_room() {
         let ours = run(&furnished, &materials, case, &profiles, &settings);
 
         println!("\n================ {} ================", case.name);
-        println!("      {:>34}   {:>34}", "SIMLUX (furnished)", "DIALux (furnished)");
+        println!(
+            "      {:>34}   {:>34}",
+            "SIMLUX (furnished)", "DIALux (furnished)"
+        );
         let (mut sum_abs_pct, mut counted, mut worst) = (0.0, 0usize, (0.0_f64, 0usize, 0usize));
         for r in 0..8usize {
-            let fmt_ours =
-                (0..8).map(|c| format!("{:>6.0}", ours[r * 8 + c])).collect::<Vec<_>>().join("");
+            let fmt_ours = (0..8)
+                .map(|c| format!("{:>6.0}", ours[r * 8 + c]))
+                .collect::<Vec<_>>()
+                .join("");
             let fmt_dial = (0..8)
                 .map(|c| case.grid[r][c].map_or("     ·".to_string(), |v| format!("{v:>6.0}")))
                 .collect::<Vec<_>>()
                 .join("");
             println!("  r{r}  {fmt_ours}   {fmt_dial}");
             for c in 0..8 {
-                let Some(theirs) = case.grid[r][c] else { continue };
+                let Some(theirs) = case.grid[r][c] else {
+                    continue;
+                };
                 let pct = (ours[r * 8 + c] - theirs) / theirs * 100.0;
                 sum_abs_pct += pct.abs();
                 counted += 1;
@@ -335,9 +391,10 @@ fn simlux_against_dialux_with_the_furniture_in_the_room() {
 #[test]
 #[ignore = "needs IDENTICAL_DIR and IDENTICAL_FURNITURE"]
 fn the_shadow_lands_where_the_object_stands() {
-    let (Ok(dir), Ok(furn)) =
-        (std::env::var("IDENTICAL_DIR"), std::env::var("IDENTICAL_FURNITURE"))
-    else {
+    let (Ok(dir), Ok(furn)) = (
+        std::env::var("IDENTICAL_DIR"),
+        std::env::var("IDENTICAL_FURNITURE"),
+    ) else {
         return;
     };
     let mut profiles = HashMap::new();
@@ -349,12 +406,26 @@ fn the_shadow_lands_where_the_object_stands() {
     furnished.push(furniture_mesh(&furn));
 
     // DIRECT ONLY, one ray: bounced light fills a shadow in, and this is measuring the shadow.
-    let settings = RaySettings { rays_per_point: 1, max_bounces: 0, shadows: true };
+    let settings = RaySettings {
+        rays_per_point: 1,
+        max_bounces: 0,
+        shadows: true,
+    };
     let lums = luminaires(&CASES[0]); // the centred fitting, straight above the object
     const N: usize = 200;
-    let plane =
-        CalcPlane { origin: Vertex::new(1.0, 1.0, WORK_PLANE), width: 2.0, depth: 2.0, cols: N as u32, rows: N as u32 };
-    let maint = Maintenance { llmf: MF, lsf: 1.0, lmf: 1.0, rsmf: 1.0 };
+    let plane = CalcPlane {
+        origin: Vertex::new(1.0, 1.0, WORK_PLANE),
+        width: 2.0,
+        depth: 2.0,
+        cols: N as u32,
+        rows: N as u32,
+    };
+    let maint = Maintenance {
+        llmf: MF,
+        lsf: 1.0,
+        lmf: 1.0,
+        rsmf: 1.0,
+    };
     let run_one = |m: &[Mesh]| {
         calculate_maintained(m, &lums, &profiles, &materials, &plane, &settings, maint).values
     };
@@ -371,13 +442,23 @@ fn the_shadow_lands_where_the_object_stands() {
             let ratio = shaded[i] / open[i];
             deepest = deepest.min(ratio);
             if ratio < 0.5 {
-                lost.push((1.0 + (c as f32 + 0.5) * 2.0 / N as f32, 1.0 + (r as f32 + 0.5) * 2.0 / N as f32));
+                lost.push((
+                    1.0 + (c as f32 + 0.5) * 2.0 / N as f32,
+                    1.0 + (r as f32 + 0.5) * 2.0 / N as f32,
+                ));
             }
         }
     }
     let area = lost.len() as f64 * (2.0 / N as f64).powi(2);
-    println!("\n{} of {} cells lost over half their direct light — {area:.4} m²", lost.len(), N * N);
-    println!("deepest cell keeps {:.1}% of its open-room direct light", deepest * 100.0);
+    println!(
+        "\n{} of {} cells lost over half their direct light — {area:.4} m²",
+        lost.len(),
+        N * N
+    );
+    println!(
+        "deepest cell keeps {:.1}% of its open-room direct light",
+        deepest * 100.0
+    );
 
     assert!(
         !lost.is_empty(),
@@ -392,12 +473,18 @@ fn the_shadow_lands_where_the_object_stands() {
         lo = (lo.0.min(x), lo.1.min(y));
         hi = (hi.0.max(x), hi.1.max(y));
     }
-    println!("shadow extent  x {:.3}..{:.3}   y {:.3}..{:.3}", lo.0, hi.0, lo.1, hi.1);
+    println!(
+        "shadow extent  x {:.3}..{:.3}   y {:.3}..{:.3}",
+        lo.0, hi.0, lo.1, hi.1
+    );
     // The object's own footprint, plus 6 cm for the spread of a shadow cast from 3.2 m above by a
     // source of finite size and read on a plane 0.8 m up.
     let (hx, hy) = (0.2404 + 0.06, 0.4849 + 0.06);
     assert!(
-        lo.0 > FURN_XY.0 - hx && hi.0 < FURN_XY.0 + hx && lo.1 > FURN_XY.1 - hy && hi.1 < FURN_XY.1 + hy,
+        lo.0 > FURN_XY.0 - hx
+            && hi.0 < FURN_XY.0 + hx
+            && lo.1 > FURN_XY.1 - hy
+            && hi.1 < FURN_XY.1 + hy,
         "the shadow falls outside the object's footprint — the mesh is posed somewhere it is not",
     );
     // And it has to be a real shadow rather than one stray triangle clipped by the plane.
@@ -408,8 +495,15 @@ fn the_shadow_lands_where_the_object_stands() {
     // the frame all sit below the plane and cast their shadows onto the floor, not onto it. The
     // measured 0.026 m² at x 1.82–2.19, y 2.00–2.19 is exactly the handlebar and tank, and the
     // rest of the object correctly shades nothing.
-    assert!(area > 0.01, "only {area:.4} m² darkened — too little to be the object");
+    assert!(
+        area > 0.01,
+        "only {area:.4} m² darkened — too little to be the object"
+    );
     // Somewhere the direct component has to be gone OUTRIGHT. A grazing edge dims a cell; only
     // solid geometry between the fitting and the plane removes it.
-    assert!(deepest < 0.05, "nothing was fully occluded — the deepest cell kept {:.0}%", deepest * 100.0);
+    assert!(
+        deepest < 0.05,
+        "nothing was fully occluded — the deepest cell kept {:.0}%",
+        deepest * 100.0
+    );
 }

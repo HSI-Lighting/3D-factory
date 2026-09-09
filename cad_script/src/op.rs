@@ -38,7 +38,9 @@ pub enum ScriptOp {
     /// Number of model-space dobjects.
     DocCount,
     /// One dobject by index (owned copy).
-    DocGet { index: usize },
+    DocGet {
+        index: usize,
+    },
     /// Every dobject (owned copies). Explicit — O(N) memory by choice.
     DocAll,
     /// The current selection indices.
@@ -50,25 +52,60 @@ pub enum ScriptOp {
     /// All block definition names.
     BlocksGet,
     /// A sysvar value (None = unknown/unset).
-    SysVarGet { name: String },
+    SysVarGet {
+        name: String,
+    },
     /// The main canvas view (world centre + px-per-unit scale).
     ViewGet,
 
     // ---- writes ----
     /// Replace the selection.
-    SelectionSet { indices: Vec<usize> },
-    AddLine { a: Vec2, b: Vec2 },
-    AddCircle { center: Vec2, radius: f64 },
-    AddArc { center: Vec2, radius: f64, start_deg: f64, sweep_deg: f64 },
-    AddEllipse { center: Vec2, major: Vec2, ratio: f64 },
-    AddPolyline { vertices: Vec<Vec2>, closed: bool },
-    AddPoint { at: Vec2 },
-    AddText { text: String, at: Vec2, height: f64, angle_deg: f64 },
+    SelectionSet {
+        indices: Vec<usize>,
+    },
+    AddLine {
+        a: Vec2,
+        b: Vec2,
+    },
+    AddCircle {
+        center: Vec2,
+        radius: f64,
+    },
+    AddArc {
+        center: Vec2,
+        radius: f64,
+        start_deg: f64,
+        sweep_deg: f64,
+    },
+    AddEllipse {
+        center: Vec2,
+        major: Vec2,
+        ratio: f64,
+    },
+    AddPolyline {
+        vertices: Vec<Vec2>,
+        closed: bool,
+    },
+    AddPoint {
+        at: Vec2,
+    },
+    AddText {
+        text: String,
+        at: Vec2,
+        height: f64,
+        angle_deg: f64,
+    },
     /// Delete dobjects by index (highest first so earlier indices stay valid).
-    Delete { indices: Vec<usize> },
+    Delete {
+        indices: Vec<usize>,
+    },
     /// Create a layer. The host rejects duplicate / empty names.
-    LayerAdd { name: String },
-    LayerSetActive { name: String },
+    LayerAdd {
+        name: String,
+    },
+    LayerSetActive {
+        name: String,
+    },
     /// Set one or more layer properties (None = leave unchanged).
     LayerSet {
         name: String,
@@ -80,44 +117,101 @@ pub enum ScriptOp {
     },
     /// Create a block definition from the CURRENT SELECTION and instance it
     /// at `base` (mirrors the `block <name>` command).
-    BlockCreate { name: String, base: Vec2 },
+    BlockCreate {
+        name: String,
+        base: Vec2,
+    },
     /// Insert a plain (non-parametric) block instance.
-    BlockInsert { name: String, at: Vec2, rotation: f64 },
+    BlockInsert {
+        name: String,
+        at: Vec2,
+        rotation: f64,
+    },
     /// Drive the existing command seams (run_command).
-    Command { raw: String },
-    SysVarSet { name: String, value: String },
+    Command {
+        raw: String,
+    },
+    SysVarSet {
+        name: String,
+        value: String,
+    },
     /// Move / zoom the main canvas. `scale` = px per world unit; None = pan only.
-    ViewSet { center: Vec2, scale: Option<f64> },
-    Save { path: String },
-    Open { path: String },
+    ViewSet {
+        center: Vec2,
+        scale: Option<f64>,
+    },
+    Save {
+        path: String,
+    },
+    Open {
+        path: String,
+    },
 
     // ---- entity modification (P1: transform existing shapes) ----
     /// Move entities in place (hatch boundaries included).
-    ModifyMove { indices: Vec<usize>, delta: Vec2 },
+    ModifyMove {
+        indices: Vec<usize>,
+        delta: Vec2,
+    },
     /// Copy entities by `delta` (fresh handles); reply = the new indices.
-    ModifyCopy { indices: Vec<usize>, delta: Vec2 },
-    ModifyRotate { indices: Vec<usize>, pivot: Vec2, angle_deg: f64 },
-    ModifyScale { indices: Vec<usize>, pivot: Vec2, factor: f64 },
-    ModifyMirror { indices: Vec<usize>, a: Vec2, b: Vec2 },
+    ModifyCopy {
+        indices: Vec<usize>,
+        delta: Vec2,
+    },
+    ModifyRotate {
+        indices: Vec<usize>,
+        pivot: Vec2,
+        angle_deg: f64,
+    },
+    ModifyScale {
+        indices: Vec<usize>,
+        pivot: Vec2,
+        factor: f64,
+    },
+    ModifyMirror {
+        indices: Vec<usize>,
+        a: Vec2,
+        b: Vec2,
+    },
     /// Per-entity style. Color: `-1` = ByLayer, `-2` = ByBlock, 0..=255 = ACI.
-    SetEntityColor { indices: Vec<usize>, color: i32 },
+    SetEntityColor {
+        indices: Vec<usize>,
+        color: i32,
+    },
     /// `name` = linetype name, or empty = ByLayer.
-    SetEntityLinetype { indices: Vec<usize>, name: String },
+    SetEntityLinetype {
+        indices: Vec<usize>,
+        name: String,
+    },
     /// Move entities onto another layer (name).
-    SetEntityLayer { indices: Vec<usize>, name: String },
+    SetEntityLayer {
+        indices: Vec<usize>,
+        name: String,
+    },
     /// Lineweight in mm; negative = ByLayer.
-    SetEntityLineweight { indices: Vec<usize>, mm: f64 },
-    SetEntityVisible { indices: Vec<usize>, visible: bool },
+    SetEntityLineweight {
+        indices: Vec<usize>,
+        mm: f64,
+    },
+    SetEntityVisible {
+        indices: Vec<usize>,
+        visible: bool,
+    },
     /// Replace ONE entity's GEOMETRY — the shape-specific properties
     /// (endpoints, center/radius, text string, …). The style stays.
-    SetEntityGeom { index: usize, geom: Geom },
+    SetEntityGeom {
+        index: usize,
+        geom: Geom,
+    },
 
     // ---- P2 document-state reads ----
     DocUnits,
     /// Bbox of all model-space entities ((min), (max)); None = empty doc.
     DocBounds,
     LayoutsGet,
-    LayoutSetActive { name: String },
+    LayoutSetActive {
+        name: String,
+    },
     LinetypesGet,
 
     // ---- P3 ----
@@ -125,9 +219,15 @@ pub enum ScriptOp {
     /// the run start) collapses into ONE undo unit at the end of the run.
     UndoGroup,
     /// Current style for NEW entities (the script's own adds).
-    SetCurrentColor { color: i32 },
-    SetCurrentLinetype { name: String },
-    SetCurrentLineweight { mm: f64 },
+    SetCurrentColor {
+        color: i32,
+    },
+    SetCurrentLinetype {
+        name: String,
+    },
+    SetCurrentLineweight {
+        mm: f64,
+    },
 
     // ---- P4 convenience ----
     ZoomExtents,
@@ -136,11 +236,17 @@ pub enum ScriptOp {
     /// Create a hatch from EXPLICIT boundary entity indices (closed
     /// polylines / circles / ellipses / closed splines are accepted; other
     /// kinds are skipped loudly). `pattern` = "SOLID" or a catalog name.
-    AddHatch { boundary_indices: Vec<usize>, pattern: String },
+    AddHatch {
+        boundary_indices: Vec<usize>,
+        pattern: String,
+    },
     /// Trace the smallest closed region around a world point (the app's
     /// pick-point primitive, islands included) and hatch it. Reply =
     /// `Indices(boundary)` — EMPTY when no closed region contains the point.
-    HatchAt { point: Vec2, pattern: String },
+    HatchAt {
+        point: Vec2,
+        pattern: String,
+    },
     /// The hatch-pattern catalog names.
     HatchPatternsGet,
 }

@@ -7,9 +7,9 @@
 // Primitives are GEOMETRY ONLY. Color, lineweight, dash, and CTB overrides
 // are resolved separately by the caller and applied at emit time.
 
-use crate::Document;
 use crate::geom::{Geom, HatchPattern};
 use crate::math::Vec2;
+use crate::Document;
 
 /// A single drawing primitive — geometry only, no style.
 #[derive(Clone, Debug, PartialEq)]
@@ -17,21 +17,48 @@ pub enum VectorPrimitive {
     /// A straight line segment from p0 to p1.
     Segment { p0: Vec2, p1: Vec2 },
     /// A circular arc. `sweep_angle` is CCW in radians.
-    Arc { center: Vec2, radius: f64, start_angle: f64, sweep_angle: f64 },
+    Arc {
+        center: Vec2,
+        radius: f64,
+        start_angle: f64,
+        sweep_angle: f64,
+    },
     /// A full circle.
     Circle { center: Vec2, radius: f64 },
     /// An elliptical arc. `major` is the semi-major axis vector.
-    EllipseArc { center: Vec2, major: Vec2, ratio: f64, start_param: f64, sweep_param: f64 },
+    EllipseArc {
+        center: Vec2,
+        major: Vec2,
+        ratio: f64,
+        start_param: f64,
+        sweep_param: f64,
+    },
     /// A NURBS spline curve.
-    Spline { degree: usize, control_points: Vec<Vec2>, closed: bool },
+    Spline {
+        degree: usize,
+        control_points: Vec<Vec2>,
+        closed: bool,
+    },
     /// Single-line text entity.
-    Text { position: Vec2, content: String, height: f64, rotation: f64 },
+    Text {
+        position: Vec2,
+        content: String,
+        height: f64,
+        rotation: f64,
+    },
     /// A point marker.
     Point { position: Vec2, size: f64 },
     /// A filled polygon region. `outer` is the boundary; `holes` are cutouts.
-    FilledPolygon { outer: Vec<Vec2>, holes: Vec<Vec<Vec2>> },
+    FilledPolygon {
+        outer: Vec<Vec2>,
+        holes: Vec<Vec<Vec2>>,
+    },
     /// A viewport frame rectangle on paper.
-    ViewportRect { center: Vec2, width: f64, height: f64 },
+    ViewportRect {
+        center: Vec2,
+        width: f64,
+        height: f64,
+    },
 }
 
 impl Geom {
@@ -66,14 +93,19 @@ impl Geom {
                     } else {
                         d.bbox()
                     };
-                    if b.x < a.x || b.y < a.y { continue; }
+                    if b.x < a.x || b.y < a.y {
+                        continue;
+                    }
                     any = true;
                     mn = Vec2::new(mn.x.min(a.x), mn.y.min(a.y));
                     mx = Vec2::new(mx.x.max(b.x), mx.y.max(b.y));
                 }
                 if !any {
                     let seg = x.line_segment(1e4);
-                    vec![Segment { p0: seg.a, p1: seg.b }]
+                    vec![Segment {
+                        p0: seg.a,
+                        p1: seg.b,
+                    }]
                 } else {
                     let diag = (mx - mn).len().max(1.0);
                     let lo = mn - Vec2::new(diag, diag);
@@ -95,7 +127,8 @@ impl Geom {
                         let t = std::f64::consts::TAU * (i as f64 / n as f64);
                         pts.push(Vec2::new(
                             d.center.x + radius * t.cos(),
-                            d.center.y + radius * t.sin()));
+                            d.center.y + radius * t.sin(),
+                        ));
                     }
                     pts
                 };
@@ -126,14 +159,19 @@ impl Geom {
                     } else {
                         d.bbox()
                     };
-                    if b.x < a.x || b.y < a.y { continue; }
+                    if b.x < a.x || b.y < a.y {
+                        continue;
+                    }
                     any = true;
                     mn = Vec2::new(mn.x.min(a.x), mn.y.min(a.y));
                     mx = Vec2::new(mx.x.max(b.x), mx.y.max(b.y));
                 }
                 if !any {
                     let seg = r.ray_segment(1e4);
-                    vec![Segment { p0: seg.a, p1: seg.b }]
+                    vec![Segment {
+                        p0: seg.a,
+                        p1: seg.b,
+                    }]
                 } else {
                     let diag = (mx - mn).len().max(1.0);
                     let lo = mn - Vec2::new(diag, diag);
@@ -145,17 +183,24 @@ impl Geom {
                 }
             }
 
-            Geom::Circle(c) => vec![Circle { center: c.center, radius: c.radius }],
+            Geom::Circle(c) => vec![Circle {
+                center: c.center,
+                radius: c.radius,
+            }],
 
             Geom::Arc(a) => vec![Arc {
-                center: a.center, radius: a.radius,
-                start_angle: a.start_angle, sweep_angle: a.sweep_angle,
+                center: a.center,
+                radius: a.radius,
+                start_angle: a.start_angle,
+                sweep_angle: a.sweep_angle,
             }],
 
             Geom::Ellipse(e) => {
                 // A full ellipse = elliptical arc spanning 0..2π.
                 vec![EllipseArc {
-                    center: e.center, major: e.major, ratio: e.ratio,
+                    center: e.center,
+                    major: e.major,
+                    ratio: e.ratio,
                     start_param: 0.0,
                     sweep_param: std::f64::consts::TAU,
                 }]
@@ -169,7 +214,10 @@ impl Geom {
                 sweep_param: ea.sweep_param,
             }],
 
-            Geom::Point(p) => vec![Point { position: p.location, size: p.size as f64 }],
+            Geom::Point(p) => vec![Point {
+                position: p.location,
+                size: p.size as f64,
+            }],
 
             Geom::Polyline(p) => {
                 let n = p.vertices.len();
@@ -182,13 +230,24 @@ impl Geom {
                     let v0 = &p.vertices[i];
                     let v1 = &p.vertices[(i + 1) % n];
                     if v0.bulge.abs() < 1e-9 {
-                        out.push(Segment { p0: v0.pos, p1: v1.pos });
+                        out.push(Segment {
+                            p0: v0.pos,
+                            p1: v1.pos,
+                        });
                     } else if let Some((center, radius, start_angle, sweep)) =
                         crate::join::bulge_arc(v0.pos, v1.pos, v0.bulge)
                     {
-                        out.push(Arc { center, radius, start_angle, sweep_angle: sweep });
+                        out.push(Arc {
+                            center,
+                            radius,
+                            start_angle,
+                            sweep_angle: sweep,
+                        });
                     } else {
-                        out.push(Segment { p0: v0.pos, p1: v1.pos });
+                        out.push(Segment {
+                            p0: v0.pos,
+                            p1: v1.pos,
+                        });
                     }
                 }
                 out
@@ -205,10 +264,18 @@ impl Geom {
                             return Vec::new();
                         }
                         let outer = loops[0].clone();
-                        let holes = if loops.len() > 1 { loops[1..].to_vec() } else { Vec::new() };
+                        let holes = if loops.len() > 1 {
+                            loops[1..].to_vec()
+                        } else {
+                            Vec::new()
+                        };
                         vec![FilledPolygon { outer, holes }]
                     }
-                    HatchPattern::Pattern { name, scale, angle_deg } => {
+                    HatchPattern::Pattern {
+                        name,
+                        scale,
+                        angle_deg,
+                    } => {
                         // Pattern hatches emit their pattern LINES (and
                         // circles for ring families), NOT a solid fill —
                         // `patterns::hatch_geometry` is the single source
@@ -224,7 +291,10 @@ impl Geom {
                             out.push(Segment { p0: a, p1: b });
                         }
                         for (c, r) in circs {
-                            out.push(Circle { center: c, radius: r });
+                            out.push(Circle {
+                                center: c,
+                                radius: r,
+                            });
                         }
                         out
                     }
@@ -245,13 +315,19 @@ impl Geom {
                 let n = left.len();
                 if n >= 2 {
                     for i in 0..n - 1 {
-                        out.push(Segment { p0: left[i], p1: left[i + 1] });
+                        out.push(Segment {
+                            p0: left[i],
+                            p1: left[i + 1],
+                        });
                     }
                 }
                 let n = right.len();
                 if n >= 2 {
                     for i in 0..n - 1 {
-                        out.push(Segment { p0: right[i], p1: right[i + 1] });
+                        out.push(Segment {
+                            p0: right[i],
+                            p1: right[i + 1],
+                        });
                     }
                 }
                 out
@@ -285,7 +361,11 @@ impl Geom {
             // else the default (mirrors what the renderer shows).
             Geom::AttrDef(a) => vec![Text {
                 position: a.position,
-                content: if a.default.is_empty() { a.tag.clone() } else { a.default.clone() },
+                content: if a.default.is_empty() {
+                    a.tag.clone()
+                } else {
+                    a.default.clone()
+                },
                 height: a.height,
                 rotation: a.angle,
             }],
@@ -323,10 +403,7 @@ impl Geom {
             // CenterMark — the two crossing arms.
             Geom::CenterMark(cm) => {
                 let [t0, t1, t2, t3] = cm.tips();
-                vec![
-                    Segment { p0: t0, p1: t2 },
-                    Segment { p0: t1, p1: t3 },
-                ]
+                vec![Segment { p0: t0, p1: t2 }, Segment { p0: t1, p1: t3 }]
             }
 
             // Issue #10 — emit the FULL dimension instead of nothing: dim
@@ -335,7 +412,9 @@ impl Geom {
             // Uses the same resolved geometry as the on-screen renderer
             // (`Dim::render_geometry`), so exports match the canvas.
             Geom::Dimension(d) => {
-                let style = doc.dim_styles.get(d.style)
+                let style = doc
+                    .dim_styles
+                    .get(d.style)
                     .or_else(|| doc.dim_styles.get(0))
                     .cloned()
                     .unwrap_or_else(crate::dim::DimStyle::standard);
@@ -352,10 +431,12 @@ impl Geom {
                     if geo.text_on_dim_line {
                         let text = d.formatted_text(&style);
                         if !text.is_empty() {
-                            let u   = (b - a).normalized();
+                            let u = (b - a).normalized();
                             let len = (b - a).len();
-                            let half_gap = text.len() as f64 * 0.6
-                                * (style.text_height * style.overall_scale) * 0.5
+                            let half_gap = text.len() as f64
+                                * 0.6
+                                * (style.text_height * style.overall_scale)
+                                * 0.5
                                 + style.text_gap * style.overall_scale;
                             let g1 = geo.text_pos - u * half_gap;
                             let g2 = geo.text_pos + u * half_gap;
@@ -377,8 +458,10 @@ impl Geom {
                 // Angular dim arc — emit as a native Arc primitive.
                 if let Some((c, r, a1, sweep)) = geo.dim_arc {
                     out.push(Arc {
-                        center: c, radius: r,
-                        start_angle: a1, sweep_angle: sweep,
+                        center: c,
+                        radius: r,
+                        start_angle: a1,
+                        sweep_angle: sweep,
                     });
                 }
                 let arrow_size = (style.arrow_size * style.overall_scale).max(1e-6);
@@ -389,7 +472,10 @@ impl Geom {
                         // Architectural tick — a 45° slash centered on the tip.
                         let c = std::f64::consts::FRAC_1_SQRT_2;
                         let t = Vec2::new(dn.x * c - dn.y * c, dn.x * c + dn.y * c);
-                        out.push(Segment { p0: *tip + t * tick_w, p1: *tip - t * tick_w });
+                        out.push(Segment {
+                            p0: *tip + t * tick_w,
+                            p1: *tip - t * tick_w,
+                        });
                     } else {
                         // Filled arrowhead: tip + two base corners (20° half
                         // angle, AutoCAD default); hollow = outline strokes.
@@ -446,12 +532,15 @@ impl Geom {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geom::{Circle, Line, Polyline, PolyVertex};
     use crate::dobject::DObject;
+    use crate::geom::{Circle, Line, PolyVertex, Polyline};
 
     #[test]
     fn line_to_segment() {
-        let g = Geom::Line(Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 5.0) });
+        let g = Geom::Line(Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(10.0, 5.0),
+        });
         let doc = Document::default();
         let prims = g.to_vector_primitives(&doc);
         assert_eq!(prims.len(), 1);
@@ -466,7 +555,10 @@ mod tests {
 
     #[test]
     fn circle_is_intact() {
-        let g = Geom::Circle(Circle { center: Vec2::new(5.0, 5.0), radius: 3.0 });
+        let g = Geom::Circle(Circle {
+            center: Vec2::new(5.0, 5.0),
+            radius: 3.0,
+        });
         let doc = Document::default();
         let prims = g.to_vector_primitives(&doc);
         assert_eq!(prims.len(), 1);
@@ -483,9 +575,18 @@ mod tests {
     fn polyline_bulge_becomes_arc() {
         let pl = Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 1.0 },
-                PolyVertex { pos: Vec2::new(10.0, 10.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 0.0),
+                    bulge: 1.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 10.0),
+                    bulge: 0.0,
+                },
             ],
             closed: false,
             widths: Vec::new(),
@@ -507,7 +608,8 @@ mod tests {
     fn dimension_exports_full_geometry() {
         let g = Geom::Dimension(crate::dim::Dim {
             kind: crate::dim::DimKind::Linear {
-                p1: Vec2::ZERO, p2: Vec2::new(10.0, 0.0),
+                p1: Vec2::ZERO,
+                p2: Vec2::new(10.0, 0.0),
                 dimline_pos: Vec2::new(5.0, 1.0),
                 ortho: crate::dim::LinearOrtho::Aligned,
             },
@@ -518,15 +620,27 @@ mod tests {
         let prims = g.to_vector_primitives(&doc);
         // 2 extension lines + (gap-trimmed) dim line = 4 segments, 2 filled
         // arrowheads, 1 text label.
-        let segs  = prims.iter().filter(|p| matches!(p, VectorPrimitive::Segment { .. })).count();
-        let fills = prims.iter().filter(|p| matches!(p, VectorPrimitive::FilledPolygon { .. })).count();
-        let texts = prims.iter().filter(|p| matches!(p, VectorPrimitive::Text { .. })).count();
+        let segs = prims
+            .iter()
+            .filter(|p| matches!(p, VectorPrimitive::Segment { .. }))
+            .count();
+        let fills = prims
+            .iter()
+            .filter(|p| matches!(p, VectorPrimitive::FilledPolygon { .. }))
+            .count();
+        let texts = prims
+            .iter()
+            .filter(|p| matches!(p, VectorPrimitive::Text { .. }))
+            .count();
         assert_eq!(segs, 4, "extension×2 + dim-line×2 (gap-trimmed): {prims:?}");
         assert_eq!(fills, 2, "one arrowhead per dim-line end");
         assert_eq!(texts, 1, "the measured-value label");
         // The label is the measured distance (10.0) formatted by the style.
         if let VectorPrimitive::Text { content, .. } = &prims[prims.len() - 1] {
-            assert!(content.contains("10"), "label carries the measured value: {content}");
+            assert!(
+                content.contains("10"),
+                "label carries the measured value: {content}"
+            );
         } else {
             panic!("last primitive must be the text label");
         }
@@ -536,9 +650,9 @@ mod tests {
     fn angular_dim_exports_arc_and_extensions() {
         let g = Geom::Dimension(crate::dim::Dim {
             kind: crate::dim::DimKind::Angular {
-                vertex:  Vec2::ZERO,
-                p1:      Vec2::new(10.0, 0.0),
-                p2:      Vec2::new(0.0, 10.0),
+                vertex: Vec2::ZERO,
+                p1: Vec2::new(10.0, 0.0),
+                p2: Vec2::new(0.0, 10.0),
                 arc_pos: Vec2::new(5.0, 5.0),
             },
             style: 0,
@@ -546,15 +660,25 @@ mod tests {
         });
         let doc = Document::default();
         let prims = g.to_vector_primitives(&doc);
-        let arcs = prims.iter()
+        let arcs = prims
+            .iter()
             .filter(|p| matches!(p, VectorPrimitive::Arc { .. }))
             .count();
-        assert_eq!(arcs, 1, "the dim arc must export as a native Arc: {prims:?}");
-        let segs = prims.iter()
+        assert_eq!(
+            arcs, 1,
+            "the dim arc must export as a native Arc: {prims:?}"
+        );
+        let segs = prims
+            .iter()
             .filter(|p| matches!(p, VectorPrimitive::Segment { .. }))
             .count();
         assert_eq!(segs, 2, "two extension lines");
-        if let Some(VectorPrimitive::Arc { radius, sweep_angle, .. }) = prims.iter()
+        if let Some(VectorPrimitive::Arc {
+            radius,
+            sweep_angle,
+            ..
+        }) = prims
+            .iter()
             .find(|p| matches!(p, VectorPrimitive::Arc { .. }))
         {
             assert!((*radius - (5.0f64 * std::f64::consts::SQRT_2)).abs() < 1e-9);
@@ -571,7 +695,10 @@ fn loop_segments(pts: &[Vec2]) -> Vec<VectorPrimitive> {
     let n = pts.len();
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        out.push(Segment { p0: pts[i], p1: pts[(i + 1) % n] });
+        out.push(Segment {
+            p0: pts[i],
+            p1: pts[(i + 1) % n],
+        });
     }
     out
 }

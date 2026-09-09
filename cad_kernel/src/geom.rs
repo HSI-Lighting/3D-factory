@@ -1,12 +1,15 @@
 // Geometric primitives. Tight, Copy, no virtual dispatch.
 
-use crate::layout::ViewportGeom;
-use crate::math::{Vec2, EPS, norm_angle};
 use crate::join::{bulge_arc, polyline_segments};
+use crate::layout::ViewportGeom;
+use crate::math::{norm_angle, Vec2, EPS};
 use crate::text::Leader;
 
 #[derive(Clone, Copy, Debug)]
-pub struct Line { pub a: Vec2, pub b: Vec2 }
+pub struct Line {
+    pub a: Vec2,
+    pub b: Vec2,
+}
 
 /// Infinite construction line (AutoCAD XLINE) — passes through `base` along
 /// the direction `dir` (kept normalized). Used for drafting guides; renders
@@ -24,16 +27,25 @@ impl Xline {
     /// Build from a base point + direction vector (direction normalized).
     pub fn new(base: Vec2, dir: Vec2) -> Self {
         let len = dir.len();
-        let dir = if len > 1e-12 { dir / len } else { Vec2::new(1.0, 0.0) };
+        let dir = if len > 1e-12 {
+            dir / len
+        } else {
+            Vec2::new(1.0, 0.0)
+        };
         Xline { base, dir }
     }
 
     /// Point on the line at parameter `t` (world units along `dir`).
-    pub fn point_at(&self, t: f64) -> Vec2 { self.base + self.dir * t }
+    pub fn point_at(&self, t: f64) -> Vec2 {
+        self.base + self.dir * t
+    }
 
     /// A long finite segment (for intersections, previews, bbox fallbacks).
     pub fn line_segment(&self, extent: f64) -> Line {
-        Line { a: self.point_at(-extent), b: self.point_at(extent) }
+        Line {
+            a: self.point_at(-extent),
+            b: self.point_at(extent),
+        }
     }
 
     /// Signed perpendicular distance from a point to the infinite line.
@@ -51,19 +63,30 @@ impl Xline {
         let mut t0 = f64::NEG_INFINITY;
         let mut t1 = f64::INFINITY;
         for (axis, lo, hi) in [(0, mn.x, mx.x), (1, mn.y, mx.y)] {
-            let (b, d) = if axis == 0 { (self.base.x, self.dir.x) } else { (self.base.y, self.dir.y) };
+            let (b, d) = if axis == 0 {
+                (self.base.x, self.dir.x)
+            } else {
+                (self.base.y, self.dir.y)
+            };
             if d.abs() < 1e-12 {
-                if b < lo || b > hi { return None; }
+                if b < lo || b > hi {
+                    return None;
+                }
             } else {
                 let ta = (lo - b) / d;
                 let tb = (hi - b) / d;
                 let (tl, th) = if ta < tb { (ta, tb) } else { (tb, ta) };
                 t0 = t0.max(tl);
                 t1 = t1.min(th);
-                if t0 > t1 { return None; }
+                if t0 > t1 {
+                    return None;
+                }
             }
         }
-        Some(Line { a: self.point_at(t0), b: self.point_at(t1) })
+        Some(Line {
+            a: self.point_at(t0),
+            b: self.point_at(t1),
+        })
     }
 
     /// The line's own bbox: a very large finite box along the direction.
@@ -89,22 +112,35 @@ impl Ray {
     /// Build from a base point + direction vector (direction normalized).
     pub fn new(base: Vec2, dir: Vec2) -> Self {
         let len = dir.len();
-        let dir = if len > 1e-12 { dir / len } else { Vec2::new(1.0, 0.0) };
+        let dir = if len > 1e-12 {
+            dir / len
+        } else {
+            Vec2::new(1.0, 0.0)
+        };
         Ray { base, dir }
     }
 
     /// Point on the ray at parameter `t` (world units along `dir`, `t >= 0`).
-    pub fn point_at(&self, t: f64) -> Vec2 { self.base + self.dir * t }
+    pub fn point_at(&self, t: f64) -> Vec2 {
+        self.base + self.dir * t
+    }
 
     /// A long finite segment from the base along the ray (for
     /// intersections, previews, bbox fallbacks).
     pub fn ray_segment(&self, extent: f64) -> Line {
-        Line { a: self.base, b: self.point_at(extent) }
+        Line {
+            a: self.base,
+            b: self.point_at(extent),
+        }
     }
 
     pub fn distance_to_point(&self, p: Vec2) -> f64 {
         let t = (p - self.base).dot(self.dir);
-        if t < 0.0 { p.dist(self.base) } else { (p - self.base).cross(self.dir).abs() }
+        if t < 0.0 {
+            p.dist(self.base)
+        } else {
+            (p - self.base).cross(self.dir).abs()
+        }
     }
 
     /// Clip the ray to `rect` → the visible segment, if any. Slab clip over
@@ -113,27 +149,44 @@ impl Ray {
         let mut t0 = 0.0_f64;
         let mut t1 = f64::INFINITY;
         for (axis, lo, hi) in [(0, mn.x, mx.x), (1, mn.y, mx.y)] {
-            let (b, d) = if axis == 0 { (self.base.x, self.dir.x) } else { (self.base.y, self.dir.y) };
+            let (b, d) = if axis == 0 {
+                (self.base.x, self.dir.x)
+            } else {
+                (self.base.y, self.dir.y)
+            };
             if d.abs() < 1e-12 {
-                if b < lo || b > hi { return None; }
+                if b < lo || b > hi {
+                    return None;
+                }
             } else {
                 let ta = (lo - b) / d;
                 let tb = (hi - b) / d;
                 let (tl, th) = if ta < tb { (ta, tb) } else { (tb, ta) };
                 t0 = t0.max(tl);
                 t1 = t1.min(th);
-                if t0 > t1 { return None; }
+                if t0 > t1 {
+                    return None;
+                }
             }
         }
-        Some(Line { a: self.point_at(t0), b: self.point_at(t1) })
+        Some(Line {
+            a: self.point_at(t0),
+            b: self.point_at(t1),
+        })
     }
 
     /// The ray's own bbox: from the base, a very large finite box forward.
     pub fn bbox(&self) -> (Vec2, Vec2) {
         let e = Vec2::new(self.dir.x.abs(), self.dir.y.abs()) * 1e6;
         (
-            Vec2::new(self.base.x.min(self.base.x + e.x), self.base.y.min(self.base.y + e.y)),
-            Vec2::new(self.base.x.max(self.base.x + e.x), self.base.y.max(self.base.y + e.y)),
+            Vec2::new(
+                self.base.x.min(self.base.x + e.x),
+                self.base.y.min(self.base.y + e.y),
+            ),
+            Vec2::new(
+                self.base.x.max(self.base.x + e.x),
+                self.base.y.max(self.base.y + e.y),
+            ),
         )
     }
 }
@@ -151,22 +204,24 @@ impl Ray {
 /// along its centerline).
 #[derive(Clone, Copy, Debug)]
 pub struct Wall {
-    pub start:     Vec2,
-    pub end:       Vec2,
+    pub start: Vec2,
+    pub end: Vec2,
     pub thickness: f64,
     /// WallStyle id (drywall / structural / …). 0 = STANDARD. Drives the
     /// poché fill + (optionally) thickness; see `WallStyleTable`.
-    pub style:     u32,
+    pub style: u32,
     /// Centerline bulge (polyline/DXF convention = tan(sweep/4)): 0 = a
     /// straight segment; ≠ 0 = the centerline is a circular arc from
     /// start→end. Used for rounded wall corners — a fillet (r>0) on two
     /// straight walls spawns a curved corner wall.
-    pub bulge:     f64,
+    pub bulge: f64,
 }
 
 impl Wall {
     /// True when the centerline is an arc (rounded corner wall).
-    pub fn is_curved(&self) -> bool { self.bulge.abs() > 1e-9 }
+    pub fn is_curved(&self) -> bool {
+        self.bulge.abs() > 1e-9
+    }
 
     /// Tessellate the CENTERLINE into a polyline: 2 points for a straight
     /// wall, `n`+1 points along the arc for a curved one. Faces are derived
@@ -178,10 +233,12 @@ impl Wall {
         match bulge_arc(self.start, self.end, self.bulge) {
             Some((center, r, a0, sweep)) => {
                 let steps = n.max(2);
-                (0..=steps).map(|i| {
-                    let t = a0 + sweep * (i as f64 / steps as f64);
-                    Vec2::new(center.x + r * t.cos(), center.y + r * t.sin())
-                }).collect()
+                (0..=steps)
+                    .map(|i| {
+                        let t = a0 + sweep * (i as f64 / steps as f64);
+                        Vec2::new(center.x + r * t.cos(), center.y + r * t.sin())
+                    })
+                    .collect()
             }
             None => vec![self.start, self.end],
         }
@@ -205,9 +262,7 @@ impl Wall {
             let r = self.right_line()?;
             return Some((vec![l.a, l.b], vec![r.a, r.b]));
         }
-        let Some((center, radius, a0, sweep)) =
-            bulge_arc(self.start, self.end, self.bulge)
-        else {
+        let Some((center, radius, a0, sweep)) = bulge_arc(self.start, self.end, self.bulge) else {
             // Degenerate chord — fall back to the straight faces.
             let l = self.left_line()?;
             let r = self.right_line()?;
@@ -218,7 +273,7 @@ impl Wall {
         // points OUTWARD (+radial).
         let side = if sweep >= 0.0 { -1.0 } else { 1.0 };
         let steps = n.max(2);
-        let mut left  = Vec::with_capacity(steps + 1);
+        let mut left = Vec::with_capacity(steps + 1);
         let mut right = Vec::with_capacity(steps + 1);
         for i in 0..=steps {
             let t = a0 + sweep * (i as f64 / steps as f64);
@@ -235,7 +290,9 @@ impl Wall {
     pub fn normal(&self) -> Option<Vec2> {
         let d = self.end - self.start;
         let len = d.len();
-        if len < EPS { return None; }
+        if len < EPS {
+            return None;
+        }
         Some((d / len).perp())
     }
 
@@ -243,19 +300,28 @@ impl Wall {
     pub fn left_line(&self) -> Option<Line> {
         let n = self.normal()?;
         let off = n * (self.thickness * 0.5);
-        Some(Line { a: self.start + off, b: self.end + off })
+        Some(Line {
+            a: self.start + off,
+            b: self.end + off,
+        })
     }
 
     /// The "right" (CW-side) face line of the wall.
     pub fn right_line(&self) -> Option<Line> {
         let n = self.normal()?;
         let off = n * (self.thickness * 0.5);
-        Some(Line { a: self.start - off, b: self.end - off })
+        Some(Line {
+            a: self.start - off,
+            b: self.end - off,
+        })
     }
 
     /// The implicit centerline as a regular Line.
     pub fn centerline(&self) -> Line {
-        Line { a: self.start, b: self.end }
+        Line {
+            a: self.start,
+            b: self.end,
+        }
     }
 
     /// Centerline length.
@@ -264,16 +330,18 @@ impl Wall {
     }
 }
 
-
 #[derive(Clone, Copy, Debug)]
-pub struct Circle { pub center: Vec2, pub radius: f64 }
+pub struct Circle {
+    pub center: Vec2,
+    pub radius: f64,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Arc {
     pub center: Vec2,
     pub radius: f64,
-    pub start_angle: f64,   // radians, in [0, 2π)
-    pub sweep_angle: f64,   // radians, in (0, 2π], positive = CCW from start
+    pub start_angle: f64, // radians, in [0, 2π)
+    pub sweep_angle: f64, // radians, in (0, 2π], positive = CCW from start
 }
 
 impl Arc {
@@ -302,8 +370,8 @@ impl Arc {
 #[derive(Clone, Copy, Debug)]
 pub struct Ellipse {
     pub center: Vec2,
-    pub major:  Vec2,
-    pub ratio:  f64,
+    pub major: Vec2,
+    pub ratio: f64,
 }
 
 /// Partial ellipse — the elliptical analogue of `Arc`. `start_param` and
@@ -312,9 +380,9 @@ pub struct Ellipse {
 /// stretched ellipse they don't.
 #[derive(Clone, Copy, Debug)]
 pub struct EllipseArc {
-    pub ellipse:     Ellipse,
-    pub start_param: f64,    // in [0, 2π)
-    pub sweep_param: f64,    // (0, 2π], positive = CCW (in parameter space)
+    pub ellipse: Ellipse,
+    pub start_param: f64, // in [0, 2π)
+    pub sweep_param: f64, // (0, 2π], positive = CCW (in parameter space)
 }
 
 /// A 2D point primitive — AutoCAD POINT entity. Has a location and a
@@ -323,8 +391,8 @@ pub struct EllipseArc {
 #[derive(Clone, Copy, Debug)]
 pub struct Point {
     pub location: Vec2,
-    pub style:    u8,    // PDMODE — 0 = single pixel dot, 2 = +, 3 = ×, 4 = |, …
-    pub size:     f32,   // PDSIZE — drawing units; 0.0 = use renderer default
+    pub style: u8, // PDMODE — 0 = single pixel dot, 2 = +, 3 = ×, 4 = |, …
+    pub size: f32, // PDSIZE — drawing units; 0.0 = use renderer default
 }
 
 /// A center mark — AutoCAD CENTERMARK. A symmetric cross (two lines
@@ -334,9 +402,9 @@ pub struct Point {
 /// typically on a CENTER linetype.
 #[derive(Clone, Copy, Debug)]
 pub struct CenterMark {
-    pub center:   Vec2,
+    pub center: Vec2,
     /// Half-width of the cross: each arm reaches `size` from the center.
-    pub size:     f64,
+    pub size: f64,
     /// Rotation in radians CCW; the arms point along `rotation` and
     /// `rotation + π/2` (0 = axis-aligned cross).
     pub rotation: f64,
@@ -349,8 +417,12 @@ impl CenterMark {
         let s = self.rotation.sin();
         let u = Vec2::new(c, s) * self.size;
         let v = Vec2::new(-s, c) * self.size;
-        [self.center + u, self.center + v,
-         self.center - u, self.center - v]
+        [
+            self.center + u,
+            self.center + v,
+            self.center - u,
+            self.center - v,
+        ]
     }
 
     /// The two crossing line segments.
@@ -377,7 +449,9 @@ impl CenterMark {
         let mut best = f64::INFINITY;
         for (a, b) in self.segments() {
             let d = Line { a, b }.distance_to_point(p);
-            if d < best { best = d; }
+            if d < best {
+                best = d;
+            }
         }
         best
     }
@@ -389,14 +463,14 @@ impl CenterMark {
 /// != 0 means an arc segment whose mid-deviation = `chord_len * bulge / 2`.
 #[derive(Clone, Copy, Debug)]
 pub struct PolyVertex {
-    pub pos:   Vec2,
+    pub pos: Vec2,
     pub bulge: f64,
 }
 
 #[derive(Clone, Debug)]
 pub struct Polyline {
     pub vertices: Vec<PolyVertex>,
-    pub closed:   bool,
+    pub closed: bool,
     /// Per-segment (start_width, end_width) in drawing units, linear taper
     /// within each segment. EMPTY = no width (render as a thin stroke — current
     /// behaviour). When non-empty, length == segment count (vertices.len()-1
@@ -418,20 +492,38 @@ impl Polyline {
         let mut min = self.vertices[0].pos;
         let mut max = min;
         for v in &self.vertices[1..] {
-            if v.pos.x < min.x { min.x = v.pos.x; }
-            if v.pos.y < min.y { min.y = v.pos.y; }
-            if v.pos.x > max.x { max.x = v.pos.x; }
-            if v.pos.y > max.y { max.y = v.pos.y; }
+            if v.pos.x < min.x {
+                min.x = v.pos.x;
+            }
+            if v.pos.y < min.y {
+                min.y = v.pos.y;
+            }
+            if v.pos.x > max.x {
+                max.x = v.pos.x;
+            }
+            if v.pos.y > max.y {
+                max.y = v.pos.y;
+            }
         }
         // Union in each real segment's bbox so arc bulges are included.
         for seg in polyline_segments(self) {
             let (smin, smax) = seg.bbox();
-            min.x = min.x.min(smin.x); min.y = min.y.min(smin.y);
-            max.x = max.x.max(smax.x); max.y = max.y.max(smax.y);
+            min.x = min.x.min(smin.x);
+            min.y = min.y.min(smin.y);
+            max.x = max.x.max(smax.x);
+            max.y = max.y.max(smax.y);
         }
-        let hw = self.widths.iter().flat_map(|&(a,b)| [a,b]).fold(0.0_f64, f64::max) * 0.5;
+        let hw = self
+            .widths
+            .iter()
+            .flat_map(|&(a, b)| [a, b])
+            .fold(0.0_f64, f64::max)
+            * 0.5;
         if hw > 0.0 {
-            min.x -= hw; min.y -= hw; max.x += hw; max.y += hw;
+            min.x -= hw;
+            min.y -= hw;
+            max.x += hw;
+            max.y += hw;
         }
         (min, max)
     }
@@ -440,15 +532,21 @@ impl Polyline {
     /// Each bulged segment is tested as its true Arc (via `polyline_segments`),
     /// not its straight chord — so picking works on the curved part too.
     pub fn distance_to_point(&self, p: Vec2) -> f64 {
-        if self.vertices.is_empty() { return f64::INFINITY; }
+        if self.vertices.is_empty() {
+            return f64::INFINITY;
+        }
         let mut best = f64::INFINITY;
         for seg in polyline_segments(self) {
             let d = seg.distance_to_point(p);
-            if d < best { best = d; }
+            if d < best {
+                best = d;
+            }
         }
         // Fallback for a 1-vertex / degenerate polyline (no segments).
         if best.is_infinite() {
-            for v in &self.vertices { best = best.min(p.dist(v.pos)); }
+            for v in &self.vertices {
+                best = best.min(p.dist(v.pos));
+            }
         }
         best
     }
@@ -456,7 +554,9 @@ impl Polyline {
     /// Total length (sum of straight chords; arc bulges add the true arc
     /// length on top — TODO when bulge math lands).
     pub fn length(&self) -> f64 {
-        if self.vertices.len() < 2 { return 0.0; }
+        if self.vertices.len() < 2 {
+            return 0.0;
+        }
         let n = self.vertices.len();
         let pairs = if self.closed { n } else { n - 1 };
         let mut sum = 0.0;
@@ -493,7 +593,9 @@ impl Polyline {
         let sagitta = arc_len * 0.2;
         // Sub-arc bulge for a chord `c` + sagitta `s` (CCW positive).
         let sub_bulge = |c: f64| -> f64 {
-            if c < 1e-9 { return 0.0; }
+            if c < 1e-9 {
+                return 0.0;
+            }
             let r = (c * c / 4.0 + sagitta * sagitta) / (2.0 * sagitta);
             let sweep = 2.0 * (c / (2.0 * r)).asin();
             (sweep / 4.0).tan()
@@ -508,7 +610,9 @@ impl Polyline {
             let b = corners[(i + 1) % 4];
             let edge = b - a;
             let len = edge.len();
-            if len < 1e-9 { continue; }
+            if len < 1e-9 {
+                continue;
+            }
             let n = (len / chord).round().max(1.0) as usize;
             let seg = edge / n as f64;
             let bl = sub_bulge(len / n as f64) * signs[i];
@@ -524,7 +628,11 @@ impl Polyline {
         if vertices.len() < 3 {
             return None;
         }
-        Some(Polyline { vertices, closed: true, widths: Vec::new() })
+        Some(Polyline {
+            vertices,
+            closed: true,
+            widths: Vec::new(),
+        })
     }
 }
 
@@ -548,9 +656,9 @@ pub enum HatchPattern {
         /// Canonical name (`"ANSI31"`, `"BRICK"`, …) — case-insensitive
         /// lookup. Unknown names render as nothing (the hatch still
         /// exists in the doc; user can rename it later).
-        name:      String,
+        name: String,
         /// Multiplier applied to every family's spacing. 1.0 = catalog.
-        scale:     f64,
+        scale: f64,
         /// Degrees added to every family's angle. 0.0 = catalog.
         angle_deg: f64,
     },
@@ -580,7 +688,7 @@ pub struct Hatch {
     /// A handle that no longer resolves is silently skipped — the
     /// hatch shrinks gracefully if the user deletes a boundary.
     pub boundary_handles: Vec<crate::dobject::Handle>,
-    pub pattern:          HatchPattern,
+    pub pattern: HatchPattern,
 }
 
 impl Hatch {
@@ -618,24 +726,24 @@ impl Hatch {
 /// representation.
 #[derive(Clone, Debug)]
 pub struct Spline {
-    pub degree:         usize,
+    pub degree: usize,
     pub control_points: Vec<Vec2>,
     /// One weight per control point. Must satisfy
     /// `weights.len() == control_points.len()` and each weight > 0.
     /// Use `Spline::new_bspline` to build a non-rational (all-1)
     /// variant without constructing the weight vector by hand.
-    pub weights:        Vec<f64>,
+    pub weights: Vec<f64>,
     /// Explicit knot vector (length degree + control_points.len() + 1).
     /// `None` = clamped/open uniform — the `new_bspline` default, and what
     /// every shape-creation path uses. `Spline::split_at` produces trimmed
     /// halves with `Some(non-uniform knots)` so a trimmed spline still
     /// evaluates exactly (issue #21).
-    pub knots:          Option<Vec<f64>>,
+    pub knots: Option<Vec<f64>>,
     /// Uniform ribbon width in drawing units (0 = a thin stroke, the default
     /// and the AutoCAD spline look). Unlike a polyline's per-segment taper this
     /// is ONE constant width for the whole curve; the SPLINE draw tool's
     /// `Width` option and the Inspector set it. Scales with the geometry.
-    pub width:          f64,
+    pub width: f64,
 }
 
 impl Spline {
@@ -643,11 +751,22 @@ impl Spline {
     /// control-point count or if the curve is degenerate
     /// (control_points <= degree).
     pub fn new(degree: usize, control_points: Vec<Vec2>, weights: Vec<f64>) -> Self {
-        assert_eq!(weights.len(), control_points.len(),
-            "Spline: weights count must match control_points count");
-        assert!(control_points.len() > degree,
-            "Spline: need more control points than degree");
-        Self { degree, control_points, weights, knots: None, width: 0.0 }
+        assert_eq!(
+            weights.len(),
+            control_points.len(),
+            "Spline: weights count must match control_points count"
+        );
+        assert!(
+            control_points.len() > degree,
+            "Spline: need more control points than degree"
+        );
+        Self {
+            degree,
+            control_points,
+            weights,
+            knots: None,
+            width: 0.0,
+        }
     }
 
     /// Non-rational B-spline (all weights = 1.0). Same constraints as
@@ -674,10 +793,18 @@ impl Spline {
         let mut min = self.control_points[0];
         let mut max = min;
         for v in &self.control_points[1..] {
-            if v.x < min.x { min.x = v.x; }
-            if v.y < min.y { min.y = v.y; }
-            if v.x > max.x { max.x = v.x; }
-            if v.y > max.y { max.y = v.y; }
+            if v.x < min.x {
+                min.x = v.x;
+            }
+            if v.y < min.y {
+                min.y = v.y;
+            }
+            if v.x > max.x {
+                max.x = v.x;
+            }
+            if v.y > max.y {
+                max.y = v.y;
+            }
         }
         (min, max)
     }
@@ -688,17 +815,27 @@ impl Spline {
     /// the boundary.
     pub fn tessellate(&self, n_samples: usize) -> Vec<Vec2> {
         use cad_nurbs::{BSplineCurve, KnotVector, NurbsCurve, Vec2 as NV};
-        let ctrls: Vec<NV> = self.control_points.iter()
-            .map(|v| NV::new(v.x, v.y)).collect();
+        let ctrls: Vec<NV> = self
+            .control_points
+            .iter()
+            .map(|v| NV::new(v.x, v.y))
+            .collect();
         // Trimmed splines carry their explicit (non-uniform) knots; plain
         // splines use the clamped-uniform default (issue #21).
         let curve = match &self.knots {
             Some(k) => NurbsCurve::new(
-                BSplineCurve::new(self.degree, ctrls, KnotVector::from_raw(k.clone(), self.degree)),
-                self.weights.clone()),
+                BSplineCurve::new(
+                    self.degree,
+                    ctrls,
+                    KnotVector::from_raw(k.clone(), self.degree),
+                ),
+                self.weights.clone(),
+            ),
             None => NurbsCurve::new_clamped(self.degree, ctrls, self.weights.clone()),
         };
-        curve.tessellate(n_samples).into_iter()
+        curve
+            .tessellate(n_samples)
+            .into_iter()
             .map(|p| Vec2::new(p.x, p.y))
             .collect()
     }
@@ -710,23 +847,33 @@ impl Spline {
         use cad_nurbs::{BSplineCurve, KnotVector, Vec2 as NV};
         let (u_min, u_max) = match &self.knots {
             Some(k) => (k[0], k[k.len() - 1]),
-            None    => (0.0, 1.0),
+            None => (0.0, 1.0),
         };
         let u = u_min + u.clamp(0.0, 1.0) * (u_max - u_min);
-        let ctrls: Vec<NV> = self.control_points.iter()
-            .map(|v| NV::new(v.x, v.y)).collect();
+        let ctrls: Vec<NV> = self
+            .control_points
+            .iter()
+            .map(|v| NV::new(v.x, v.y))
+            .collect();
         let curve = match &self.knots {
-            Some(k) => BSplineCurve::new(self.degree, ctrls, KnotVector::from_raw(k.clone(), self.degree)),
-            None    => BSplineCurve::new_clamped(self.degree, ctrls),
+            Some(k) => BSplineCurve::new(
+                self.degree,
+                ctrls,
+                KnotVector::from_raw(k.clone(), self.degree),
+            ),
+            None => BSplineCurve::new_clamped(self.degree, ctrls),
         };
         let (l, r) = curve.split(u);
         let to_spline = |c: BSplineCurve| Spline {
             degree: c.degree,
-            control_points: c.control_points.iter()
-                .map(|p| Vec2::new(p.x, p.y)).collect(),
+            control_points: c
+                .control_points
+                .iter()
+                .map(|p| Vec2::new(p.x, p.y))
+                .collect(),
             weights: self.weights.clone(),
             knots: Some(c.knots.knots().to_vec()),
-            width: self.width,      // both halves inherit the ribbon width
+            width: self.width, // both halves inherit the ribbon width
         };
         (to_spline(l), to_spline(r))
     }
@@ -737,10 +884,13 @@ impl Spline {
     /// projection iteration when sub-pixel accuracy is needed.
     pub fn distance_to_point(&self, p: Vec2) -> f64 {
         let samples = self.tessellate(64);
-        if samples.len() < 2 { return f64::INFINITY; }
+        if samples.len() < 2 {
+            return f64::INFINITY;
+        }
         let mut best = f64::INFINITY;
         for w in samples.windows(2) {
-            let a = w[0]; let b = w[1];
+            let a = w[0];
+            let b = w[1];
             let d = b - a;
             let len_sq = d.len_sq();
             let dist = if len_sq < EPS {
@@ -749,7 +899,9 @@ impl Spline {
                 let t = ((p - a).dot(d) / len_sq).clamp(0.0, 1.0);
                 p.dist(a + d * t)
             };
-            if dist < best { best = dist; }
+            if dist < best {
+                best = dist;
+            }
         }
         best
     }
@@ -786,8 +938,10 @@ impl Donut {
         }
     }
     pub fn bbox(&self) -> (Vec2, Vec2) {
-        (self.center - Vec2::new(self.outer_radius, self.outer_radius),
-         self.center + Vec2::new(self.outer_radius, self.outer_radius))
+        (
+            self.center - Vec2::new(self.outer_radius, self.outer_radius),
+            self.center + Vec2::new(self.outer_radius, self.outer_radius),
+        )
     }
 }
 
@@ -807,10 +961,16 @@ impl Wipeout {
             mn = Vec2::new(mn.x.min(p.x), mn.y.min(p.y));
             mx = Vec2::new(mx.x.max(p.x), mx.y.max(p.y));
         }
-        if mn.x.is_infinite() { (Vec2::ZERO, Vec2::ZERO) } else { (mn, mx) }
+        if mn.x.is_infinite() {
+            (Vec2::ZERO, Vec2::ZERO)
+        } else {
+            (mn, mx)
+        }
     }
     pub fn distance_to_point(&self, p: Vec2) -> f64 {
-        if point_in_polygon(p, &self.pts) { 0.0 } else {
+        if point_in_polygon(p, &self.pts) {
+            0.0
+        } else {
             // Distance to the nearest edge.
             let n = self.pts.len();
             let mut best = f64::INFINITY;
@@ -819,7 +979,9 @@ impl Wipeout {
                 let b = self.pts[(i + 1) % n];
                 let d = b - a;
                 let l2 = d.len_sq();
-                let t = if l2 < 1e-12 { 0.0 } else {
+                let t = if l2 < 1e-12 {
+                    0.0
+                } else {
                     ((p - a).dot(d) / l2).clamp(0.0, 1.0)
                 };
                 best = best.min(p.dist(a + d * t));
@@ -844,10 +1006,16 @@ impl Region {
             mn = Vec2::new(mn.x.min(p.x), mn.y.min(p.y));
             mx = Vec2::new(mx.x.max(p.x), mx.y.max(p.y));
         }
-        if mn.x.is_infinite() { (Vec2::ZERO, Vec2::ZERO) } else { (mn, mx) }
+        if mn.x.is_infinite() {
+            (Vec2::ZERO, Vec2::ZERO)
+        } else {
+            (mn, mx)
+        }
     }
     pub fn distance_to_point(&self, p: Vec2) -> f64 {
-        if point_in_polygon(p, &self.loop_pts) { 0.0 } else {
+        if point_in_polygon(p, &self.loop_pts) {
+            0.0
+        } else {
             let n = self.loop_pts.len();
             let mut best = f64::INFINITY;
             for i in 0..n {
@@ -855,7 +1023,9 @@ impl Region {
                 let b = self.loop_pts[(i + 1) % n];
                 let d = b - a;
                 let l2 = d.len_sq();
-                let t = if l2 < 1e-12 { 0.0 } else {
+                let t = if l2 < 1e-12 {
+                    0.0
+                } else {
                     ((p - a).dot(d) / l2).clamp(0.0, 1.0)
                 };
                 best = best.min(p.dist(a + d * t));
@@ -948,13 +1118,19 @@ impl Geom {
     /// circle/arc/ellipse becomes an ellipse / elliptical-arc — matching
     /// AutoCAD/LibreCAD block-insert behaviour for stretched blocks.
     pub fn scaled_xy(&self, pivot: Vec2, sx: f64, sy: f64) -> Geom {
-        if (sx - sy).abs() < 1e-9 { return self.scaled(pivot, sx); }
-        let sc  = |p: Vec2| Vec2::new(pivot.x + (p.x - pivot.x) * sx,
-                                      pivot.y + (p.y - pivot.y) * sy);
-        let scd = |v: Vec2| Vec2::new(v.x * sx, v.y * sy);   // linear part (no shift)
-        // Two CONJUGATE semi-diameters u,v (point = cos t·u + sin t·v) → axis
-        // form: (major vector, ratio, param phase). The image param t maps to
-        // ellipse param (t − phase). sx,sy>0 ⇒ orientation preserved.
+        if (sx - sy).abs() < 1e-9 {
+            return self.scaled(pivot, sx);
+        }
+        let sc = |p: Vec2| {
+            Vec2::new(
+                pivot.x + (p.x - pivot.x) * sx,
+                pivot.y + (p.y - pivot.y) * sy,
+            )
+        };
+        let scd = |v: Vec2| Vec2::new(v.x * sx, v.y * sy); // linear part (no shift)
+                                                           // Two CONJUGATE semi-diameters u,v (point = cos t·u + sin t·v) → axis
+                                                           // form: (major vector, ratio, param phase). The image param t maps to
+                                                           // ellipse param (t − phase). sx,sy>0 ⇒ orientation preserved.
         let to_axes = |u: Vec2, v: Vec2| -> (Vec2, f64, f64) {
             let (a, b, c) = (u.dot(u), v.dot(v), u.dot(v));
             let sstar = 0.5 * (2.0 * c).atan2(a - b);
@@ -969,17 +1145,17 @@ impl Geom {
             (major, ratio, phase)
         };
         match self {
-            Geom::Line(l) => Geom::Line(Line { a: sc(l.a), b: sc(l.b) }),
+            Geom::Line(l) => Geom::Line(Line {
+                a: sc(l.a),
+                b: sc(l.b),
+            }),
             // Xline — base scales; direction re-normalizes under the axis
             // squish (the infinite line through the new base, same visual).
             Geom::Xline(x) => Geom::Xline(Xline::new(
                 sc(x.base),
                 Vec2::new(x.dir.x * sx, x.dir.y * sy),
             )),
-            Geom::Ray(r) => Geom::Ray(Ray::new(
-                sc(r.base),
-                Vec2::new(r.dir.x * sx, r.dir.y * sy),
-            )),
+            Geom::Ray(r) => Geom::Ray(Ray::new(sc(r.base), Vec2::new(r.dir.x * sx, r.dir.y * sy))),
             Geom::Donut(d) => Geom::Donut(Donut::new(
                 sc(d.center),
                 d.inner_radius * sx.abs().min(sy.abs()),
@@ -1005,68 +1181,124 @@ impl Geom {
                 scale: x.scale * 0.5 * (sx.abs() + sy.abs()).max(1e-6),
                 ..x.clone()
             }),
-            Geom::Point(pt) => Geom::Point(Point { location: sc(pt.location),
-                style: pt.style, size: pt.size }),
+            Geom::Point(pt) => Geom::Point(Point {
+                location: sc(pt.location),
+                style: pt.style,
+                size: pt.size,
+            }),
             Geom::Polyline(p) => {
                 // Width is a perpendicular thickness with no single axis under
                 // anisotropic scale → use the average of the two factors.
                 let wf = 0.5 * (sx.abs() + sy.abs());
                 Geom::Polyline(Polyline {
-                    vertices: p.vertices.iter()
-                        .map(|v| PolyVertex { pos: sc(v.pos), bulge: v.bulge }).collect(),
+                    vertices: p
+                        .vertices
+                        .iter()
+                        .map(|v| PolyVertex {
+                            pos: sc(v.pos),
+                            bulge: v.bulge,
+                        })
+                        .collect(),
                     closed: p.closed,
-                    widths: p.widths.iter().map(|&(a, b)| (a * wf, b * wf)).collect() })
+                    widths: p.widths.iter().map(|&(a, b)| (a * wf, b * wf)).collect(),
+                })
             }
-            Geom::Spline(s) => Geom::Spline(Spline { degree: s.degree,
+            Geom::Spline(s) => Geom::Spline(Spline {
+                degree: s.degree,
                 control_points: s.control_points.iter().map(|p| sc(*p)).collect(),
                 weights: s.weights.clone(),
                 knots: s.knots.clone(),
                 // Same average-factor as the polyline arm (anisotropic scale).
-                width: s.width * 0.5 * (sx.abs() + sy.abs()) }),
+                width: s.width * 0.5 * (sx.abs() + sy.abs()),
+            }),
             Geom::Circle(c) => {
-                let (major, ratio, _) = to_axes(
-                    Vec2::new(sx * c.radius, 0.0), Vec2::new(0.0, sy * c.radius));
-                Geom::Ellipse(Ellipse { center: sc(c.center), major, ratio })
+                let (major, ratio, _) =
+                    to_axes(Vec2::new(sx * c.radius, 0.0), Vec2::new(0.0, sy * c.radius));
+                Geom::Ellipse(Ellipse {
+                    center: sc(c.center),
+                    major,
+                    ratio,
+                })
             }
             Geom::Arc(arc) => {
                 let (major, ratio, phase) = to_axes(
-                    Vec2::new(sx * arc.radius, 0.0), Vec2::new(0.0, sy * arc.radius));
+                    Vec2::new(sx * arc.radius, 0.0),
+                    Vec2::new(0.0, sy * arc.radius),
+                );
                 Geom::EllipseArc(EllipseArc {
-                    ellipse: Ellipse { center: sc(arc.center), major, ratio },
-                    start_param: arc.start_angle - phase, sweep_param: arc.sweep_angle })
+                    ellipse: Ellipse {
+                        center: sc(arc.center),
+                        major,
+                        ratio,
+                    },
+                    start_param: arc.start_angle - phase,
+                    sweep_param: arc.sweep_angle,
+                })
             }
             Geom::Ellipse(e) => {
                 let (major, ratio, _) = to_axes(scd(e.major), scd(e.major.perp() * e.ratio));
-                Geom::Ellipse(Ellipse { center: sc(e.center), major, ratio })
+                Geom::Ellipse(Ellipse {
+                    center: sc(e.center),
+                    major,
+                    ratio,
+                })
             }
             Geom::EllipseArc(ea) => {
-                let (major, ratio, phase) =
-                    to_axes(scd(ea.ellipse.major), scd(ea.ellipse.major.perp() * ea.ellipse.ratio));
+                let (major, ratio, phase) = to_axes(
+                    scd(ea.ellipse.major),
+                    scd(ea.ellipse.major.perp() * ea.ellipse.ratio),
+                );
                 Geom::EllipseArc(EllipseArc {
-                    ellipse: Ellipse { center: sc(ea.ellipse.center), major, ratio },
-                    start_param: ea.start_param - phase, sweep_param: ea.sweep_param })
+                    ellipse: Ellipse {
+                        center: sc(ea.ellipse.center),
+                        major,
+                        ratio,
+                    },
+                    start_param: ea.start_param - phase,
+                    sweep_param: ea.sweep_param,
+                })
             }
             Geom::Dimension(d) => Geom::Dimension(d.with_points_mapped(sc)),
             Geom::Hatch(h) => Geom::Hatch(h.clone()),
             // Best-effort for the rare cases — non-uniform on these is approximate.
-            Geom::Wall(w) => Geom::Wall(Wall { start: sc(w.start), end: sc(w.end),
-                thickness: w.thickness * 0.5 * (sx + sy), style: w.style, bulge: w.bulge }),
-            Geom::Text(t) => { let mut nt = t.clone(); nt.position = sc(t.position);
-                nt.height *= sy; Geom::Text(nt) }
+            Geom::Wall(w) => Geom::Wall(Wall {
+                start: sc(w.start),
+                end: sc(w.end),
+                thickness: w.thickness * 0.5 * (sx + sy),
+                style: w.style,
+                bulge: w.bulge,
+            }),
+            Geom::Text(t) => {
+                let mut nt = t.clone();
+                nt.position = sc(t.position);
+                nt.height *= sy;
+                Geom::Text(nt)
+            }
             Geom::BlockRef(br) => Geom::BlockRef(crate::block::BlockRef {
-                insert: sc(br.insert), scale: br.scale * sx, scale_y: br.scale_y * sy, ..br.clone() }),
+                insert: sc(br.insert),
+                scale: br.scale * sx,
+                scale_y: br.scale_y * sy,
+                ..br.clone()
+            }),
             Geom::Leader(l) => Geom::Leader(Leader {
                 pts: l.pts.iter().map(|p| sc(*p)).collect(),
-                label: { let mut nt = l.label.clone(); nt.position = sc(l.label.position);
-                    nt.height *= sy; nt },
+                label: {
+                    let mut nt = l.label.clone();
+                    nt.position = sc(l.label.position);
+                    nt.height *= sy;
+                    nt
+                },
                 arrow: l.arrow,
             }),
             Geom::AttrDef(a) => Geom::AttrDef(crate::block::AttrDef {
-                position: sc(a.position), height: a.height * sy, ..a.clone() }),
+                position: sc(a.position),
+                height: a.height * sy,
+                ..a.clone()
+            }),
             // CenterMark — scale the arms non-uniformly (like Point).
             Geom::CenterMark(cm) => Geom::CenterMark(CenterMark {
                 center: sc(cm.center),
-                size:   cm.size * sy,
+                size: cm.size * sy,
                 rotation: cm.rotation,
             }),
             Geom::Viewport(vp) => Geom::Viewport(ViewportGeom {
@@ -1074,7 +1306,7 @@ impl Geom {
                 width: vp.width * sx.abs(),
                 height: vp.height * sy.abs(),
                 model_center: sc(vp.model_center),
-                model_zoom: vp.model_zoom,  // zoom is scale-independent
+                model_zoom: vp.model_zoom,   // zoom is scale-independent
                 model_scale: vp.model_scale, // paper scale stays
                 frame_visible: vp.frame_visible,
             }),
@@ -1086,17 +1318,28 @@ impl Geom {
         let s = angle.sin();
         let rot = |p: Vec2| -> Vec2 {
             let d = p - pivot;
-            Vec2 { x: pivot.x + d.x * c - d.y * s, y: pivot.y + d.x * s + d.y * c }
+            Vec2 {
+                x: pivot.x + d.x * c - d.y * s,
+                y: pivot.y + d.x * s + d.y * c,
+            }
         };
         let rot_dir = |v: Vec2| -> Vec2 {
             // direction vectors don't shift by pivot
-            Vec2 { x: v.x * c - v.y * s, y: v.x * s + v.y * c }
+            Vec2 {
+                x: v.x * c - v.y * s,
+                y: v.x * s + v.y * c,
+            }
         };
         match self {
-            Geom::Line(l) => Geom::Line(Line { a: rot(l.a), b: rot(l.b) }),
+            Geom::Line(l) => Geom::Line(Line {
+                a: rot(l.a),
+                b: rot(l.b),
+            }),
             Geom::Xline(x) => Geom::Xline(Xline::new(rot(x.base), rot_dir(x.dir))),
             Geom::Ray(r) => Geom::Ray(Ray::new(rot(r.base), rot_dir(r.dir))),
-            Geom::Donut(d) => Geom::Donut(Donut::new(rot(d.center), d.inner_radius, d.outer_radius)),
+            Geom::Donut(d) => {
+                Geom::Donut(Donut::new(rot(d.center), d.inner_radius, d.outer_radius))
+            }
             Geom::Wipeout(w) => Geom::Wipeout(Wipeout {
                 pts: w.pts.iter().map(|p| rot(*p)).collect(),
             }),
@@ -1115,7 +1358,10 @@ impl Geom {
                 rotation: x.rotation + angle,
                 ..x.clone()
             }),
-            Geom::Circle(c) => Geom::Circle(Circle { center: rot(c.center), radius: c.radius }),
+            Geom::Circle(c) => Geom::Circle(Circle {
+                center: rot(c.center),
+                radius: c.radius,
+            }),
             Geom::Arc(a) => Geom::Arc(Arc {
                 center: rot(a.center),
                 radius: a.radius,
@@ -1124,14 +1370,14 @@ impl Geom {
             }),
             Geom::Ellipse(e) => Geom::Ellipse(Ellipse {
                 center: rot(e.center),
-                major:  rot_dir(e.major),
-                ratio:  e.ratio,
+                major: rot_dir(e.major),
+                ratio: e.ratio,
             }),
             Geom::EllipseArc(ea) => Geom::EllipseArc(EllipseArc {
                 ellipse: Ellipse {
                     center: rot(ea.ellipse.center),
-                    major:  rot_dir(ea.ellipse.major),
-                    ratio:  ea.ellipse.ratio,
+                    major: rot_dir(ea.ellipse.major),
+                    ratio: ea.ellipse.ratio,
                 },
                 // Parameter space is local to the ellipse's own frame, which
                 // we rotated by `angle` (the major direction moved). The
@@ -1141,11 +1387,18 @@ impl Geom {
                 sweep_param: ea.sweep_param,
             }),
             Geom::Point(pt) => Geom::Point(Point {
-                location: rot(pt.location), style: pt.style, size: pt.size,
+                location: rot(pt.location),
+                style: pt.style,
+                size: pt.size,
             }),
             Geom::Polyline(p) => Geom::Polyline(Polyline {
-                vertices: p.vertices.iter()
-                    .map(|v| PolyVertex { pos: rot(v.pos), bulge: v.bulge })
+                vertices: p
+                    .vertices
+                    .iter()
+                    .map(|v| PolyVertex {
+                        pos: rot(v.pos),
+                        bulge: v.bulge,
+                    })
                     .collect(),
                 closed: p.closed,
                 widths: p.widths.clone(),
@@ -1162,26 +1415,26 @@ impl Geom {
             // P_i rotates the whole curve by the same R). Weights
             // and degree are invariant.
             Geom::Spline(s) => Geom::Spline(Spline {
-                degree:         s.degree,
+                degree: s.degree,
                 control_points: s.control_points.iter().map(|p| rot(*p)).collect(),
-                weights:        s.weights.clone(),
-                knots:          s.knots.clone(),
-                width:          s.width,      // rotation is width-invariant
+                weights: s.weights.clone(),
+                knots: s.knots.clone(),
+                width: s.width, // rotation is width-invariant
             }),
             // Wall — rotate the centerline; thickness is direction-
             // invariant. Side lines re-derive from the new endpoints.
             Geom::Wall(w) => Geom::Wall(Wall {
-                start:     rot(w.start),
-                end:       rot(w.end),
+                start: rot(w.start),
+                end: rot(w.end),
                 thickness: w.thickness,
-                style:     w.style,
-                bulge:     w.bulge,        // rotation preserves arc winding
+                style: w.style,
+                bulge: w.bulge, // rotation preserves arc winding
             }),
             // Text — rotate the anchor + bump the text's own angle.
             Geom::Text(t) => {
                 let mut nt = t.clone();
                 nt.position = rot(t.position);
-                nt.angle    = t.angle + angle;
+                nt.angle = t.angle + angle;
                 Geom::Text(nt)
             }
             // Dimension — rotate every def point. Text orientation
@@ -1191,7 +1444,7 @@ impl Geom {
             // add the angle to the instance rotation. Exact (similarity
             // transforms compose).
             Geom::BlockRef(br) => Geom::BlockRef(crate::block::BlockRef {
-                insert:   rot(br.insert),
+                insert: rot(br.insert),
                 rotation: br.rotation + angle,
                 ..br.clone()
             }),
@@ -1202,7 +1455,7 @@ impl Geom {
                 label: {
                     let mut nt = l.label.clone();
                     nt.position = rot(l.label.position);
-                    nt.angle    = l.label.angle + angle;
+                    nt.angle = l.label.angle + angle;
                     nt
                 },
                 arrow: l.arrow,
@@ -1215,7 +1468,7 @@ impl Geom {
             }),
             // CenterMark — rotate the position + the cross itself.
             Geom::CenterMark(cm) => Geom::CenterMark(CenterMark {
-                center:   rot(cm.center),
+                center: rot(cm.center),
                 rotation: cm.rotation + angle,
                 ..*cm
             }),
@@ -1231,18 +1484,23 @@ impl Geom {
     /// Non-uniform scale (different x/y) isn't supported because it
     /// turns circles into ellipses — a separate refactor.
     pub fn scaled(&self, pivot: Vec2, factor: f64) -> Geom {
-        let sc = |p: Vec2| -> Vec2 {
-            pivot + (p - pivot) * factor
-        };
+        let sc = |p: Vec2| -> Vec2 { pivot + (p - pivot) * factor };
         let sc_dir = |v: Vec2| -> Vec2 { v * factor };
         let f_abs = factor.abs();
         match self {
-            Geom::Line(l) => Geom::Line(Line { a: sc(l.a), b: sc(l.b) }),
+            Geom::Line(l) => Geom::Line(Line {
+                a: sc(l.a),
+                b: sc(l.b),
+            }),
             // Xline — base scales, direction stays (a line's direction is
             // scale-invariant; re-normalize for safety).
             Geom::Xline(x) => Geom::Xline(Xline::new(sc(x.base), x.dir)),
             Geom::Ray(r) => Geom::Ray(Ray::new(sc(r.base), r.dir)),
-            Geom::Donut(d) => Geom::Donut(Donut::new(sc(d.center), d.inner_radius * f_abs, d.outer_radius * f_abs)),
+            Geom::Donut(d) => Geom::Donut(Donut::new(
+                sc(d.center),
+                d.inner_radius * f_abs,
+                d.outer_radius * f_abs,
+            )),
             Geom::Wipeout(w) => Geom::Wipeout(Wipeout {
                 pts: w.pts.iter().map(|p| sc(*p)).collect(),
             }),
@@ -1264,57 +1522,74 @@ impl Geom {
                 ..x.clone()
             }),
             Geom::Circle(c) => Geom::Circle(Circle {
-                center: sc(c.center), radius: c.radius * f_abs,
+                center: sc(c.center),
+                radius: c.radius * f_abs,
             }),
             Geom::Arc(a) => Geom::Arc(Arc {
-                center: sc(a.center), radius: a.radius * f_abs,
-                start_angle: a.start_angle, sweep_angle: a.sweep_angle,
+                center: sc(a.center),
+                radius: a.radius * f_abs,
+                start_angle: a.start_angle,
+                sweep_angle: a.sweep_angle,
             }),
             Geom::Ellipse(e) => Geom::Ellipse(Ellipse {
-                center: sc(e.center), major: sc_dir(e.major), ratio: e.ratio,
+                center: sc(e.center),
+                major: sc_dir(e.major),
+                ratio: e.ratio,
             }),
             Geom::EllipseArc(ea) => Geom::EllipseArc(EllipseArc {
                 ellipse: Ellipse {
                     center: sc(ea.ellipse.center),
-                    major:  sc_dir(ea.ellipse.major),
-                    ratio:  ea.ellipse.ratio,
+                    major: sc_dir(ea.ellipse.major),
+                    ratio: ea.ellipse.ratio,
                 },
-                start_param: ea.start_param, sweep_param: ea.sweep_param,
+                start_param: ea.start_param,
+                sweep_param: ea.sweep_param,
             }),
             Geom::Point(pt) => Geom::Point(Point {
-                location: sc(pt.location), style: pt.style, size: pt.size * factor as f32,
+                location: sc(pt.location),
+                style: pt.style,
+                size: pt.size * factor as f32,
             }),
             Geom::Polyline(p) => Geom::Polyline(Polyline {
-                vertices: p.vertices.iter()
-                    .map(|v| PolyVertex { pos: sc(v.pos), bulge: v.bulge })
+                vertices: p
+                    .vertices
+                    .iter()
+                    .map(|v| PolyVertex {
+                        pos: sc(v.pos),
+                        bulge: v.bulge,
+                    })
                     .collect(),
                 closed: p.closed,
-                widths: p.widths.iter().map(|&(a,b)| (a * f_abs, b * f_abs)).collect(),
+                widths: p
+                    .widths
+                    .iter()
+                    .map(|&(a, b)| (a * f_abs, b * f_abs))
+                    .collect(),
             }),
             // No-op for the same reason as `rotated`.
             Geom::Hatch(h) => Geom::Hatch(h.clone()),
             Geom::Spline(s) => Geom::Spline(Spline {
-                degree:         s.degree,
+                degree: s.degree,
                 control_points: s.control_points.iter().map(|p| sc(*p)).collect(),
-                weights:        s.weights.clone(),
-                knots:          s.knots.clone(),
-                width:          s.width * f_abs,   // uniform scale
+                weights: s.weights.clone(),
+                knots: s.knots.clone(),
+                width: s.width * f_abs, // uniform scale
             }),
             // Wall — scale the centerline + thickness uniformly so
             // the wall stays geometrically similar.
             Geom::Wall(w) => Geom::Wall(Wall {
-                start:     sc(w.start),
-                end:       sc(w.end),
+                start: sc(w.start),
+                end: sc(w.end),
                 thickness: w.thickness * f_abs,
-                style:     w.style,
-                bulge:     w.bulge,        // tan(sweep/4) is scale-invariant
+                style: w.style,
+                bulge: w.bulge, // tan(sweep/4) is scale-invariant
             }),
             // Text — scale anchor + height (angle invariant under
             // uniform scale).
             Geom::Text(t) => {
                 let mut nt = t.clone();
                 nt.position = sc(t.position);
-                nt.height   = t.height * f_abs;
+                nt.height = t.height * f_abs;
                 Geom::Text(nt)
             }
             // Dimension — scale every def point. Renderer uses the
@@ -1326,7 +1601,7 @@ impl Geom {
             // thickness; negative factors don't reflect a block in v1).
             Geom::BlockRef(br) => Geom::BlockRef(crate::block::BlockRef {
                 insert: sc(br.insert),
-                scale:   br.scale   * f_abs,
+                scale: br.scale * f_abs,
                 scale_y: br.scale_y * f_abs,
                 ..br.clone()
             }),
@@ -1335,7 +1610,7 @@ impl Geom {
                 label: {
                     let mut nt = l.label.clone();
                     nt.position = sc(l.label.position);
-                    nt.height   = l.label.height * f_abs;
+                    nt.height = l.label.height * f_abs;
                     nt
                 },
                 arrow: l.arrow,
@@ -1348,7 +1623,7 @@ impl Geom {
             // CenterMark — uniform scale of the arms.
             Geom::CenterMark(cm) => Geom::CenterMark(CenterMark {
                 center: sc(cm.center),
-                size:   cm.size * f_abs,
+                size: cm.size * f_abs,
                 ..*cm
             }),
             Geom::Viewport(vp) => Geom::Viewport(ViewportGeom {
@@ -1366,7 +1641,7 @@ impl Geom {
         let dir = b - a;
         let len_sq = dir.len_sq();
         if len_sq < EPS {
-            return self.clone();   // degenerate axis — no-op
+            return self.clone(); // degenerate axis — no-op
         }
         let mirror = |p: Vec2| -> Vec2 {
             let d = p - a;
@@ -1381,10 +1656,15 @@ impl Geom {
             foot * 2.0 - v
         };
         match self {
-            Geom::Line(l) => Geom::Line(Line { a: mirror(l.a), b: mirror(l.b) }),
+            Geom::Line(l) => Geom::Line(Line {
+                a: mirror(l.a),
+                b: mirror(l.b),
+            }),
             Geom::Xline(x) => Geom::Xline(Xline::new(mirror(x.base), mirror(x.dir))),
             Geom::Ray(r) => Geom::Ray(Ray::new(mirror(r.base), mirror(r.dir))),
-            Geom::Donut(d) => Geom::Donut(Donut::new(mirror(d.center), d.inner_radius, d.outer_radius)),
+            Geom::Donut(d) => {
+                Geom::Donut(Donut::new(mirror(d.center), d.inner_radius, d.outer_radius))
+            }
             Geom::Wipeout(w) => Geom::Wipeout(Wipeout {
                 pts: w.pts.iter().map(|p| mirror(*p)).collect(),
             }),
@@ -1410,7 +1690,8 @@ impl Geom {
                 })
             }
             Geom::Circle(c) => Geom::Circle(Circle {
-                center: mirror(c.center), radius: c.radius,
+                center: mirror(c.center),
+                radius: c.radius,
             }),
             Geom::Arc(arc) => {
                 // Mirroring flips CCW → CW; we keep CCW convention by starting
@@ -1420,35 +1701,46 @@ impl Geom {
                 let new_center = mirror(arc.center);
                 let new_start = (m2 - new_center).angle();
                 Geom::Arc(Arc {
-                    center: new_center, radius: arc.radius,
+                    center: new_center,
+                    radius: arc.radius,
                     start_angle: new_start.rem_euclid(std::f64::consts::TAU),
                     sweep_angle: arc.sweep_angle,
                 })
             }
             Geom::Ellipse(e) => Geom::Ellipse(Ellipse {
-                center: mirror(e.center), major: mirror_dir(e.major), ratio: e.ratio,
+                center: mirror(e.center),
+                major: mirror_dir(e.major),
+                ratio: e.ratio,
             }),
             Geom::EllipseArc(ea) => Geom::EllipseArc(EllipseArc {
                 ellipse: Ellipse {
                     center: mirror(ea.ellipse.center),
-                    major:  mirror_dir(ea.ellipse.major),
-                    ratio:  ea.ellipse.ratio,
+                    major: mirror_dir(ea.ellipse.major),
+                    ratio: ea.ellipse.ratio,
                 },
                 // WP2.3 [M-P4]: the reconstructed minor axis (major'.perp()·ratio)
                 // flips sign under reflection, so param θ maps to −θ. Negate both
                 // start + sweep so the reflected endpoints are preserved and the
                 // arc sweeps the mirror-image (CW↔CCW) side — was: unchanged (wrong
                 // quadrant).
-                start_param: -ea.start_param, sweep_param: -ea.sweep_param,
+                start_param: -ea.start_param,
+                sweep_param: -ea.sweep_param,
             }),
             Geom::Point(pt) => Geom::Point(Point {
-                location: mirror(pt.location), style: pt.style, size: pt.size,
+                location: mirror(pt.location),
+                style: pt.style,
+                size: pt.size,
             }),
             Geom::Polyline(p) => Geom::Polyline(Polyline {
                 // WP1.6 [M-P1]: reflection reverses arc winding — negate every
                 // per-vertex bulge (vertex order unchanged), matching the Wall arm.
-                vertices: p.vertices.iter()
-                    .map(|v| PolyVertex { pos: mirror(v.pos), bulge: -v.bulge })
+                vertices: p
+                    .vertices
+                    .iter()
+                    .map(|v| PolyVertex {
+                        pos: mirror(v.pos),
+                        bulge: -v.bulge,
+                    })
                     .collect(),
                 closed: p.closed,
                 widths: p.widths.clone(),
@@ -1456,19 +1748,19 @@ impl Geom {
             // No-op for the same reason as `rotated`.
             Geom::Hatch(h) => Geom::Hatch(h.clone()),
             Geom::Spline(s) => Geom::Spline(Spline {
-                degree:         s.degree,
+                degree: s.degree,
                 control_points: s.control_points.iter().map(|p| mirror(*p)).collect(),
-                weights:        s.weights.clone(),
-                knots:          s.knots.clone(),
-                width:          s.width,      // mirror is width-invariant
+                weights: s.weights.clone(),
+                knots: s.knots.clone(),
+                width: s.width, // mirror is width-invariant
             }),
             // Wall — mirror the centerline; thickness unchanged.
             Geom::Wall(w) => Geom::Wall(Wall {
-                start:     mirror(w.start),
-                end:       mirror(w.end),
+                start: mirror(w.start),
+                end: mirror(w.end),
                 thickness: w.thickness,
-                style:     w.style,
-                bulge:     -w.bulge,       // reflection flips arc winding
+                style: w.style,
+                bulge: -w.bulge, // reflection flips arc winding
             }),
             // Text — mirror the anchor; reflect the text angle by the
             // mirror axis. Text content remains readable (would appear
@@ -1495,9 +1787,9 @@ impl Geom {
             Geom::BlockRef(br) => {
                 let axis_angle = (b - a).angle();
                 Geom::BlockRef(crate::block::BlockRef {
-                    insert:   mirror(br.insert),
+                    insert: mirror(br.insert),
                     rotation: 2.0 * axis_angle - br.rotation,
-                    mirror_x: !br.mirror_x,   // reflecting flips the parity
+                    mirror_x: !br.mirror_x, // reflecting flips the parity
                     ..br.clone()
                 })
             }
@@ -1529,7 +1821,7 @@ impl Geom {
             Geom::CenterMark(cm) => {
                 let axis_angle = (b - a).angle();
                 Geom::CenterMark(CenterMark {
-                    center:   mirror(cm.center),
+                    center: mirror(cm.center),
                     rotation: 2.0 * axis_angle - cm.rotation,
                     ..*cm
                 })
@@ -1550,22 +1842,34 @@ impl Geom {
     ///   total arc length changes by `delta`.
     /// Other variants return Err.
     pub fn lengthened(&self, delta: f64, near: Vec2) -> Result<Geom, &'static str> {
-        if delta.abs() < EPS { return Ok(self.clone()); }
+        if delta.abs() < EPS {
+            return Ok(self.clone());
+        }
         match self {
             Geom::Line(l) => {
                 let dir = l.b - l.a;
                 let len = dir.len();
-                if len < EPS { return Err("lengthen: zero-length line"); }
+                if len < EPS {
+                    return Err("lengthen: zero-length line");
+                }
                 let u = dir / len;
                 let at_b = near.dist(l.b) < near.dist(l.a);
                 if at_b {
-                    Ok(Geom::Line(Line { a: l.a, b: l.b + u * delta }))
+                    Ok(Geom::Line(Line {
+                        a: l.a,
+                        b: l.b + u * delta,
+                    }))
                 } else {
-                    Ok(Geom::Line(Line { a: l.a - u * delta, b: l.b }))
+                    Ok(Geom::Line(Line {
+                        a: l.a - u * delta,
+                        b: l.b,
+                    }))
                 }
             }
             Geom::Arc(a) => {
-                if a.radius < EPS { return Err("lengthen: zero-radius arc"); }
+                if a.radius < EPS {
+                    return Err("lengthen: zero-radius arc");
+                }
                 let d_angle = delta / a.radius;
                 let (e1, e2) = a.endpoints();
                 let at_end = near.dist(e2) < near.dist(e1);
@@ -1575,15 +1879,18 @@ impl Geom {
                 }
                 if at_end {
                     Ok(Geom::Arc(Arc {
-                        center: a.center, radius: a.radius,
-                        start_angle: a.start_angle, sweep_angle: new_sweep,
+                        center: a.center,
+                        radius: a.radius,
+                        start_angle: a.start_angle,
+                        sweep_angle: new_sweep,
                     }))
                 } else {
-                    let new_start = (a.start_angle - d_angle)
-                        .rem_euclid(std::f64::consts::TAU);
+                    let new_start = (a.start_angle - d_angle).rem_euclid(std::f64::consts::TAU);
                     Ok(Geom::Arc(Arc {
-                        center: a.center, radius: a.radius,
-                        start_angle: new_start, sweep_angle: new_sweep,
+                        center: a.center,
+                        radius: a.radius,
+                        start_angle: new_start,
+                        sweep_angle: new_sweep,
                     }))
                 }
             }
@@ -1603,14 +1910,15 @@ impl Geom {
                 if at_end {
                     Ok(Geom::EllipseArc(EllipseArc {
                         ellipse: ea.ellipse,
-                        start_param: ea.start_param, sweep_param: new_sweep,
+                        start_param: ea.start_param,
+                        sweep_param: new_sweep,
                     }))
                 } else {
-                    let new_start = (ea.start_param - dp)
-                        .rem_euclid(std::f64::consts::TAU);
+                    let new_start = (ea.start_param - dp).rem_euclid(std::f64::consts::TAU);
                     Ok(Geom::EllipseArc(EllipseArc {
                         ellipse: ea.ellipse,
-                        start_param: new_start, sweep_param: new_sweep,
+                        start_param: new_start,
+                        sweep_param: new_sweep,
                     }))
                 }
             }
@@ -1621,12 +1929,14 @@ impl Geom {
                 if let Geom::Line(new_line) = g {
                     Ok(Geom::Wall(Wall {
                         start: new_line.a,
-                        end:   new_line.b,
+                        end: new_line.b,
                         thickness: w.thickness,
                         style: w.style,
-                        bulge: 0.0,        // lengthen yields a straight wall
+                        bulge: 0.0, // lengthen yields a straight wall
                     }))
-                } else { Err("lengthen wall: unexpected non-Line result") }
+                } else {
+                    Err("lengthen wall: unexpected non-Line result")
+                }
             }
             _ => Err("lengthen: only Line / Arc / EllipseArc / Wall are supported"),
         }
@@ -1643,16 +1953,24 @@ impl Geom {
     /// - Already-closed (Circle, Ellipse) or dimensionless (Point) → clone
     /// - Polyline: per-segment "extend" doesn't generalise; clone for now
     pub fn extended_for_edgemode(&self) -> Geom {
-        const EXT: f64 = 1.0e6;     // big enough to clear any drawing
+        const EXT: f64 = 1.0e6; // big enough to clear any drawing
         match self {
             Geom::Line(l) => {
                 let d = l.b - l.a;
                 let len = d.len();
-                if len < EPS { return Geom::Line(*l); }
+                if len < EPS {
+                    return Geom::Line(*l);
+                }
                 let u = d / len;
-                Geom::Line(Line { a: l.a - u * EXT, b: l.b + u * EXT })
+                Geom::Line(Line {
+                    a: l.a - u * EXT,
+                    b: l.b + u * EXT,
+                })
             }
-            Geom::Arc(a) => Geom::Circle(Circle { center: a.center, radius: a.radius }),
+            Geom::Arc(a) => Geom::Circle(Circle {
+                center: a.center,
+                radius: a.radius,
+            }),
             Geom::EllipseArc(ea) => Geom::Ellipse(ea.ellipse),
             // A Wall's "infinite form" is its centerline lengthened past the
             // drawing — same as a Line. WITHOUT this, a Wall TARGET (or an
@@ -1663,15 +1981,18 @@ impl Geom {
                 let cl = w.centerline();
                 let d = cl.b - cl.a;
                 let len = d.len();
-                if len < EPS { return self.clone(); }
+                if len < EPS {
+                    return self.clone();
+                }
                 let u = d / len;
-                Geom::Line(Line { a: cl.a - u * EXT, b: cl.b + u * EXT })
+                Geom::Line(Line {
+                    a: cl.a - u * EXT,
+                    b: cl.b + u * EXT,
+                })
             }
             other => other.clone(),
         }
     }
-
-
 
     /// Return a copy with direction flipped, where direction is defined.
     /// - Line: swap a/b
@@ -1686,8 +2007,14 @@ impl Geom {
             Geom::Line(l) => Geom::Line(Line { a: l.b, b: l.a }),
             // Xline — the line occupies the same infinite set; flip dir for
             // traversal parity with Line.
-            Geom::Xline(x) => Geom::Xline(Xline { base: x.base, dir: -x.dir }),
-            Geom::Ray(r) => Geom::Ray(Ray { base: r.base, dir: -r.dir }),
+            Geom::Xline(x) => Geom::Xline(Xline {
+                base: x.base,
+                dir: -x.dir,
+            }),
+            Geom::Ray(r) => Geom::Ray(Ray {
+                base: r.base,
+                dir: -r.dir,
+            }),
             Geom::Donut(d) => Geom::Donut(*d),
             Geom::Wipeout(w) => Geom::Wipeout(w.clone()),
             Geom::Region(rg) => Geom::Region(rg.clone()),
@@ -1710,8 +2037,14 @@ impl Geom {
                 // (n-1-i) and (n-2-i) traversed in reverse — so its bulge
                 // is the OLD segment's bulge with sign flipped.
                 let n = p.vertices.len();
-                let mut new_verts: Vec<PolyVertex> = p.vertices.iter().rev()
-                    .map(|v| PolyVertex { pos: v.pos, bulge: 0.0 })
+                let mut new_verts: Vec<PolyVertex> = p
+                    .vertices
+                    .iter()
+                    .rev()
+                    .map(|v| PolyVertex {
+                        pos: v.pos,
+                        bulge: 0.0,
+                    })
                     .collect();
                 for i in 0..n {
                     let old_seg = if p.closed {
@@ -1721,7 +2054,9 @@ impl Geom {
                     } else {
                         // open has n-1 segments; vertex (n-1)'s bulge slot
                         // is unused, so skip when i+1 >= n.
-                        if i + 1 >= n { continue; }
+                        if i + 1 >= n {
+                            continue;
+                        }
                         n - 2 - i
                     };
                     new_verts[i].bulge = -p.vertices[old_seg].bulge;
@@ -1729,7 +2064,11 @@ impl Geom {
                 Geom::Polyline(Polyline {
                     vertices: new_verts,
                     closed: p.closed,
-                    widths: { let mut w: Vec<(f64,f64)> = p.widths.iter().rev().map(|&(s,e)| (e,s)).collect(); w },
+                    widths: {
+                        let mut w: Vec<(f64, f64)> =
+                            p.widths.iter().rev().map(|&(s, e)| (e, s)).collect();
+                        w
+                    },
                 })
             }
             // Direction-agnostic — return a deep copy.
@@ -1739,19 +2078,22 @@ impl Geom {
             //         vector that's symmetric, reversing control
             //         points + weights is enough.
             Geom::Spline(s) => Geom::Spline(Spline {
-                degree:         s.degree,
+                degree: s.degree,
                 control_points: s.control_points.iter().rev().copied().collect(),
-                weights:        s.weights.iter().rev().copied().collect(),
-                knots:          s.knots.clone(),
-                width:          s.width,      // uniform width — reversal-invariant
+                weights: s.weights.iter().rev().copied().collect(),
+                knots: s.knots.clone(),
+                width: s.width, // uniform width — reversal-invariant
             }),
             Geom::Circle(_) | Geom::Ellipse(_) | Geom::Point(_) | Geom::Hatch(_) => self.clone(),
             // Wall — reverse the centerline; thickness unchanged. The
             // visible side-line naming (left/right) swaps because the
             // CCW normal flips, but the geometry is identical.
             Geom::Wall(w) => Geom::Wall(Wall {
-                start: w.end, end: w.start, thickness: w.thickness,
-                style: w.style, bulge: -w.bulge,   // reversing flips winding
+                start: w.end,
+                end: w.start,
+                thickness: w.thickness,
+                style: w.style,
+                bulge: -w.bulge, // reversing flips winding
             }),
             // Text — reversal has no geometric meaning. Clone.
             Geom::Text(t) => Geom::Text(t.clone()),
@@ -1773,17 +2115,21 @@ impl Geom {
     pub fn translated(&self, off: Vec2) -> Geom {
         match self {
             Geom::Line(l) => Geom::Line(Line {
-                a: l.a + off, b: l.b + off,
+                a: l.a + off,
+                b: l.b + off,
             }),
             Geom::Xline(x) => Geom::Xline(Xline {
-                base: x.base + off, dir: x.dir,
+                base: x.base + off,
+                dir: x.dir,
             }),
             Geom::Ray(r) => Geom::Ray(Ray {
-                base: r.base + off, dir: r.dir,
+                base: r.base + off,
+                dir: r.dir,
             }),
             Geom::Donut(d) => Geom::Donut(Donut {
                 center: d.center + off,
-                inner_radius: d.inner_radius, outer_radius: d.outer_radius,
+                inner_radius: d.inner_radius,
+                outer_radius: d.outer_radius,
             }),
             Geom::Wipeout(w) => Geom::Wipeout(Wipeout {
                 pts: w.pts.iter().map(|p| *p + off).collect(),
@@ -1800,7 +2146,8 @@ impl Geom {
                 ..x.clone()
             }),
             Geom::Circle(c) => Geom::Circle(Circle {
-                center: c.center + off, radius: c.radius,
+                center: c.center + off,
+                radius: c.radius,
             }),
             Geom::Arc(a) => Geom::Arc(Arc {
                 center: a.center + off,
@@ -1810,42 +2157,50 @@ impl Geom {
             }),
             Geom::Ellipse(e) => Geom::Ellipse(Ellipse {
                 center: e.center + off,
-                major:  e.major,
-                ratio:  e.ratio,
+                major: e.major,
+                ratio: e.ratio,
             }),
             Geom::EllipseArc(ea) => Geom::EllipseArc(EllipseArc {
-                ellipse:     Ellipse {
+                ellipse: Ellipse {
                     center: ea.ellipse.center + off,
-                    major:  ea.ellipse.major,
-                    ratio:  ea.ellipse.ratio,
+                    major: ea.ellipse.major,
+                    ratio: ea.ellipse.ratio,
                 },
                 start_param: ea.start_param,
                 sweep_param: ea.sweep_param,
             }),
             Geom::Point(pt) => Geom::Point(Point {
                 location: pt.location + off,
-                style:    pt.style,
-                size:     pt.size,
+                style: pt.style,
+                size: pt.size,
             }),
             Geom::Polyline(p) => Geom::Polyline(Polyline {
-                vertices: p.vertices.iter()
-                    .map(|v| PolyVertex { pos: v.pos + off, bulge: v.bulge })
+                vertices: p
+                    .vertices
+                    .iter()
+                    .map(|v| PolyVertex {
+                        pos: v.pos + off,
+                        bulge: v.bulge,
+                    })
                     .collect(),
-                closed:   p.closed,
-                widths:   p.widths.clone(),
+                closed: p.closed,
+                widths: p.widths.clone(),
             }),
             // No-op for the same reason as `rotated`.
             Geom::Hatch(h) => Geom::Hatch(h.clone()),
             Geom::Spline(s) => Geom::Spline(Spline {
-                degree:         s.degree,
+                degree: s.degree,
                 control_points: s.control_points.iter().map(|p| *p + off).collect(),
-                weights:        s.weights.clone(),
-                knots:          s.knots.clone(),
-                width:          s.width,      // translation is width-invariant
+                weights: s.weights.clone(),
+                knots: s.knots.clone(),
+                width: s.width, // translation is width-invariant
             }),
             Geom::Wall(w) => Geom::Wall(Wall {
-                start: w.start + off, end: w.end + off, thickness: w.thickness,
-                style: w.style, bulge: w.bulge,
+                start: w.start + off,
+                end: w.end + off,
+                thickness: w.thickness,
+                style: w.style,
+                bulge: w.bulge,
             }),
             Geom::Text(t) => {
                 let mut nt = t.clone();
@@ -1888,24 +2243,24 @@ impl Geom {
     /// Minimum distance from the dobject (its visible curve) to a point.
     pub fn distance_to_point(&self, p: Vec2) -> f64 {
         match self {
-            Geom::Line(l)        => l.distance_to_point(p),
-            Geom::Xline(x)       => x.distance_to_point(p),
-            Geom::Ray(r)         => r.distance_to_point(p),
-            Geom::Donut(d)       => d.distance_to_point(p),
-            Geom::Wipeout(w)     => w.distance_to_point(p),
-            Geom::Region(rg)     => rg.distance_to_point(p),
+            Geom::Line(l) => l.distance_to_point(p),
+            Geom::Xline(x) => x.distance_to_point(p),
+            Geom::Ray(r) => r.distance_to_point(p),
+            Geom::Donut(d) => d.distance_to_point(p),
+            Geom::Wipeout(w) => w.distance_to_point(p),
+            Geom::Region(rg) => rg.distance_to_point(p),
             // Table — nearest grid rule or cell text.
-            Geom::Table(t)      => t.distance_to_point(p),
+            Geom::Table(t) => t.distance_to_point(p),
             // Xref — nearest resolved child (transformed).
-            Geom::Xref(x)       => x.distance_to_point(p),
-            Geom::Circle(c)      => c.distance_to_point(p),
-            Geom::Arc(a)         => a.distance_to_point(p),
-            Geom::Ellipse(e)     => e.distance_to_point(p),
+            Geom::Xref(x) => x.distance_to_point(p),
+            Geom::Circle(c) => c.distance_to_point(p),
+            Geom::Arc(a) => a.distance_to_point(p),
+            Geom::Ellipse(e) => e.distance_to_point(p),
             Geom::EllipseArc(ea) => ea.distance_to_point(p),
-            Geom::Point(pt)      => pt.location.dist(p),
-            Geom::Polyline(pl)   => pl.distance_to_point(p),
-            Geom::Hatch(h)       => h.distance_to_point(p),
-            Geom::Spline(s)      => s.distance_to_point(p),
+            Geom::Point(pt) => pt.location.dist(p),
+            Geom::Polyline(pl) => pl.distance_to_point(p),
+            Geom::Hatch(h) => h.distance_to_point(p),
+            Geom::Spline(s) => s.distance_to_point(p),
             // Wall — min distance to either visible side line. The
             // centerline ITSELF is invisible (a debug overlay) so it
             // doesn't participate in pick-test.
@@ -1913,8 +2268,7 @@ impl Geom {
                 let l = w.left_line();
                 let r = w.right_line();
                 match (l, r) {
-                    (Some(l), Some(r)) =>
-                        l.distance_to_point(p).min(r.distance_to_point(p)),
+                    (Some(l), Some(r)) => l.distance_to_point(p).min(r.distance_to_point(p)),
                     _ => f64::INFINITY,
                 }
             }
@@ -1929,11 +2283,15 @@ impl Geom {
                 let mut best = f64::INFINITY;
                 for (a, b) in d.outline_segments() {
                     let dist = Line { a, b }.distance_to_point(p);
-                    if dist < best { best = dist; }
+                    if dist < best {
+                        best = dist;
+                    }
                 }
                 for gp in d.grip_points() {
                     let dist = gp.dist(p);
-                    if dist < best { best = dist; }
+                    if dist < best {
+                        best = dist;
+                    }
                 }
                 best
             }
@@ -1949,7 +2307,9 @@ impl Geom {
             // AttrDef — distance to the value-text box (treat like Text).
             Geom::AttrDef(a) => {
                 let t = crate::text::Text {
-                    position: a.position, height: a.height, angle: a.angle,
+                    position: a.position,
+                    height: a.height,
+                    angle: a.angle,
                     text: a.tag.clone(),
                     h_align: crate::text::HAlign::Left,
                     v_align: crate::text::VAlign::Baseline,
@@ -1963,7 +2323,9 @@ impl Geom {
                 let (mn, mx) = vp.bbox_world();
                 let cw = mx.x - mn.x;
                 let ch = mx.y - mn.y;
-                if cw < 1e-9 || ch < 1e-9 { return f64::INFINITY; }
+                if cw < 1e-9 || ch < 1e-9 {
+                    return f64::INFINITY;
+                }
                 // Signed distance to the rect interior (negative inside).
                 let dx = (mn.x - p.x).max(0.0).max(p.x - mx.x);
                 let dy = (mn.y - p.y).max(0.0).max(p.y - mx.y);
@@ -1979,7 +2341,9 @@ impl Line {
     pub fn distance_to_point(&self, p: Vec2) -> f64 {
         let d = self.b - self.a;
         let len_sq = d.len_sq();
-        if len_sq < EPS { return p.dist(self.a); }
+        if len_sq < EPS {
+            return p.dist(self.a);
+        }
         let t = ((p - self.a).dot(d) / len_sq).clamp(0.0, 1.0);
         let foot = self.a + d * t;
         p.dist(foot)
@@ -2024,7 +2388,9 @@ impl Geom {
                 Some(std::f64::consts::PI * a * b)
             }
             Geom::Polyline(p) => {
-                if !p.closed || p.vertices.len() < 3 { return None; }
+                if !p.closed || p.vertices.len() < 3 {
+                    return None;
+                }
                 let mut area2 = 0.0;
                 for seg in polyline_segments(p) {
                     match seg {
@@ -2036,8 +2402,10 @@ impl Geom {
                             let n = 64usize;
                             let pt = |t: f64| {
                                 let ang = a.start_angle + t * a.sweep_angle;
-                                Vec2::new(a.center.x + a.radius * ang.cos(),
-                                          a.center.y + a.radius * ang.sin())
+                                Vec2::new(
+                                    a.center.x + a.radius * ang.cos(),
+                                    a.center.y + a.radius * ang.sin(),
+                                )
                             };
                             let mut p0 = pt(0.0);
                             for k in 1..=n {
@@ -2053,8 +2421,12 @@ impl Geom {
             }
             Geom::Spline(s) => {
                 let pts = s.tessellate(64);
-                if pts.len() < 4 { return None; }
-                if pts[0].dist(pts[pts.len() - 1]) > 1e-6 { return None; }
+                if pts.len() < 4 {
+                    return None;
+                }
+                if pts[0].dist(pts[pts.len() - 1]) > 1e-6 {
+                    return None;
+                }
                 let mut area2 = 0.0;
                 for i in 0..pts.len() - 1 {
                     let a = pts[i];
@@ -2080,23 +2452,29 @@ impl Geom {
                 let a = e.semi_major();
                 let b = a * e.ratio;
                 let h = (a - b) * (a - b) / ((a + b) * (a + b));
-                Some(std::f64::consts::PI * (a + b) * (1.0 + 3.0 * h
-                    / (10.0 + (4.0 - 3.0 * h).sqrt())))
+                Some(
+                    std::f64::consts::PI
+                        * (a + b)
+                        * (1.0 + 3.0 * h / (10.0 + (4.0 - 3.0 * h).sqrt())),
+                )
             }
             Geom::EllipseArc(ea) => {
                 let n = 32usize;
                 let mut len = 0.0;
                 let mut prev = ea.ellipse.point_at(ea.start_param);
                 for k in 1..=n {
-                    let cur = ea.ellipse.point_at(
-                        ea.start_param + ea.sweep_param * k as f64 / n as f64);
+                    let cur = ea
+                        .ellipse
+                        .point_at(ea.start_param + ea.sweep_param * k as f64 / n as f64);
                     len += prev.dist(cur);
                     prev = cur;
                 }
                 Some(len)
             }
             Geom::Polyline(p) => {
-                if p.vertices.len() < 2 { return None; }
+                if p.vertices.len() < 2 {
+                    return None;
+                }
                 let mut len = 0.0;
                 for seg in polyline_segments(p) {
                     match seg {
@@ -2110,7 +2488,9 @@ impl Geom {
             Geom::Spline(s) => {
                 let pts = s.tessellate(64);
                 let mut len = 0.0;
-                for w in pts.windows(2) { len += w[0].dist(w[1]); }
+                for w in pts.windows(2) {
+                    len += w[0].dist(w[1]);
+                }
                 Some(len)
             }
             _ => None,
@@ -2145,14 +2525,17 @@ impl Geom {
                     if rel <= a.sweep_angle + 1e-12 {
                         let p = Vec2::new(
                             a.center.x + a.radius * ang.cos(),
-                            a.center.y + a.radius * ang.sin());
-                        min.x = min.x.min(p.x); min.y = min.y.min(p.y);
-                        max.x = max.x.max(p.x); max.y = max.y.max(p.y);
+                            a.center.y + a.radius * ang.sin(),
+                        );
+                        min.x = min.x.min(p.x);
+                        min.y = min.y.min(p.y);
+                        max.x = max.x.max(p.x);
+                        max.y = max.y.max(p.y);
                     }
                 }
                 (min, max)
             }
-            Geom::Ellipse(e)     => e.bbox(),
+            Geom::Ellipse(e) => e.bbox(),
             // TIGHT elliptical-arc bbox by sampling — the full-ellipse bbox
             // had the same window-selection bug as Arc.
             Geom::EllipseArc(ea) => {
@@ -2162,28 +2545,24 @@ impl Geom {
                 for i in 0..=n {
                     let t = ea.start_param + ea.sweep_param * (i as f64 / n as f64);
                     let p = ea.ellipse.point_at(t);
-                    min.x = min.x.min(p.x); min.y = min.y.min(p.y);
-                    max.x = max.x.max(p.x); max.y = max.y.max(p.y);
+                    min.x = min.x.min(p.x);
+                    min.y = min.y.min(p.y);
+                    max.x = max.x.max(p.x);
+                    max.y = max.y.max(p.y);
                 }
                 (min, max)
             }
             Geom::Point(pt) => (pt.location, pt.location),
             Geom::Polyline(pl) => pl.bbox(),
-            Geom::Hatch(h)  => h.bbox(),
+            Geom::Hatch(h) => h.bbox(),
             Geom::Spline(s) => s.bbox(),
             // Wall bbox = centerline bbox EXPANDED by thickness/2 in
             // both axes (loose but cheap; the rotated side-line corners
             // are always within this box).
             Geom::Wall(w) => {
                 let h = w.thickness * 0.5;
-                let min = Vec2::new(
-                    w.start.x.min(w.end.x) - h,
-                    w.start.y.min(w.end.y) - h,
-                );
-                let max = Vec2::new(
-                    w.start.x.max(w.end.x) + h,
-                    w.start.y.max(w.end.y) + h,
-                );
+                let min = Vec2::new(w.start.x.min(w.end.x) - h, w.start.y.min(w.end.y) - h);
+                let max = Vec2::new(w.start.x.max(w.end.x) + h, w.start.y.max(w.end.y) + h);
                 (min, max)
             }
             // Text — unrotated bbox (loose; ignores `angle`). Same
@@ -2217,7 +2596,9 @@ impl Geom {
             // AttrDef — value-text bbox at angle 0 (loose, like Text).
             Geom::AttrDef(a) => {
                 let t = crate::text::Text {
-                    position: a.position, height: a.height, angle: a.angle,
+                    position: a.position,
+                    height: a.height,
+                    angle: a.angle,
                     text: a.tag.clone(),
                     h_align: crate::text::HAlign::Left,
                     v_align: crate::text::VAlign::Baseline,
@@ -2273,7 +2654,9 @@ impl Geom {
                 s.control_points.capacity() * std::mem::size_of::<Vec2>()
                     + s.weights.capacity() * std::mem::size_of::<f64>()
             }
-            Geom::Hatch(h) => h.boundary_handles.capacity() * std::mem::size_of::<crate::dobject::Handle>(),
+            Geom::Hatch(h) => {
+                h.boundary_handles.capacity() * std::mem::size_of::<crate::dobject::Handle>()
+            }
             Geom::Text(t) => t.text.capacity(),
             // The rest are fixed-size: their fields live inside the enum already.
             _ => 0,
@@ -2286,14 +2669,22 @@ impl Geom {
 
 impl Ellipse {
     /// Semi-major axis length, `a`.
-    pub fn semi_major(&self) -> f64 { self.major.len() }
+    pub fn semi_major(&self) -> f64 {
+        self.major.len()
+    }
     /// Semi-minor axis length, `b = a · ratio`.
-    pub fn semi_minor(&self) -> f64 { self.semi_major() * self.ratio }
+    pub fn semi_minor(&self) -> f64 {
+        self.semi_major() * self.ratio
+    }
 
     /// Unit vector along the major axis (the "u" direction).
-    pub fn u_hat(&self) -> Vec2 { self.major.normalized() }
+    pub fn u_hat(&self) -> Vec2 {
+        self.major.normalized()
+    }
     /// Unit vector along the minor axis (u rotated 90° CCW).
-    pub fn v_hat(&self) -> Vec2 { self.u_hat().perp() }
+    pub fn v_hat(&self) -> Vec2 {
+        self.u_hat().perp()
+    }
 
     /// Point on the ellipse curve at parameter t (radians).
     /// P(t) = center + a·cos(t)·û + b·sin(t)·v̂
@@ -2323,8 +2714,10 @@ impl Ellipse {
         let r2 = self.ratio * self.ratio;
         let hx = (mx * mx + r2 * my * my).sqrt();
         let hy = (my * my + r2 * mx * mx).sqrt();
-        (Vec2::new(self.center.x - hx, self.center.y - hy),
-         Vec2::new(self.center.x + hx, self.center.y + hy))
+        (
+            Vec2::new(self.center.x - hx, self.center.y - hy),
+            Vec2::new(self.center.x + hx, self.center.y + hy),
+        )
     }
 
     /// Closest parameter t to a world point `p`, found by Newton iteration on
@@ -2349,7 +2742,9 @@ impl Ellipse {
     /// correct in every case that matters.
     pub fn nearest_param(&self, p: Vec2) -> f64 {
         let a = self.semi_major();
-        if a < EPS { return 0.0; }
+        if a < EPS {
+            return 0.0;
+        }
         let b = self.semi_minor();
         // Initial guess: rotate `p - center` into local frame, then take atan2
         // using the scaled coordinates so the angle matches PARAMETER space.
@@ -2364,7 +2759,10 @@ impl Ellipse {
         for k in 0..4 {
             let cand = t0 + k as f64 * quarter;
             let dist2 = (self.point_at(cand) - p).len_sq();
-            if dist2 < best_d2 { best_d2 = dist2; t = cand; }
+            if dist2 < best_d2 {
+                best_d2 = dist2;
+                t = cand;
+            }
         }
         // ONE Newton refine from the chosen basin. 5 iterations is more than
         // enough for 1e-9 convergence in double precision for any reasonable ratio.
@@ -2372,9 +2770,11 @@ impl Ellipse {
             let pt = self.point_at(t);
             let dp = self.tangent_at(t);
             let d2 = -self.u_hat() * (a * t.cos()) - self.v_hat() * (b * t.sin());
-            let f  = (pt - p).dot(dp);
+            let f = (pt - p).dot(dp);
             let fd = (pt - p).dot(d2) + dp.dot(dp);
-            if fd.abs() < EPS { break; }
+            if fd.abs() < EPS {
+                break;
+            }
             t -= f / fd;
         }
         t.rem_euclid(std::f64::consts::TAU)
@@ -2394,14 +2794,22 @@ mod wall_explode_tests {
     fn straight_wall_faces_are_offset_by_half_thickness() {
         // A horizontal wall of thickness 4 → two faces at y = ±2, both 2-point
         // (lines), which is exactly what `explode` turns into face Lines + caps.
-        let w = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0),
-                       thickness: 4.0, style: 0, bulge: 0.0 };
+        let w = Wall {
+            start: Vec2::new(0.0, 0.0),
+            end: Vec2::new(10.0, 0.0),
+            thickness: 4.0,
+            style: 0,
+            bulge: 0.0,
+        };
         let (left, right) = w.face_polylines(48).expect("faces");
         assert_eq!(left.len(), 2);
         assert_eq!(right.len(), 2);
         // faces sit ±2 off the centerline
         assert!((left[0].y.abs() - 2.0).abs() < 1e-9 && (right[0].y.abs() - 2.0).abs() < 1e-9);
-        assert!((left[0].y * right[0].y) < 0.0, "faces must be on opposite sides");
+        assert!(
+            (left[0].y * right[0].y) < 0.0,
+            "faces must be on opposite sides"
+        );
         // end caps span the full thickness (4)
         let start_cap = (left[0] - right[0]).len();
         assert!((start_cap - 4.0).abs() < 1e-9, "cap width {start_cap}");
@@ -2409,10 +2817,18 @@ mod wall_explode_tests {
 
     #[test]
     fn curved_wall_faces_are_sampled_polylines() {
-        let w = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0),
-                       thickness: 2.0, style: 0, bulge: 0.5 };
+        let w = Wall {
+            start: Vec2::new(0.0, 0.0),
+            end: Vec2::new(10.0, 0.0),
+            thickness: 2.0,
+            style: 0,
+            bulge: 0.5,
+        };
         let (left, right) = w.face_polylines(16).expect("faces");
-        assert!(left.len() > 2 && right.len() > 2, "curved faces should sample many points");
+        assert!(
+            left.len() > 2 && right.len() > 2,
+            "curved faces should sample many points"
+        );
     }
 }
 
@@ -2420,48 +2836,74 @@ mod wall_explode_tests {
 mod transform_tests {
     use super::*;
     use crate::join::*;
-    use crate::trim::*;
-    use crate::modify::*;
     use crate::math::approx_eq;
+    use crate::modify::*;
+    use crate::trim::*;
 
     #[test]
     fn line_rotated_90_around_origin() {
-        let g = Geom::Line(Line { a: Vec2::new(1.0, 0.0), b: Vec2::new(2.0, 0.0) });
+        let g = Geom::Line(Line {
+            a: Vec2::new(1.0, 0.0),
+            b: Vec2::new(2.0, 0.0),
+        });
         let r = g.rotated(Vec2::ZERO, std::f64::consts::FRAC_PI_2);
         if let Geom::Line(l) = r {
-            assert!(approx_eq(l.a.x, 0.0)); assert!(approx_eq(l.a.y, 1.0));
-            assert!(approx_eq(l.b.x, 0.0)); assert!(approx_eq(l.b.y, 2.0));
-        } else { panic!(); }
+            assert!(approx_eq(l.a.x, 0.0));
+            assert!(approx_eq(l.a.y, 1.0));
+            assert!(approx_eq(l.b.x, 0.0));
+            assert!(approx_eq(l.b.y, 2.0));
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn circle_scaled_2x_around_origin() {
-        let g = Geom::Circle(Circle { center: Vec2::new(5.0, 0.0), radius: 3.0 });
+        let g = Geom::Circle(Circle {
+            center: Vec2::new(5.0, 0.0),
+            radius: 3.0,
+        });
         let s = g.scaled(Vec2::ZERO, 2.0);
         if let Geom::Circle(c) = s {
             assert!(approx_eq(c.center.x, 10.0));
             assert!(approx_eq(c.radius, 6.0));
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn line_mirrored_across_x_axis() {
         // Axis from (-10,0) to (10,0). Point (3,4) mirrors to (3,-4).
-        let g = Geom::Line(Line { a: Vec2::new(3.0, 4.0), b: Vec2::new(8.0, 2.0) });
+        let g = Geom::Line(Line {
+            a: Vec2::new(3.0, 4.0),
+            b: Vec2::new(8.0, 2.0),
+        });
         let m = g.mirrored(Vec2::new(-10.0, 0.0), Vec2::new(10.0, 0.0));
         if let Geom::Line(l) = m {
-            assert!(approx_eq(l.a.x, 3.0)); assert!(approx_eq(l.a.y, -4.0));
-            assert!(approx_eq(l.b.x, 8.0)); assert!(approx_eq(l.b.y, -2.0));
-        } else { panic!(); }
+            assert!(approx_eq(l.a.x, 3.0));
+            assert!(approx_eq(l.a.y, -4.0));
+            assert!(approx_eq(l.b.x, 8.0));
+            assert!(approx_eq(l.b.y, -2.0));
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn line_reversed_swaps_endpoints() {
-        let g = Geom::Line(Line { a: Vec2::new(1.0, 2.0), b: Vec2::new(7.0, 9.0) });
+        let g = Geom::Line(Line {
+            a: Vec2::new(1.0, 2.0),
+            b: Vec2::new(7.0, 9.0),
+        });
         if let Geom::Line(l) = g.reversed() {
-            assert!(approx_eq(l.a.x, 7.0)); assert!(approx_eq(l.a.y, 9.0));
-            assert!(approx_eq(l.b.x, 1.0)); assert!(approx_eq(l.b.y, 2.0));
-        } else { panic!(); }
+            assert!(approx_eq(l.a.x, 7.0));
+            assert!(approx_eq(l.a.y, 9.0));
+            assert!(approx_eq(l.b.x, 1.0));
+            assert!(approx_eq(l.b.y, 2.0));
+        } else {
+            panic!();
+        }
     }
 
     #[test]
@@ -2470,7 +2912,8 @@ mod transform_tests {
         // Reversing must leave the SAME geometric arc (identical endpoints),
         // NOT relocate it. Arc from 0°→90°, radius 5: endpoints (5,0)→(0,5).
         let g = Geom::Arc(Arc {
-            center: Vec2::ZERO, radius: 5.0,
+            center: Vec2::ZERO,
+            radius: 5.0,
             start_angle: 0.0,
             sweep_angle: std::f64::consts::FRAC_PI_2,
         });
@@ -2480,16 +2923,27 @@ mod transform_tests {
             let (p1, p2) = a.endpoints();
             assert!(approx_eq(p1.x, 5.0) && approx_eq(p1.y, 0.0));
             assert!(approx_eq(p2.x, 0.0) && approx_eq(p2.y, 5.0));
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn polyline_reversed_flips_vertex_order_and_bulges() {
         let g = Geom::Polyline(Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.2 },
-                PolyVertex { pos: Vec2::new(1.0, 0.0), bulge: -0.4 },
-                PolyVertex { pos: Vec2::new(1.0, 1.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.2,
+                },
+                PolyVertex {
+                    pos: Vec2::new(1.0, 0.0),
+                    bulge: -0.4,
+                },
+                PolyVertex {
+                    pos: Vec2::new(1.0, 1.0),
+                    bulge: 0.0,
+                },
             ],
             closed: false,
             widths: Vec::new(),
@@ -2500,32 +2954,54 @@ mod transform_tests {
             // bulge[0] of reversed = -original bulge[1] (shifted+sign-flipped)
             assert!(approx_eq(p.vertices[0].bulge, 0.4));
             assert!(approx_eq(p.vertices[1].bulge, -0.2));
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn offset_line_picks_side_by_hint() {
         // Horizontal line from (0,0) to (10,0). Side hint above → offset up.
-        let g = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
+        let g = Geom::Line(Line {
+            a: Vec2::ZERO,
+            b: Vec2::new(10.0, 0.0),
+        });
         let up = g.offset(2.0, Vec2::new(5.0, 5.0)).unwrap();
         if let Geom::Line(l) = up {
-            assert!(approx_eq(l.a.y, 2.0)); assert!(approx_eq(l.b.y, 2.0));
-        } else { panic!(); }
+            assert!(approx_eq(l.a.y, 2.0));
+            assert!(approx_eq(l.b.y, 2.0));
+        } else {
+            panic!();
+        }
         let dn = g.offset(2.0, Vec2::new(5.0, -5.0)).unwrap();
         if let Geom::Line(l) = dn {
-            assert!(approx_eq(l.a.y, -2.0)); assert!(approx_eq(l.b.y, -2.0));
-        } else { panic!(); }
+            assert!(approx_eq(l.a.y, -2.0));
+            assert!(approx_eq(l.b.y, -2.0));
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn offset_circle_outward_grows_radius() {
-        let g = Geom::Circle(Circle { center: Vec2::ZERO, radius: 5.0 });
+        let g = Geom::Circle(Circle {
+            center: Vec2::ZERO,
+            radius: 5.0,
+        });
         let outside_hint = Vec2::new(10.0, 0.0);
         let out = g.offset(2.0, outside_hint).unwrap();
-        if let Geom::Circle(c) = out { assert!(approx_eq(c.radius, 7.0)); } else { panic!(); }
+        if let Geom::Circle(c) = out {
+            assert!(approx_eq(c.radius, 7.0));
+        } else {
+            panic!();
+        }
         let inside_hint = Vec2::new(1.0, 0.0);
         let inn = g.offset(2.0, inside_hint).unwrap();
-        if let Geom::Circle(c) = inn { assert!(approx_eq(c.radius, 3.0)); } else { panic!(); }
+        if let Geom::Circle(c) = inn {
+            assert!(approx_eq(c.radius, 3.0));
+        } else {
+            panic!();
+        }
     }
 
     #[test]
@@ -2534,27 +3010,49 @@ mod transform_tests {
         // on every edge (8×4, same 4 corners pulled in).
         let g = Geom::Polyline(Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 6.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(0.0, 6.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 6.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 6.0),
+                    bulge: 0.0,
+                },
             ],
             closed: true,
             widths: Vec::new(),
         });
         let out = g.offset(1.0, Vec2::new(5.0, 3.0)).expect("offset ok");
-        let Geom::Polyline(pl) = out else { panic!("not a polyline") };
+        let Geom::Polyline(pl) = out else {
+            panic!("not a polyline")
+        };
         assert!(pl.closed);
         assert_eq!(pl.vertices.len(), 4);
         let corners: Vec<Vec2> = pl.vertices.iter().map(|x| x.pos).collect();
         // Expect the inset rectangle (1,1)-(9,5).
         let want = [
-            Vec2::new(1.0, 1.0), Vec2::new(9.0, 1.0),
-            Vec2::new(9.0, 5.0), Vec2::new(1.0, 5.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(9.0, 1.0),
+            Vec2::new(9.0, 5.0),
+            Vec2::new(1.0, 5.0),
         ];
         for w in &want {
-            assert!(corners.iter().any(|c| approx_eq(c.x, w.x) && approx_eq(c.y, w.y)),
-                "missing inset corner {:?} in {:?}", w, corners);
+            assert!(
+                corners
+                    .iter()
+                    .any(|c| approx_eq(c.x, w.x) && approx_eq(c.y, w.y)),
+                "missing inset corner {:?} in {:?}",
+                w,
+                corners
+            );
         }
     }
 
@@ -2562,25 +3060,47 @@ mod transform_tests {
     fn offset_closed_rectangle_outward_grows() {
         let g = Geom::Polyline(Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 6.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(0.0, 6.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 6.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 6.0),
+                    bulge: 0.0,
+                },
             ],
             closed: true,
             widths: Vec::new(),
         });
         // Click OUTSIDE (below the bottom edge) → grow.
         let out = g.offset(1.0, Vec2::new(5.0, -3.0)).expect("offset ok");
-        let Geom::Polyline(pl) = out else { panic!("not a polyline") };
+        let Geom::Polyline(pl) = out else {
+            panic!("not a polyline")
+        };
         let corners: Vec<Vec2> = pl.vertices.iter().map(|x| x.pos).collect();
         let want = [
-            Vec2::new(-1.0, -1.0), Vec2::new(11.0, -1.0),
-            Vec2::new(11.0, 7.0), Vec2::new(-1.0, 7.0),
+            Vec2::new(-1.0, -1.0),
+            Vec2::new(11.0, -1.0),
+            Vec2::new(11.0, 7.0),
+            Vec2::new(-1.0, 7.0),
         ];
         for w in &want {
-            assert!(corners.iter().any(|c| approx_eq(c.x, w.x) && approx_eq(c.y, w.y)),
-                "missing grown corner {:?} in {:?}", w, corners);
+            assert!(
+                corners
+                    .iter()
+                    .any(|c| approx_eq(c.x, w.x) && approx_eq(c.y, w.y)),
+                "missing grown corner {:?} in {:?}",
+                w,
+                corners
+            );
         }
     }
 
@@ -2592,10 +3112,22 @@ mod transform_tests {
         // returning an inverted rectangle (owner: "edges cross, reduce value").
         let g = Geom::Polyline(Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 6.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(0.0, 6.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 6.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 6.0),
+                    bulge: 0.0,
+                },
             ],
             closed: true,
             widths: Vec::new(),
@@ -2603,8 +3135,10 @@ mod transform_tests {
         let err = g.offset(4.0, Vec2::new(5.0, 3.0)).unwrap_err();
         assert!(err.contains("edges cross"), "unexpected error: {}", err);
         // Just under the limit (3 → height 0? use 2.9) still succeeds.
-        assert!(g.offset(2.9, Vec2::new(5.0, 3.0)).is_ok(),
-            "a valid inward offset must not be rejected");
+        assert!(
+            g.offset(2.9, Vec2::new(5.0, 3.0)).is_ok(),
+            "a valid inward offset must not be rejected"
+        );
     }
 
     #[test]
@@ -2613,17 +3147,35 @@ mod transform_tests {
         // offset is fine; a large one that inverts it is rejected.
         let g = Geom::Polyline(Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(47.712, 40.540), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(70.000, 62.828), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(92.434, 40.395), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(81.106, 17.739), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(53.470, 23.266), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(47.712, 40.540),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(70.000, 62.828),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(92.434, 40.395),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(81.106, 17.739),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(53.470, 23.266),
+                    bulge: 0.0,
+                },
             ],
             closed: true,
             widths: Vec::new(),
         });
         let inside = Vec2::new(70.0, 38.0);
-        assert!(g.offset(5.0, inside).is_ok(), "small inward offset should work");
+        assert!(
+            g.offset(5.0, inside).is_ok(),
+            "small inward offset should work"
+        );
         // Way past the inradius → collapses/crosses → rejected.
         assert!(g.offset(40.0, inside).unwrap_err().contains("edges cross"));
     }
@@ -2633,23 +3185,38 @@ mod transform_tests {
         // A degree-3 B-spline. Offsetting samples the curve and shifts each
         // point along its normal → a Polyline whose every vertex sits ~dist
         // from the original curve, on the clicked side.
-        let sp = Spline::new_bspline(3, vec![
-            Vec2::new(0.0, 0.0), Vec2::new(10.0, 20.0), Vec2::new(30.0, -10.0),
-            Vec2::new(50.0, 15.0), Vec2::new(70.0, 0.0),
-        ]);
+        let sp = Spline::new_bspline(
+            3,
+            vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(10.0, 20.0),
+                Vec2::new(30.0, -10.0),
+                Vec2::new(50.0, 15.0),
+                Vec2::new(70.0, 0.0),
+            ],
+        );
         let g = Geom::Spline(sp.clone());
         let dist = 2.0;
         // Pick a side well below the curve's start tangent region.
-        let out = g.offset(dist, Vec2::new(0.0, -50.0)).expect("spline offset ok");
-        let Geom::Polyline(pl) = out else { panic!("spline offset must be a polyline") };
+        let out = g
+            .offset(dist, Vec2::new(0.0, -50.0))
+            .expect("spline offset ok");
+        let Geom::Polyline(pl) = out else {
+            panic!("spline offset must be a polyline")
+        };
         assert!(!pl.closed, "an open spline offsets to an open polyline");
         assert!(pl.vertices.len() >= 96, "expected a dense sampling");
         // Every offset vertex should be ~dist from the source curve (allow a
         // little slack for discrete sampling + curvature).
         for v in &pl.vertices {
             let d = sp.distance_to_point(v.pos);
-            assert!((d - dist).abs() < 0.5,
-                "vertex {:?} is {:.3} from the curve, expected ~{}", v.pos, d, dist);
+            assert!(
+                (d - dist).abs() < 0.5,
+                "vertex {:?} is {:.3} from the curve, expected ~{}",
+                v.pos,
+                d,
+                dist
+            );
         }
     }
 
@@ -2658,23 +3225,40 @@ mod transform_tests {
         // Single arc segment: quarter circle (1,0)→(0,1), centre origin,
         // CCW (bulge = tan(22.5°)). Offset OUTWARD → concentric radius 2,
         // same bulge.
-        let b = (std::f64::consts::FRAC_PI_8).tan();   // tan(22.5°)
+        let b = (std::f64::consts::FRAC_PI_8).tan(); // tan(22.5°)
         let g = Geom::Polyline(Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(1.0, 0.0), bulge: b },
-                PolyVertex { pos: Vec2::new(0.0, 1.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(1.0, 0.0),
+                    bulge: b,
+                },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 1.0),
+                    bulge: 0.0,
+                },
             ],
             closed: false,
             widths: Vec::new(),
         });
         let out = g.offset(1.0, Vec2::new(1.0, 1.0)).expect("offset ok");
-        let Geom::Polyline(pl) = out else { panic!("not a polyline") };
+        let Geom::Polyline(pl) = out else {
+            panic!("not a polyline")
+        };
         assert_eq!(pl.vertices.len(), 2);
-        assert!(approx_eq(pl.vertices[0].pos.x, 2.0) && approx_eq(pl.vertices[0].pos.y, 0.0),
-            "arc start {:?} should scale to (2,0)", pl.vertices[0].pos);
-        assert!(approx_eq(pl.vertices[1].pos.x, 0.0) && approx_eq(pl.vertices[1].pos.y, 2.0),
-            "arc end {:?} should scale to (0,2)", pl.vertices[1].pos);
-        assert!(approx_eq(pl.vertices[0].bulge, b), "bulge preserved (concentric)");
+        assert!(
+            approx_eq(pl.vertices[0].pos.x, 2.0) && approx_eq(pl.vertices[0].pos.y, 0.0),
+            "arc start {:?} should scale to (2,0)",
+            pl.vertices[0].pos
+        );
+        assert!(
+            approx_eq(pl.vertices[1].pos.x, 0.0) && approx_eq(pl.vertices[1].pos.y, 2.0),
+            "arc end {:?} should scale to (0,2)",
+            pl.vertices[1].pos
+        );
+        assert!(
+            approx_eq(pl.vertices[0].bulge, b),
+            "bulge preserved (concentric)"
+        );
     }
 
     #[test]
@@ -2682,62 +3266,118 @@ mod transform_tests {
         // L-shape (open): (0,0)-(10,0)-(10,10). Offset to the +Y/-X inside.
         let g = Geom::Polyline(Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 10.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 10.0),
+                    bulge: 0.0,
+                },
             ],
             closed: false,
             widths: Vec::new(),
         });
         let out = g.offset(1.0, Vec2::new(5.0, 1.0)).expect("offset ok");
-        let Geom::Polyline(pl) = out else { panic!("not a polyline") };
+        let Geom::Polyline(pl) = out else {
+            panic!("not a polyline")
+        };
         assert!(!pl.closed);
         assert_eq!(pl.vertices.len(), 3);
         // The miter corner moves from (10,0) to (9,1).
         let mid = pl.vertices[1].pos;
-        assert!(approx_eq(mid.x, 9.0) && approx_eq(mid.y, 1.0),
-            "miter corner {:?} should be (9,1)", mid);
+        assert!(
+            approx_eq(mid.x, 9.0) && approx_eq(mid.y, 1.0),
+            "miter corner {:?} should be (9,1)",
+            mid
+        );
     }
 
     #[test]
     fn lengthen_line_extends_at_clicked_end() {
-        let g = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
+        let g = Geom::Line(Line {
+            a: Vec2::ZERO,
+            b: Vec2::new(10.0, 0.0),
+        });
         // Click near (10, 0) — the b-end — to extend it.
         let longer = g.lengthened(3.0, Vec2::new(10.0, 1.0)).unwrap();
-        if let Geom::Line(l) = longer { assert!(approx_eq(l.b.x, 13.0)); } else { panic!(); }
+        if let Geom::Line(l) = longer {
+            assert!(approx_eq(l.b.x, 13.0));
+        } else {
+            panic!();
+        }
         // Click near (0, 0) — the a-end — to extend backwards.
         let earlier = g.lengthened(3.0, Vec2::new(-1.0, 0.0)).unwrap();
-        if let Geom::Line(l) = earlier { assert!(approx_eq(l.a.x, -3.0)); } else { panic!(); }
+        if let Geom::Line(l) = earlier {
+            assert!(approx_eq(l.a.x, -3.0));
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn trim_line_at_single_cutter_keeps_other_side() {
         // Horizontal line 0→10. Vertical cutter at x=5. Click at x=7 (right
         // of the cut) → that side is removed; we keep 0→5.
-        let target  = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
-        let cutter  = Geom::Line(Line { a: Vec2::new(5.0, -5.0), b: Vec2::new(5.0, 5.0) });
-        let out = target.trim_at(&[cutter], Vec2::new(7.0, 0.0), false).unwrap();
+        let target = Geom::Line(Line {
+            a: Vec2::ZERO,
+            b: Vec2::new(10.0, 0.0),
+        });
+        let cutter = Geom::Line(Line {
+            a: Vec2::new(5.0, -5.0),
+            b: Vec2::new(5.0, 5.0),
+        });
+        let out = target
+            .trim_at(&[cutter], Vec2::new(7.0, 0.0), false)
+            .unwrap();
         assert_eq!(out.len(), 1);
         if let Geom::Line(l) = &out[0] {
-            assert!(approx_eq(l.a.x, 0.0)); assert!(approx_eq(l.b.x, 5.0));
-        } else { panic!(); }
+            assert!(approx_eq(l.a.x, 0.0));
+            assert!(approx_eq(l.b.x, 5.0));
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn trim_line_between_two_cutters_keeps_outer_pieces() {
         // 0→10 cut at x=3 and x=7; click at x=5 (middle) removes 3..7.
         // Two cuts = three segments; click middle → 2 outer pieces survive.
-        let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
-        let c1 = Geom::Line(Line { a: Vec2::new(3.0, -5.0), b: Vec2::new(3.0, 5.0) });
-        let c2 = Geom::Line(Line { a: Vec2::new(7.0, -5.0), b: Vec2::new(7.0, 5.0) });
-        let out = target.trim_at(&[c1, c2], Vec2::new(5.0, 0.0), false).unwrap();
+        let target = Geom::Line(Line {
+            a: Vec2::ZERO,
+            b: Vec2::new(10.0, 0.0),
+        });
+        let c1 = Geom::Line(Line {
+            a: Vec2::new(3.0, -5.0),
+            b: Vec2::new(3.0, 5.0),
+        });
+        let c2 = Geom::Line(Line {
+            a: Vec2::new(7.0, -5.0),
+            b: Vec2::new(7.0, 5.0),
+        });
+        let out = target
+            .trim_at(&[c1, c2], Vec2::new(5.0, 0.0), false)
+            .unwrap();
         assert_eq!(out.len(), 2);
-        let mut xs: Vec<(f64, f64)> = out.iter().map(|g| {
-            if let Geom::Line(l) = g { (l.a.x, l.b.x) } else { panic!() }
-        }).collect();
+        let mut xs: Vec<(f64, f64)> = out
+            .iter()
+            .map(|g| {
+                if let Geom::Line(l) = g {
+                    (l.a.x, l.b.x)
+                } else {
+                    panic!()
+                }
+            })
+            .collect();
         xs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        assert!(approx_eq(xs[0].0, 0.0)); assert!(approx_eq(xs[0].1, 3.0));
-        assert!(approx_eq(xs[1].0, 7.0)); assert!(approx_eq(xs[1].1, 10.0));
+        assert!(approx_eq(xs[0].0, 0.0));
+        assert!(approx_eq(xs[0].1, 3.0));
+        assert!(approx_eq(xs[1].0, 7.0));
+        assert!(approx_eq(xs[1].1, 10.0));
     }
 
     #[test]
@@ -2748,19 +3388,39 @@ mod transform_tests {
         // Updated from the prior N+1 over-split rule (2026-06-08 — user
         // bug report: trimming outside a closed cutter incorrectly split
         // the line at the far intersection too).
-        let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
-        let cs: Vec<Geom> = [2.0, 5.0, 8.0].iter().map(|&x| {
-            Geom::Line(Line { a: Vec2::new(x, -5.0), b: Vec2::new(x, 5.0) })
-        }).collect();
+        let target = Geom::Line(Line {
+            a: Vec2::ZERO,
+            b: Vec2::new(10.0, 0.0),
+        });
+        let cs: Vec<Geom> = [2.0, 5.0, 8.0]
+            .iter()
+            .map(|&x| {
+                Geom::Line(Line {
+                    a: Vec2::new(x, -5.0),
+                    b: Vec2::new(x, 5.0),
+                })
+            })
+            .collect();
         let out = target.trim_at(&cs, Vec2::new(3.5, 0.0), false).unwrap();
-        assert_eq!(out.len(), 2,
-            "expected 2 surviving pieces (AutoCAD-style), got {}", out.len());
-        let mut xs: Vec<(f64, f64)> = out.iter().map(|g| {
-            if let Geom::Line(l) = g { (l.a.x, l.b.x) } else { panic!() }
-        }).collect();
+        assert_eq!(
+            out.len(),
+            2,
+            "expected 2 surviving pieces (AutoCAD-style), got {}",
+            out.len()
+        );
+        let mut xs: Vec<(f64, f64)> = out
+            .iter()
+            .map(|g| {
+                if let Geom::Line(l) = g {
+                    (l.a.x, l.b.x)
+                } else {
+                    panic!()
+                }
+            })
+            .collect();
         xs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         assert!(approx_eq(xs[0].0, 0.0) && approx_eq(xs[0].1, 2.0));
-        assert!(approx_eq(xs[1].0, 5.0) && approx_eq(xs[1].1, 10.0));   // not split at 8!
+        assert!(approx_eq(xs[1].0, 5.0) && approx_eq(xs[1].1, 10.0)); // not split at 8!
     }
 
     #[test]
@@ -2768,16 +3428,36 @@ mod transform_tests {
         // AutoCAD-correct: 5 cuts at x=2,4,6,8,10; click in interval
         // (4..6) → 2 surviving pieces: (0..4) and (6..12). Non-bounding
         // intersections at x=2, 8, 10 do NOT cause splits.
-        let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(12.0, 0.0) });
-        let cs: Vec<Geom> = [2.0, 4.0, 6.0, 8.0, 10.0].iter().map(|&x| {
-            Geom::Line(Line { a: Vec2::new(x, -5.0), b: Vec2::new(x, 5.0) })
-        }).collect();
+        let target = Geom::Line(Line {
+            a: Vec2::ZERO,
+            b: Vec2::new(12.0, 0.0),
+        });
+        let cs: Vec<Geom> = [2.0, 4.0, 6.0, 8.0, 10.0]
+            .iter()
+            .map(|&x| {
+                Geom::Line(Line {
+                    a: Vec2::new(x, -5.0),
+                    b: Vec2::new(x, 5.0),
+                })
+            })
+            .collect();
         let out = target.trim_at(&cs, Vec2::new(5.0, 0.0), false).unwrap();
-        assert_eq!(out.len(), 2,
-            "expected 2 surviving pieces (AutoCAD-style), got {}", out.len());
-        let mut xs: Vec<(f64, f64)> = out.iter().map(|g| {
-            if let Geom::Line(l) = g { (l.a.x, l.b.x) } else { panic!() }
-        }).collect();
+        assert_eq!(
+            out.len(),
+            2,
+            "expected 2 surviving pieces (AutoCAD-style), got {}",
+            out.len()
+        );
+        let mut xs: Vec<(f64, f64)> = out
+            .iter()
+            .map(|g| {
+                if let Geom::Line(l) = g {
+                    (l.a.x, l.b.x)
+                } else {
+                    panic!()
+                }
+            })
+            .collect();
         xs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         assert!(approx_eq(xs[0].0, 0.0) && approx_eq(xs[0].1, 4.0));
         assert!(approx_eq(xs[1].0, 6.0) && approx_eq(xs[1].1, 12.0));
@@ -2791,16 +3471,29 @@ mod transform_tests {
         // intersection1 → line.end (passing through the inside AND
         // outside-B without further splits).
         let target = Geom::Line(Line {
-            a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 0.0),
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(10.0, 0.0),
         });
         // Two perpendicular cutters at x=3 and x=7 (simulate ellipse's
         // two intersections with the line).
-        let c1 = Geom::Line(Line { a: Vec2::new(3.0, -2.0), b: Vec2::new(3.0, 2.0) });
-        let c2 = Geom::Line(Line { a: Vec2::new(7.0, -2.0), b: Vec2::new(7.0, 2.0) });
+        let c1 = Geom::Line(Line {
+            a: Vec2::new(3.0, -2.0),
+            b: Vec2::new(3.0, 2.0),
+        });
+        let c2 = Geom::Line(Line {
+            a: Vec2::new(7.0, -2.0),
+            b: Vec2::new(7.0, 2.0),
+        });
         // Click before first intersection — on the OUTSIDE-A portion.
-        let out = target.trim_at(&[c1, c2], Vec2::new(1.5, 0.0), false).unwrap();
-        assert_eq!(out.len(), 1,
-            "expected ONE continuous piece (3 → 10), got {}", out.len());
+        let out = target
+            .trim_at(&[c1, c2], Vec2::new(1.5, 0.0), false)
+            .unwrap();
+        assert_eq!(
+            out.len(),
+            1,
+            "expected ONE continuous piece (3 → 10), got {}",
+            out.len()
+        );
         if let Geom::Line(l) = &out[0] {
             assert!(approx_eq(l.a.x, 3.0));
             assert!(approx_eq(l.b.x, 10.0));
@@ -2813,25 +3506,38 @@ mod transform_tests {
         // Half-arc 0°→180° at radius 5. Cuts at 60° and 120°. Click at 90°
         // (between the cuts) → segments (0..60) and (120..180) survive.
         let arc = Geom::Arc(Arc {
-            center: Vec2::ZERO, radius: 5.0,
-            start_angle: 0.0, sweep_angle: std::f64::consts::PI,
+            center: Vec2::ZERO,
+            radius: 5.0,
+            start_angle: 0.0,
+            sweep_angle: std::f64::consts::PI,
         });
         let cx_60 = 5.0 * (60.0_f64).to_radians().cos();
         let cy_60 = 5.0 * (60.0_f64).to_radians().sin();
         let cx_120 = 5.0 * (120.0_f64).to_radians().cos();
         let cy_120 = 5.0 * (120.0_f64).to_radians().sin();
         // Radial cut lines from origin through each angle, long enough.
-        let c1 = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(cx_60 * 2.0, cy_60 * 2.0) });
-        let c2 = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(cx_120 * 2.0, cy_120 * 2.0) });
+        let c1 = Geom::Line(Line {
+            a: Vec2::ZERO,
+            b: Vec2::new(cx_60 * 2.0, cy_60 * 2.0),
+        });
+        let c2 = Geom::Line(Line {
+            a: Vec2::ZERO,
+            b: Vec2::new(cx_120 * 2.0, cy_120 * 2.0),
+        });
         // Click at 90° (top of arc): (0, 5)
         let out = arc.trim_at(&[c1, c2], Vec2::new(0.0, 5.0), false).unwrap();
         assert_eq!(out.len(), 2, "expected 2 sub-arcs, got {}", out.len());
         for g in &out {
             if let Geom::Arc(a) = g {
                 let sweep_deg = a.sweep_angle.to_degrees();
-                assert!((sweep_deg - 60.0).abs() < 1.0,
-                    "each surviving sub-arc should sweep ~60°, got {}°", sweep_deg);
-            } else { panic!() }
+                assert!(
+                    (sweep_deg - 60.0).abs() < 1.0,
+                    "each surviving sub-arc should sweep ~60°, got {}°",
+                    sweep_deg
+                );
+            } else {
+                panic!()
+            }
         }
         let _ = FRAC_PI_2;
     }
@@ -2841,18 +3547,28 @@ mod transform_tests {
         // Target line 0→10 at y=0. Cutter is a SHORT segment that, in its
         // visible form, does NOT cross the target. With EdgMod ON it
         // extends to a full line that DOES cross at x=5.
-        let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
+        let target = Geom::Line(Line {
+            a: Vec2::ZERO,
+            b: Vec2::new(10.0, 0.0),
+        });
         let short_cutter = Geom::Line(Line {
-            a: Vec2::new(5.0, 3.0), b: Vec2::new(5.0, 4.0),    // y=3..4 only
+            a: Vec2::new(5.0, 3.0),
+            b: Vec2::new(5.0, 4.0), // y=3..4 only
         });
         // EdgMod OFF — no intersection; trim fails.
-        assert!(target.trim_at(&[short_cutter.clone()], Vec2::new(7.0, 0.0), false).is_err());
+        assert!(target
+            .trim_at(&[short_cutter.clone()], Vec2::new(7.0, 0.0), false)
+            .is_err());
         // EdgMod ON — imaginary intersection at (5,0); right side trimmed.
-        let out = target.trim_at(&[short_cutter], Vec2::new(7.0, 0.0), true).unwrap();
+        let out = target
+            .trim_at(&[short_cutter], Vec2::new(7.0, 0.0), true)
+            .unwrap();
         assert_eq!(out.len(), 1);
         if let Geom::Line(l) = &out[0] {
             assert!(approx_eq(l.b.x, 5.0));
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
@@ -2861,33 +3577,49 @@ mod transform_tests {
         // at x = 5·cos(45°) ≈ 3.536, which intersects the arc at 45°.
         // Click at angle 22° (lower-left half) → removes that side, keeps 45°→90°.
         let arc = Geom::Arc(Arc {
-            center: Vec2::ZERO, radius: 5.0,
-            start_angle: 0.0, sweep_angle: std::f64::consts::FRAC_PI_2,
+            center: Vec2::ZERO,
+            radius: 5.0,
+            start_angle: 0.0,
+            sweep_angle: std::f64::consts::FRAC_PI_2,
         });
         let cut_x = 5.0 * std::f64::consts::FRAC_1_SQRT_2;
         let cutter = Geom::Line(Line {
-            a: Vec2::new(cut_x, -10.0), b: Vec2::new(cut_x, 10.0),
+            a: Vec2::new(cut_x, -10.0),
+            b: Vec2::new(cut_x, 10.0),
         });
         // Click below the cutter (small angle on the arc)
-        let pick = Vec2::new(4.5, 1.0);   // ≈12° on the arc
+        let pick = Vec2::new(4.5, 1.0); // ≈12° on the arc
         let out = arc.trim_at(&[cutter], pick, false).unwrap();
         assert_eq!(out.len(), 1);
         if let Geom::Arc(a) = &out[0] {
             // Should start at ≈45° and sweep to ≈90°
-            assert!(a.start_angle > 0.5 && a.start_angle < 1.0,
-                "start_angle = {} rad ({}°)", a.start_angle, a.start_angle.to_degrees());
-            assert!((a.sweep_angle - std::f64::consts::FRAC_PI_4).abs() < 0.05,
-                "sweep_angle = {} rad", a.sweep_angle);
-        } else { panic!(); }
+            assert!(
+                a.start_angle > 0.5 && a.start_angle < 1.0,
+                "start_angle = {} rad ({}°)",
+                a.start_angle,
+                a.start_angle.to_degrees()
+            );
+            assert!(
+                (a.sweep_angle - std::f64::consts::FRAC_PI_4).abs() < 0.05,
+                "sweep_angle = {} rad",
+                a.sweep_angle
+            );
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn trim_target_with_disjoint_cutters_errors_when_pick_is_outside() {
         // Line 0→10. Cutter at x=15 (no intersection on the visible line).
         // EdgMod OFF — no imaginary intersection either. trim should fail.
-        let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
+        let target = Geom::Line(Line {
+            a: Vec2::ZERO,
+            b: Vec2::new(10.0, 0.0),
+        });
         let cutter = Geom::Line(Line {
-            a: Vec2::new(15.0, -1.0), b: Vec2::new(15.0, 1.0),
+            a: Vec2::new(15.0, -1.0),
+            b: Vec2::new(15.0, 1.0),
         });
         let r = target.trim_at(&[cutter], Vec2::new(5.0, 0.0), false);
         assert!(r.is_err());
@@ -2897,13 +3629,24 @@ mod transform_tests {
     fn trim_with_pick_on_endpoint_side_of_intersection() {
         // Line 0→10 cut at x=5. Click at x=2 (left of cut) → trims toward a;
         // result keeps the right half (5..10).
-        let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
-        let cutter = Geom::Line(Line { a: Vec2::new(5.0, -1.0), b: Vec2::new(5.0, 1.0) });
-        let out = target.trim_at(&[cutter], Vec2::new(2.0, 0.0), false).unwrap();
+        let target = Geom::Line(Line {
+            a: Vec2::ZERO,
+            b: Vec2::new(10.0, 0.0),
+        });
+        let cutter = Geom::Line(Line {
+            a: Vec2::new(5.0, -1.0),
+            b: Vec2::new(5.0, 1.0),
+        });
+        let out = target
+            .trim_at(&[cutter], Vec2::new(2.0, 0.0), false)
+            .unwrap();
         assert_eq!(out.len(), 1);
         if let Geom::Line(l) = &out[0] {
-            assert!(approx_eq(l.a.x, 5.0)); assert!(approx_eq(l.b.x, 10.0));
-        } else { panic!(); }
+            assert!(approx_eq(l.a.x, 5.0));
+            assert!(approx_eq(l.b.x, 10.0));
+        } else {
+            panic!();
+        }
     }
 
     #[test]
@@ -2911,14 +3654,24 @@ mod transform_tests {
         // Cutter VISIBLY intersects target. EdgMod OFF: should use the real
         // intersection (no need to extend). Confirms we don't accidentally
         // always extend.
-        let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
-        let cutter = Geom::Line(Line { a: Vec2::new(5.0, -5.0), b: Vec2::new(5.0, 5.0) });
-        let out = target.trim_at(&[cutter.clone()], Vec2::new(7.0, 0.0), false).unwrap();
+        let target = Geom::Line(Line {
+            a: Vec2::ZERO,
+            b: Vec2::new(10.0, 0.0),
+        });
+        let cutter = Geom::Line(Line {
+            a: Vec2::new(5.0, -5.0),
+            b: Vec2::new(5.0, 5.0),
+        });
+        let out = target
+            .trim_at(&[cutter.clone()], Vec2::new(7.0, 0.0), false)
+            .unwrap();
         // Same result as the EdgMod-ON case for this geometry; assert we
         // got the trimmed left half.
         if let Geom::Line(l) = &out[0] {
             assert!(approx_eq(l.b.x, 5.0));
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
@@ -2929,22 +3682,33 @@ mod transform_tests {
         // Simpler boundary: vertical line at x = -2 (cuts arc extension
         // at angle just past 90°).
         let arc = Geom::Arc(Arc {
-            center: Vec2::ZERO, radius: 5.0,
-            start_angle: 0.0, sweep_angle: std::f64::consts::FRAC_PI_2,
+            center: Vec2::ZERO,
+            radius: 5.0,
+            start_angle: 0.0,
+            sweep_angle: std::f64::consts::FRAC_PI_2,
         });
         let boundary = Geom::Line(Line {
-            a: Vec2::new(-2.0, -10.0), b: Vec2::new(-2.0, 10.0),
+            a: Vec2::new(-2.0, -10.0),
+            b: Vec2::new(-2.0, 10.0),
         });
         // End of arc is at (0, 5). Click slightly past it (above and left).
         let pick = Vec2::new(-0.5, 5.5);
         let out = arc.extend_to(&[boundary], pick, true).unwrap();
         if let Geom::Arc(a) = out {
             // Sweep should be > original PI/2 but < PI (since x=-2 → angle ≈113°)
-            assert!(a.sweep_angle > std::f64::consts::FRAC_PI_2,
-                "sweep didn't grow: {}", a.sweep_angle);
-            assert!(a.sweep_angle < std::f64::consts::PI,
-                "sweep overshot: {}", a.sweep_angle);
-        } else { panic!(); }
+            assert!(
+                a.sweep_angle > std::f64::consts::FRAC_PI_2,
+                "sweep didn't grow: {}",
+                a.sweep_angle
+            );
+            assert!(
+                a.sweep_angle < std::f64::consts::PI,
+                "sweep overshot: {}",
+                a.sweep_angle
+            );
+        } else {
+            panic!();
+        }
     }
 
     #[test]
@@ -2953,43 +3717,80 @@ mod transform_tests {
         // space. Vertical boundary at x=-2 crosses the full ellipse in the
         // upper-left quadrant (param ≈ 1.98 rad). Picking just past the (0,3) end
         // must grow the sweep to reach it (start_param unchanged).
-        let ell = Ellipse { center: Vec2::ZERO, major: Vec2::new(5.0, 0.0), ratio: 0.6 };
+        let ell = Ellipse {
+            center: Vec2::ZERO,
+            major: Vec2::new(5.0, 0.0),
+            ratio: 0.6,
+        };
         let ea = Geom::EllipseArc(EllipseArc {
-            ellipse: ell, start_param: 0.0, sweep_param: std::f64::consts::FRAC_PI_2,
+            ellipse: ell,
+            start_param: 0.0,
+            sweep_param: std::f64::consts::FRAC_PI_2,
         });
-        let boundary = Geom::Line(Line { a: Vec2::new(-2.0, -10.0), b: Vec2::new(-2.0, 10.0) });
-        let pick = Vec2::new(-0.5, 3.0);   // just past the (0,3) end
+        let boundary = Geom::Line(Line {
+            a: Vec2::new(-2.0, -10.0),
+            b: Vec2::new(-2.0, 10.0),
+        });
+        let pick = Vec2::new(-0.5, 3.0); // just past the (0,3) end
         let out = ea.extend_to(&[boundary], pick, true).unwrap();
         if let Geom::EllipseArc(a) = out {
             assert!(a.start_param.abs() < 1e-9, "start moved: {}", a.start_param);
-            assert!(a.sweep_param > std::f64::consts::FRAC_PI_2,
-                "sweep didn't grow: {}", a.sweep_param);
-            assert!(a.sweep_param < std::f64::consts::PI,
-                "sweep overshot: {}", a.sweep_param);
-        } else { panic!("expected EllipseArc, got {out:?}"); }
+            assert!(
+                a.sweep_param > std::f64::consts::FRAC_PI_2,
+                "sweep didn't grow: {}",
+                a.sweep_param
+            );
+            assert!(
+                a.sweep_param < std::f64::consts::PI,
+                "sweep overshot: {}",
+                a.sweep_param
+            );
+        } else {
+            panic!("expected EllipseArc, got {out:?}");
+        }
     }
 
     #[test]
     fn extend_closed_circle_and_ellipse_report_precisely() {
         // A boundary that CROSSES the target (so `hits` is non-empty and the
         // match arm is reached, not the earlier "no intersection" guard).
-        let boundary = Geom::Line(Line { a: Vec2::new(2.0, -10.0), b: Vec2::new(2.0, 10.0) });
-        let circle = Geom::Circle(Circle { center: Vec2::ZERO, radius: 5.0 });
-        let ell = Geom::Ellipse(Ellipse { center: Vec2::ZERO, major: Vec2::new(5.0, 0.0), ratio: 0.6 });
+        let boundary = Geom::Line(Line {
+            a: Vec2::new(2.0, -10.0),
+            b: Vec2::new(2.0, 10.0),
+        });
+        let circle = Geom::Circle(Circle {
+            center: Vec2::ZERO,
+            radius: 5.0,
+        });
+        let ell = Geom::Ellipse(Ellipse {
+            center: Vec2::ZERO,
+            major: Vec2::new(5.0, 0.0),
+            ratio: 0.6,
+        });
         assert_eq!(
-            circle.extend_to(&[boundary.clone()], Vec2::new(5.0, 0.0), true).err(),
-            Some("extend: can't extend a closed circle"));
+            circle
+                .extend_to(&[boundary.clone()], Vec2::new(5.0, 0.0), true)
+                .err(),
+            Some("extend: can't extend a closed circle")
+        );
         assert_eq!(
             ell.extend_to(&[boundary], Vec2::new(5.0, 0.0), true).err(),
-            Some("extend: can't extend a closed ellipse"));
+            Some("extend: can't extend a closed ellipse")
+        );
     }
 
     #[test]
     fn spline_ribbon_width_survives_transforms() {
-        let sp = Spline::new_bspline(3, vec![
-            Vec2::new(0.0, 0.0), Vec2::new(3.0, 2.0),
-            Vec2::new(6.0, -1.0), Vec2::new(9.0, 1.0),
-        ]).with_width(0.4);
+        let sp = Spline::new_bspline(
+            3,
+            vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(3.0, 2.0),
+                Vec2::new(6.0, -1.0),
+                Vec2::new(9.0, 1.0),
+            ],
+        )
+        .with_width(0.4);
         // Rotation, mirror, translation and reversal are width-invariant.
         for out in [
             Geom::Spline(sp.clone()).rotated(Vec2::ZERO, 0.7),
@@ -2998,16 +3799,30 @@ mod transform_tests {
             Geom::Spline(sp.clone()).reversed(),
         ] {
             if let Geom::Spline(s) = out {
-                assert!((s.width - 0.4).abs() < 1e-12,
-                    "transform dropped the ribbon width: {}", s.width);
-            } else { panic!("expected a spline back"); }
+                assert!(
+                    (s.width - 0.4).abs() < 1e-12,
+                    "transform dropped the ribbon width: {}",
+                    s.width
+                );
+            } else {
+                panic!("expected a spline back");
+            }
         }
         // Uniform scale scales the width; with_width clamps negatives.
         if let Geom::Spline(s) = Geom::Spline(sp.clone()).scaled(Vec2::ZERO, 2.0) {
             assert!((s.width - 0.8).abs() < 1e-12, "scaled width: {}", s.width);
-        } else { panic!("expected a spline back"); }
-        assert_eq!(Spline::new_bspline(2, vec![Vec2::ZERO, Vec2::new(1.0, 0.0),
-            Vec2::new(2.0, 0.0)]).with_width(-3.0).width, 0.0);
+        } else {
+            panic!("expected a spline back");
+        }
+        assert_eq!(
+            Spline::new_bspline(
+                2,
+                vec![Vec2::ZERO, Vec2::new(1.0, 0.0), Vec2::new(2.0, 0.0)]
+            )
+            .with_width(-3.0)
+            .width,
+            0.0
+        );
     }
 
     #[test]
@@ -3018,19 +3833,28 @@ mod transform_tests {
         use crate::Document;
         let mut doc = Document::default();
         // Cutter at index 0, target at index 1.
-        let cutter_i = doc.push(Line {
-            a: Vec2::new(5.0, -5.0), b: Vec2::new(5.0, 5.0),
-        }.into());
-        let target_i = doc.push(Line {
-            a: Vec2::ZERO, b: Vec2::new(10.0, 0.0),
-        }.into());
+        let cutter_i = doc.push(
+            Line {
+                a: Vec2::new(5.0, -5.0),
+                b: Vec2::new(5.0, 5.0),
+            }
+            .into(),
+        );
+        let target_i = doc.push(
+            Line {
+                a: Vec2::ZERO,
+                b: Vec2::new(10.0, 0.0),
+            }
+            .into(),
+        );
         assert_eq!(cutter_i, 0);
         assert_eq!(target_i, 1);
 
         // Mirror apply_trim_pick:
         let cutter_geom = doc.dobjects[cutter_i].geom.clone();
         let target_style = doc.dobjects[target_i].style;
-        let pieces = doc.dobjects[target_i].geom
+        let pieces = doc.dobjects[target_i]
+            .geom
             .trim_at(&[cutter_geom], Vec2::new(7.0, 0.0), true)
             .unwrap();
         doc.dobjects.remove(target_i);
@@ -3044,25 +3868,39 @@ mod transform_tests {
         // Cutter still at index 0 (unchanged).
         if let Geom::Line(l) = &doc.dobjects[0].geom {
             assert!(approx_eq(l.a.x, 5.0));
-        } else { panic!("cutter shifted or mutated"); }
+        } else {
+            panic!("cutter shifted or mutated");
+        }
         // Piece is the original LEFT half (since pick was on the right at x=7).
         if let Geom::Line(l) = &doc.dobjects[1].geom {
             assert!(approx_eq(l.a.x, 0.0));
             assert!(approx_eq(l.b.x, 5.0));
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn extend_line_grows_toward_boundary() {
         // Target line 0→4 at y=0. Boundary at x=10.
-        let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(4.0, 0.0) });
-        let boundary = Geom::Line(Line { a: Vec2::new(10.0, -5.0), b: Vec2::new(10.0, 5.0) });
+        let target = Geom::Line(Line {
+            a: Vec2::ZERO,
+            b: Vec2::new(4.0, 0.0),
+        });
+        let boundary = Geom::Line(Line {
+            a: Vec2::new(10.0, -5.0),
+            b: Vec2::new(10.0, 5.0),
+        });
         // Click near the right end (b) — extend that side toward x=10.
-        let out = target.extend_to(&[boundary], Vec2::new(4.0, 0.5), false).unwrap();
+        let out = target
+            .extend_to(&[boundary], Vec2::new(4.0, 0.5), false)
+            .unwrap();
         if let Geom::Line(l) = out {
             assert!(approx_eq(l.a.x, 0.0));
             assert!(approx_eq(l.b.x, 10.0));
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
@@ -3072,12 +3910,20 @@ mod transform_tests {
         // hits-empty guard bailed before the Wall arm could run. The wall's
         // top end (y=4) must extend up to the boundary at y=10.
         let target = Geom::Wall(Wall {
-            start: Vec2::new(2.0, 0.0), end: Vec2::new(2.0, 4.0),
-            thickness: 0.3, style: 0, bulge: 0.0,
+            start: Vec2::new(2.0, 0.0),
+            end: Vec2::new(2.0, 4.0),
+            thickness: 0.3,
+            style: 0,
+            bulge: 0.0,
         });
-        let boundary = Geom::Line(Line { a: Vec2::new(-5.0, 10.0), b: Vec2::new(5.0, 10.0) });
+        let boundary = Geom::Line(Line {
+            a: Vec2::new(-5.0, 10.0),
+            b: Vec2::new(5.0, 10.0),
+        });
         // Click near the top end (y=4) → extend that side up to y=10.
-        let out = target.extend_to(&[boundary], Vec2::new(2.0, 3.5), false).unwrap();
+        let out = target
+            .extend_to(&[boundary], Vec2::new(2.0, 3.5), false)
+            .unwrap();
         if let Geom::Wall(w) = out {
             assert!(approx_eq(w.start.y, 0.0));
             assert!(approx_eq(w.end.y, 10.0));
@@ -3089,25 +3935,36 @@ mod transform_tests {
 
     #[test]
     fn break_line_at_midpoint_makes_two() {
-        let g = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
+        let g = Geom::Line(Line {
+            a: Vec2::ZERO,
+            b: Vec2::new(10.0, 0.0),
+        });
         let (l1, l2) = g.split_at(Vec2::new(5.0, 0.0)).unwrap();
         if let (Geom::Line(a), Geom::Line(b)) = (l1, l2) {
             assert!(approx_eq(a.b.x, 5.0));
             assert!(approx_eq(b.a.x, 5.0));
             assert!(approx_eq(b.b.x, 10.0));
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn break_circle_errors() {
-        let g = Geom::Circle(Circle { center: Vec2::ZERO, radius: 5.0 });
+        let g = Geom::Circle(Circle {
+            center: Vec2::ZERO,
+            radius: 5.0,
+        });
         assert!(g.split_at(Vec2::new(5.0, 0.0)).is_err());
     }
 
     #[test]
     fn translate_then_rotate_then_translate_back() {
         // Translation invariance under rotation around the SAME pivot
-        let g = Geom::Circle(Circle { center: Vec2::new(7.0, 3.0), radius: 2.0 });
+        let g = Geom::Circle(Circle {
+            center: Vec2::new(7.0, 3.0),
+            radius: 2.0,
+        });
         let g2 = g.translated(Vec2::new(10.0, 0.0));
         let g3 = g2.rotated(Vec2::new(17.0, 3.0), std::f64::consts::PI);
         let g4 = g3.translated(Vec2::new(-10.0, 0.0));
@@ -3116,7 +3973,9 @@ mod transform_tests {
             assert!(approx_eq(c.center.x, 7.0));
             assert!(approx_eq(c.center.y, 3.0));
             assert!(approx_eq(c.radius, 2.0));
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 }
 
@@ -3124,9 +3983,9 @@ mod transform_tests {
 mod ellipse_tests {
     use super::*;
     use crate::join::*;
-    use crate::trim::*;
-    use crate::modify::*;
     use crate::math::approx_eq;
+    use crate::modify::*;
+    use crate::trim::*;
 
     fn close(p: Vec2, x: f64, y: f64) -> bool {
         approx_eq(p.x, x) && approx_eq(p.y, y)
@@ -3135,7 +3994,11 @@ mod ellipse_tests {
     #[test]
     fn axis_aligned_ellipse_point_at() {
         // a = 5, b = 2, no rotation
-        let e = Ellipse { center: Vec2::ZERO, major: Vec2::new(5.0, 0.0), ratio: 0.4 };
+        let e = Ellipse {
+            center: Vec2::ZERO,
+            major: Vec2::new(5.0, 0.0),
+            ratio: 0.4,
+        };
         assert!(close(e.point_at(0.0), 5.0, 0.0));
         assert!(close(e.point_at(std::f64::consts::FRAC_PI_2), 0.0, 2.0));
         assert!(close(e.point_at(std::f64::consts::PI), -5.0, 0.0));
@@ -3144,10 +4007,14 @@ mod ellipse_tests {
     #[test]
     fn rotated_ellipse_bbox() {
         // Rotate 90°: major now points up. Bbox half-extents swap.
-        let e = Ellipse { center: Vec2::ZERO, major: Vec2::new(0.0, 5.0), ratio: 0.4 };
+        let e = Ellipse {
+            center: Vec2::ZERO,
+            major: Vec2::new(0.0, 5.0),
+            ratio: 0.4,
+        };
         let (mn, mx) = e.bbox();
-        assert!(approx_eq(mx.x, 2.0));   // semi-minor along x
-        assert!(approx_eq(mx.y, 5.0));   // semi-major along y
+        assert!(approx_eq(mx.x, 2.0)); // semi-minor along x
+        assert!(approx_eq(mx.y, 5.0)); // semi-major along y
         assert!(approx_eq(mn.x, -2.0));
         assert!(approx_eq(mn.y, -5.0));
     }
@@ -3155,18 +4022,29 @@ mod ellipse_tests {
     #[test]
     fn nearest_param_on_circle_is_atan2() {
         // ratio=1.0 means circle — nearest point on a circle is the radial.
-        let e = Ellipse { center: Vec2::ZERO, major: Vec2::new(5.0, 0.0), ratio: 1.0 };
+        let e = Ellipse {
+            center: Vec2::ZERO,
+            major: Vec2::new(5.0, 0.0),
+            ratio: 1.0,
+        };
         let p = Vec2::new(10.0, 10.0);
         let t = e.nearest_param(p);
         let pt = e.point_at(t);
         // pt should be on the circle of r=5 in the same direction as p.
         assert!(approx_eq(pt.len(), 5.0));
-        assert!(approx_eq((pt.y / pt.x).atan(), (10.0_f64 / 10.0_f64).atan()));
+        assert!(approx_eq(
+            (pt.y / pt.x).atan(),
+            (10.0_f64 / 10.0_f64).atan()
+        ));
     }
 
     #[test]
     fn ellipse_arc_endpoints_and_contains() {
-        let e = Ellipse { center: Vec2::ZERO, major: Vec2::new(5.0, 0.0), ratio: 0.4 };
+        let e = Ellipse {
+            center: Vec2::ZERO,
+            major: Vec2::new(5.0, 0.0),
+            ratio: 0.4,
+        };
         let ea = EllipseArc {
             ellipse: e,
             start_param: 0.0,
@@ -3189,8 +4067,10 @@ impl EllipseArc {
     }
 
     pub fn endpoints(&self) -> (Vec2, Vec2) {
-        (self.ellipse.point_at(self.start_param),
-         self.ellipse.point_at(self.start_param + self.sweep_param))
+        (
+            self.ellipse.point_at(self.start_param),
+            self.ellipse.point_at(self.start_param + self.sweep_param),
+        )
     }
 
     /// Distance from the visible arc to a point. If the nearest-on-full-
@@ -3223,8 +4103,8 @@ pub enum GripRole {
     ArcMid,
     ArcCenter,
     EllipseCenter,
-    EllipseMajorTip,        // either +major or -major tip
-    EllipseMinorTip,        // either +minor or -minor tip
+    EllipseMajorTip, // either +major or -major tip
+    EllipseMinorTip, // either +minor or -minor tip
     EllipseArcEndStart,
     EllipseArcEndEnd,
     EllipseArcCenter,
@@ -3265,34 +4145,34 @@ impl Geom {
                 let r = c.radius;
                 vec![
                     (c.center, GripRole::CircleCenter),
-                    (c.center + Vec2::new( r, 0.0), GripRole::CircleQuadrant),
-                    (c.center + Vec2::new( 0.0,  r), GripRole::CircleQuadrant),
+                    (c.center + Vec2::new(r, 0.0), GripRole::CircleQuadrant),
+                    (c.center + Vec2::new(0.0, r), GripRole::CircleQuadrant),
                     (c.center + Vec2::new(-r, 0.0), GripRole::CircleQuadrant),
-                    (c.center + Vec2::new( 0.0, -r), GripRole::CircleQuadrant),
+                    (c.center + Vec2::new(0.0, -r), GripRole::CircleQuadrant),
                 ]
             }
             Geom::Arc(a) => {
                 let (e1, e2) = a.endpoints();
                 let mid_t = a.start_angle + a.sweep_angle * 0.5;
-                let mid   = a.center + Vec2::new(
-                    a.radius * mid_t.cos(),
-                    a.radius * mid_t.sin(),
-                );
+                let mid = a.center + Vec2::new(a.radius * mid_t.cos(), a.radius * mid_t.sin());
                 vec![
-                    (e1,        GripRole::ArcEndStart),
-                    (e2,        GripRole::ArcEndEnd),
-                    (mid,       GripRole::ArcMid),
-                    (a.center,  GripRole::ArcCenter),
+                    (e1, GripRole::ArcEndStart),
+                    (e2, GripRole::ArcEndEnd),
+                    (mid, GripRole::ArcMid),
+                    (a.center, GripRole::ArcCenter),
                 ]
             }
             Geom::Ellipse(el) => {
                 let half = std::f64::consts::FRAC_PI_2;
                 vec![
-                    (el.center,                                GripRole::EllipseCenter),
-                    (el.point_at(0.0),                          GripRole::EllipseMajorTip),
-                    (el.point_at(half),                         GripRole::EllipseMinorTip),
-                    (el.point_at(std::f64::consts::PI),         GripRole::EllipseMajorTip),
-                    (el.point_at(std::f64::consts::PI + half),  GripRole::EllipseMinorTip),
+                    (el.center, GripRole::EllipseCenter),
+                    (el.point_at(0.0), GripRole::EllipseMajorTip),
+                    (el.point_at(half), GripRole::EllipseMinorTip),
+                    (el.point_at(std::f64::consts::PI), GripRole::EllipseMajorTip),
+                    (
+                        el.point_at(std::f64::consts::PI + half),
+                        GripRole::EllipseMinorTip,
+                    ),
                 ]
             }
             Geom::EllipseArc(ea) => {
@@ -3303,7 +4183,10 @@ impl Geom {
                     (ea.ellipse.center, GripRole::EllipseArcCenter),
                 ]
             }
-            Geom::Polyline(p) => p.vertices.iter().enumerate()
+            Geom::Polyline(p) => p
+                .vertices
+                .iter()
+                .enumerate()
                 .map(|(i, v)| (v.pos, GripRole::PolyVertex(i)))
                 .collect(),
             Geom::Point(p) => vec![(p.location, GripRole::PointLoc)],
@@ -3315,7 +4198,10 @@ impl Geom {
             // reshapes the curve locally (NURBS basis support is
             // narrow — drag at index i only affects a span of degree+1
             // segments around i).
-            Geom::Spline(s) => s.control_points.iter().enumerate()
+            Geom::Spline(s) => s
+                .control_points
+                .iter()
+                .enumerate()
                 .map(|(i, p)| (*p, GripRole::SplineCtrlPt(i)))
                 .collect(),
             // Wall — grip at each centerline endpoint + midpoint.
@@ -3323,7 +4209,7 @@ impl Geom {
             // path "just work"; `with_grip_moved` below maps them back.
             Geom::Wall(w) => vec![
                 (w.start, GripRole::LineEndA),
-                (w.end,   GripRole::LineEndB),
+                (w.end, GripRole::LineEndB),
                 ((w.start + w.end) * 0.5, GripRole::LineMid),
             ],
             // Text — one grip at the anchor position. Re-uses PointLoc
@@ -3336,46 +4222,89 @@ impl Geom {
             Geom::Dimension(d) => {
                 use crate::dim::DimKind;
                 match &d.kind {
-                    DimKind::Linear { p1, p2, dimline_pos, .. } => vec![
-                        (*p1,          GripRole::DimP1),
-                        (*p2,          GripRole::DimP2),
+                    DimKind::Linear {
+                        p1,
+                        p2,
+                        dimline_pos,
+                        ..
+                    } => vec![
+                        (*p1, GripRole::DimP1),
+                        (*p2, GripRole::DimP2),
                         (*dimline_pos, GripRole::DimLeader),
                     ],
-                    DimKind::Radius { center, on_circle, leader_end } |
-                    DimKind::Diameter { center, on_circle, leader_end } => vec![
-                        (*center,     GripRole::DimP1),
-                        (*on_circle,  GripRole::DimP2),
+                    DimKind::Radius {
+                        center,
+                        on_circle,
+                        leader_end,
+                    }
+                    | DimKind::Diameter {
+                        center,
+                        on_circle,
+                        leader_end,
+                    } => vec![
+                        (*center, GripRole::DimP1),
+                        (*on_circle, GripRole::DimP2),
                         (*leader_end, GripRole::DimLeader),
                     ],
                     // Angular — 4 grips: vertex, the two ray points, and
                     // the arc-position handle.
-                    DimKind::Angular { vertex, p1, p2, arc_pos } => vec![
-                        (*vertex,  GripRole::DimP1),
-                        (*p1,      GripRole::DimP2),
-                        (*p2,      GripRole::DimLeader),
+                    DimKind::Angular {
+                        vertex,
+                        p1,
+                        p2,
+                        arc_pos,
+                    } => vec![
+                        (*vertex, GripRole::DimP1),
+                        (*p1, GripRole::DimP2),
+                        (*p2, GripRole::DimLeader),
                         (*arc_pos, GripRole::DimArc),
                     ],
                     // ArcLen — center, arc start, arc end, leader.
-                    DimKind::ArcLen { center, radius, start_angle, sweep, leader_end } => vec![
+                    DimKind::ArcLen {
+                        center,
+                        radius,
+                        start_angle,
+                        sweep,
+                        leader_end,
+                    } => vec![
                         (*center, GripRole::DimP1),
-                        (*center + Vec2::new(start_angle.cos() * radius,
-                                             start_angle.sin() * radius), GripRole::DimP2),
-                        (*center + Vec2::new((start_angle + sweep).cos() * radius,
-                                             (start_angle + sweep).sin() * radius), GripRole::DimLeader),
+                        (
+                            *center
+                                + Vec2::new(start_angle.cos() * radius, start_angle.sin() * radius),
+                            GripRole::DimP2,
+                        ),
+                        (
+                            *center
+                                + Vec2::new(
+                                    (start_angle + sweep).cos() * radius,
+                                    (start_angle + sweep).sin() * radius,
+                                ),
+                            GripRole::DimLeader,
+                        ),
                         (*leader_end, GripRole::DimLeader),
                     ],
                     // Ordinate — datum, point, leader.
-                    DimKind::Ordinate { datum, point, leader_end, .. } => vec![
-                        (*datum,      GripRole::DimP1),
-                        (*point,      GripRole::DimP2),
+                    DimKind::Ordinate {
+                        datum,
+                        point,
+                        leader_end,
+                        ..
+                    } => vec![
+                        (*datum, GripRole::DimP1),
+                        (*point, GripRole::DimP2),
                         (*leader_end, GripRole::DimLeader),
                     ],
                     // JoggedRadius — center, on-circle, leader, jog.
-                    DimKind::JoggedRadius { center, on_circle, leader_end, jog_pos } => vec![
-                        (*center,     GripRole::DimP1),
-                        (*on_circle,  GripRole::DimP2),
+                    DimKind::JoggedRadius {
+                        center,
+                        on_circle,
+                        leader_end,
+                        jog_pos,
+                    } => vec![
+                        (*center, GripRole::DimP1),
+                        (*on_circle, GripRole::DimP2),
                         (*leader_end, GripRole::DimLeader),
-                        (*jog_pos,    GripRole::DimLeader),
+                        (*jog_pos, GripRole::DimLeader),
                     ],
                 }
             }
@@ -3386,10 +4315,20 @@ impl Geom {
             // landing) + the label anchor. Reuses LineEnd roles so the
             // existing grip renderer + `with_grip_moved` handle them.
             Geom::Leader(l) => {
-                let mut out: Vec<(Vec2, GripRole)> = l.pts.iter()
+                let mut out: Vec<(Vec2, GripRole)> = l
+                    .pts
+                    .iter()
                     .enumerate()
-                    .map(|(i, p)| (*p, if i == 0 { GripRole::LineEndA }
-                        else { GripRole::PolyVertex(i) }))
+                    .map(|(i, p)| {
+                        (
+                            *p,
+                            if i == 0 {
+                                GripRole::LineEndA
+                            } else {
+                                GripRole::PolyVertex(i)
+                            },
+                        )
+                    })
                     .collect();
                 out.push((l.label.position, GripRole::PointLoc));
                 out
@@ -3408,17 +4347,40 @@ impl Geom {
             ],
             Geom::Donut(d) => vec![
                 (d.center, GripRole::CircleCenter),
-                (d.center + Vec2::new(d.outer_radius, 0.0), GripRole::LineEndA),
+                (
+                    d.center + Vec2::new(d.outer_radius, 0.0),
+                    GripRole::LineEndA,
+                ),
             ],
-            Geom::Wipeout(w) => w.pts.iter()
+            Geom::Wipeout(w) => w
+                .pts
+                .iter()
                 .enumerate()
-                .map(|(i, p)| (*p, if i == 0 { GripRole::LineEndA }
-                    else { GripRole::PolyVertex(i) }))
+                .map(|(i, p)| {
+                    (
+                        *p,
+                        if i == 0 {
+                            GripRole::LineEndA
+                        } else {
+                            GripRole::PolyVertex(i)
+                        },
+                    )
+                })
                 .collect(),
-            Geom::Region(rg) => rg.loop_pts.iter()
+            Geom::Region(rg) => rg
+                .loop_pts
+                .iter()
                 .enumerate()
-                .map(|(i, p)| (*p, if i == 0 { GripRole::LineEndA }
-                    else { GripRole::PolyVertex(i) }))
+                .map(|(i, p)| {
+                    (
+                        *p,
+                        if i == 0 {
+                            GripRole::LineEndA
+                        } else {
+                            GripRole::PolyVertex(i)
+                        },
+                    )
+                })
                 .collect(),
             // Xref — insert grip (move) + a far grip (scale).
             Geom::Xref(x) => {
@@ -3434,10 +4396,11 @@ impl Geom {
             Geom::Table(t) => {
                 let s = t.size();
                 let (sin, cos) = t.rotation.sin_cos();
-                let far = t.insert + Vec2::new(
-                    s.x * cos + s.y * sin, s.x * sin - s.y * cos);
-                vec![(t.insert, GripRole::CircleCenter),
-                     (far, GripRole::LineEndA)]
+                let far = t.insert + Vec2::new(s.x * cos + s.y * sin, s.x * sin - s.y * cos);
+                vec![
+                    (t.insert, GripRole::CircleCenter),
+                    (far, GripRole::LineEndA),
+                ]
             }
             // CenterMark — center grip (move) + 4 arm-tip grips (resize).
             // Tip roles reuse the line-end slots so the existing grip
@@ -3470,20 +4433,26 @@ impl Geom {
     pub fn with_grip_moved(&self, role: GripRole, new_pos: Vec2) -> Geom {
         match (self, role) {
             // ---- Line --------------------------------------------------
-            (Geom::Line(l), GripRole::LineEndA) =>
-                Geom::Line(Line { a: new_pos, b: l.b }),
-            (Geom::Line(l), GripRole::LineEndB) =>
-                Geom::Line(Line { a: l.a, b: new_pos }),
+            (Geom::Line(l), GripRole::LineEndA) => Geom::Line(Line { a: new_pos, b: l.b }),
+            (Geom::Line(l), GripRole::LineEndB) => Geom::Line(Line { a: l.a, b: new_pos }),
             (Geom::Line(l), GripRole::LineMid) => {
                 let delta = new_pos - (l.a + l.b) * 0.5;
-                Geom::Line(Line { a: l.a + delta, b: l.b + delta })
+                Geom::Line(Line {
+                    a: l.a + delta,
+                    b: l.b + delta,
+                })
             }
             // ---- Circle ------------------------------------------------
-            (Geom::Circle(c), GripRole::CircleCenter) =>
-                Geom::Circle(Circle { center: new_pos, radius: c.radius }),
+            (Geom::Circle(c), GripRole::CircleCenter) => Geom::Circle(Circle {
+                center: new_pos,
+                radius: c.radius,
+            }),
             (Geom::Circle(c), GripRole::CircleQuadrant) => {
                 let new_r = (new_pos - c.center).len().max(EPS);
-                Geom::Circle(Circle { center: c.center, radius: new_r })
+                Geom::Circle(Circle {
+                    center: c.center,
+                    radius: new_r,
+                })
             }
             // ---- Arc ---------------------------------------------------
             (Geom::Arc(a), GripRole::ArcCenter) => {
@@ -3498,12 +4467,11 @@ impl Geom {
             (Geom::Arc(a), GripRole::ArcEndStart) => {
                 // Slide start endpoint along the radial direction at the
                 // new angle; sweep adjusts so the END endpoint stays put.
-                let new_start = (new_pos - a.center).angle()
+                let new_start = (new_pos - a.center)
+                    .angle()
                     .rem_euclid(std::f64::consts::TAU);
-                let old_end_abs = (a.start_angle + a.sweep_angle)
-                    .rem_euclid(std::f64::consts::TAU);
-                let new_sweep = (old_end_abs - new_start)
-                    .rem_euclid(std::f64::consts::TAU);
+                let old_end_abs = (a.start_angle + a.sweep_angle).rem_euclid(std::f64::consts::TAU);
+                let new_sweep = (old_end_abs - new_start).rem_euclid(std::f64::consts::TAU);
                 Geom::Arc(Arc {
                     center: a.center,
                     radius: a.radius,
@@ -3512,10 +4480,10 @@ impl Geom {
                 })
             }
             (Geom::Arc(a), GripRole::ArcEndEnd) => {
-                let new_end_abs = (new_pos - a.center).angle()
+                let new_end_abs = (new_pos - a.center)
+                    .angle()
                     .rem_euclid(std::f64::consts::TAU);
-                let new_sweep = (new_end_abs - a.start_angle)
-                    .rem_euclid(std::f64::consts::TAU);
+                let new_sweep = (new_end_abs - a.start_angle).rem_euclid(std::f64::consts::TAU);
                 Geom::Arc(Arc {
                     center: a.center,
                     radius: a.radius,
@@ -3526,10 +4494,7 @@ impl Geom {
             (Geom::Arc(a), GripRole::ArcMid) => {
                 // v1: translate whole arc so the midpoint lands at new_pos.
                 let mid_t = a.start_angle + a.sweep_angle * 0.5;
-                let mid = a.center + Vec2::new(
-                    a.radius * mid_t.cos(),
-                    a.radius * mid_t.sin(),
-                );
+                let mid = a.center + Vec2::new(a.radius * mid_t.cos(), a.radius * mid_t.sin());
                 let delta = new_pos - mid;
                 Geom::Arc(Arc {
                     center: a.center + delta,
@@ -3539,12 +4504,11 @@ impl Geom {
                 })
             }
             // ---- Ellipse -----------------------------------------------
-            (Geom::Ellipse(el), GripRole::EllipseCenter) =>
-                Geom::Ellipse(Ellipse {
-                    center: new_pos,
-                    major:  el.major,
-                    ratio:  el.ratio,
-                }),
+            (Geom::Ellipse(el), GripRole::EllipseCenter) => Geom::Ellipse(Ellipse {
+                center: new_pos,
+                major: el.major,
+                ratio: el.ratio,
+            }),
             (Geom::Ellipse(el), GripRole::EllipseMajorTip) => {
                 // Major axis becomes (new_pos - center). Ratio (b/a) stays
                 // so b scales proportionally. Direction of the ellipse
@@ -3555,8 +4519,8 @@ impl Geom {
                 }
                 Geom::Ellipse(Ellipse {
                     center: el.center,
-                    major:  new_major,
-                    ratio:  el.ratio,
+                    major: new_major,
+                    ratio: el.ratio,
                 })
             }
             (Geom::Ellipse(el), GripRole::EllipseMinorTip) => {
@@ -3566,8 +4530,8 @@ impl Geom {
                 let new_ratio = (new_b / el.semi_major()).max(1e-6);
                 Geom::Ellipse(Ellipse {
                     center: el.center,
-                    major:  el.major,
-                    ratio:  new_ratio,
+                    major: el.major,
+                    ratio: new_ratio,
                 })
             }
             // ---- EllipseArc --------------------------------------------
@@ -3585,12 +4549,12 @@ impl Geom {
             (Geom::EllipseArc(ea), GripRole::EllipseArcEndStart) => {
                 // Re-project new_pos to the ellipse parameter; new start_param
                 // = that t; sweep_param adjusts so the END endpoint stays.
-                let new_start = ea.ellipse.nearest_param(new_pos)
+                let new_start = ea
+                    .ellipse
+                    .nearest_param(new_pos)
                     .rem_euclid(std::f64::consts::TAU);
-                let old_end = (ea.start_param + ea.sweep_param)
-                    .rem_euclid(std::f64::consts::TAU);
-                let new_sweep = (old_end - new_start)
-                    .rem_euclid(std::f64::consts::TAU);
+                let old_end = (ea.start_param + ea.sweep_param).rem_euclid(std::f64::consts::TAU);
+                let new_sweep = (old_end - new_start).rem_euclid(std::f64::consts::TAU);
                 Geom::EllipseArc(EllipseArc {
                     ellipse: ea.ellipse,
                     start_param: new_start,
@@ -3598,10 +4562,11 @@ impl Geom {
                 })
             }
             (Geom::EllipseArc(ea), GripRole::EllipseArcEndEnd) => {
-                let new_end = ea.ellipse.nearest_param(new_pos)
+                let new_end = ea
+                    .ellipse
+                    .nearest_param(new_pos)
                     .rem_euclid(std::f64::consts::TAU);
-                let new_sweep = (new_end - ea.start_param)
-                    .rem_euclid(std::f64::consts::TAU);
+                let new_sweep = (new_end - ea.start_param).rem_euclid(std::f64::consts::TAU);
                 Geom::EllipseArc(EllipseArc {
                     ellipse: ea.ellipse,
                     start_param: ea.start_param,
@@ -3611,24 +4576,35 @@ impl Geom {
             // ---- Polyline ----------------------------------------------
             (Geom::Polyline(p), GripRole::PolyVertex(i)) => {
                 let mut new_verts = p.vertices.clone();
-                if let Some(v) = new_verts.get_mut(i) { v.pos = new_pos; }
-                Geom::Polyline(Polyline { vertices: new_verts, closed: p.closed, widths: p.widths.clone() })
+                if let Some(v) = new_verts.get_mut(i) {
+                    v.pos = new_pos;
+                }
+                Geom::Polyline(Polyline {
+                    vertices: new_verts,
+                    closed: p.closed,
+                    widths: p.widths.clone(),
+                })
             }
             // ---- Spline (control-point edit) ---------------------------
             (Geom::Spline(s), GripRole::SplineCtrlPt(i)) => {
                 let mut new_ctrls = s.control_points.clone();
-                if let Some(c) = new_ctrls.get_mut(i) { *c = new_pos; }
+                if let Some(c) = new_ctrls.get_mut(i) {
+                    *c = new_pos;
+                }
                 Geom::Spline(Spline {
-                    degree:         s.degree,
+                    degree: s.degree,
                     control_points: new_ctrls,
-                    weights:        s.weights.clone(),
-                    knots:          s.knots.clone(),
-                    width:          s.width,
+                    weights: s.weights.clone(),
+                    knots: s.knots.clone(),
+                    width: s.width,
                 })
             }
             // ---- Point -------------------------------------------------
-            (Geom::Point(p), GripRole::PointLoc) =>
-                Geom::Point(Point { location: new_pos, style: p.style, size: p.size }),
+            (Geom::Point(p), GripRole::PointLoc) => Geom::Point(Point {
+                location: new_pos,
+                style: p.style,
+                size: p.size,
+            }),
             // ---- Text — re-uses PointLoc role for its single anchor grip.
             (Geom::Text(t), GripRole::PointLoc) => {
                 let mut nt = t.clone();
@@ -3639,21 +4615,29 @@ impl Geom {
             // Grip drags reshape the centerline; both side lines re-derive
             // on render so the wall moves coherently as one entity.
             (Geom::Wall(w), GripRole::LineEndA) => Geom::Wall(Wall {
-                start: new_pos, end: w.end, thickness: w.thickness,
-                style: w.style, bulge: w.bulge,
+                start: new_pos,
+                end: w.end,
+                thickness: w.thickness,
+                style: w.style,
+                bulge: w.bulge,
             }),
             (Geom::Wall(w), GripRole::LineEndB) => Geom::Wall(Wall {
-                start: w.start, end: new_pos, thickness: w.thickness,
-                style: w.style, bulge: w.bulge,
+                start: w.start,
+                end: new_pos,
+                thickness: w.thickness,
+                style: w.style,
+                bulge: w.bulge,
             }),
             (Geom::Wall(w), GripRole::LineMid) => {
                 // Move the whole wall — translate by (new_pos - current mid).
                 let mid = (w.start + w.end) * 0.5;
                 let off = new_pos - mid;
                 Geom::Wall(Wall {
-                    start: w.start + off, end: w.end + off,
+                    start: w.start + off,
+                    end: w.end + off,
                     thickness: w.thickness,
-                    style: w.style, bulge: w.bulge,
+                    style: w.style,
+                    bulge: w.bulge,
                 })
             }
             // ---- Dimension --------------------------------------------------
@@ -3663,154 +4647,329 @@ impl Geom {
             (Geom::Dimension(d), GripRole::DimP1) => {
                 use crate::dim::DimKind;
                 let new_kind = match &d.kind {
-                    DimKind::Linear { p2, dimline_pos, ortho, .. } => DimKind::Linear {
-                        p1: new_pos, p2: *p2, dimline_pos: *dimline_pos, ortho: *ortho,
+                    DimKind::Linear {
+                        p2,
+                        dimline_pos,
+                        ortho,
+                        ..
+                    } => DimKind::Linear {
+                        p1: new_pos,
+                        p2: *p2,
+                        dimline_pos: *dimline_pos,
+                        ortho: *ortho,
                     },
-                    DimKind::Radius { on_circle, leader_end, .. } => DimKind::Radius {
-                        center: new_pos, on_circle: *on_circle, leader_end: *leader_end,
+                    DimKind::Radius {
+                        on_circle,
+                        leader_end,
+                        ..
+                    } => DimKind::Radius {
+                        center: new_pos,
+                        on_circle: *on_circle,
+                        leader_end: *leader_end,
                     },
-                    DimKind::Diameter { on_circle, leader_end, .. } => DimKind::Diameter {
-                        center: new_pos, on_circle: *on_circle, leader_end: *leader_end,
+                    DimKind::Diameter {
+                        on_circle,
+                        leader_end,
+                        ..
+                    } => DimKind::Diameter {
+                        center: new_pos,
+                        on_circle: *on_circle,
+                        leader_end: *leader_end,
                     },
                     // Angular DimP1 = the vertex.
-                    DimKind::Angular { p1, p2, arc_pos, .. } => DimKind::Angular {
-                        vertex: new_pos, p1: *p1, p2: *p2, arc_pos: *arc_pos,
+                    DimKind::Angular {
+                        p1, p2, arc_pos, ..
+                    } => DimKind::Angular {
+                        vertex: new_pos,
+                        p1: *p1,
+                        p2: *p2,
+                        arc_pos: *arc_pos,
                     },
                     // ArcLen P1 = the center.
-                    DimKind::ArcLen { radius, start_angle, sweep, leader_end, .. } =>
-                        DimKind::ArcLen {
-                            center: new_pos, radius: *radius,
-                            start_angle: *start_angle, sweep: *sweep,
-                            leader_end: *leader_end,
-                        },
+                    DimKind::ArcLen {
+                        radius,
+                        start_angle,
+                        sweep,
+                        leader_end,
+                        ..
+                    } => DimKind::ArcLen {
+                        center: new_pos,
+                        radius: *radius,
+                        start_angle: *start_angle,
+                        sweep: *sweep,
+                        leader_end: *leader_end,
+                    },
                     // Ordinate P1 = the datum.
-                    DimKind::Ordinate { point, leader_end, is_x, .. } => DimKind::Ordinate {
-                        datum: new_pos, point: *point, leader_end: *leader_end, is_x: *is_x,
+                    DimKind::Ordinate {
+                        point,
+                        leader_end,
+                        is_x,
+                        ..
+                    } => DimKind::Ordinate {
+                        datum: new_pos,
+                        point: *point,
+                        leader_end: *leader_end,
+                        is_x: *is_x,
                     },
                     // JoggedRadius P1 = the center.
-                    DimKind::JoggedRadius { on_circle, leader_end, jog_pos, .. } =>
-                        DimKind::JoggedRadius {
-                            center: new_pos, on_circle: *on_circle,
-                            leader_end: *leader_end, jog_pos: *jog_pos,
-                        },
+                    DimKind::JoggedRadius {
+                        on_circle,
+                        leader_end,
+                        jog_pos,
+                        ..
+                    } => DimKind::JoggedRadius {
+                        center: new_pos,
+                        on_circle: *on_circle,
+                        leader_end: *leader_end,
+                        jog_pos: *jog_pos,
+                    },
                 };
                 Geom::Dimension(crate::dim::Dim {
-                    kind: new_kind, style: d.style, text_override: d.text_override.clone(),
+                    kind: new_kind,
+                    style: d.style,
+                    text_override: d.text_override.clone(),
                 })
             }
             (Geom::Dimension(d), GripRole::DimP2) => {
                 use crate::dim::DimKind;
                 let new_kind = match &d.kind {
-                    DimKind::Linear { p1, dimline_pos, ortho, .. } => DimKind::Linear {
-                        p1: *p1, p2: new_pos, dimline_pos: *dimline_pos, ortho: *ortho,
+                    DimKind::Linear {
+                        p1,
+                        dimline_pos,
+                        ortho,
+                        ..
+                    } => DimKind::Linear {
+                        p1: *p1,
+                        p2: new_pos,
+                        dimline_pos: *dimline_pos,
+                        ortho: *ortho,
                     },
-                    DimKind::Radius { center, leader_end, .. } => DimKind::Radius {
-                        center: *center, on_circle: new_pos, leader_end: *leader_end,
+                    DimKind::Radius {
+                        center, leader_end, ..
+                    } => DimKind::Radius {
+                        center: *center,
+                        on_circle: new_pos,
+                        leader_end: *leader_end,
                     },
-                    DimKind::Diameter { center, leader_end, .. } => DimKind::Diameter {
-                        center: *center, on_circle: new_pos, leader_end: *leader_end,
+                    DimKind::Diameter {
+                        center, leader_end, ..
+                    } => DimKind::Diameter {
+                        center: *center,
+                        on_circle: new_pos,
+                        leader_end: *leader_end,
                     },
                     // Angular DimP2 = the first ray point.
-                    DimKind::Angular { vertex, p2, arc_pos, .. } => DimKind::Angular {
-                        vertex: *vertex, p1: new_pos, p2: *p2, arc_pos: *arc_pos,
+                    DimKind::Angular {
+                        vertex,
+                        p2,
+                        arc_pos,
+                        ..
+                    } => DimKind::Angular {
+                        vertex: *vertex,
+                        p1: new_pos,
+                        p2: *p2,
+                        arc_pos: *arc_pos,
                     },
                     // ArcLen P2 = the arc start point (re-anchor start angle).
-                    DimKind::ArcLen { center, radius, sweep, leader_end, .. } => {
+                    DimKind::ArcLen {
+                        center,
+                        radius,
+                        sweep,
+                        leader_end,
+                        ..
+                    } => {
                         let start_angle = (new_pos - *center).angle();
                         DimKind::ArcLen {
-                            center: *center, radius: *radius,
-                            start_angle, sweep: *sweep, leader_end: *leader_end,
+                            center: *center,
+                            radius: *radius,
+                            start_angle,
+                            sweep: *sweep,
+                            leader_end: *leader_end,
                         }
                     }
                     // Ordinate P2 = the measured point.
-                    DimKind::Ordinate { datum, leader_end, is_x, .. } => DimKind::Ordinate {
-                        datum: *datum, point: new_pos, leader_end: *leader_end, is_x: *is_x,
+                    DimKind::Ordinate {
+                        datum,
+                        leader_end,
+                        is_x,
+                        ..
+                    } => DimKind::Ordinate {
+                        datum: *datum,
+                        point: new_pos,
+                        leader_end: *leader_end,
+                        is_x: *is_x,
                     },
                     // JoggedRadius P2 = the on-circle point.
-                    DimKind::JoggedRadius { center, leader_end, jog_pos, .. } =>
-                        DimKind::JoggedRadius {
-                            center: *center, on_circle: new_pos,
-                            leader_end: *leader_end, jog_pos: *jog_pos,
-                        },
+                    DimKind::JoggedRadius {
+                        center,
+                        leader_end,
+                        jog_pos,
+                        ..
+                    } => DimKind::JoggedRadius {
+                        center: *center,
+                        on_circle: new_pos,
+                        leader_end: *leader_end,
+                        jog_pos: *jog_pos,
+                    },
                 };
                 Geom::Dimension(crate::dim::Dim {
-                    kind: new_kind, style: d.style, text_override: d.text_override.clone(),
+                    kind: new_kind,
+                    style: d.style,
+                    text_override: d.text_override.clone(),
                 })
             }
             (Geom::Dimension(d), GripRole::DimLeader) => {
                 use crate::dim::DimKind;
                 let new_kind = match &d.kind {
                     DimKind::Linear { p1, p2, ortho, .. } => DimKind::Linear {
-                        p1: *p1, p2: *p2, dimline_pos: new_pos, ortho: *ortho,
+                        p1: *p1,
+                        p2: *p2,
+                        dimline_pos: new_pos,
+                        ortho: *ortho,
                     },
-                    DimKind::Radius { center, on_circle, .. } => DimKind::Radius {
-                        center: *center, on_circle: *on_circle, leader_end: new_pos,
+                    DimKind::Radius {
+                        center, on_circle, ..
+                    } => DimKind::Radius {
+                        center: *center,
+                        on_circle: *on_circle,
+                        leader_end: new_pos,
                     },
-                    DimKind::Diameter { center, on_circle, .. } => DimKind::Diameter {
-                        center: *center, on_circle: *on_circle, leader_end: new_pos,
+                    DimKind::Diameter {
+                        center, on_circle, ..
+                    } => DimKind::Diameter {
+                        center: *center,
+                        on_circle: *on_circle,
+                        leader_end: new_pos,
                     },
                     // Angular DimP1 = the vertex.
-                    DimKind::Angular { p1, p2, arc_pos, .. } => DimKind::Angular {
-                        vertex: new_pos, p1: *p1, p2: *p2, arc_pos: *arc_pos,
+                    DimKind::Angular {
+                        p1, p2, arc_pos, ..
+                    } => DimKind::Angular {
+                        vertex: new_pos,
+                        p1: *p1,
+                        p2: *p2,
+                        arc_pos: *arc_pos,
                     },
                     // ArcLen P1 = the center.
-                    DimKind::ArcLen { radius, start_angle, sweep, leader_end, .. } =>
-                        DimKind::ArcLen {
-                            center: new_pos, radius: *radius,
-                            start_angle: *start_angle, sweep: *sweep,
-                            leader_end: *leader_end,
-                        },
+                    DimKind::ArcLen {
+                        radius,
+                        start_angle,
+                        sweep,
+                        leader_end,
+                        ..
+                    } => DimKind::ArcLen {
+                        center: new_pos,
+                        radius: *radius,
+                        start_angle: *start_angle,
+                        sweep: *sweep,
+                        leader_end: *leader_end,
+                    },
                     // Ordinate P1 = the datum.
-                    DimKind::Ordinate { point, leader_end, is_x, .. } => DimKind::Ordinate {
-                        datum: new_pos, point: *point, leader_end: *leader_end, is_x: *is_x,
+                    DimKind::Ordinate {
+                        point,
+                        leader_end,
+                        is_x,
+                        ..
+                    } => DimKind::Ordinate {
+                        datum: new_pos,
+                        point: *point,
+                        leader_end: *leader_end,
+                        is_x: *is_x,
                     },
                     // JoggedRadius P1 = the center.
-                    DimKind::JoggedRadius { on_circle, leader_end, jog_pos, .. } =>
-                        DimKind::JoggedRadius {
-                            center: new_pos, on_circle: *on_circle,
-                            leader_end: *leader_end, jog_pos: *jog_pos,
-                        },
+                    DimKind::JoggedRadius {
+                        on_circle,
+                        leader_end,
+                        jog_pos,
+                        ..
+                    } => DimKind::JoggedRadius {
+                        center: new_pos,
+                        on_circle: *on_circle,
+                        leader_end: *leader_end,
+                        jog_pos: *jog_pos,
+                    },
                 };
                 Geom::Dimension(crate::dim::Dim {
-                    kind: new_kind, style: d.style, text_override: d.text_override.clone(),
+                    kind: new_kind,
+                    style: d.style,
+                    text_override: d.text_override.clone(),
                 })
             }
             (Geom::Dimension(d), GripRole::DimLeader) => {
                 use crate::dim::DimKind;
                 let new_kind = match &d.kind {
                     DimKind::Linear { p1, p2, ortho, .. } => DimKind::Linear {
-                        p1: *p1, p2: *p2, dimline_pos: new_pos, ortho: *ortho,
+                        p1: *p1,
+                        p2: *p2,
+                        dimline_pos: new_pos,
+                        ortho: *ortho,
                     },
-                    DimKind::Radius { center, on_circle, .. } => DimKind::Radius {
-                        center: *center, on_circle: *on_circle, leader_end: new_pos,
+                    DimKind::Radius {
+                        center, on_circle, ..
+                    } => DimKind::Radius {
+                        center: *center,
+                        on_circle: *on_circle,
+                        leader_end: new_pos,
                     },
-                    DimKind::Diameter { center, on_circle, .. } => DimKind::Diameter {
-                        center: *center, on_circle: *on_circle, leader_end: new_pos,
+                    DimKind::Diameter {
+                        center, on_circle, ..
+                    } => DimKind::Diameter {
+                        center: *center,
+                        on_circle: *on_circle,
+                        leader_end: new_pos,
                     },
                     // Angular DimLeader = the second ray point.
-                    DimKind::Angular { vertex, p1, arc_pos, .. } => DimKind::Angular {
-                        vertex: *vertex, p1: *p1, p2: new_pos, arc_pos: *arc_pos,
+                    DimKind::Angular {
+                        vertex,
+                        p1,
+                        arc_pos,
+                        ..
+                    } => DimKind::Angular {
+                        vertex: *vertex,
+                        p1: *p1,
+                        p2: new_pos,
+                        arc_pos: *arc_pos,
                     },
                     // ArcLen leader = the leader tail.
-                    DimKind::ArcLen { center, radius, start_angle, sweep, .. } =>
-                        DimKind::ArcLen {
-                            center: *center, radius: *radius,
-                            start_angle: *start_angle, sweep: *sweep,
-                            leader_end: new_pos,
-                        },
+                    DimKind::ArcLen {
+                        center,
+                        radius,
+                        start_angle,
+                        sweep,
+                        ..
+                    } => DimKind::ArcLen {
+                        center: *center,
+                        radius: *radius,
+                        start_angle: *start_angle,
+                        sweep: *sweep,
+                        leader_end: new_pos,
+                    },
                     // Ordinate leader = the leader tail.
-                    DimKind::Ordinate { datum, point, is_x, .. } => DimKind::Ordinate {
-                        datum: *datum, point: *point, leader_end: new_pos, is_x: *is_x,
+                    DimKind::Ordinate {
+                        datum, point, is_x, ..
+                    } => DimKind::Ordinate {
+                        datum: *datum,
+                        point: *point,
+                        leader_end: new_pos,
+                        is_x: *is_x,
                     },
                     // JoggedRadius leader = the leader tail.
-                    DimKind::JoggedRadius { center, on_circle, jog_pos, .. } =>
-                        DimKind::JoggedRadius {
-                            center: *center, on_circle: *on_circle,
-                            leader_end: new_pos, jog_pos: *jog_pos,
-                        },
+                    DimKind::JoggedRadius {
+                        center,
+                        on_circle,
+                        jog_pos,
+                        ..
+                    } => DimKind::JoggedRadius {
+                        center: *center,
+                        on_circle: *on_circle,
+                        leader_end: new_pos,
+                        jog_pos: *jog_pos,
+                    },
                 };
                 Geom::Dimension(crate::dim::Dim {
-                    kind: new_kind, style: d.style, text_override: d.text_override.clone(),
+                    kind: new_kind,
+                    style: d.style,
+                    text_override: d.text_override.clone(),
                 })
             }
             // Angular arc-position grip: move the arc handle.
@@ -3818,31 +4977,45 @@ impl Geom {
                 use crate::dim::DimKind;
                 let new_kind = match &d.kind {
                     DimKind::Angular { vertex, p1, p2, .. } => DimKind::Angular {
-                        vertex: *vertex, p1: *p1, p2: *p2, arc_pos: new_pos,
+                        vertex: *vertex,
+                        p1: *p1,
+                        p2: *p2,
+                        arc_pos: new_pos,
                     },
                     _ => return self.clone(),
                 };
                 Geom::Dimension(crate::dim::Dim {
-                    kind: new_kind, style: d.style, text_override: d.text_override.clone(),
+                    kind: new_kind,
+                    style: d.style,
+                    text_override: d.text_override.clone(),
                 })
             }
             // BlockRef — the insertion grip carries the whole instance.
-            (Geom::BlockRef(br), GripRole::BlockInsert) => {
-                Geom::BlockRef(crate::block::BlockRef {
-                    insert: new_pos, ..br.clone()
-                })
-            }
+            (Geom::BlockRef(br), GripRole::BlockInsert) => Geom::BlockRef(crate::block::BlockRef {
+                insert: new_pos,
+                ..br.clone()
+            }),
             // ---- Leader — vertex grips reshape the chain; PointLoc moves
             // the label anchor (and the landing vertex stays put).
             (Geom::Leader(l), GripRole::PolyVertex(i)) => {
                 let mut new_pts = l.pts.clone();
-                if let Some(p) = new_pts.get_mut(i) { *p = new_pos; }
-                Geom::Leader(Leader { pts: new_pts, ..l.clone() })
+                if let Some(p) = new_pts.get_mut(i) {
+                    *p = new_pos;
+                }
+                Geom::Leader(Leader {
+                    pts: new_pts,
+                    ..l.clone()
+                })
             }
             (Geom::Leader(l), GripRole::LineEndA) => {
                 let mut new_pts = l.pts.clone();
-                if let Some(p) = new_pts.first_mut() { *p = new_pos; }
-                Geom::Leader(Leader { pts: new_pts, ..l.clone() })
+                if let Some(p) = new_pts.first_mut() {
+                    *p = new_pos;
+                }
+                Geom::Leader(Leader {
+                    pts: new_pts,
+                    ..l.clone()
+                })
             }
             (Geom::Leader(l), GripRole::PointLoc) => {
                 let mut nl = l.clone();
@@ -3850,39 +5023,47 @@ impl Geom {
                 Geom::Leader(nl)
             }
             // ---- AttrDef — move the position (like Text).
-            (Geom::AttrDef(a), GripRole::PointLoc) => {
-                Geom::AttrDef(crate::block::AttrDef { position: new_pos, ..a.clone() })
-            }
+            (Geom::AttrDef(a), GripRole::PointLoc) => Geom::AttrDef(crate::block::AttrDef {
+                position: new_pos,
+                ..a.clone()
+            }),
             // ---- CenterMark — center grip translates; any arm-tip grip
             // resizes the cross symmetrically (size = distance from the
             // moved tip to the center, floored so it can't collapse).
-            (Geom::CenterMark(cm), GripRole::CircleCenter) => {
-                Geom::CenterMark(CenterMark { center: new_pos, ..*cm })
-            }
+            (Geom::CenterMark(cm), GripRole::CircleCenter) => Geom::CenterMark(CenterMark {
+                center: new_pos,
+                ..*cm
+            }),
             // ---- Xline — base grip translates; direction handle rotates
             // the direction to point at the grip (keeps base fixed).
-            (Geom::Xline(x), GripRole::CircleCenter) => {
-                Geom::Xline(Xline { base: new_pos, dir: x.dir })
-            }
+            (Geom::Xline(x), GripRole::CircleCenter) => Geom::Xline(Xline {
+                base: new_pos,
+                dir: x.dir,
+            }),
             (Geom::Xline(x), GripRole::LineEndA) => {
                 Geom::Xline(Xline::new(x.base, new_pos - x.base))
             }
             // Xref — insert grip moves; far grip rescales.
-            (Geom::Xref(x), GripRole::BlockInsert) => {
-                Geom::Xref(crate::xref::Xref { insert: new_pos, ..x.clone() })
-            }
+            (Geom::Xref(x), GripRole::BlockInsert) => Geom::Xref(crate::xref::Xref {
+                insert: new_pos,
+                ..x.clone()
+            }),
             (Geom::Xref(x), GripRole::LineEndA) => {
                 let (mn, mx) = x.bbox();
                 let w = (mx.x - mn.x).max(x.scale).max(1e-9);
                 let d = (new_pos - x.insert).len();
                 let k = (d / w).clamp(0.01, 1e6);
-                Geom::Xref(crate::xref::Xref { scale: x.scale * k, ..x.clone() })
+                Geom::Xref(crate::xref::Xref {
+                    scale: x.scale * k,
+                    ..x.clone()
+                })
             }
             // Table — anchor grip moves; far-corner grip rescales (uniform
             // factor from the anchor so rows/cols stay proportional).
-            (Geom::Table(t), GripRole::CircleCenter) => {
-                Geom::Table(crate::table::Table { insert: new_pos, ..t.clone() })
-            }
+            (Geom::Table(t), GripRole::CircleCenter) => Geom::Table(crate::table::Table {
+                insert: new_pos,
+                ..t.clone()
+            }),
             (Geom::Table(t), GripRole::LineEndA) => {
                 let s = t.size();
                 let (sin, cos) = t.rotation.sin_cos();
@@ -3890,7 +5071,9 @@ impl Geom {
                 let d = new_pos - t.insert;
                 let gx = d.x * cos + d.y * sin;
                 let gy = -d.x * sin + d.y * cos;
-                if s.x.abs() < 1e-9 || s.y.abs() < 1e-9 { return self.clone(); }
+                if s.x.abs() < 1e-9 || s.y.abs() < 1e-9 {
+                    return self.clone();
+                }
                 let kx = gx / s.x;
                 let ky = (-gy) / s.y;
                 let k = kx.max(ky).max(0.05);
@@ -3940,8 +5123,9 @@ impl Geom {
                 })
             }
             // ---- Donut ------------------------------------------------
-            (Geom::Donut(d), GripRole::CircleCenter) =>
-                Geom::Donut(Donut::new(new_pos, d.inner_radius, d.outer_radius)),
+            (Geom::Donut(d), GripRole::CircleCenter) => {
+                Geom::Donut(Donut::new(new_pos, d.inner_radius, d.outer_radius))
+            }
             (Geom::Donut(d), GripRole::LineEndA) => {
                 // Outer grip: re-radius the ring; inner clamps to the new
                 // outer (Donut::new keeps inner <= outer).
@@ -3956,7 +5140,9 @@ impl Geom {
             }
             (Geom::Wipeout(w), GripRole::LineEndA) => {
                 let mut pts = w.pts.clone();
-                if let Some(p) = pts.first_mut() { *p = new_pos; }
+                if let Some(p) = pts.first_mut() {
+                    *p = new_pos;
+                }
                 Geom::Wipeout(Wipeout { pts })
             }
             (Geom::Region(rg), GripRole::PolyVertex(i)) if i < rg.loop_pts.len() => {
@@ -3966,7 +5152,9 @@ impl Geom {
             }
             (Geom::Region(rg), GripRole::LineEndA) => {
                 let mut loop_pts = rg.loop_pts.clone();
-                if let Some(p) = loop_pts.first_mut() { *p = new_pos; }
+                if let Some(p) = loop_pts.first_mut() {
+                    *p = new_pos;
+                }
                 Geom::Region(Region { loop_pts })
             }
             // Mismatched (role, geom) — return unchanged.
@@ -3989,27 +5177,35 @@ impl Geom {
                 let anchor = p.vertices[(i + 2) % 4].pos;
                 let e1 = p.vertices[(i + 1) % 4].pos - anchor;
                 let e2 = p.vertices[(i + 3) % 4].pos - anchor;
-                let d = p.vertices[i].pos - anchor;      // = e1 + e2
-                if d.len() < EPS { return None; }
+                let d = p.vertices[i].pos - anchor; // = e1 + e2
+                if d.len() < EPS {
+                    return None;
+                }
                 let rel = new_pos - anchor;
                 let (sx, sy) = if uniform {
                     let s = rel.dot(d) / d.len_sq();
                     (s, s)
                 } else {
                     let denom = e1.x * e2.y - e1.y * e2.x;
-                    if denom.abs() < 1e-9 { return None; }
+                    if denom.abs() < 1e-9 {
+                        return None;
+                    }
                     let sx = (rel.x * e2.y - rel.y * e2.x) / denom;
                     let sy = (e1.x * rel.y - e1.y * rel.x) / denom;
                     (sx, sy)
                 };
                 // A scale to (near-)zero collapses the quad — refuse it.
-                if sx.abs() < 1e-6 || sy.abs() < 1e-6 { return None; }
+                if sx.abs() < 1e-6 || sy.abs() < 1e-6 {
+                    return None;
+                }
                 let mut verts = p.vertices.clone();
-                verts[i].pos          = anchor + e1 * sx + e2 * sy;
+                verts[i].pos = anchor + e1 * sx + e2 * sy;
                 verts[(i + 1) % 4].pos = anchor + e1 * sx;
                 verts[(i + 3) % 4].pos = anchor + e2 * sy;
                 Some(Geom::Polyline(Polyline {
-                    vertices: verts, closed: true, widths: p.widths.clone(),
+                    vertices: verts,
+                    closed: true,
+                    widths: p.widths.clone(),
                 }))
             }
             _ => None,
@@ -4017,30 +5213,27 @@ impl Geom {
     }
 }
 
-
-
-
-
-
-
 #[cfg(test)]
 mod fillet_chamfer_join_tests {
     use super::*;
     use crate::join::*;
-    use crate::trim::*;
-    use crate::modify::*;
     use crate::math::approx_eq;
+    use crate::modify::*;
+    use crate::trim::*;
 
     fn ln(ax: f64, ay: f64, bx: f64, by: f64) -> Line {
-        Line { a: Vec2::new(ax, ay), b: Vec2::new(bx, by) }
+        Line {
+            a: Vec2::new(ax, ay),
+            b: Vec2::new(bx, by),
+        }
     }
 
     // --- fillet -----------------------------------------------------------
 
     #[test]
     fn fillet_right_angle_radius_1() {
-        let l1 = ln(0.0, 0.0, 5.0, 0.0);  // along +X
-        let l2 = ln(0.0, 0.0, 0.0, 5.0);  // along +Y
+        let l1 = ln(0.0, 0.0, 5.0, 0.0); // along +X
+        let l2 = ln(0.0, 0.0, 0.0, 5.0); // along +Y
         let p1 = Vec2::new(3.0, 0.0);
         let p2 = Vec2::new(0.0, 3.0);
         let out = fillet_lines(&l1, p1, &l2, p2, 1.0).unwrap();
@@ -4048,19 +5241,25 @@ mod fillet_chamfer_join_tests {
             assert!(approx_eq(l.a.x, 5.0));
             assert!(approx_eq(l.b.x, 1.0));
             assert!(approx_eq(l.b.y, 0.0));
-        } else { panic!("g1_new not a Line") }
+        } else {
+            panic!("g1_new not a Line")
+        }
         if let Geom::Line(l) = out.g2_new {
             assert!(approx_eq(l.b.y, 5.0));
             assert!(approx_eq(l.a.x, 0.0));
             assert!(approx_eq(l.a.y, 1.0));
-        } else { panic!("g2_new not a Line") }
+        } else {
+            panic!("g2_new not a Line")
+        }
         let arc = out.arc.expect("expected an arc for r>0");
         if let Geom::Arc(a) = arc {
             assert!(approx_eq(a.radius, 1.0));
             assert!(approx_eq(a.center.x, 1.0));
             assert!(approx_eq(a.center.y, 1.0));
             assert!(approx_eq(a.sweep_angle, std::f64::consts::FRAC_PI_2));
-        } else { panic!("arc not an Arc") }
+        } else {
+            panic!("arc not an Arc")
+        }
     }
 
     #[test]
@@ -4071,49 +5270,74 @@ mod fillet_chamfer_join_tests {
         // The old `dot > 0` start-angle heuristic mis-fired here and rendered
         // the arc on the wrong side (only θ = 90° happened to be correct).
         use std::f64::consts::PI;
-        let theta = 2.0 * PI / 3.0;                       // 120°
-        let dir2  = Vec2::new(theta.cos(), theta.sin());
+        let theta = 2.0 * PI / 3.0; // 120°
+        let dir2 = Vec2::new(theta.cos(), theta.sin());
         let l1 = ln(0.0, 0.0, 10.0, 0.0);
-        let l2 = Line { a: Vec2::new(0.0, 0.0), b: dir2 * 10.0 };
+        let l2 = Line {
+            a: Vec2::new(0.0, 0.0),
+            b: dir2 * 10.0,
+        };
         let p1 = Vec2::new(8.0, 0.0);
         let p2 = dir2 * 8.0;
-        let r  = 2.0;
+        let r = 2.0;
         let out = fillet_lines(&l1, p1, &l2, p2, r).unwrap();
 
         // Expected geometry from first principles.
-        let t      = r / (theta / 2.0).tan();
-        let tp1    = Vec2::new(t, 0.0);
-        let tp2    = dir2 * t;
-        let bis    = Vec2::new(1.0, 0.0) + dir2;
+        let t = r / (theta / 2.0).tan();
+        let tp1 = Vec2::new(t, 0.0);
+        let tp2 = dir2 * t;
+        let bis = Vec2::new(1.0, 0.0) + dir2;
         let center = bis / bis.len() * (r / (theta / 2.0).sin());
-        let i_pt   = Vec2::new(0.0, 0.0);
+        let i_pt = Vec2::new(0.0, 0.0);
         let mid_exp = center + (i_pt - center) / (i_pt - center).len() * r;
 
-        let Geom::Arc(a) = out.arc.expect("expected an arc") else { panic!("not an arc") };
-        let pt = |ang: f64| Vec2::new(
-            a.center.x + a.radius * ang.cos(),
-            a.center.y + a.radius * ang.sin());
+        let Geom::Arc(a) = out.arc.expect("expected an arc") else {
+            panic!("not an arc")
+        };
+        let pt = |ang: f64| {
+            Vec2::new(
+                a.center.x + a.radius * ang.cos(),
+                a.center.y + a.radius * ang.sin(),
+            )
+        };
         let start = pt(a.start_angle);
-        let end   = pt(a.start_angle + a.sweep_angle);
-        let mid   = pt(a.start_angle + a.sweep_angle * 0.5);
+        let end = pt(a.start_angle + a.sweep_angle);
+        let mid = pt(a.start_angle + a.sweep_angle * 0.5);
         let close = |p: Vec2, q: Vec2| approx_eq(p.x, q.x) && approx_eq(p.y, q.y);
 
-        assert!(approx_eq(a.sweep_angle, PI - theta), "sweep should be π−θ (60°)");
-        assert!(close(a.center, center), "center {:?} != {:?}", a.center, center);
+        assert!(
+            approx_eq(a.sweep_angle, PI - theta),
+            "sweep should be π−θ (60°)"
+        );
+        assert!(
+            close(a.center, center),
+            "center {:?} != {:?}",
+            a.center,
+            center
+        );
         // Endpoints land on the two tangent points (either traversal order).
         assert!(
-            (close(start, tp1) && close(end, tp2)) ||
-            (close(start, tp2) && close(end, tp1)),
-            "arc endpoints {:?},{:?} should be tangent pts {:?},{:?}", start, end, tp1, tp2);
+            (close(start, tp1) && close(end, tp2)) || (close(start, tp2) && close(end, tp1)),
+            "arc endpoints {:?},{:?} should be tangent pts {:?},{:?}",
+            start,
+            end,
+            tp1,
+            tp2
+        );
         // Midpoint bulges toward the corner vertex I (the bug put it on the
         // opposite side of the circle).
-        assert!(close(mid, mid_exp), "arc mid {:?} should bulge toward I ({:?})", mid, mid_exp);
+        assert!(
+            close(mid, mid_exp),
+            "arc mid {:?} should bulge toward I ({:?})",
+            mid,
+            mid_exp
+        );
     }
 
     #[test]
     fn fillet_radius_zero_makes_sharp_corner() {
         let l1 = ln(0.0, 0.0, 5.0, 0.0);
-        let l2 = ln(2.0, -3.0, 2.0, 4.0);    // intersects l1 at (2, 0)
+        let l2 = ln(2.0, -3.0, 2.0, 4.0); // intersects l1 at (2, 0)
         let p1 = Vec2::new(4.5, 0.0);
         let p2 = Vec2::new(2.0, 3.0);
         let out = fillet_lines(&l1, p1, &l2, p2, 0.0).unwrap();
@@ -4121,7 +5345,9 @@ mod fillet_chamfer_join_tests {
         if let Geom::Line(l) = out.g1_new {
             assert!(approx_eq(l.b.x, 2.0));
             assert!(approx_eq(l.b.y, 0.0));
-        } else { panic!() }
+        } else {
+            panic!()
+        }
     }
 
     #[test]
@@ -4135,7 +5361,7 @@ mod fillet_chamfer_join_tests {
 
     #[test]
     fn fillet_radius_too_large_errs() {
-        let l1 = ln(0.0, 0.0, 1.0, 0.0);  // 1-long
+        let l1 = ln(0.0, 0.0, 1.0, 0.0); // 1-long
         let l2 = ln(0.0, 0.0, 0.0, 1.0);
         let p1 = Vec2::new(0.5, 0.0);
         let p2 = Vec2::new(0.0, 0.5);
@@ -4155,15 +5381,23 @@ mod fillet_chamfer_join_tests {
         if let Geom::Line(l) = out.g1_new {
             assert!(approx_eq(l.b.x, 1.0));
             assert!(approx_eq(l.b.y, 0.0));
-        } else { panic!() }
+        } else {
+            panic!()
+        }
         if let Geom::Line(l) = out.g2_new {
             assert!(approx_eq(l.a.x, 0.0));
             assert!(approx_eq(l.a.y, 2.0));
-        } else { panic!() }
+        } else {
+            panic!()
+        }
         if let Some(Geom::Line(l)) = out.bridge {
-            assert!(approx_eq(l.a.x, 1.0)); assert!(approx_eq(l.a.y, 0.0));
-            assert!(approx_eq(l.b.x, 0.0)); assert!(approx_eq(l.b.y, 2.0));
-        } else { panic!() }
+            assert!(approx_eq(l.a.x, 1.0));
+            assert!(approx_eq(l.a.y, 0.0));
+            assert!(approx_eq(l.b.x, 0.0));
+            assert!(approx_eq(l.b.y, 2.0));
+        } else {
+            panic!()
+        }
     }
 
     // --- join: collinear lines -------------------------------------------
@@ -4180,7 +5414,9 @@ mod fillet_chamfer_join_tests {
         if let Geom::Line(l) = &out.merged[0] {
             assert!(approx_eq(l.a.x, 0.0));
             assert!(approx_eq(l.b.x, 5.0));
-        } else { panic!() }
+        } else {
+            panic!()
+        }
     }
 
     #[test]
@@ -4194,7 +5430,9 @@ mod fillet_chamfer_join_tests {
         if let Geom::Line(l) = &out.merged[0] {
             assert!(approx_eq(l.a.x, 0.0));
             assert!(approx_eq(l.b.x, 5.0));
-        } else { panic!() }
+        } else {
+            panic!()
+        }
     }
 
     #[test]
@@ -4205,21 +5443,35 @@ mod fillet_chamfer_join_tests {
         // chord).
         let pl = Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 1.0 },
-                PolyVertex { pos: Vec2::new(2.0, 0.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 1.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(2.0, 0.0),
+                    bulge: 0.0,
+                },
             ],
             closed: false,
             widths: Vec::new(),
         };
         let (min, max) = pl.bbox();
-        assert!(min.y <= -0.99, "bbox must include the arc apex, got min.y={}", min.y);
+        assert!(
+            min.y <= -0.99,
+            "bbox must include the arc apex, got min.y={}",
+            min.y
+        );
         assert!(max.y >= -0.01);
         // A point right on the arc apex (1,-1) should be ~0 from the polyline.
         let d = pl.distance_to_point(Vec2::new(1.0, -1.0));
         assert!(d < 1e-6, "apex should lie on the polyline, got dist={}", d);
         // The chord midpoint (1,0) is ~1 unit from the arc (NOT on it).
         let d_chord = pl.distance_to_point(Vec2::new(1.0, 0.0));
-        assert!(d_chord > 0.9, "chord midpoint should be off the arc, got {}", d_chord);
+        assert!(
+            d_chord > 0.9,
+            "chord midpoint should be off the arc, got {}",
+            d_chord
+        );
     }
 
     #[test]
@@ -4232,7 +5484,10 @@ mod fillet_chamfer_join_tests {
             (1usize, Geom::Line(ln(5.0, 0.0, 8.0, 0.0))),
         ];
         let out = join_geoms(&items);
-        assert!(out.merged.is_empty(), "gapped collinear lines must not merge");
+        assert!(
+            out.merged.is_empty(),
+            "gapped collinear lines must not merge"
+        );
         assert!(out.consumed_indices.is_empty());
     }
 
@@ -4242,29 +5497,42 @@ mod fillet_chamfer_join_tests {
         // each other, but each touches an arc that bridges the gap. Must yield
         // a single polyline (line→arc→line), NOT a straight line across.
         let a = Vec2::new(0.0, 0.0);
-        let b = Vec2::new(2.0, 0.0);          // stub-left end / arc start
-        let c = Vec2::new(4.0, 0.0);          // arc end / stub-right start
+        let b = Vec2::new(2.0, 0.0); // stub-left end / arc start
+        let c = Vec2::new(4.0, 0.0); // arc end / stub-right start
         let d = Vec2::new(6.0, 0.0);
         // Semicircle bulging up from b to c (center (3,0), r=1).
         let (center, r, start, sweep) = bulge_arc(b, c, 1.0).unwrap();
         let items = vec![
             (0usize, Geom::Line(Line { a, b })),
             (1usize, Geom::Line(Line { a: c, b: d })),
-            (2usize, Geom::Arc(Arc { center, radius: r,
-                                     start_angle: start, sweep_angle: sweep })),
+            (
+                2usize,
+                Geom::Arc(Arc {
+                    center,
+                    radius: r,
+                    start_angle: start,
+                    sweep_angle: sweep,
+                }),
+            ),
         ];
         let out = join_geoms(&items);
-        assert_eq!(out.consumed_indices.len(), 3, "all three pieces should chain");
+        assert_eq!(
+            out.consumed_indices.len(),
+            3,
+            "all three pieces should chain"
+        );
         assert_eq!(out.merged.len(), 1);
-        assert!(matches!(out.merged[0], Geom::Polyline(_)),
-                "result must be one polyline, not a bridged straight line");
+        assert!(
+            matches!(out.merged[0], Geom::Polyline(_)),
+            "result must be one polyline, not a bridged straight line"
+        );
     }
 
     #[test]
     fn bulge_from_arc_sign_major_and_minor() {
         let c = Vec2::ZERO;
-        let q = std::f64::consts::FRAC_PI_2;          // 90°
-        let three_q = 3.0 * q;                        // 270°
+        let q = std::f64::consts::FRAC_PI_2; // 90°
+        let three_q = 3.0 * q; // 270°
         let s = Vec2::new(1.0, 0.0);
         // Minor CCW: start (1,0) → end (0,1), 90° → positive bulge tan(22.5°).
         let b_minor = bulge_from_arc(s, Vec2::new(0.0, 1.0), c, q);
@@ -4282,18 +5550,27 @@ mod fillet_chamfer_join_tests {
 
     #[test]
     fn join_two_touching_arcs_same_center_radius() {
-        let a1 = Arc { center: Vec2::ZERO, radius: 1.0,
-                       start_angle: 0.0, sweep_angle: std::f64::consts::FRAC_PI_2 };
-        let a2 = Arc { center: Vec2::ZERO, radius: 1.0,
-                       start_angle: std::f64::consts::FRAC_PI_2,
-                       sweep_angle: std::f64::consts::FRAC_PI_2 };
+        let a1 = Arc {
+            center: Vec2::ZERO,
+            radius: 1.0,
+            start_angle: 0.0,
+            sweep_angle: std::f64::consts::FRAC_PI_2,
+        };
+        let a2 = Arc {
+            center: Vec2::ZERO,
+            radius: 1.0,
+            start_angle: std::f64::consts::FRAC_PI_2,
+            sweep_angle: std::f64::consts::FRAC_PI_2,
+        };
         let items = vec![(0usize, Geom::Arc(a1)), (1usize, Geom::Arc(a2))];
         let out = join_geoms(&items);
         assert_eq!(out.merged.len(), 1);
         if let Geom::Arc(a) = &out.merged[0] {
             assert!(approx_eq(a.sweep_angle, std::f64::consts::PI));
             assert!(approx_eq(a.radius, 1.0));
-        } else { panic!() }
+        } else {
+            panic!()
+        }
     }
 
     // --- join: chain → polyline ------------------------------------------
@@ -4302,11 +5579,15 @@ mod fillet_chamfer_join_tests {
     fn join_line_arc_line_chain_to_polyline() {
         let items = vec![
             (0, Geom::Line(ln(0.0, 0.0, 1.0, 0.0))),
-            (1, Geom::Arc(Arc {
-                center: Vec2::new(1.0, 1.0), radius: 1.0,
-                start_angle: -std::f64::consts::FRAC_PI_2,
-                sweep_angle: std::f64::consts::FRAC_PI_2,
-            })),
+            (
+                1,
+                Geom::Arc(Arc {
+                    center: Vec2::new(1.0, 1.0),
+                    radius: 1.0,
+                    start_angle: -std::f64::consts::FRAC_PI_2,
+                    sweep_angle: std::f64::consts::FRAC_PI_2,
+                }),
+            ),
             (2, Geom::Line(ln(2.0, 1.0, 2.0, 3.0))),
         ];
         let out = join_geoms(&items);
@@ -4323,13 +5604,13 @@ mod fillet_chamfer_join_tests {
         // Click on upper half → upper EllipseArc dropped; lower survives.
         let el = Ellipse {
             center: Vec2::ZERO,
-            major:  Vec2::new(2.0, 0.0),
-            ratio:  0.5,
+            major: Vec2::new(2.0, 0.0),
+            ratio: 0.5,
         };
-        let g      = Geom::Ellipse(el);
+        let g = Geom::Ellipse(el);
         let cutter = Geom::Line(Line {
             a: Vec2::new(-3.0, 0.0),
-            b: Vec2::new( 3.0, 0.0),
+            b: Vec2::new(3.0, 0.0),
         });
         let pieces = g.trim_at(&[cutter], Vec2::new(0.0, 0.5), false).unwrap();
         assert_eq!(pieces.len(), 1, "expected one surviving EllipseArc");
@@ -4346,8 +5627,8 @@ mod fillet_chamfer_join_tests {
         // Three cuts → 3 arcs. Click inside one → 2 survive.
         let el = Ellipse {
             center: Vec2::ZERO,
-            major:  Vec2::new(3.0, 0.0),
-            ratio:  0.5,
+            major: Vec2::new(3.0, 0.0),
+            ratio: 0.5,
         };
         let g = Geom::Ellipse(el);
         // Three horizontal/diagonal lines through the ellipse, picked so
@@ -4356,8 +5637,14 @@ mod fillet_chamfer_join_tests {
         // not 3. Adjust: pick lines that share a common pair of points.
         // Easier: cut twice by parallel lines y=±0.4 — 4 intersections,
         // four sub-arcs.
-        let c1 = Geom::Line(Line { a: Vec2::new(-4.0,  0.4), b: Vec2::new(4.0,  0.4) });
-        let c2 = Geom::Line(Line { a: Vec2::new(-4.0, -0.4), b: Vec2::new(4.0, -0.4) });
+        let c1 = Geom::Line(Line {
+            a: Vec2::new(-4.0, 0.4),
+            b: Vec2::new(4.0, 0.4),
+        });
+        let c2 = Geom::Line(Line {
+            a: Vec2::new(-4.0, -0.4),
+            b: Vec2::new(4.0, -0.4),
+        });
         let pieces = g.trim_at(&[c1, c2], Vec2::new(0.0, 1.0), false).unwrap();
         // Click is on the top arc (between y=0.4 cuts at the top); 3 survive.
         assert_eq!(pieces.len(), 3);
@@ -4377,9 +5664,13 @@ mod fillet_chamfer_join_tests {
         let g = Geom::Line(ln(0.0, 0.0, 10.0, 0.0));
         let out = g.with_grip_moved(GripRole::LineEndA, Vec2::new(2.0, 5.0));
         if let Geom::Line(l) = out {
-            assert!(approx_eq(l.a.x, 2.0)); assert!(approx_eq(l.a.y, 5.0));
-            assert!(approx_eq(l.b.x, 10.0)); assert!(approx_eq(l.b.y, 0.0));
-        } else { panic!(); }
+            assert!(approx_eq(l.a.x, 2.0));
+            assert!(approx_eq(l.a.y, 5.0));
+            assert!(approx_eq(l.b.x, 10.0));
+            assert!(approx_eq(l.b.y, 0.0));
+        } else {
+            panic!();
+        }
     }
 
     #[test]
@@ -4392,39 +5683,60 @@ mod fillet_chamfer_join_tests {
             assert!(approx_eq(l.b.y, 3.0));
             assert!(approx_eq(l.a.x, 0.0));
             assert!(approx_eq(l.b.x, 10.0));
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn grip_circle_quadrant_changes_radius() {
-        let g = Geom::Circle(Circle { center: Vec2::ZERO, radius: 1.0 });
+        let g = Geom::Circle(Circle {
+            center: Vec2::ZERO,
+            radius: 1.0,
+        });
         // Drag a quadrant to (3, 4) → new radius = 5.
         let out = g.with_grip_moved(GripRole::CircleQuadrant, Vec2::new(3.0, 4.0));
         if let Geom::Circle(c) = out {
             assert!(approx_eq(c.center.x, 0.0));
             assert!(approx_eq(c.center.y, 0.0));
             assert!(approx_eq(c.radius, 5.0));
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn grip_circle_center_translates() {
-        let g = Geom::Circle(Circle { center: Vec2::ZERO, radius: 2.0 });
+        let g = Geom::Circle(Circle {
+            center: Vec2::ZERO,
+            radius: 2.0,
+        });
         let out = g.with_grip_moved(GripRole::CircleCenter, Vec2::new(7.0, 8.0));
         if let Geom::Circle(c) = out {
             assert!(approx_eq(c.center.x, 7.0));
             assert!(approx_eq(c.center.y, 8.0));
             assert!(approx_eq(c.radius, 2.0));
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn grip_polyline_vertex_moves_only_that_vertex() {
         let pl = Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(4.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(4.0, 4.0),
+                    bulge: 0.0,
+                },
             ],
             closed: false,
             widths: Vec::new(),
@@ -4435,7 +5747,9 @@ mod fillet_chamfer_join_tests {
             assert!(approx_eq(p.vertices[0].pos.y, 0.0));
             assert!(approx_eq(p.vertices[1].pos.y, -2.0));
             assert!(approx_eq(p.vertices[2].pos.y, 4.0));
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     /// Issue #39 — corner-grip scale on a closed quad: dragging corner 0
@@ -4445,62 +5759,124 @@ mod fillet_chamfer_join_tests {
     fn grip_corner_scale_closed_quad() {
         let pl = Geom::Polyline(Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(2.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(2.0, 1.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(0.0, 1.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(2.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(2.0, 1.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 1.0),
+                    bulge: 0.0,
+                },
             ],
             closed: true,
             widths: Vec::new(),
         });
         // Drag corner 0 (0,0) to (-1,-0.5): anchor stays (2,1); the other
         // two corners scale to (-1,1) and (2,-0.5).
-        let out = pl.with_corner_scale(0, Vec2::new(-1.0, -0.5), false).expect("scale");
-        let Geom::Polyline(p) = out else { panic!("scaled quad stays a polyline") };
-        assert!(approx_eq(p.vertices[0].pos.x, -1.0) && approx_eq(p.vertices[0].pos.y, -0.5),
-            "dragged corner lands at the cursor");
-        assert!(approx_eq(p.vertices[2].pos.x, 2.0) && approx_eq(p.vertices[2].pos.y, 1.0),
-            "opposite corner is the anchor");
-        assert!(approx_eq(p.vertices[1].pos.x, 2.0) && approx_eq(p.vertices[1].pos.y, -0.5),
-            "adjacent A scales along its edge");
-        assert!(approx_eq(p.vertices[3].pos.x, -1.0) && approx_eq(p.vertices[3].pos.y, 1.0),
-            "adjacent B scales along its edge");
+        let out = pl
+            .with_corner_scale(0, Vec2::new(-1.0, -0.5), false)
+            .expect("scale");
+        let Geom::Polyline(p) = out else {
+            panic!("scaled quad stays a polyline")
+        };
+        assert!(
+            approx_eq(p.vertices[0].pos.x, -1.0) && approx_eq(p.vertices[0].pos.y, -0.5),
+            "dragged corner lands at the cursor"
+        );
+        assert!(
+            approx_eq(p.vertices[2].pos.x, 2.0) && approx_eq(p.vertices[2].pos.y, 1.0),
+            "opposite corner is the anchor"
+        );
+        assert!(
+            approx_eq(p.vertices[1].pos.x, 2.0) && approx_eq(p.vertices[1].pos.y, -0.5),
+            "adjacent A scales along its edge"
+        );
+        assert!(
+            approx_eq(p.vertices[3].pos.x, -1.0) && approx_eq(p.vertices[3].pos.y, 1.0),
+            "adjacent B scales along its edge"
+        );
         // Uniform (Shift): dragging along the diagonal scales all corners by
         // one factor — (2,1) stays put, (0,0) → (−2,−1) with s = 1.5.
-        let out = pl.with_corner_scale(0, Vec2::new(-1.0, -0.5), true).expect("uniform scale");
-        let Geom::Polyline(p) = out else { panic!("uniform scale") };
+        let out = pl
+            .with_corner_scale(0, Vec2::new(-1.0, -0.5), true)
+            .expect("uniform scale");
+        let Geom::Polyline(p) = out else {
+            panic!("uniform scale")
+        };
         assert!(approx_eq(p.vertices[0].pos.x, -1.0) && approx_eq(p.vertices[0].pos.y, -0.5));
         assert!(approx_eq(p.vertices[1].pos.x, 2.0) && approx_eq(p.vertices[1].pos.y, -0.5));
         assert!(approx_eq(p.vertices[3].pos.x, -1.0) && approx_eq(p.vertices[3].pos.y, 1.0));
         // Crossing the anchor flips (negative factors) but stays valid.
-        let out = pl.with_corner_scale(0, Vec2::new(3.0, 2.0), false).expect("flip");
-        let Geom::Polyline(p) = out else { panic!("flip") };
+        let out = pl
+            .with_corner_scale(0, Vec2::new(3.0, 2.0), false)
+            .expect("flip");
+        let Geom::Polyline(p) = out else {
+            panic!("flip")
+        };
         assert!(approx_eq(p.vertices[0].pos.x, 3.0) && approx_eq(p.vertices[0].pos.y, 2.0));
-        assert!(approx_eq(p.vertices[2].pos.x, 2.0) && approx_eq(p.vertices[2].pos.y, 1.0),
-            "anchor never moves");
+        assert!(
+            approx_eq(p.vertices[2].pos.x, 2.0) && approx_eq(p.vertices[2].pos.y, 1.0),
+            "anchor never moves"
+        );
         // Non-quad / open polylines fall back to None (vertex move).
         let open = Geom::Polyline(Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(2.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(2.0, 1.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(2.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(2.0, 1.0),
+                    bulge: 0.0,
+                },
             ],
             closed: false,
             widths: Vec::new(),
         });
-        assert!(open.with_corner_scale(0, Vec2::new(9.0, 9.0), false).is_none());
+        assert!(open
+            .with_corner_scale(0, Vec2::new(9.0, 9.0), false)
+            .is_none());
         let pent = Geom::Polyline(Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(1.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(2.0, 1.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(1.0, 2.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(0.0, 2.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(1.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(2.0, 1.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(1.0, 2.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 2.0),
+                    bulge: 0.0,
+                },
             ],
             closed: true,
             widths: Vec::new(),
         });
-        assert!(pent.with_corner_scale(0, Vec2::new(9.0, 9.0), false).is_none());
+        assert!(pent
+            .with_corner_scale(0, Vec2::new(9.0, 9.0), false)
+            .is_none());
     }
 
     #[test]
@@ -4510,16 +5886,26 @@ mod fillet_chamfer_join_tests {
         // and (4,0) → that sub-segment is dropped. Other segments survive.
         let pl = Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(4.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(4.0, 4.0),
+                    bulge: 0.0,
+                },
             ],
             closed: false,
             widths: Vec::new(),
         };
         let g = Geom::Polyline(pl);
         let cutter = Geom::Line(Line {
-            a: Vec2::new(2.0, -1.0), b: Vec2::new(2.0, 5.0),
+            a: Vec2::new(2.0, -1.0),
+            b: Vec2::new(2.0, 5.0),
         });
         let pieces = g.trim_at(&[cutter], Vec2::new(3.0, 0.0), false).unwrap();
         // Nodes are vertices AND crossings, so the click removes ONLY the sub-edge
@@ -4527,17 +5913,33 @@ mod fillet_chamfer_join_tests {
         // survive: (0,0)→(2,0) and (4,0)→(4,4). The neighbour vertical arm is NOT
         // carried off across the (4,0) vertex.
         assert_eq!(pieces.len(), 2, "expected two survivors: {pieces:?}");
-        let ends: Vec<(Vec2, Vec2)> = pieces.iter().map(|g| {
-            if let Geom::Polyline(pl) = g {
-                (pl.vertices.first().unwrap().pos, pl.vertices.last().unwrap().pos)
-            } else { unreachable!() }
-        }).collect();
-        assert!(ends.iter().any(|&(a, b)|
-            approx_eq(a.x, 0.0) && approx_eq(a.y, 0.0) && approx_eq(b.x, 2.0) && approx_eq(b.y, 0.0)),
-            "left piece (0,0)→(2,0): {ends:?}");
-        assert!(ends.iter().any(|&(a, b)|
-            approx_eq(a.x, 4.0) && approx_eq(a.y, 0.0) && approx_eq(b.x, 4.0) && approx_eq(b.y, 4.0)),
-            "far arm (4,0)→(4,4) survives intact: {ends:?}");
+        let ends: Vec<(Vec2, Vec2)> = pieces
+            .iter()
+            .map(|g| {
+                if let Geom::Polyline(pl) = g {
+                    (
+                        pl.vertices.first().unwrap().pos,
+                        pl.vertices.last().unwrap().pos,
+                    )
+                } else {
+                    unreachable!()
+                }
+            })
+            .collect();
+        assert!(
+            ends.iter().any(|&(a, b)| approx_eq(a.x, 0.0)
+                && approx_eq(a.y, 0.0)
+                && approx_eq(b.x, 2.0)
+                && approx_eq(b.y, 0.0)),
+            "left piece (0,0)→(2,0): {ends:?}"
+        );
+        assert!(
+            ends.iter().any(|&(a, b)| approx_eq(a.x, 4.0)
+                && approx_eq(a.y, 0.0)
+                && approx_eq(b.x, 4.0)
+                && approx_eq(b.y, 4.0)),
+            "far arm (4,0)→(4,4) survives intact: {ends:?}"
+        );
     }
 
     #[test]
@@ -4548,24 +5950,53 @@ mod fillet_chamfer_join_tests {
         // (0,0)→(4,4) vertex-to-vertex segment.
         let pl = Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(0.0, 4.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(4.0, 4.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(4.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 4.0),
+                    bulge: 0.0,
+                },
             ],
-            closed: false, widths: Vec::new(),
+            closed: false,
+            widths: Vec::new(),
         };
         // No external cutters (self-trim); click on the stub near (1,1).
-        let pieces = Geom::Polyline(pl).trim_at(&[], Vec2::new(1.0, 1.0), false).unwrap();
-        let verts: Vec<Vec2> = pieces.iter().flat_map(|g| {
-            if let Geom::Polyline(pl) = g { pl.vertices.iter().map(|v| v.pos).collect() }
-            else { Vec::new() }
-        }).collect();
+        let pieces = Geom::Polyline(pl)
+            .trim_at(&[], Vec2::new(1.0, 1.0), false)
+            .unwrap();
+        let verts: Vec<Vec2> = pieces
+            .iter()
+            .flat_map(|g| {
+                if let Geom::Polyline(pl) = g {
+                    pl.vertices.iter().map(|v| v.pos).collect()
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
         // The (0,0) stub end is gone; the crossing (2,2) is a new endpoint.
-        assert!(!verts.iter().any(|p| approx_eq(p.x, 0.0) && approx_eq(p.y, 0.0)),
-            "stub end (0,0) should be trimmed off: {verts:?}");
-        assert!(verts.iter().any(|p| approx_eq(p.x, 2.0) && approx_eq(p.y, 2.0)),
-            "crossing (2,2) should be the new cut end: {verts:?}");
+        assert!(
+            !verts
+                .iter()
+                .any(|p| approx_eq(p.x, 0.0) && approx_eq(p.y, 0.0)),
+            "stub end (0,0) should be trimmed off: {verts:?}"
+        );
+        assert!(
+            verts
+                .iter()
+                .any(|p| approx_eq(p.x, 2.0) && approx_eq(p.y, 2.0)),
+            "crossing (2,2) should be the new cut end: {verts:?}"
+        );
     }
 
     #[test]
@@ -4576,32 +6007,63 @@ mod fillet_chamfer_join_tests {
         // (4,8) vertex — its neighbour arm (4,8)→(8,0) must stay.
         let pl = Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0),  bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(4.0, 8.0),  bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(8.0, 0.0),  bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(12.0, 8.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(2.0, 4.0),  bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 4.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(4.0, 8.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(8.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(12.0, 8.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(2.0, 4.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 4.0),
+                    bulge: 0.0,
+                },
             ],
-            closed: false, widths: Vec::new(),
+            closed: false,
+            widths: Vec::new(),
         };
         // Self-trim (no external cutters); click the LEFT arm near (2,4)… use a
         // point clearly on segment 0 below the crossing: (1,2).
-        let pieces = Geom::Polyline(pl).trim_at(&[], Vec2::new(1.0, 2.0), false).unwrap();
+        let pieces = Geom::Polyline(pl)
+            .trim_at(&[], Vec2::new(1.0, 2.0), false)
+            .unwrap();
         // The (4,8) vertex must still appear as an endpoint on a survivor — the
         // neighbour arm (4,8)→(8,0) was NOT carried off with the clicked arm.
         let keeps_neighbour_vertex = pieces.iter().any(|g| {
             if let Geom::Polyline(pl) = g {
-                pl.vertices.iter().any(|v| approx_eq(v.pos.x, 4.0) && approx_eq(v.pos.y, 8.0))
-            } else { false }
+                pl.vertices
+                    .iter()
+                    .any(|v| approx_eq(v.pos.x, 4.0) && approx_eq(v.pos.y, 8.0))
+            } else {
+                false
+            }
         });
-        assert!(keeps_neighbour_vertex,
-            "neighbour arm through vertex (4,8) must survive: {pieces:?}");
+        assert!(
+            keeps_neighbour_vertex,
+            "neighbour arm through vertex (4,8) must survive: {pieces:?}"
+        );
         // And the clicked point (1,2) must be gone from every survivor.
         let clicked_gone = !pieces.iter().any(|g| {
             if let Geom::Polyline(pl) = g {
-                pl.vertices.iter().any(|v| approx_eq(v.pos.x, 1.0) && approx_eq(v.pos.y, 2.0))
-            } else { false }
+                pl.vertices
+                    .iter()
+                    .any(|v| approx_eq(v.pos.x, 1.0) && approx_eq(v.pos.y, 2.0))
+            } else {
+                false
+            }
         });
         assert!(clicked_gone, "clicked arm should be removed: {pieces:?}");
     }
@@ -4613,28 +6075,61 @@ mod fillet_chamfer_join_tests {
         // (3,0)→(7,0) is removed, leaving (0,0)→(3,0) and (7,0)→(10,0)→(10,10).
         let pl = Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 10.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 10.0),
+                    bulge: 0.0,
+                },
             ],
-            closed: false, widths: Vec::new(),
+            closed: false,
+            widths: Vec::new(),
         };
         let cutters = vec![
-            Geom::Line(Line { a: Vec2::new(3.0, -1.0), b: Vec2::new(3.0, 1.0) }),
-            Geom::Line(Line { a: Vec2::new(7.0, -1.0), b: Vec2::new(7.0, 1.0) }),
+            Geom::Line(Line {
+                a: Vec2::new(3.0, -1.0),
+                b: Vec2::new(3.0, 1.0),
+            }),
+            Geom::Line(Line {
+                a: Vec2::new(7.0, -1.0),
+                b: Vec2::new(7.0, 1.0),
+            }),
         ];
-        let pieces = Geom::Polyline(pl).trim_at(&cutters, Vec2::new(5.0, 0.0), false).unwrap();
+        let pieces = Geom::Polyline(pl)
+            .trim_at(&cutters, Vec2::new(5.0, 0.0), false)
+            .unwrap();
         assert_eq!(pieces.len(), 2, "expected two survivors, got {pieces:?}");
-        let ends: Vec<(Vec2, Vec2)> = pieces.iter().map(|g| {
-            if let Geom::Polyline(pl) = g {
-                (pl.vertices.first().unwrap().pos, pl.vertices.last().unwrap().pos)
-            } else { unreachable!() }
-        }).collect();
-        assert!(ends.iter().any(|&(a, b)|
-            approx_eq(a.x, 0.0) && approx_eq(b.x, 3.0) && approx_eq(b.y, 0.0)), "left piece: {ends:?}");
-        assert!(ends.iter().any(|&(a, b)|
-            approx_eq(a.x, 7.0) && approx_eq(a.y, 0.0) && approx_eq(b.x, 10.0) && approx_eq(b.y, 10.0)),
-            "right piece to the end: {ends:?}");
+        let ends: Vec<(Vec2, Vec2)> = pieces
+            .iter()
+            .map(|g| {
+                if let Geom::Polyline(pl) = g {
+                    (
+                        pl.vertices.first().unwrap().pos,
+                        pl.vertices.last().unwrap().pos,
+                    )
+                } else {
+                    unreachable!()
+                }
+            })
+            .collect();
+        assert!(
+            ends.iter()
+                .any(|&(a, b)| approx_eq(a.x, 0.0) && approx_eq(b.x, 3.0) && approx_eq(b.y, 0.0)),
+            "left piece: {ends:?}"
+        );
+        assert!(
+            ends.iter().any(|&(a, b)| approx_eq(a.x, 7.0)
+                && approx_eq(a.y, 0.0)
+                && approx_eq(b.x, 10.0)
+                && approx_eq(b.y, 10.0)),
+            "right piece to the end: {ends:?}"
+        );
     }
 
     #[test]
@@ -4646,30 +6141,67 @@ mod fillet_chamfer_join_tests {
         // square into independent segments (the "over-crossed pline" report).
         let pl = Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 10.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(0.0, 10.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 10.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 10.0),
+                    bulge: 0.0,
+                },
             ],
-            closed: true, widths: Vec::new(),
+            closed: true,
+            widths: Vec::new(),
         };
         let cutters = vec![
-            Geom::Line(Line { a: Vec2::new(3.0, -1.0), b: Vec2::new(3.0, 1.0) }),
-            Geom::Line(Line { a: Vec2::new(7.0, -1.0), b: Vec2::new(7.0, 1.0) }),
+            Geom::Line(Line {
+                a: Vec2::new(3.0, -1.0),
+                b: Vec2::new(3.0, 1.0),
+            }),
+            Geom::Line(Line {
+                a: Vec2::new(7.0, -1.0),
+                b: Vec2::new(7.0, 1.0),
+            }),
         ];
-        let pieces = Geom::Polyline(pl).trim_at(&cutters, Vec2::new(5.0, 0.0), false).unwrap();
-        assert_eq!(pieces.len(), 1, "closed loop → one surviving open piece, got {pieces:?}");
-        let Geom::Polyline(surv) = &pieces[0] else { panic!("expected a polyline") };
+        let pieces = Geom::Polyline(pl)
+            .trim_at(&cutters, Vec2::new(5.0, 0.0), false)
+            .unwrap();
+        assert_eq!(
+            pieces.len(),
+            1,
+            "closed loop → one surviving open piece, got {pieces:?}"
+        );
+        let Geom::Polyline(surv) = &pieces[0] else {
+            panic!("expected a polyline")
+        };
         assert!(!surv.closed, "survivor must be OPEN");
         let vs: Vec<Vec2> = surv.vertices.iter().map(|v| v.pos).collect();
-        assert!(approx_eq(vs.first().unwrap().x, 7.0) && approx_eq(vs.first().unwrap().y, 0.0),
-            "survivor starts at the (7,0) cut: {vs:?}");
-        assert!(approx_eq(vs.last().unwrap().x, 3.0) && approx_eq(vs.last().unwrap().y, 0.0),
-            "survivor ends at the (3,0) cut: {vs:?}");
-        assert!(vs.iter().any(|p| approx_eq(p.x, 0.0) && approx_eq(p.y, 10.0)),
-            "survivor wraps through corner (0,10): {vs:?}");
-        assert!(!vs.iter().any(|p| approx_eq(p.x, 5.0) && approx_eq(p.y, 0.0)),
-            "the clicked span must be gone: {vs:?}");
+        assert!(
+            approx_eq(vs.first().unwrap().x, 7.0) && approx_eq(vs.first().unwrap().y, 0.0),
+            "survivor starts at the (7,0) cut: {vs:?}"
+        );
+        assert!(
+            approx_eq(vs.last().unwrap().x, 3.0) && approx_eq(vs.last().unwrap().y, 0.0),
+            "survivor ends at the (3,0) cut: {vs:?}"
+        );
+        assert!(
+            vs.iter()
+                .any(|p| approx_eq(p.x, 0.0) && approx_eq(p.y, 10.0)),
+            "survivor wraps through corner (0,10): {vs:?}"
+        );
+        assert!(
+            !vs.iter()
+                .any(|p| approx_eq(p.x, 5.0) && approx_eq(p.y, 0.0)),
+            "the clicked span must be gone: {vs:?}"
+        );
     }
 
     #[test]
@@ -4703,9 +6235,18 @@ mod fillet_chamfer_join_tests {
         use crate::intersect::intersect;
         let pl = Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(4.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(4.0, 4.0),
+                    bulge: 0.0,
+                },
             ],
             closed: false,
             widths: Vec::new(),
@@ -4713,7 +6254,8 @@ mod fillet_chamfer_join_tests {
         let g = Geom::Polyline(pl);
         // Diagonal line crosses both segments.
         let line = Geom::Line(Line {
-            a: Vec2::new(-1.0, -1.0), b: Vec2::new(5.0, 5.0),
+            a: Vec2::new(-1.0, -1.0),
+            b: Vec2::new(5.0, 5.0),
         });
         let hits = intersect(&g, &line);
         assert_eq!(hits.len(), 2);
@@ -4726,12 +6268,12 @@ mod fillet_chamfer_join_tests {
     fn offset_ellipse_inward_beyond_curvature_is_rejected() {
         let el = Ellipse {
             center: Vec2::ZERO,
-            major:  Vec2::new(4.0, 0.0),
-            ratio:  0.5,
+            major: Vec2::new(4.0, 0.0),
+            ratio: 0.5,
         };
         // b²/a = (2²)/4 = 1.0 — anything above ~1 inward must fail.
         let g = Geom::Ellipse(el);
-        let inside = Vec2::new(0.0, 0.0);          // click inside → inward
+        let inside = Vec2::new(0.0, 0.0); // click inside → inward
         let err = g.offset(1.2, inside).unwrap_err();
         assert!(err.contains("radius of curvature"), "got: {err}");
         // Just under the limit still works.
@@ -4747,10 +6289,12 @@ mod fillet_chamfer_join_tests {
         let ea = Geom::EllipseArc(crate::EllipseArc {
             ellipse: el,
             start_param: std::f64::consts::FRAC_PI_2 - 0.3,
-            sweep_param: 0.6,                            // around the minor end only
+            sweep_param: 0.6, // around the minor end only
         });
-        assert!(ea.offset(1.2, inside).is_ok(),
-            "arc away from the high-curvature region may offset further");
+        assert!(
+            ea.offset(1.2, inside).is_ok(),
+            "arc away from the high-curvature region may offset further"
+        );
         // Outward is unlimited (no curvature bound applies).
         assert!(g.offset(50.0, Vec2::new(100.0, 0.0)).is_ok());
     }
@@ -4762,8 +6306,8 @@ mod fillet_chamfer_join_tests {
         // original.
         let el = Ellipse {
             center: Vec2::ZERO,
-            major:  Vec2::new(2.0, 0.0),
-            ratio:  0.5,
+            major: Vec2::new(2.0, 0.0),
+            ratio: 0.5,
         };
         let g = Geom::Ellipse(el);
         let out = g.offset(0.5, Vec2::new(10.0, 0.0)).unwrap();
@@ -4774,9 +6318,12 @@ mod fillet_chamfer_join_tests {
             // the parametric form satisfies x²/a² + y²/b² >= 1.
             for v in &p.vertices {
                 let val = (v.pos.x / 2.0).powi(2) + (v.pos.y / 1.0).powi(2);
-                assert!(val > 1.0,
+                assert!(
+                    val > 1.0,
                     "offset vertex {:?} lies inside original ellipse (val={})",
-                    v.pos, val);
+                    v.pos,
+                    val
+                );
             }
         } else {
             panic!("expected Polyline, got {:?}", out);
@@ -4789,8 +6336,8 @@ mod fillet_chamfer_join_tests {
         // original ellipse.
         let el = Ellipse {
             center: Vec2::ZERO,
-            major:  Vec2::new(2.0, 0.0),
-            ratio:  0.5,
+            major: Vec2::new(2.0, 0.0),
+            ratio: 0.5,
         };
         let g = Geom::Ellipse(el);
         let out = g.offset(0.3, Vec2::new(0.0, 0.0)).unwrap();
@@ -4798,9 +6345,12 @@ mod fillet_chamfer_join_tests {
             assert!(p.closed);
             for v in &p.vertices {
                 let val = (v.pos.x / 2.0).powi(2) + (v.pos.y / 1.0).powi(2);
-                assert!(val < 1.0,
+                assert!(
+                    val < 1.0,
                     "offset vertex {:?} lies outside original ellipse (val={})",
-                    v.pos, val);
+                    v.pos,
+                    val
+                );
             }
         } else {
             panic!("expected Polyline, got {:?}", out);
@@ -4813,8 +6363,8 @@ mod fillet_chamfer_join_tests {
         let ea = EllipseArc {
             ellipse: Ellipse {
                 center: Vec2::ZERO,
-                major:  Vec2::new(2.0, 0.0),
-                ratio:  0.5,
+                major: Vec2::new(2.0, 0.0),
+                ratio: 0.5,
             },
             start_param: 0.0,
             sweep_param: std::f64::consts::PI,
@@ -4823,7 +6373,7 @@ mod fillet_chamfer_join_tests {
         let out = g.offset(0.2, Vec2::new(0.0, 5.0)).unwrap();
         if let Geom::Polyline(p) = out {
             assert!(!p.closed, "ellipse arc offset must be an OPEN polyline");
-            assert!(p.vertices.len() >= 49);  // n+1 samples
+            assert!(p.vertices.len() >= 49); // n+1 samples
         } else {
             panic!("expected Polyline, got {:?}", out);
         }
@@ -4833,66 +6383,101 @@ mod fillet_chamfer_join_tests {
     fn trim_ellipse_single_tangent_intersection_errs() {
         let el = Ellipse {
             center: Vec2::ZERO,
-            major:  Vec2::new(2.0, 0.0),
-            ratio:  0.5,
+            major: Vec2::new(2.0, 0.0),
+            ratio: 0.5,
         };
         let g = Geom::Ellipse(el);
         // Tangent at the top: y = 1. Touches at one point (0, 1).
         let tangent = Geom::Line(Line {
             a: Vec2::new(-3.0, 1.0),
-            b: Vec2::new( 3.0, 1.0),
+            b: Vec2::new(3.0, 1.0),
         });
-        let err = g.trim_at(&[tangent], Vec2::new(0.0, 0.5), false).unwrap_err();
-        assert!(err.contains("at least 2 intersections")
-             || err.contains("no intersection"));
+        let err = g
+            .trim_at(&[tangent], Vec2::new(0.0, 0.5), false)
+            .unwrap_err();
+        assert!(err.contains("at least 2 intersections") || err.contains("no intersection"));
     }
 
     // ---- Wall ----------------------------------------------------------
     #[test]
     fn wall_translated_moves_centerline_keeps_thickness() {
-        let w = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0),
-                       thickness: 2.0, style: 0, bulge: 0.0 };
+        let w = Wall {
+            start: Vec2::new(0.0, 0.0),
+            end: Vec2::new(10.0, 0.0),
+            thickness: 2.0,
+            style: 0,
+            bulge: 0.0,
+        };
         let g = Geom::Wall(w).translated(Vec2::new(5.0, 3.0));
         if let Geom::Wall(w2) = g {
             assert_eq!(w2.start, Vec2::new(5.0, 3.0));
-            assert_eq!(w2.end,   Vec2::new(15.0, 3.0));
+            assert_eq!(w2.end, Vec2::new(15.0, 3.0));
             assert_eq!(w2.thickness, 2.0);
-        } else { panic!("translated lost variant"); }
+        } else {
+            panic!("translated lost variant");
+        }
     }
 
     #[test]
     fn wall_scaled_scales_thickness() {
-        let w = Wall { start: Vec2::ZERO, end: Vec2::new(4.0, 0.0), thickness: 1.0, style: 0, bulge: 0.0 };
+        let w = Wall {
+            start: Vec2::ZERO,
+            end: Vec2::new(4.0, 0.0),
+            thickness: 1.0,
+            style: 0,
+            bulge: 0.0,
+        };
         let g = Geom::Wall(w).scaled(Vec2::ZERO, 2.5);
         if let Geom::Wall(w2) = g {
             assert!((w2.end.x - 10.0).abs() < 1e-12);
             assert!((w2.thickness - 2.5).abs() < 1e-12);
-        } else { panic!("scaled lost variant"); }
+        } else {
+            panic!("scaled lost variant");
+        }
     }
 
     #[test]
     fn wall_rotated_90_swaps_axes() {
-        let w = Wall { start: Vec2::ZERO, end: Vec2::new(5.0, 0.0), thickness: 1.0, style: 0, bulge: 0.0 };
+        let w = Wall {
+            start: Vec2::ZERO,
+            end: Vec2::new(5.0, 0.0),
+            thickness: 1.0,
+            style: 0,
+            bulge: 0.0,
+        };
         let g = Geom::Wall(w).rotated(Vec2::ZERO, std::f64::consts::FRAC_PI_2);
         if let Geom::Wall(w2) = g {
             assert!((w2.end - Vec2::new(0.0, 5.0)).len() < 1e-9);
             assert_eq!(w2.thickness, 1.0);
-        } else { panic!("rotated lost variant"); }
+        } else {
+            panic!("rotated lost variant");
+        }
     }
 
     #[test]
     fn wall_distance_to_point_picks_nearer_side() {
         // Horizontal wall along the X-axis, thickness 2 → sides at y=±1.
         // Point at (5, 0.3) is distance 0.7 from the upper side and 1.3 from the lower.
-        let w = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0),
-                       thickness: 2.0, style: 0, bulge: 0.0 };
+        let w = Wall {
+            start: Vec2::new(0.0, 0.0),
+            end: Vec2::new(10.0, 0.0),
+            thickness: 2.0,
+            style: 0,
+            bulge: 0.0,
+        };
         let d = Geom::Wall(w).distance_to_point(Vec2::new(5.0, 0.3));
         assert!((d - 0.7).abs() < 1e-9);
     }
 
     #[test]
     fn wall_bbox_includes_thickness() {
-        let w = Wall { start: Vec2::ZERO, end: Vec2::new(10.0, 0.0), thickness: 2.0, style: 0, bulge: 0.0 };
+        let w = Wall {
+            start: Vec2::ZERO,
+            end: Vec2::new(10.0, 0.0),
+            thickness: 2.0,
+            style: 0,
+            bulge: 0.0,
+        };
         let (min, max) = Geom::Wall(w).bbox();
         // Loose bbox: expanded by thk/2 = 1.0 in both axes.
         assert!((min.y + 1.0).abs() < 1e-9);
@@ -4904,15 +6489,32 @@ mod fillet_chamfer_join_tests {
         // 45°→135° top-cap arc, r=5 at origin. Tight bbox must hug the cap,
         // NOT return the full circle (that broke window selection).
         let a = Arc {
-            center: Vec2::ZERO, radius: 5.0,
+            center: Vec2::ZERO,
+            radius: 5.0,
             start_angle: std::f64::consts::FRAC_PI_4,
             sweep_angle: std::f64::consts::FRAC_PI_2,
         };
         let (min, max) = Geom::Arc(a).bbox();
-        assert!((max.y - 5.0).abs() < 1e-6, "top cardinal swept → max.y=5, got {}", max.y);
-        assert!(min.y > 3.0, "bottom NOT swept → min.y ~3.54 (not -5), got {}", min.y);
-        assert!((max.x - 3.5355).abs() < 1e-3, "max.x from endpoint, got {}", max.x);
-        assert!((min.x + 3.5355).abs() < 1e-3, "min.x from endpoint, got {}", min.x);
+        assert!(
+            (max.y - 5.0).abs() < 1e-6,
+            "top cardinal swept → max.y=5, got {}",
+            max.y
+        );
+        assert!(
+            min.y > 3.0,
+            "bottom NOT swept → min.y ~3.54 (not -5), got {}",
+            min.y
+        );
+        assert!(
+            (max.x - 3.5355).abs() < 1e-3,
+            "max.x from endpoint, got {}",
+            max.x
+        );
+        assert!(
+            (min.x + 3.5355).abs() < 1e-3,
+            "min.x from endpoint, got {}",
+            min.x
+        );
     }
 
     #[test]
@@ -4924,10 +6526,20 @@ mod fillet_chamfer_join_tests {
         // the straight wall's END face points — the old chord-normal
         // offsetting left a ≈(t/2)·sweep/(2·steps) gap here.
         let b = (std::f64::consts::FRAC_PI_2 / 4.0).tan();
-        let s = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0),
-                       thickness: 0.3, style: 0, bulge: 0.0 };
-        let c = Wall { start: Vec2::new(10.0, 0.0), end: Vec2::new(15.0, 5.0),
-                       thickness: 0.3, style: 0, bulge: b };
+        let s = Wall {
+            start: Vec2::new(0.0, 0.0),
+            end: Vec2::new(10.0, 0.0),
+            thickness: 0.3,
+            style: 0,
+            bulge: 0.0,
+        };
+        let c = Wall {
+            start: Vec2::new(10.0, 0.0),
+            end: Vec2::new(15.0, 5.0),
+            thickness: 0.3,
+            style: 0,
+            bulge: b,
+        };
         let (sl, sr) = s.face_polylines(1).unwrap();
         let (cl, cr) = c.face_polylines(28).unwrap();
         let gap_l = (sl[1] - cl[0]).len();
@@ -4937,8 +6549,12 @@ mod fillet_chamfer_join_tests {
         // Faces must be true concentric arcs: inner radius 5−0.15,
         // outer 5+0.15, for every sample.
         let centre = Vec2::new(10.0, 5.0);
-        for p in &cl { assert!(((  *p - centre).len() - 4.85).abs() < 1e-9); }
-        for p in &cr { assert!(((  *p - centre).len() - 5.15).abs() < 1e-9); }
+        for p in &cl {
+            assert!(((*p - centre).len() - 4.85).abs() < 1e-9);
+        }
+        for p in &cr {
+            assert!(((*p - centre).len() - 5.15).abs() < 1e-9);
+        }
     }
 
     #[test]
@@ -4973,21 +6589,31 @@ mod nearest_param_tests {
     #[test]
     fn nearest_param_returns_global_not_local_foot() {
         let c = Vec2::new(1.0e6, 1.0e6);
-        let el = Ellipse { center: c, major: Vec2::new(10.0, 0.0), ratio: 0.1 }; // a=10, b=1
+        let el = Ellipse {
+            center: c,
+            major: Vec2::new(10.0, 0.0),
+            ratio: 0.1,
+        }; // a=10, b=1
         let q = Vec2::new(c.x + 0.1, c.y + 0.001);
         let t = el.nearest_param(q);
         let foot = el.point_at(t);
-        let major = Vec2::new(c.x + 10.0, c.y);       // the local (wrong) foot, dist ≈ 10
-        assert!(foot.dist(q) < 2.0,
-            "foot {foot:?} is far from the query (dist {}) — a local root", foot.dist(q));
-        assert!(foot.dist(major) > 5.0,
-            "returned the FAR major vertex {major:?} — single-seed local root");
+        let major = Vec2::new(c.x + 10.0, c.y); // the local (wrong) foot, dist ≈ 10
+        assert!(
+            foot.dist(q) < 2.0,
+            "foot {foot:?} is far from the query (dist {}) — a local root",
+            foot.dist(q)
+        );
+        assert!(
+            foot.dist(major) > 5.0,
+            "returned the FAR major vertex {major:?} — single-seed local root"
+        );
         // near a MINOR vertex (|x| small in local frame), either ± sign.
-        assert!((foot.x - c.x).abs() < 1.0,
-            "foot {foot:?} not near a minor vertex (should be ~x=center)");
+        assert!(
+            (foot.x - c.x).abs() < 1.0,
+            "foot {foot:?} not near a minor vertex (should be ~x=center)"
+        );
     }
 }
-
 
 #[cfg(test)]
 mod centermark_tests {
@@ -4995,7 +6621,11 @@ mod centermark_tests {
     use crate::math::Vec2;
 
     fn cm() -> CenterMark {
-        CenterMark { center: Vec2::new(5.0, 5.0), size: 2.0, rotation: 0.0 }
+        CenterMark {
+            center: Vec2::new(5.0, 5.0),
+            size: 2.0,
+            rotation: 0.0,
+        }
     }
 
     #[test]
@@ -5020,9 +6650,9 @@ mod centermark_tests {
     #[test]
     fn distance_to_point_is_zero_on_the_arm() {
         let m = cm();
-        let on = Vec2::new(6.0, 5.0);   // on the horizontal arm
+        let on = Vec2::new(6.0, 5.0); // on the horizontal arm
         assert!(m.distance_to_point(on) < 1e-12);
-        let off = Vec2::new(6.0, 6.5);  // 1.0 from the vertical arm (x=5)
+        let off = Vec2::new(6.0, 6.5); // 1.0 from the vertical arm (x=5)
         assert!((m.distance_to_point(off) - 1.0).abs() < 1e-9);
     }
 
@@ -5033,7 +6663,9 @@ mod centermark_tests {
         if let Geom::CenterMark(r) = g {
             assert!((r.rotation - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
             assert!((r.center - Vec2::new(5.0, 5.0)).len() < 1e-12);
-        } else { panic!("rotated lost the variant"); }
+        } else {
+            panic!("rotated lost the variant");
+        }
     }
 
     #[test]
@@ -5041,18 +6673,25 @@ mod centermark_tests {
         let g = Geom::CenterMark(cm()).translated(Vec2::new(10.0, 0.0));
         if let Geom::CenterMark(m) = g {
             assert!((m.center - Vec2::new(15.0, 5.0)).len() < 1e-12);
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
         let g2 = Geom::CenterMark(cm()).scaled(Vec2::ZERO, 3.0);
         if let Geom::CenterMark(m) = g2 {
             assert!((m.size - 6.0).abs() < 1e-12);
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn intersects_other_geometry_through_arms() {
         use crate::intersect::intersect;
         let m = Geom::CenterMark(cm());
-        let line = Geom::Line(Line { a: Vec2::new(0.0, 6.0), b: Vec2::new(10.0, 6.0) });
+        let line = Geom::Line(Line {
+            a: Vec2::new(0.0, 6.0),
+            b: Vec2::new(10.0, 6.0),
+        });
         let hits = intersect(&m, &line);
         assert_eq!(hits.len(), 1);
         assert!((hits[0] - Vec2::new(5.0, 6.0)).len() < 1e-9);
@@ -5068,11 +6707,15 @@ mod centermark_tests {
         if let Geom::CenterMark(m) = moved {
             assert!((m.center - Vec2::new(0.0, 0.0)).len() < 1e-12);
             assert!((m.size - 2.0).abs() < 1e-12);
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
         let resized = g.with_grip_moved(GripRole::LineEndA, Vec2::new(5.0, 9.0));
         if let Geom::CenterMark(m) = resized {
             assert!((m.size - 4.0).abs() < 1e-12, "size {}", m.size);
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 }
 
@@ -5105,31 +6748,46 @@ mod xline_tests {
     #[test]
     fn clip_to_rect_returns_visible_segment() {
         let x = xl();
-        let l = x.clip_to_rect(Vec2::new(-5.0, -1.0), Vec2::new(5.0, 1.0)).unwrap();
+        let l = x
+            .clip_to_rect(Vec2::new(-5.0, -1.0), Vec2::new(5.0, 1.0))
+            .unwrap();
         assert!((l.a - Vec2::new(-5.0, 0.0)).len() < 1e-9);
         assert!((l.b - Vec2::new(5.0, 0.0)).len() < 1e-9);
         // Parallel-but-outside line clips to nothing.
         let miss = Xline::new(Vec2::new(0.0, 10.0), Vec2::new(1.0, 0.0));
-        assert!(miss.clip_to_rect(Vec2::new(-5.0, -1.0), Vec2::new(5.0, 1.0)).is_none());
+        assert!(miss
+            .clip_to_rect(Vec2::new(-5.0, -1.0), Vec2::new(5.0, 1.0))
+            .is_none());
     }
 
     #[test]
     fn transforms_keep_geometry_consistent() {
         let x = Geom::Xline(xl());
         let t = x.translated(Vec2::new(3.0, 4.0));
-        if let Geom::Xline(tx) = t { assert!((tx.base - Vec2::new(3.0, 4.0)).len() < 1e-9); }
-        else { panic!("translated must stay xline"); }
+        if let Geom::Xline(tx) = t {
+            assert!((tx.base - Vec2::new(3.0, 4.0)).len() < 1e-9);
+        } else {
+            panic!("translated must stay xline");
+        }
         let r = x.rotated(Vec2::ZERO, std::f64::consts::FRAC_PI_2);
         if let Geom::Xline(rx) = r {
             assert!((rx.dir.y - 1.0).abs() < 1e-9);
             assert!(rx.distance_to_point(Vec2::new(0.0, 5.0)) < 1e-9);
-        } else { panic!("rotated must stay xline"); }
+        } else {
+            panic!("rotated must stay xline");
+        }
         let m = x.mirrored(Vec2::new(0.0, 0.0), Vec2::new(0.0, 1.0));
-        if let Geom::Xline(mx) = m { assert!((mx.dir.x + 1.0).abs() < 1e-9); }
-        else { panic!("mirrored must stay xline"); }
+        if let Geom::Xline(mx) = m {
+            assert!((mx.dir.x + 1.0).abs() < 1e-9);
+        } else {
+            panic!("mirrored must stay xline");
+        }
         let s = x.scaled(Vec2::ZERO, 2.0);
-        if let Geom::Xline(sx) = s { assert!((sx.dir.len() - 1.0).abs() < 1e-9); }
-        else { panic!("scaled must stay xline"); }
+        if let Geom::Xline(sx) = s {
+            assert!((sx.dir.len() - 1.0).abs() < 1e-9);
+        } else {
+            panic!("scaled must stay xline");
+        }
     }
 
     #[test]
@@ -5140,19 +6798,27 @@ mod xline_tests {
             assert!((ox.base.y - 2.0).abs() < 1e-9);
             let orig = xl();
             assert!((ox.dir - orig.dir).len() < 1e-9);
-        } else { panic!("offset must stay an xline"); }
+        } else {
+            panic!("offset must stay an xline");
+        }
     }
 
     #[test]
     fn intersects_other_shapes() {
         use crate::intersect::intersect;
         let x = Geom::Xline(xl());
-        let l = Geom::Line(Line { a: Vec2::new(5.0, -1.0), b: Vec2::new(5.0, 1.0) });
+        let l = Geom::Line(Line {
+            a: Vec2::new(5.0, -1.0),
+            b: Vec2::new(5.0, 1.0),
+        });
         let hits = intersect(&x, &l);
         assert_eq!(hits.len(), 1);
         assert!((hits[0] - Vec2::new(5.0, 0.0)).len() < 1e-9);
 
-        let c = Geom::Circle(Circle { center: Vec2::new(0.0, 0.0), radius: 3.0 });
+        let c = Geom::Circle(Circle {
+            center: Vec2::new(0.0, 0.0),
+            radius: 3.0,
+        });
         let hits = intersect(&x, &c);
         assert_eq!(hits.len(), 2);
         assert!((hits[0].x + 3.0).abs() < 1e-9 || (hits[0].x - 3.0).abs() < 1e-9);
@@ -5178,11 +6844,15 @@ mod xline_tests {
         let moved = g.with_grip_moved(GripRole::CircleCenter, Vec2::new(9.0, 9.0));
         if let Geom::Xline(mx) = moved {
             assert!((mx.base - Vec2::new(9.0, 9.0)).len() < 1e-9);
-        } else { panic!("grip must keep xline"); }
+        } else {
+            panic!("grip must keep xline");
+        }
         let turned = g.with_grip_moved(GripRole::LineEndA, Vec2::new(0.0, 1.0));
         if let Geom::Xline(tx) = turned {
             assert!((tx.dir.y - 1.0).abs() < 1e-9);
-        } else { panic!("grip must keep xline"); }
+        } else {
+            panic!("grip must keep xline");
+        }
     }
 }
 
@@ -5192,8 +6862,7 @@ mod revcloud_tests {
 
     #[test]
     fn rect_cloud_is_closed_with_bulges() {
-        let pl = Polyline::revcloud_rect(
-            Vec2::new(0.0, 0.0), Vec2::new(10.0, 6.0), 0.5).unwrap();
+        let pl = Polyline::revcloud_rect(Vec2::new(0.0, 0.0), Vec2::new(10.0, 6.0), 0.5).unwrap();
         assert!(pl.closed);
         assert!(pl.vertices.len() >= 4);
         // Every segment has a non-zero outward bulge.
@@ -5212,31 +6881,28 @@ mod revcloud_tests {
             let (s1, s2) = seg.bbox();
             eprintln!("seg bbox {s1:?}..{s2:?}");
         }
-        assert!(mn.x < -0.01 && mn.y < -0.01 && mx.x > 10.01 && mx.y > 6.01,
-            "bbox {mn:?}..{mx:?} must exceed rect");
+        assert!(
+            mn.x < -0.01 && mn.y < -0.01 && mx.x > 10.01 && mx.y > 6.01,
+            "bbox {mn:?}..{mx:?} must exceed rect"
+        );
     }
 
     #[test]
     fn degenerate_rect_is_rejected() {
-        assert!(Polyline::revcloud_rect(
-            Vec2::new(0.0, 0.0), Vec2::new(0.0, 5.0), 0.5).is_none());
-        assert!(Polyline::revcloud_rect(
-            Vec2::new(0.0, 0.0), Vec2::new(5.0, 5.0), 0.5).is_some());
+        assert!(Polyline::revcloud_rect(Vec2::new(0.0, 0.0), Vec2::new(0.0, 5.0), 0.5).is_none());
+        assert!(Polyline::revcloud_rect(Vec2::new(0.0, 0.0), Vec2::new(5.0, 5.0), 0.5).is_some());
     }
 
     #[test]
     fn corner_order_does_not_matter() {
-        let a = Polyline::revcloud_rect(
-            Vec2::new(0.0, 0.0), Vec2::new(10.0, 6.0), 0.5).unwrap();
-        let b = Polyline::revcloud_rect(
-            Vec2::new(10.0, 6.0), Vec2::new(0.0, 0.0), 0.5).unwrap();
+        let a = Polyline::revcloud_rect(Vec2::new(0.0, 0.0), Vec2::new(10.0, 6.0), 0.5).unwrap();
+        let b = Polyline::revcloud_rect(Vec2::new(10.0, 6.0), Vec2::new(0.0, 0.0), 0.5).unwrap();
         assert_eq!(a.vertices.len(), b.vertices.len());
     }
 
     #[test]
     fn cloud_area_is_positive() {
-        let pl = Polyline::revcloud_rect(
-            Vec2::new(0.0, 0.0), Vec2::new(4.0, 3.0), 0.5).unwrap();
+        let pl = Polyline::revcloud_rect(Vec2::new(0.0, 0.0), Vec2::new(4.0, 3.0), 0.5).unwrap();
         // Shoelace over the polygon approximates the cloud area > rect area.
         let mut area2 = 0.0;
         let n = pl.vertices.len();
@@ -5255,7 +6921,10 @@ mod area_tests {
 
     #[test]
     fn circle_area_and_perimeter() {
-        let c = Geom::Circle(Circle { center: Vec2::ZERO, radius: 2.0 });
+        let c = Geom::Circle(Circle {
+            center: Vec2::ZERO,
+            radius: 2.0,
+        });
         assert!((c.measured_area().unwrap() - std::f64::consts::PI * 4.0).abs() < 1e-9);
         assert!((c.measured_perimeter().unwrap() - std::f64::consts::TAU * 2.0).abs() < 1e-9);
     }
@@ -5264,10 +6933,22 @@ mod area_tests {
     fn rect_polyline_area() {
         let pl = Geom::Polyline(Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 4.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(0.0, 4.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 4.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 4.0),
+                    bulge: 0.0,
+                },
             ],
             closed: true,
             widths: Vec::new(),
@@ -5277,8 +6958,14 @@ mod area_tests {
         // Open polyline → no area.
         let open = Geom::Polyline(Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(10.0, 0.0),
+                    bulge: 0.0,
+                },
             ],
             closed: false,
             widths: Vec::new(),
@@ -5291,21 +6978,37 @@ mod area_tests {
         // Semicircle bulge on the top edge of a 2x2 rect (bulge = 1 = 180°).
         let pl = Geom::Polyline(Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(-1.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(1.0, 0.0), bulge: 1.0 },
-                PolyVertex { pos: Vec2::new(1.0, 2.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(-1.0, 2.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(-1.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(1.0, 0.0),
+                    bulge: 1.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(1.0, 2.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(-1.0, 2.0),
+                    bulge: 0.0,
+                },
             ],
             closed: true,
             widths: Vec::new(),
         });
         let area = pl.measured_area().unwrap();
         // Chord-based rect area would be 4.0; the top semicircle adds π/2.
-        assert!((area - (4.0 + std::f64::consts::FRAC_PI_2)).abs() < 1e-3,
-            "area {area} must include the bulge (64-pt sampling ~0.1%)");
+        assert!(
+            (area - (4.0 + std::f64::consts::FRAC_PI_2)).abs() < 1e-3,
+            "area {area} must include the bulge (64-pt sampling ~0.1%)"
+        );
         let perim = pl.measured_perimeter().unwrap();
-        assert!((perim - (6.0 + std::f64::consts::PI)).abs() < 1e-6,
-            "perimeter {perim} must include the arc");
+        assert!(
+            (perim - (6.0 + std::f64::consts::PI)).abs() < 1e-6,
+            "perimeter {perim} must include the arc"
+        );
     }
 
     #[test]
@@ -5331,23 +7034,24 @@ mod area_tests {
 /// Boundary points count as inside. `pts` must have at least 3 vertices.
 pub fn point_in_polygon(p: Vec2, pts: &[Vec2]) -> bool {
     let n = pts.len();
-    if n < 3 { return false; }
+    if n < 3 {
+        return false;
+    }
     let mut inside = false;
     let mut j = n - 1;
     for i in 0..n {
         let (a, b) = (pts[i], pts[j]);
         // Boundary hit → inside (avoids the classic ray-grazing ambiguity).
         let cross = (p - a).cross(b - a);
-        if cross.abs() < 1e-12 && p.x >= a.x.min(b.x) - 1e-12
+        if cross.abs() < 1e-12
+            && p.x >= a.x.min(b.x) - 1e-12
             && p.x <= a.x.max(b.x) + 1e-12
             && p.y >= a.y.min(b.y) - 1e-12
             && p.y <= a.y.max(b.y) + 1e-12
         {
             return true;
         }
-        if ((a.y > p.y) != (b.y > p.y))
-            && (p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x)
-        {
+        if ((a.y > p.y) != (b.y > p.y)) && (p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x) {
             inside = !inside;
         }
         j = i;
@@ -5365,18 +7069,30 @@ mod ray_tests {
         // Horizontal ray from (0,0) → +x. A rect fully BEHIND the base
         // (x < 0) must clip to nothing; the base itself is included.
         let r = Ray::new(Vec2::ZERO, Vec2::new(1.0, 0.0));
-        assert!(r.clip_to_rect(Vec2::new(-10.0, -1.0), Vec2::new(-2.0, 1.0)).is_none());
-        let seg = r.clip_to_rect(Vec2::new(-1.0, -1.0), Vec2::new(10.0, 1.0))
+        assert!(r
+            .clip_to_rect(Vec2::new(-10.0, -1.0), Vec2::new(-2.0, 1.0))
+            .is_none());
+        let seg = r
+            .clip_to_rect(Vec2::new(-1.0, -1.0), Vec2::new(10.0, 1.0))
             .expect("forward rect hits");
-        assert!(approx_eq(seg.a.x, 0.0) && approx_eq(seg.a.y, 0.0), "clip starts at base");
-        assert!(approx_eq(seg.b.x, 10.0) && approx_eq(seg.b.y, 0.0), "clip reaches rect edge");
+        assert!(
+            approx_eq(seg.a.x, 0.0) && approx_eq(seg.a.y, 0.0),
+            "clip starts at base"
+        );
+        assert!(
+            approx_eq(seg.b.x, 10.0) && approx_eq(seg.b.y, 0.0),
+            "clip reaches rect edge"
+        );
     }
 
     #[test]
     fn ray_distance_is_half_line() {
         let r = Ray::new(Vec2::ZERO, Vec2::new(1.0, 0.0));
         // Behind the base → distance to the base, not the perpendicular.
-        assert!(approx_eq(r.distance_to_point(Vec2::new(-5.0, 3.0)), 5.0_f64.hypot(3.0)));
+        assert!(approx_eq(
+            r.distance_to_point(Vec2::new(-5.0, 3.0)),
+            5.0_f64.hypot(3.0)
+        ));
         // Ahead → perpendicular distance.
         assert!(approx_eq(r.distance_to_point(Vec2::new(7.0, 4.0)), 4.0));
     }
@@ -5395,45 +7111,79 @@ mod ray_tests {
     fn ray_transforms() {
         let r = Geom::Ray(Ray::new(Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)));
         let t = r.translated(Vec2::new(10.0, 10.0));
-        let Geom::Ray(t2) = t else { panic!("translated lost"); };
+        let Geom::Ray(t2) = t else {
+            panic!("translated lost");
+        };
         assert!(approx_eq(t2.base.x, 11.0) && approx_eq(t2.base.y, 10.0));
         assert!(approx_eq(t2.dir.x, 0.0) && approx_eq(t2.dir.y, 1.0));
         let rot = r.rotated(Vec2::ZERO, std::f64::consts::FRAC_PI_2);
-        let Geom::Ray(r2) = rot else { panic!("rotated lost"); };
+        let Geom::Ray(r2) = rot else {
+            panic!("rotated lost");
+        };
         // base (1,0) → (0,1); dir (0,1) → (-1,0).
         assert!(approx_eq(r2.base.x, 0.0) && approx_eq(r2.base.y, 1.0));
         assert!(approx_eq(r2.dir.x, -1.0) && approx_eq(r2.dir.y, 0.0));
         let mir = r.mirrored(Vec2::new(-10.0, 0.0), Vec2::new(10.0, 0.0));
-        let Geom::Ray(m2) = mir else { panic!("mirror lost"); };
+        let Geom::Ray(m2) = mir else {
+            panic!("mirror lost");
+        };
         assert!(approx_eq(m2.base.x, 1.0) && approx_eq(m2.base.y, 0.0));
         assert!(approx_eq(m2.dir.x, 0.0) && approx_eq(m2.dir.y, -1.0));
     }
 
     #[test]
     fn point_in_polygon_ray_cast() {
-        let sq = vec![Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0),
-                      Vec2::new(10.0, 10.0), Vec2::new(0.0, 10.0)];
+        let sq = vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(10.0, 0.0),
+            Vec2::new(10.0, 10.0),
+            Vec2::new(0.0, 10.0),
+        ];
         assert!(point_in_polygon(Vec2::new(5.0, 5.0), &sq));
-        assert!(point_in_polygon(Vec2::new(0.0, 0.0), &sq), "vertex counts inside");
-        assert!(point_in_polygon(Vec2::new(10.0, 5.0), &sq), "edge counts inside");
+        assert!(
+            point_in_polygon(Vec2::new(0.0, 0.0), &sq),
+            "vertex counts inside"
+        );
+        assert!(
+            point_in_polygon(Vec2::new(10.0, 5.0), &sq),
+            "edge counts inside"
+        );
         assert!(!point_in_polygon(Vec2::new(-1.0, 5.0), &sq));
         assert!(!point_in_polygon(Vec2::new(15.0, 15.0), &sq));
         // Concave U: the notch is outside.
-        let u = vec![Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(10.0, 10.0),
-                     Vec2::new(6.0, 10.0), Vec2::new(6.0, 4.0), Vec2::new(4.0, 4.0),
-                     Vec2::new(4.0, 10.0), Vec2::new(0.0, 10.0)];
-        assert!(!point_in_polygon(Vec2::new(5.0, 8.0), &u), "in the top notch");
-        assert!(point_in_polygon(Vec2::new(5.0, 2.0), &u), "inside the cavity floor");
+        let u = vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(10.0, 0.0),
+            Vec2::new(10.0, 10.0),
+            Vec2::new(6.0, 10.0),
+            Vec2::new(6.0, 4.0),
+            Vec2::new(4.0, 4.0),
+            Vec2::new(4.0, 10.0),
+            Vec2::new(0.0, 10.0),
+        ];
+        assert!(
+            !point_in_polygon(Vec2::new(5.0, 8.0), &u),
+            "in the top notch"
+        );
+        assert!(
+            point_in_polygon(Vec2::new(5.0, 2.0), &u),
+            "inside the cavity floor"
+        );
     }
 
     #[test]
     fn ray_offset_and_split_error() {
         let g = Geom::Ray(Ray::new(Vec2::ZERO, Vec2::new(1.0, 0.0)));
         let off = g.offset(2.0, Vec2::new(0.0, 1.0)).expect("offset");
-        let Geom::Ray(r) = off else { panic!("offset lost"); };
+        let Geom::Ray(r) = off else {
+            panic!("offset lost");
+        };
         assert!(approx_eq(r.base.y, 2.0));
         assert!(approx_eq(r.dir.x, 1.0));
-        assert!(g.split_at(Vec2::new(5.0, 0.0)).is_err(), "ray cannot be split");
+        assert!(
+            g.split_at(Vec2::new(5.0, 0.0)).is_err(),
+            "ray cannot be split"
+        );
     }
 }
 
@@ -5477,35 +7227,55 @@ mod donut_wipeout_region_tests {
         let g = Geom::Donut(Donut::new(Vec2::new(1.0, 1.0), 1.0, 2.0));
         // Translated → center moves, radii unchanged.
         let t = g.translated(Vec2::new(10.0, 0.0));
-        let Geom::Donut(td) = t else { panic!("translated must stay donut") };
+        let Geom::Donut(td) = t else {
+            panic!("translated must stay donut")
+        };
         assert!((td.center - Vec2::new(11.0, 1.0)).len() < 1e-9);
         assert!(approx_eq(td.outer_radius, 2.0));
         // Scaled about origin → radii scale, center scales.
         let s = g.scaled(Vec2::ZERO, 2.0);
-        let Geom::Donut(sd) = s else { panic!("scaled must stay donut") };
+        let Geom::Donut(sd) = s else {
+            panic!("scaled must stay donut")
+        };
         assert!((sd.center - Vec2::new(2.0, 2.0)).len() < 1e-9);
         assert!(approx_eq(sd.outer_radius, 4.0));
         assert!(approx_eq(sd.inner_radius, 2.0));
         // Offset → ring grows/shrinks in place (side picks the hand).
         let o = g.offset(0.5, Vec2::new(0.0, 2.0)).expect("offset");
-        let Geom::Donut(od) = o else { panic!("offset must stay donut") };
-        assert!((od.center - Vec2::new(1.0, 1.0)).len() < 1e-9, "center unchanged");
-        assert!(approx_eq(od.outer_radius, 1.5), "ring shrinks on the inside hand");
+        let Geom::Donut(od) = o else {
+            panic!("offset must stay donut")
+        };
+        assert!(
+            (od.center - Vec2::new(1.0, 1.0)).len() < 1e-9,
+            "center unchanged"
+        );
+        assert!(
+            approx_eq(od.outer_radius, 1.5),
+            "ring shrinks on the inside hand"
+        );
         assert!(approx_eq(od.inner_radius, 0.5));
         // Grip move of the center repositions the ring.
         let m = g.with_grip_moved(GripRole::CircleCenter, Vec2::new(9.0, 9.0));
-        let Geom::Donut(md) = m else { panic!("grip must keep donut") };
+        let Geom::Donut(md) = m else {
+            panic!("grip must keep donut")
+        };
         assert!((md.center - Vec2::new(9.0, 9.0)).len() < 1e-9);
     }
 
     #[test]
     fn wipeout_and_region_bbox_distance_and_transform() {
         let pts = vec![
-            Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0),
-            Vec2::new(4.0, 3.0), Vec2::new(0.0, 3.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(4.0, 0.0),
+            Vec2::new(4.0, 3.0),
+            Vec2::new(0.0, 3.0),
         ];
-        for g in [Geom::Wipeout(Wipeout { pts: pts.clone() }),
-                  Geom::Region(Region { loop_pts: pts.clone() })] {
+        for g in [
+            Geom::Wipeout(Wipeout { pts: pts.clone() }),
+            Geom::Region(Region {
+                loop_pts: pts.clone(),
+            }),
+        ] {
             // bbox spans the loop.
             let (mn, mx) = g.bbox();
             assert!((mn - Vec2::new(0.0, 0.0)).len() < 1e-9);

@@ -325,11 +325,26 @@ unsafe fn upload_stream(gl: &glow::Context, data: &[f32]) -> Result<glow::Textur
     let tex = gl.create_texture()?;
     gl.bind_texture(glow::TEXTURE_2D, Some(tex));
     gl.tex_image_2d(
-        glow::TEXTURE_2D, 0, glow::RGBA32F as i32, TEXW as i32, h as i32, 0,
-        glow::RGBA, glow::FLOAT, glow::PixelUnpackData::Slice(Some(bytes)),
+        glow::TEXTURE_2D,
+        0,
+        glow::RGBA32F as i32,
+        TEXW as i32,
+        h as i32,
+        0,
+        glow::RGBA,
+        glow::FLOAT,
+        glow::PixelUnpackData::Slice(Some(bytes)),
     );
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_MIN_FILTER,
+        glow::NEAREST as i32,
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_MAG_FILTER,
+        glow::NEAREST as i32,
+    );
     gl.bind_texture(glow::TEXTURE_2D, None);
     Ok(tex)
 }
@@ -346,7 +361,10 @@ const ENV_MAX_W: usize = 4096;
 /// A failure here returns `None` rather than aborting the render: the tracer falls back to the
 /// two-colour hemisphere, which is what it did before this existed. Losing the backdrop is a far
 /// better outcome than losing the render.
-unsafe fn upload_env(gl: &glow::Context, map: Option<&crate::env_map::EnvMap>) -> Option<glow::Texture> {
+unsafe fn upload_env(
+    gl: &glow::Context,
+    map: Option<&crate::env_map::EnvMap>,
+) -> Option<glow::Texture> {
     let map = map?;
     let scaled;
     let src = if map.w > ENV_MAX_W {
@@ -363,8 +381,15 @@ unsafe fn upload_env(gl: &glow::Context, map: Option<&crate::env_map::EnvMap>) -
     // RGB16F, not RGB8: this is scene-referred radiance and its sun is thousands of times brighter
     // than its sky. Eight bits would clip that to white and the render would lose the light.
     gl.tex_image_2d(
-        glow::TEXTURE_2D, 0, glow::RGB16F as i32, src.w as i32, src.h as i32, 0,
-        glow::RGB, glow::FLOAT, glow::PixelUnpackData::Slice(Some(bytes)),
+        glow::TEXTURE_2D,
+        0,
+        glow::RGB16F as i32,
+        src.w as i32,
+        src.h as i32,
+        0,
+        glow::RGB,
+        glow::FLOAT,
+        glow::PixelUnpackData::Slice(Some(bytes)),
     );
     // REPEAT across longitude (the map is continuous where its left edge meets its right) and
     // CLAMP down latitude (it is not continuous over the poles) — as the viewport binds it.
@@ -382,7 +407,13 @@ unsafe fn upload_env(gl: &glow::Context, map: Option<&crate::env_map::EnvMap>) -
 
 impl GpuTracer {
     /// Compile the tracer, upload the scene, create the accumulation FBO.
-    pub fn new(gl: &glow::Context, pack: &GpuPack, cam: Camera, sky: Sky, settings: Settings) -> Result<Self, String> {
+    pub fn new(
+        gl: &glow::Context,
+        pack: &GpuPack,
+        cam: Camera,
+        sky: Sky,
+        settings: Settings,
+    ) -> Result<Self, String> {
         unsafe {
             // Program.
             let program = gl.create_program()?;
@@ -390,7 +421,10 @@ impl GpuTracer {
             let fs = FS
                 .replace("@@ENV_UV_GLSL@@", crate::env::ENV_UV_GLSL)
                 .replace("@@TRI_TEXELS@@", &crate::pathtrace::TRI_TEXELS.to_string());
-            for (ty, src) in [(glow::VERTEX_SHADER, VS), (glow::FRAGMENT_SHADER, fs.as_str())] {
+            for (ty, src) in [
+                (glow::VERTEX_SHADER, VS),
+                (glow::FRAGMENT_SHADER, fs.as_str()),
+            ] {
                 let sh = gl.create_shader(ty)?;
                 gl.shader_source(sh, src);
                 gl.compile_shader(sh);
@@ -425,14 +459,35 @@ impl GpuTracer {
             let accum = gl.create_texture()?;
             gl.bind_texture(glow::TEXTURE_2D, Some(accum));
             gl.tex_image_2d(
-                glow::TEXTURE_2D, 0, glow::RGBA32F as i32, settings.w as i32, settings.h as i32, 0,
-                glow::RGBA, glow::FLOAT, glow::PixelUnpackData::Slice(None),
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA32F as i32,
+                settings.w as i32,
+                settings.h as i32,
+                0,
+                glow::RGBA,
+                glow::FLOAT,
+                glow::PixelUnpackData::Slice(None),
             );
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
             let fbo = gl.create_framebuffer()?;
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(accum), 0);
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(accum),
+                0,
+            );
             let ok = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
             gl.clear_color(0.0, 0.0, 0.0, 0.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
@@ -492,7 +547,14 @@ impl GpuTracer {
             gl.bind_vertex_array(Some(self.vao));
 
             // Scene samplers on units 0..2.
-            for (unit, (name, tex)) in [("u_tris", self.tris_tex), ("u_nodes", self.nodes_tex), ("u_order", self.order_tex)].iter().enumerate() {
+            for (unit, (name, tex)) in [
+                ("u_tris", self.tris_tex),
+                ("u_nodes", self.nodes_tex),
+                ("u_order", self.order_tex),
+            ]
+            .iter()
+            .enumerate()
+            {
                 gl.active_texture(glow::TEXTURE0 + unit as u32);
                 gl.bind_texture(glow::TEXTURE_2D, Some(*tex));
                 if let Some(loc) = gl.get_uniform_location(self.program, name) {
@@ -502,7 +564,11 @@ impl GpuTracer {
             // Camera basis.
             let fwd = (self.cam.target - self.cam.eye).normalize();
             let right0 = fwd.cross(glam::Vec3::Z);
-            let right = if right0.length_squared() < 0.5 { glam::Vec3::X } else { right0.normalize() };
+            let right = if right0.length_squared() < 0.5 {
+                glam::Vec3::X
+            } else {
+                right0.normalize()
+            };
             let up = right.cross(fwd);
             let set3 = |name: &str, v: [f32; 3]| {
                 if let Some(loc) = gl.get_uniform_location(self.program, name) {
@@ -536,7 +602,10 @@ impl GpuTracer {
                 gl.uniform_1_f32(Some(&loc), (self.cam.fov_deg.to_radians() * 0.5).tan());
             }
             if let Some(loc) = gl.get_uniform_location(self.program, "u_aspect") {
-                gl.uniform_1_f32(Some(&loc), self.settings.w as f32 / self.settings.h.max(1) as f32);
+                gl.uniform_1_f32(
+                    Some(&loc),
+                    self.settings.w as f32 / self.settings.h.max(1) as f32,
+                );
             }
             if let Some(loc) = gl.get_uniform_location(self.program, "u_res") {
                 gl.uniform_2_f32(Some(&loc), self.settings.w as f32, self.settings.h as f32);
@@ -569,7 +638,15 @@ impl GpuTracer {
         let mut bytes = vec![0u8; w * h * 16]; // RGBA f32
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
-            gl.read_pixels(0, 0, w as i32, h as i32, glow::RGBA, glow::FLOAT, glow::PixelPackData::Slice(Some(&mut bytes)));
+            gl.read_pixels(
+                0,
+                0,
+                w as i32,
+                h as i32,
+                glow::RGBA,
+                glow::FLOAT,
+                glow::PixelPackData::Slice(Some(&mut bytes)),
+            );
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
         let inv = 1.0 / self.passes_done as f32;
@@ -581,7 +658,12 @@ impl GpuTracer {
                 let d = (y * w + x) * 4;
                 let mut lin = [0.0f32; 3];
                 for c in 0..3 {
-                    let f = f32::from_ne_bytes([bytes[s + c * 4], bytes[s + c * 4 + 1], bytes[s + c * 4 + 2], bytes[s + c * 4 + 3]]);
+                    let f = f32::from_ne_bytes([
+                        bytes[s + c * 4],
+                        bytes[s + c * 4 + 1],
+                        bytes[s + c * 4 + 2],
+                        bytes[s + c * 4 + 3],
+                    ]);
                     lin[c] = f * inv;
                 }
                 let rgb = tonemap8(self.settings.color, lin);
@@ -624,13 +706,25 @@ mod tests {
     /// may mention `ENV_UV_GLSL` freely without being spliced over.
     #[test]
     fn the_tracer_and_the_viewport_read_the_environment_the_same_way() {
-        assert_eq!(FS.matches("@@ENV_UV_GLSL@@").count(), 1,
+        assert_eq!(
+            FS.matches("@@ENV_UV_GLSL@@").count(),
+            1,
             "the placeholder must appear EXACTLY once — a comment mentioning it would be \
-             spliced over by the substitution");
+             spliced over by the substitution"
+        );
         let fs = FS.replace("@@ENV_UV_GLSL@@", crate::env::ENV_UV_GLSL);
-        assert!(!fs.contains("@@ENV_UV_GLSL@@"), "…and the token is fully substituted");
-        assert!(fs.contains("vec2 env_uv(vec3 d)"), "…leaving a real env_uv behind");
-        assert!(fs.contains("uniform float u_env_rot;"), "…with the rotation it reads in scope");
+        assert!(
+            !fs.contains("@@ENV_UV_GLSL@@"),
+            "…and the token is fully substituted"
+        );
+        assert!(
+            fs.contains("vec2 env_uv(vec3 d)"),
+            "…leaving a real env_uv behind"
+        );
+        assert!(
+            fs.contains("uniform float u_env_rot;"),
+            "…with the rotation it reads in scope"
+        );
         // The viewport's copy has to stay word for word the same as the shared one, or the render
         // and the view disagree about which way round the world is.
         let shared = crate::env::ENV_UV_GLSL.trim();
@@ -645,10 +739,18 @@ mod tests {
     /// so branching on `primary` here would darken every indirect bounce for no reason.
     #[test]
     fn the_environment_answers_the_same_for_every_ray() {
-        let body = FS.split("vec3 skyRadiance").nth(1).expect("skyRadiance exists");
-        let env_line = body.find("u_env_on == 1").expect("the environment short-circuit");
+        let body = FS
+            .split("vec3 skyRadiance")
+            .nth(1)
+            .expect("skyRadiance exists");
+        let env_line = body
+            .find("u_env_on == 1")
+            .expect("the environment short-circuit");
         let primary = body.find("if (primary)").expect("the analytic sun disc");
-        assert!(env_line < primary, "the environment must answer before the primary-only branch");
+        assert!(
+            env_line < primary,
+            "the environment must answer before the primary-only branch"
+        );
     }
 
     /// A huge panorama must be shrunk rather than uploaded whole. An 8K map is 400 MB of float in
@@ -660,11 +762,17 @@ mod tests {
     /// the render comes back with every surface wearing its neighbour's material.
     #[test]
     fn the_shader_strides_by_the_packed_texel_count() {
-        assert_eq!(FS.matches("ti * @@TRI_TEXELS@@").count(), 3,
+        assert_eq!(
+            FS.matches("ti * @@TRI_TEXELS@@").count(),
+            3,
             "the stride placeholder appears at every texel-fetch site — a comment mentioning \
-             it would be spliced over");
+             it would be spliced over"
+        );
         let fs = FS.replace("@@TRI_TEXELS@@", &crate::pathtrace::TRI_TEXELS.to_string());
-        assert!(!fs.contains("@@TRI_TEXELS@@"), "…and every occurrence is substituted");
+        assert!(
+            !fs.contains("@@TRI_TEXELS@@"),
+            "…and every occurrence is substituted"
+        );
         // The highest texel the shader reads must exist in the packed stride.
         let last = (0..16)
             .filter(|i| fs.contains(&format!("fetchT(u_tris, b + {i})")))
@@ -680,18 +788,26 @@ mod tests {
     /// The clearcoat must dim what is under it before adding its own reflection, in every backend.
     #[test]
     fn the_gpu_clearcoat_pays_for_itself() {
-        let coat = FS.find("albedo *= (1.0 - coat").expect("the base is attenuated");
-        let glint = FS.find("radiance += through * vec3(spec * fc").expect("the coat's own glint");
+        let coat = FS
+            .find("albedo *= (1.0 - coat")
+            .expect("the base is attenuated");
+        let glint = FS
+            .find("radiance += through * vec3(spec * fc")
+            .expect("the coat's own glint");
         assert!(coat < glint, "the coat dims itself instead of the base");
-        assert!(FS.contains("unpack_rgb8(t3.w)"), "the sheen tint is unpacked from its float");
+        assert!(
+            FS.contains("unpack_rgb8(t3.w)"),
+            "the sheen tint is unpacked from its float"
+        );
     }
 
     #[test]
     fn an_oversized_panorama_is_capped() {
-        assert!(ENV_MAX_W <= 4096, "the upload cap has grown past what a render can show");
+        assert!(
+            ENV_MAX_W <= 4096,
+            "the upload cap has grown past what a render can show"
+        );
         let big = crate::env_map::EnvMap::from_fn(64, 32, "small", |_| [1.0; 3]);
         assert!(big.w <= ENV_MAX_W, "a small map is left alone");
     }
 }
-
-

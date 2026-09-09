@@ -103,12 +103,17 @@ impl ScriptEngine {
             let py_ident = py_ident.clone();
             std::thread::Builder::new()
                 .name("cad_script".into())
-                .spawn(move || worker_loop(job_rx, reply_tx, busy, py_ident,
-                                           op_tx, op_reply_rx))
+                .spawn(move || worker_loop(job_rx, reply_tx, busy, py_ident, op_tx, op_reply_rx))
                 .expect("spawn cad_script worker")
         };
         ScriptEngine {
-            job_tx, reply_rx, op_rx, op_reply_tx, busy, py_ident, worker: Some(worker),
+            job_tx,
+            reply_rx,
+            op_rx,
+            op_reply_tx,
+            busy,
+            py_ident,
+            worker: Some(worker),
         }
     }
 
@@ -287,7 +292,12 @@ fn worker_loop(
                 crate::rasm::clear_ctx();
                 busy.store(false, Ordering::Relaxed);
             }
-            ScriptJob::RunScript { path, name, args, params } => {
+            ScriptJob::RunScript {
+                path,
+                name,
+                args,
+                params,
+            } => {
                 busy.store(true, Ordering::Relaxed);
                 crate::rasm::install_ctx(OpCtx::new(op_tx.clone(), op_reply_rx.clone()));
                 match std::fs::read_to_string(&path) {
@@ -480,7 +490,8 @@ fn run_code<'py>(
     repl: bool,
     globals: &Bound<'py, PyDict>,
 ) -> PyResult<Option<String>> {
-    let c = CString::new(code).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let c =
+        CString::new(code).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     if repl {
         match py.eval(c.as_c_str(), Some(globals), None) {
             Ok(v) => {
@@ -507,11 +518,10 @@ fn format_traceback(py: Python<'_>, err: &PyErr) -> String {
     let render = || -> PyResult<String> {
         let tb_mod = PyModule::import(py, "traceback")?;
         let tb = err.traceback(py);
-        let parts = tb_mod.getattr("format_exception")?.call1((
-            err.get_type(py),
-            err.value(py),
-            tb,
-        ))?;
+        let parts =
+            tb_mod
+                .getattr("format_exception")?
+                .call1((err.get_type(py), err.value(py), tb))?;
         let joined: String = parts
             .try_iter()?
             .filter_map(|x| x.ok())
@@ -550,8 +560,12 @@ mod tests {
         let eng = ScriptEngine::new();
         eng.submit_text("1+1");
         let replies = drain_until_finished(&eng);
-        assert!(replies.iter().any(|r| matches!(r, ScriptReply::Value(v) if v == "2")));
-        assert!(replies.iter().any(|r| matches!(r, ScriptReply::Finished { ok: true })));
+        assert!(replies
+            .iter()
+            .any(|r| matches!(r, ScriptReply::Value(v) if v == "2")));
+        assert!(replies
+            .iter()
+            .any(|r| matches!(r, ScriptReply::Finished { ok: true })));
     }
 
     #[test]
@@ -559,7 +573,9 @@ mod tests {
         let eng = ScriptEngine::new();
         eng.submit_text("print('hello')");
         let replies = drain_until_finished(&eng);
-        assert!(replies.iter().any(|r| matches!(r, ScriptReply::Print(s) if s.contains("hello"))));
+        assert!(replies
+            .iter()
+            .any(|r| matches!(r, ScriptReply::Print(s) if s.contains("hello"))));
     }
 
     #[test]
@@ -569,7 +585,9 @@ mod tests {
         drain_until_finished(&eng);
         eng.submit_text("x");
         let replies = drain_until_finished(&eng);
-        assert!(replies.iter().any(|r| matches!(r, ScriptReply::Value(v) if v == "42")));
+        assert!(replies
+            .iter()
+            .any(|r| matches!(r, ScriptReply::Value(v) if v == "42")));
     }
 
     #[test]
@@ -577,8 +595,12 @@ mod tests {
         let eng = ScriptEngine::new();
         eng.submit_text("1/0");
         let replies = drain_until_finished(&eng);
-        assert!(replies.iter().any(|r| matches!(r, ScriptReply::Error(s) if s.contains("ZeroDivisionError"))));
-        assert!(replies.iter().any(|r| matches!(r, ScriptReply::Finished { ok: false })));
+        assert!(replies
+            .iter()
+            .any(|r| matches!(r, ScriptReply::Error(s) if s.contains("ZeroDivisionError"))));
+        assert!(replies
+            .iter()
+            .any(|r| matches!(r, ScriptReply::Finished { ok: false })));
     }
 
     #[test]
@@ -594,7 +616,9 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         eng.cancel();
         let replies = drain_until_finished(&eng);
-        assert!(replies.iter().any(|r| matches!(r, ScriptReply::Finished { ok: false })));
+        assert!(replies
+            .iter()
+            .any(|r| matches!(r, ScriptReply::Finished { ok: false })));
         assert!(!eng.is_busy());
     }
 
@@ -645,11 +669,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(
-            replies.iter().any(|r| matches!(r, ScriptReply::Finished { ok: true })),
+            replies
+                .iter()
+                .any(|r| matches!(r, ScriptReply::Finished { ok: true })),
             "script must finish ok: {replies:?}"
         );
         assert!(
-            replies.iter().any(|r| matches!(r, ScriptReply::Print(s) if s.contains("ops ok"))),
+            replies
+                .iter()
+                .any(|r| matches!(r, ScriptReply::Print(s) if s.contains("ops ok"))),
             "prints must flow back: {replies:?}"
         );
         assert_eq!(count, 1, "host applied the add");
@@ -672,11 +700,15 @@ mod tests {
         let replies = drain_until_finished(&eng);
         let _ = std::fs::remove_file(&path);
         assert!(
-            replies.iter().any(|r| matches!(r, ScriptReply::Finished { ok: true })),
+            replies
+                .iter()
+                .any(|r| matches!(r, ScriptReply::Finished { ok: true })),
             "named script must finish ok: {replies:?}"
         );
         assert!(
-            replies.iter().any(|r| matches!(r, ScriptReply::Print(s) if s.contains("argv ok"))),
+            replies
+                .iter()
+                .any(|r| matches!(r, ScriptReply::Print(s) if s.contains("argv ok"))),
             "argv prints must flow back: {replies:?}"
         );
         // A plain `py` run afterwards must see an EMPTY rasm.args (not the
@@ -684,7 +716,9 @@ mod tests {
         eng.submit_text("assert rasm.args == [], rasm.args");
         let replies = drain_until_finished(&eng);
         assert!(
-            replies.iter().any(|r| matches!(r, ScriptReply::Finished { ok: true })),
+            replies
+                .iter()
+                .any(|r| matches!(r, ScriptReply::Finished { ok: true })),
             "plain run must see empty rasm.args: {replies:?}"
         );
     }
@@ -723,9 +757,14 @@ mod tests {
         assert!(p.help.contains("outer diameter"), "help parsed: {p:?}");
         assert_eq!(meta.params[1].ptype, ParamType::Int);
         assert_eq!(meta.params[2].ptype, ParamType::Str);
-        assert_eq!(meta.params[2].default, "part", "string defaults carry NO repr quotes");
+        assert_eq!(
+            meta.params[2].default, "part",
+            "string defaults carry NO repr quotes"
+        );
         assert!(
-            replies.iter().any(|r| matches!(r, ScriptReply::Finished { ok: true })),
+            replies
+                .iter()
+                .any(|r| matches!(r, ScriptReply::Finished { ok: true })),
             "meta pass finishes: {replies:?}"
         );
     }
@@ -745,16 +784,23 @@ mod tests {
             path.clone(),
             "params_test",
             Vec::new(),
-            vec![("outer_d".into(), "55.5".into()), ("bolts".into(), "9".into())],
+            vec![
+                ("outer_d".into(), "55.5".into()),
+                ("bolts".into(), "9".into()),
+            ],
         );
         let replies = drain_until_finished(&eng);
         let _ = std::fs::remove_file(&path);
         assert!(
-            replies.iter().any(|r| matches!(r, ScriptReply::Print(s) if s.contains("got 55.5 9"))),
+            replies
+                .iter()
+                .any(|r| matches!(r, ScriptReply::Print(s) if s.contains("got 55.5 9"))),
             "typed values must reach the function: {replies:?}"
         );
         assert!(
-            replies.iter().any(|r| matches!(r, ScriptReply::Finished { ok: true })),
+            replies
+                .iter()
+                .any(|r| matches!(r, ScriptReply::Finished { ok: true })),
             "params run finishes ok: {replies:?}"
         );
     }
@@ -774,11 +820,15 @@ mod tests {
         let replies = drain_until_finished(&eng);
         let _ = std::fs::remove_file(&path);
         assert!(
-            replies.iter().any(|r| matches!(r, ScriptReply::Print(s) if s.contains("got 77.5 4"))),
+            replies
+                .iter()
+                .any(|r| matches!(r, ScriptReply::Print(s) if s.contains("got 77.5 4"))),
             "positional args must map to declared order: {replies:?}"
         );
         assert!(
-            replies.iter().any(|r| matches!(r, ScriptReply::Finished { ok: true })),
+            replies
+                .iter()
+                .any(|r| matches!(r, ScriptReply::Finished { ok: true })),
             "positional run finishes ok: {replies:?}"
         );
     }
@@ -802,8 +852,15 @@ mod tests {
             ScriptReply::Meta(m) => Some(m.clone()),
             _ => None,
         });
-        let meta = meta.expect("a Meta reply must arrive").expect("params declared");
-        assert_eq!(meta.params[0].ptype, ParamType::Point, "{:?}", meta.params[0]);
+        let meta = meta
+            .expect("a Meta reply must arrive")
+            .expect("params declared");
+        assert_eq!(
+            meta.params[0].ptype,
+            ParamType::Point,
+            "{:?}",
+            meta.params[0]
+        );
         assert_eq!(meta.params[0].default, "(1.0, 2.0)");
         assert_eq!(meta.params[1].ptype, ParamType::Color);
         assert_eq!(meta.params[1].default, "5");
@@ -812,7 +869,10 @@ mod tests {
             path.clone(),
             "pt_test",
             Vec::new(),
-            vec![("pos".into(), "30.5,40.25".into()), ("holes_color".into(), "3".into())],
+            vec![
+                ("pos".into(), "30.5,40.25".into()),
+                ("holes_color".into(), "3".into()),
+            ],
         );
         let replies = drain_until_finished(&eng);
         let _ = std::fs::remove_file(&path);
@@ -822,7 +882,9 @@ mod tests {
             "point must convert to a tuple and color to an int: {replies:?}"
         );
         assert!(
-            replies.iter().any(|r| matches!(r, ScriptReply::Finished { ok: true })),
+            replies
+                .iter()
+                .any(|r| matches!(r, ScriptReply::Finished { ok: true })),
             "point/color run finishes ok: {replies:?}"
         );
     }
@@ -846,8 +908,15 @@ mod tests {
             ScriptReply::Meta(m) => Some(m.clone()),
             _ => None,
         });
-        let meta = meta.expect("a Meta reply must arrive").expect("params declared");
-        assert_eq!(meta.params[0].ptype, ParamType::Length, "{:?}", meta.params[0]);
+        let meta = meta
+            .expect("a Meta reply must arrive")
+            .expect("params declared");
+        assert_eq!(
+            meta.params[0].ptype,
+            ParamType::Length,
+            "{:?}",
+            meta.params[0]
+        );
         assert_eq!(meta.params[0].default, "120.0");
         eng.submit_script_with_params(
             path.clone(),
@@ -858,11 +927,15 @@ mod tests {
         let replies = drain_until_finished(&eng);
         let _ = std::fs::remove_file(&path);
         assert!(
-            replies.iter().any(|r| matches!(r, ScriptReply::Print(s) if s.contains("got 250.0"))),
+            replies
+                .iter()
+                .any(|r| matches!(r, ScriptReply::Print(s) if s.contains("got 250.0"))),
             "length values arrive as scene-unit floats: {replies:?}"
         );
         assert!(
-            replies.iter().any(|r| matches!(r, ScriptReply::Finished { ok: true })),
+            replies
+                .iter()
+                .any(|r| matches!(r, ScriptReply::Finished { ok: true })),
             "length run finishes ok: {replies:?}"
         );
     }
@@ -895,7 +968,9 @@ mod choice_list_param_tests {
             ScriptReply::Meta(m) => Some(m.clone()),
             _ => None,
         });
-        let meta = meta.expect("a Meta reply must arrive").expect("params declared");
+        let meta = meta
+            .expect("a Meta reply must arrive")
+            .expect("params declared");
         assert_eq!(meta.params[0].ptype, ParamType::Choice);
         assert_eq!(meta.params[0].choices, vec!["SOLID", "ANSI31", "BRICK"]);
         assert_eq!(meta.params[0].help, "hatch pattern");
@@ -922,7 +997,9 @@ mod choice_list_param_tests {
             "lists must convert: {replies:?}"
         );
         assert!(
-            replies.iter().any(|r| matches!(r, ScriptReply::Finished { ok: true })),
+            replies
+                .iter()
+                .any(|r| matches!(r, ScriptReply::Finished { ok: true })),
             "choice/list run finishes ok: {replies:?}"
         );
         // Catalog-backed types declare via annotations too.
@@ -937,8 +1014,15 @@ mod choice_list_param_tests {
             ScriptReply::Meta(m) => Some(m.clone()),
             _ => None,
         });
-        let meta2 = meta2.expect("a Meta reply must arrive").expect("params declared");
-        assert_eq!(meta2.params[0].ptype, ParamType::Linetype, "{:?}", meta2.params[0]);
+        let meta2 = meta2
+            .expect("a Meta reply must arrive")
+            .expect("params declared");
+        assert_eq!(
+            meta2.params[0].ptype,
+            ParamType::Linetype,
+            "{:?}",
+            meta2.params[0]
+        );
         assert_eq!(meta2.params[1].ptype, ParamType::Layer);
         assert_eq!(meta2.params[2].ptype, ParamType::Block);
         assert_eq!(meta2.params[3].ptype, ParamType::HatchPattern);
@@ -947,7 +1031,10 @@ mod choice_list_param_tests {
     #[test]
     fn bad_choice_value_fails_loudly() {
         let mut path = std::env::temp_dir();
-        path.push(format!("cad_script_badchoice_test_{}.py", std::process::id()));
+        path.push(format!(
+            "cad_script_badchoice_test_{}.py",
+            std::process::id()
+        ));
         let src = "def run(pattern: 'choice' = 'SOLID'):\n\
                    \x20   '''pattern: hatch pattern [SOLID, ANSI31]\n\
                    \x20   '''\n\
@@ -964,7 +1051,9 @@ mod choice_list_param_tests {
         let replies = drain_until_finished(&eng);
         let _ = std::fs::remove_file(&path);
         assert!(
-            replies.iter().any(|r| matches!(r, ScriptReply::Error(e) if e.contains("not one of"))),
+            replies
+                .iter()
+                .any(|r| matches!(r, ScriptReply::Error(e) if e.contains("not one of"))),
             "a value outside the choices must fail loudly: {replies:?}"
         );
     }

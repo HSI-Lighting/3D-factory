@@ -115,7 +115,8 @@ pub fn residuals(s: &Sketch, x: &[f64]) -> Vec<f64> {
                 let ((cx, cy), (dx, dy)) = line_pts(s.lines[b]);
                 let (ux, uy) = (bx - ax, by - ay);
                 let (vx, vy) = (dx - cx, dy - cy);
-                let nrm = (ux * ux + uy * uy).sqrt().max(1e-9) * (vx * vx + vy * vy).sqrt().max(1e-9);
+                let nrm =
+                    (ux * ux + uy * uy).sqrt().max(1e-9) * (vx * vx + vy * vy).sqrt().max(1e-9);
                 // sin(angle) — dimensionless, so it stays well-scaled at any
                 // coordinate magnitude (the raw cross product is area-scale and
                 // makes the solver diverge on large drawings).
@@ -126,7 +127,8 @@ pub fn residuals(s: &Sketch, x: &[f64]) -> Vec<f64> {
                 let ((cx, cy), (dx, dy)) = line_pts(s.lines[b]);
                 let (ux, uy) = (bx - ax, by - ay);
                 let (vx, vy) = (dx - cx, dy - cy);
-                let nrm = (ux * ux + uy * uy).sqrt().max(1e-9) * (vx * vx + vy * vy).sqrt().max(1e-9);
+                let nrm =
+                    (ux * ux + uy * uy).sqrt().max(1e-9) * (vx * vx + vy * vy).sqrt().max(1e-9);
                 r.push((ux * vx + uy * vy) / nrm); // cos(angle), dimensionless
             }
             Constraint::Collinear { a, b } => {
@@ -157,8 +159,12 @@ pub fn residuals(s: &Sketch, x: &[f64]) -> Vec<f64> {
                 let dot = ux * vx + uy * vy;
                 // wrap the angle error into (−π, π] so e.g. 179° vs −179° is small
                 let mut e = cross.atan2(dot) - radians;
-                while e > std::f64::consts::PI { e -= 2.0 * std::f64::consts::PI; }
-                while e < -std::f64::consts::PI { e += 2.0 * std::f64::consts::PI; }
+                while e > std::f64::consts::PI {
+                    e -= 2.0 * std::f64::consts::PI;
+                }
+                while e < -std::f64::consts::PI {
+                    e += 2.0 * std::f64::consts::PI;
+                }
                 r.push(e);
             }
             Constraint::Radius { circle, r: rr } => {
@@ -280,8 +286,17 @@ pub fn solve(s: &mut Sketch) -> SolveReport {
     let m = r.len();
     if m == 0 || nf == 0 {
         unpack(s, &x);
-        let rms = if m == 0 { 0.0 } else { (sum_sq(&r) / m as f64).sqrt() };
-        return SolveReport { converged: rms < 1e-6, iterations: 0, residual: rms, dof };
+        let rms = if m == 0 {
+            0.0
+        } else {
+            (sum_sq(&r) / m as f64).sqrt()
+        };
+        return SolveReport {
+            converged: rms < 1e-6,
+            iterations: 0,
+            residual: rms,
+            dof,
+        };
     }
 
     let mut cost = sum_sq(&r);
@@ -347,7 +362,12 @@ pub fn solve(s: &mut Sketch) -> SolveReport {
 
     unpack(s, &x);
     let rms = (cost / m as f64).sqrt();
-    SolveReport { converged: rms < 1e-6, iterations: iters, residual: rms, dof }
+    SolveReport {
+        converged: rms < 1e-6,
+        iterations: iters,
+        residual: rms,
+        dof,
+    }
 }
 
 /// RMS of all constraint residuals at the sketch's CURRENT positions (no solve).
@@ -355,7 +375,11 @@ pub fn solve(s: &mut Sketch) -> SolveReport {
 pub fn current_rms(s: &Sketch) -> f64 {
     let (x, _) = pack(s);
     let r = residuals(s, &x);
-    if r.is_empty() { 0.0 } else { (sum_sq(&r) / r.len() as f64).sqrt() }
+    if r.is_empty() {
+        0.0
+    } else {
+        (sum_sq(&r) / r.len() as f64).sqrt()
+    }
 }
 
 /// Per-constraint residual MAGNITUDE at the sketch's current positions, aligned
@@ -370,7 +394,10 @@ pub fn residual_breakdown(s: &Sketch) -> Vec<f64> {
         let n = c.residual_count();
         let mut ss = 0.0;
         for _ in 0..n {
-            if k < r.len() { ss += r[k] * r[k]; k += 1; }
+            if k < r.len() {
+                ss += r[k] * r[k];
+                k += 1;
+            }
         }
         out.push(ss.sqrt());
     }
@@ -533,8 +560,16 @@ mod tests {
         let mut s = Sketch::new();
         let p0 = s.add_point(0.0, 0.0);
         let p1 = s.add_point(3.0, 4.0); // currently length 5
-        s.add(Constraint::Fixed { p: p0, x: 0.0, y: 0.0 });
-        s.add(Constraint::Distance { p: p0, q: p1, d: 10.0 });
+        s.add(Constraint::Fixed {
+            p: p0,
+            x: 0.0,
+            y: 0.0,
+        });
+        s.add(Constraint::Distance {
+            p: p0,
+            q: p1,
+            d: 10.0,
+        });
         let rep = solve(&mut s);
         assert!(rep.converged, "rms={}", rep.residual);
         assert!((dist(&s, p0, p1) - 10.0).abs() < 1e-6);
@@ -549,8 +584,16 @@ mod tests {
         let c = s.add_point(2.0, 1.0); // skewed
         let l0 = s.add_line(a, b);
         let l1 = s.add_line(a, c);
-        s.add(Constraint::Fixed { p: a, x: 0.0, y: 0.0 });
-        s.add(Constraint::Fixed { p: b, x: 10.0, y: 0.0 });
+        s.add(Constraint::Fixed {
+            p: a,
+            x: 0.0,
+            y: 0.0,
+        });
+        s.add(Constraint::Fixed {
+            p: b,
+            x: 10.0,
+            y: 0.0,
+        });
         s.add(Constraint::Perpendicular { a: l0, b: l1 });
         let rep = solve(&mut s);
         assert!(rep.converged, "rms={}", rep.residual);
@@ -570,16 +613,29 @@ mod tests {
         let l1 = s.add_line(p1, p2);
         let l2 = s.add_line(p2, p3);
         let l3 = s.add_line(p3, p0);
-        s.add(Constraint::Fixed { p: p0, x: 0.0, y: 0.0 });
+        s.add(Constraint::Fixed {
+            p: p0,
+            x: 0.0,
+            y: 0.0,
+        });
         s.add(Constraint::Horizontal { line: l0 });
         s.add(Constraint::Vertical { line: l1 });
         s.add(Constraint::Horizontal { line: l2 });
         s.add(Constraint::Vertical { line: l3 });
-        s.add(Constraint::Distance { p: p0, q: p1, d: 10.0 });
-        s.add(Constraint::Distance { p: p1, q: p2, d: 5.0 });
+        s.add(Constraint::Distance {
+            p: p0,
+            q: p1,
+            d: 10.0,
+        });
+        s.add(Constraint::Distance {
+            p: p1,
+            q: p2,
+            d: 5.0,
+        });
         let rep = solve(&mut s);
         assert!(rep.converged, "rms={}", rep.residual);
-        let close = |a: cad_kernel::Vec2, x: f64, y: f64| (a.x - x).abs() < 1e-5 && (a.y - y).abs() < 1e-5;
+        let close =
+            |a: cad_kernel::Vec2, x: f64, y: f64| (a.x - x).abs() < 1e-5 && (a.y - y).abs() < 1e-5;
         assert!(close(s.points[p0], 0.0, 0.0));
         assert!(close(s.points[p1], 10.0, 0.0));
         assert!(close(s.points[p2], 10.0, 5.0));
@@ -603,19 +659,35 @@ mod tests {
         let d = s.add_point(6548.0, 1475.0);
         let l0 = s.add_line(a, b);
         let l1 = s.add_line(c, d);
-        s.add(Constraint::Fixed { p: a, x: 3248.0, y: 4004.0 });
-        s.add(Constraint::Fixed { p: b, x: 5316.0, y: 5652.0 });
+        s.add(Constraint::Fixed {
+            p: a,
+            x: 3248.0,
+            y: 4004.0,
+        });
+        s.add(Constraint::Fixed {
+            p: b,
+            x: 5316.0,
+            y: 5652.0,
+        });
         s.add(Constraint::Parallel { a: l0, b: l1 });
         let rep = solve(&mut s);
         assert!(rep.converged, "rms={}", rep.residual);
         // nothing flew off — every point stays within the original bbox + margin
         for p in &s.points {
-            assert!(p.x.abs() < 20_000.0 && p.y.abs() < 20_000.0, "exploded: {:?}", p);
+            assert!(
+                p.x.abs() < 20_000.0 && p.y.abs() < 20_000.0,
+                "exploded: {:?}",
+                p
+            );
         }
         let u = s.points[b] - s.points[a];
         let v = s.points[d] - s.points[c];
         let cross = u.x * v.y - u.y * v.x;
-        assert!((cross / (u.len() * v.len())).abs() < 1e-6, "not parallel: sin={}", cross / (u.len() * v.len()));
+        assert!(
+            (cross / (u.len() * v.len())).abs() < 1e-6,
+            "not parallel: sin={}",
+            cross / (u.len() * v.len())
+        );
     }
 
     #[test]
@@ -627,9 +699,21 @@ mod tests {
         let d = s.add_point(9.0, 6.0);
         let l0 = s.add_line(a, b);
         let l1 = s.add_line(c, d);
-        s.add(Constraint::Fixed { p: a, x: 0.0, y: 0.0 });
-        s.add(Constraint::Fixed { p: b, x: 10.0, y: 0.0 });
-        s.add(Constraint::Fixed { p: c, x: 0.0, y: 5.0 });
+        s.add(Constraint::Fixed {
+            p: a,
+            x: 0.0,
+            y: 0.0,
+        });
+        s.add(Constraint::Fixed {
+            p: b,
+            x: 10.0,
+            y: 0.0,
+        });
+        s.add(Constraint::Fixed {
+            p: c,
+            x: 0.0,
+            y: 5.0,
+        });
         s.add(Constraint::Parallel { a: l0, b: l1 });
         let rep = solve(&mut s);
         assert!(rep.converged, "rms={}", rep.residual);
@@ -646,7 +730,11 @@ mod tests {
         let rep = solve(&mut s);
         assert!(rep.converged, "rms={}", rep.residual);
         let circ = s.circles[c];
-        assert!((s.scalars[circ.radius] - 7.5).abs() < 1e-6, "r={}", s.scalars[circ.radius]);
+        assert!(
+            (s.scalars[circ.radius] - 7.5).abs() < 1e-6,
+            "r={}",
+            s.scalars[circ.radius]
+        );
     }
 
     #[test]
@@ -656,7 +744,11 @@ mod tests {
         let c1 = s.add_circle_xy(3.0, 4.0, 2.0);
         // anchor c0's center
         let center0 = s.circles[c0].center;
-        s.add(Constraint::Fixed { p: center0, x: 0.0, y: 0.0 });
+        s.add(Constraint::Fixed {
+            p: center0,
+            x: 0.0,
+            y: 0.0,
+        });
         s.add(Constraint::Concentric { a: c0, b: c1 });
         s.add(Constraint::EqualRadius { a: c0, b: c1 });
         let rep = solve(&mut s);
@@ -676,8 +768,16 @@ mod tests {
         let b = s.add_point(5.0, 0.0);
         let l = s.add_line(a, b);
         let c = s.add_circle_xy(0.0, 5.0, 2.0);
-        s.add(Constraint::Fixed { p: a, x: -5.0, y: 0.0 });
-        s.add(Constraint::Fixed { p: b, x: 5.0, y: 0.0 });
+        s.add(Constraint::Fixed {
+            p: a,
+            x: -5.0,
+            y: 0.0,
+        });
+        s.add(Constraint::Fixed {
+            p: b,
+            x: 5.0,
+            y: 0.0,
+        });
         s.add(Constraint::Radius { circle: c, r: 2.0 });
         s.add(Constraint::TangentLineCircle { line: l, circle: c });
         let rep = solve(&mut s);
@@ -706,8 +806,16 @@ mod tests {
         let a = s.add_point(0.0, 0.0);
         let b = s.add_point(10.0, 0.0);
         let _l = s.add_line(a, b);
-        s.add(Constraint::Fixed { p: a, x: 0.0, y: 0.0 });
-        s.add(Constraint::Fixed { p: b, x: 10.0, y: 0.0 });
+        s.add(Constraint::Fixed {
+            p: a,
+            x: 0.0,
+            y: 0.0,
+        });
+        s.add(Constraint::Fixed {
+            p: b,
+            x: 10.0,
+            y: 0.0,
+        });
         let d = dof_analysis(&s);
         assert_eq!(d.dof, 0);
         assert!(d.fully_defined);
@@ -721,7 +829,11 @@ mod tests {
         let a = s.add_point(0.0, 0.0);
         let b = s.add_point(10.0, 2.0);
         let _l = s.add_line(a, b);
-        s.add(Constraint::Fixed { p: a, x: 0.0, y: 0.0 });
+        s.add(Constraint::Fixed {
+            p: a,
+            x: 0.0,
+            y: 0.0,
+        });
         assert!(!dof_analysis(&s).redundant);
     }
 
@@ -731,7 +843,11 @@ mod tests {
         let a = s.add_point(0.0, 0.0);
         let b = s.add_point(10.0, 2.0);
         let l = s.add_line(a, b);
-        s.add(Constraint::Fixed { p: a, x: 0.0, y: 0.0 });
+        s.add(Constraint::Fixed {
+            p: a,
+            x: 0.0,
+            y: 0.0,
+        });
         s.add(Constraint::Horizontal { line: l });
         s.add(Constraint::Horizontal { line: l }); // duplicate ⇒ redundant
         assert!(dof_analysis(&s).redundant);
@@ -746,15 +862,34 @@ mod tests {
         let d = s.add_point(8.0, 1.0);
         let l0 = s.add_line(a, b);
         let l1 = s.add_line(c, d);
-        s.add(Constraint::Fixed { p: a, x: 0.0, y: 0.0 });
-        s.add(Constraint::Fixed { p: b, x: 10.0, y: 0.0 });
-        s.add(Constraint::Fixed { p: c, x: 0.0, y: 0.0 });
-        s.add(Constraint::Angle { a: l0, b: l1, radians: std::f64::consts::FRAC_PI_4 });
+        s.add(Constraint::Fixed {
+            p: a,
+            x: 0.0,
+            y: 0.0,
+        });
+        s.add(Constraint::Fixed {
+            p: b,
+            x: 10.0,
+            y: 0.0,
+        });
+        s.add(Constraint::Fixed {
+            p: c,
+            x: 0.0,
+            y: 0.0,
+        });
+        s.add(Constraint::Angle {
+            a: l0,
+            b: l1,
+            radians: std::f64::consts::FRAC_PI_4,
+        });
         let rep = solve(&mut s);
         assert!(rep.converged, "rms={}", rep.residual);
         let u = s.points[b] - s.points[a];
         let v = s.points[d] - s.points[c];
         let ang = (u.x * v.y - u.y * v.x).atan2(u.x * v.x + u.y * v.y);
-        assert!((ang - std::f64::consts::FRAC_PI_4).abs() < 1e-5, "ang={ang}");
+        assert!(
+            (ang - std::f64::consts::FRAC_PI_4).abs() < 1e-5,
+            "ang={ang}"
+        );
     }
 }

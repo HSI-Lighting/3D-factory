@@ -10,8 +10,8 @@
 //! than letting it do what it is good at.
 
 pub mod layout;
-pub mod ui;
 pub mod options;
 pub mod pdf;
+pub mod ui;
 
 pub use options::{Format, ImageSlot, Options, PageSize, Prefs, ReportImage, Section};

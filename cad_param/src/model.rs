@@ -46,7 +46,11 @@ pub enum Constraint {
     /// A point lies on a line (infinite line through the segment). 1 residual.
     PointOnLine { p: PointId, line: LineId },
     /// Two points are symmetric about a line. 2 residuals.
-    Symmetric { p: PointId, q: PointId, line: LineId },
+    Symmetric {
+        p: PointId,
+        q: PointId,
+        line: LineId,
+    },
 
     // ---- line / direction ----
     /// A line is horizontal (endpoints share y). 1 residual.
@@ -77,7 +81,11 @@ pub enum Constraint {
     TangentLineCircle { line: LineId, circle: CircleId },
     /// Two circles are tangent. `internal` = inner tangency (|r₁−r₂|) vs outer
     /// (r₁+r₂). 1 residual.
-    TangentCircleCircle { a: CircleId, b: CircleId, internal: bool },
+    TangentCircleCircle {
+        a: CircleId,
+        b: CircleId,
+        internal: bool,
+    },
 }
 
 impl Constraint {

@@ -33,8 +33,10 @@ pub struct Table {
 impl Table {
     /// Total grid size (width, height) before rotation.
     pub fn size(&self) -> Vec2 {
-        Vec2::new(self.n_cols as f64 * self.col_w,
-                  self.n_rows as f64 * self.row_h)
+        Vec2::new(
+            self.n_cols as f64 * self.col_w,
+            self.n_rows as f64 * self.row_h,
+        )
     }
 
     /// World point of the cell (row, col) top-left corner (unrotated grid
@@ -51,11 +53,12 @@ impl Table {
     pub fn cell_text(&self, row: usize, col: usize) -> Option<Text> {
         let idx = row * self.n_cols + col;
         let s = self.cells.get(idx)?;
-        if s.is_empty() { return None; }
+        if s.is_empty() {
+            return None;
+        }
         let h = self.font_height;
         let pad = h * 0.25;
-        let pos = self.cell_corner(row, col)
-            + Vec2::new(pad, -h - pad);
+        let pos = self.cell_corner(row, col) + Vec2::new(pad, -h - pad);
         Some(Text {
             position: pos,
             height: h,
@@ -100,12 +103,11 @@ impl Table {
         let mut mn = Vec2::new(f64::INFINITY, f64::INFINITY);
         let mut mx = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
         for c in corners {
-            let w = self.insert + Vec2::new(
-                c.x * cos - c.y * sin,
-                c.x * sin + c.y * cos,
-            );
-            mn.x = mn.x.min(w.x); mn.y = mn.y.min(w.y);
-            mx.x = mx.x.max(w.x); mx.y = mx.y.max(w.y);
+            let w = self.insert + Vec2::new(c.x * cos - c.y * sin, c.x * sin + c.y * cos);
+            mn.x = mn.x.min(w.x);
+            mn.y = mn.y.min(w.y);
+            mx.x = mx.x.max(w.x);
+            mx.y = mx.y.max(w.y);
         }
         (mn, mx)
     }
@@ -142,8 +144,14 @@ mod tests {
             rotation: 0.0,
             style: 0,
             font_height: 1.0,
-            cells: vec!["A1".into(), "B1".into(), "C1".into(),
-                        "A2".into(), "B2".into(), "C2".into()],
+            cells: vec![
+                "A1".into(),
+                "B1".into(),
+                "C1".into(),
+                "A2".into(),
+                "B2".into(),
+                "C2".into(),
+            ],
         }
     }
 
@@ -187,8 +195,8 @@ mod tests {
     #[test]
     fn distance_hits_lines_and_text() {
         let t = tbl();
-        assert!(t.distance_to_point(Vec2::new(5.0, 0.0)) < 1e-9);   // top rule
-        assert!(t.distance_to_point(Vec2::new(0.0, -2.5)) < 1e-9);  // left rule
+        assert!(t.distance_to_point(Vec2::new(5.0, 0.0)) < 1e-9); // top rule
+        assert!(t.distance_to_point(Vec2::new(0.0, -2.5)) < 1e-9); // left rule
         assert!(t.distance_to_point(Vec2::new(15.0, 50.0)) > 30.0); // far away
     }
 }

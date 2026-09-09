@@ -121,7 +121,11 @@ impl Aperture {
         if l <= 0.0 {
             return None;
         }
-        Some(if w <= 0.0 { Aperture::Round { d: l } } else { Aperture::Rect { l, w } })
+        Some(if w <= 0.0 {
+            Aperture::Round { d: l }
+        } else {
+            Aperture::Rect { l, w }
+        })
     }
 
     /// Its area seen face-on, m².
@@ -144,7 +148,12 @@ impl Aperture {
 impl IesProfile {
     /// Peak luminous intensity across the whole table (candela), multiplier applied.
     pub fn peak_candela(&self) -> f64 {
-        self.candela.iter().flat_map(|r| r.iter()).cloned().fold(0.0, f64::max) * self.multiplier
+        self.candela
+            .iter()
+            .flat_map(|r| r.iter())
+            .cloned()
+            .fold(0.0, f64::max)
+            * self.multiplier
     }
 
     /// Bilinearly-interpolated luminous intensity (candela) toward the given
@@ -159,7 +168,11 @@ impl IesProfile {
             return 0.0;
         }
         let (v0, v1, vt) = bracket(va, vertical_deg);
-        let (h0, h1, ht) = if ha.len() == 1 { (0, 0, 0.0) } else { bracket(ha, horizontal_deg.rem_euclid(360.0)) };
+        let (h0, h1, ht) = if ha.len() == 1 {
+            (0, 0, 0.0)
+        } else {
+            bracket(ha, horizontal_deg.rem_euclid(360.0))
+        };
         let c0 = lerp(self.candela[h0][v0], self.candela[h0][v1], vt);
         let c1 = lerp(self.candela[h1][v0], self.candela[h1][v1], vt);
         lerp(c0, c1, ht) * self.multiplier
@@ -232,7 +245,10 @@ pub fn parse(contents: &str) -> Result<IesProfile, String> {
         .filter_map(|t| t.parse::<f64>().ok())
         .collect();
     let mut it = nums.into_iter();
-    let mut next = |what: &str| it.next().ok_or_else(|| err(&format!("unexpected EOF reading {what}")));
+    let mut next = |what: &str| {
+        it.next()
+            .ok_or_else(|| err(&format!("unexpected EOF reading {what}")))
+    };
 
     let _num_lamps = next("num_lamps")?;
     let lumens = next("lumens_per_lamp")?;
@@ -350,7 +366,10 @@ fn photometry_probe_real_files() {
     };
     let mut rows: Vec<String> = Vec::new();
     let (mut ok, mut bad, mut suspect) = (0, 0, 0);
-    for e in std::fs::read_dir(&dir).expect("read PHOTOMETRY_DIR").flatten() {
+    for e in std::fs::read_dir(&dir)
+        .expect("read PHOTOMETRY_DIR")
+        .flatten()
+    {
         let p = e.path();
         let is_ies = p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ies"));
         let is_ldt = p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ldt"));
@@ -363,7 +382,11 @@ fn photometry_probe_real_files() {
             Err(_) => bytes.iter().map(|&b| b as char).collect(),
         };
         let name = p.file_name().unwrap().to_string_lossy().to_string();
-        let parsed = if is_ies { parse(&text) } else { crate::ldt::parse(&text) };
+        let parsed = if is_ies {
+            parse(&text)
+        } else {
+            crate::ldt::parse(&text)
+        };
         match parsed {
             Ok(prof) => {
                 ok += 1;
@@ -470,15 +493,30 @@ mod the_glare_area_is_unchanged {
     /// is an infinite luminance, and a glare figure built on it would be nonsense with a number.
     #[test]
     fn the_edges_of_the_contract_hold() {
-        assert!(prof(0.0, 0.0).projected_luminous_area(0.0).is_none(), "no aperture declared");
-        assert!(prof(-1.0, 0.2).projected_luminous_area(0.0).is_none(), "negative length");
+        assert!(
+            prof(0.0, 0.0).projected_luminous_area(0.0).is_none(),
+            "no aperture declared"
+        );
+        assert!(
+            prof(-1.0, 0.2).projected_luminous_area(0.0).is_none(),
+            "negative length"
+        );
         let p = prof(1.2, 0.3);
         // `cos > 0.087` puts the cut-off at 85.01 deg, not 85: cos(85 deg) = 0.0872, still in.
         // Stated exactly, because "about 5 degrees of grazing" is prose, not a test.
-        assert!(p.projected_luminous_area(86.0).is_none(), "past the grazing cut-off: excluded");
-        assert!(p.projected_luminous_area(85.0).is_some(), "just inside it: included");
+        assert!(
+            p.projected_luminous_area(86.0).is_none(),
+            "past the grazing cut-off: excluded"
+        );
+        assert!(
+            p.projected_luminous_area(85.0).is_some(),
+            "just inside it: included"
+        );
         // Symmetric in gamma — the sign of the angle cannot change an area.
-        assert_eq!(p.projected_luminous_area(40.0), p.projected_luminous_area(-40.0));
+        assert_eq!(
+            p.projected_luminous_area(40.0),
+            p.projected_luminous_area(-40.0)
+        );
     }
 }
 
@@ -503,8 +541,15 @@ mod a_negative_ies_dimension_means_round {
     #[test]
     fn a_negative_width_becomes_a_round_aperture() {
         let p = parse(&ies("-0.6", "-0.6", "0.0")).expect("parses");
-        assert_eq!(p.width, 0.0, "round is marked by a zero width, not a negative one");
-        assert!((p.length - 0.6).abs() < 1e-12, "the diameter is positive: {}", p.length);
+        assert_eq!(
+            p.width, 0.0,
+            "round is marked by a zero width, not a negative one"
+        );
+        assert!(
+            (p.length - 0.6).abs() < 1e-12,
+            "the diameter is positive: {}",
+            p.length
+        );
         assert_eq!(p.aperture(), Some(Aperture::Round { d: 0.6 }));
         assert_eq!(p.housing_shape(), Some(Aperture::Round { d: 0.6 }));
         let a = p.projected_luminous_area(0.0).expect("declared");
@@ -530,7 +575,11 @@ mod a_negative_ies_dimension_means_round {
     #[test]
     fn a_negative_height_is_taken_as_a_magnitude() {
         let p = parse(&ies("0.3", "1.2", "-0.08")).expect("parses");
-        assert!((p.height - 0.08).abs() < 1e-12, "height must be positive, got {}", p.height);
+        assert!(
+            (p.height - 0.08).abs() < 1e-12,
+            "height must be positive, got {}",
+            p.height
+        );
     }
 
     /// The all-zero case stays "no dimensions declared" — the common one, and not an error.
@@ -568,7 +617,10 @@ mod the_keywords_reach_the_schedule {
         let p = parse(WITH_KEYWORDS).expect("a valid IES file");
         assert_eq!(p.manufacturer, "HSI Lighting");
         assert_eq!(p.catalogue, "OG20-36");
-        assert_eq!(p.name, "OCULUS GRANDE 2.0", "the luminaire name is still the name");
+        assert_eq!(
+            p.name, "OCULUS GRANDE 2.0",
+            "the luminaire name is still the name"
+        );
         assert_eq!(p.lamp, "LED 3000K CRI90");
         assert!(
             !p.manufacturer.contains("TR-1234"),

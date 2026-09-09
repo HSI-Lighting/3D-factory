@@ -6,17 +6,17 @@
 // named_views) slot in as new fields without touching call sites that
 // already work with the current ones.
 
+use crate::block::BlockTable;
 use crate::color::TrueColorTable;
+use crate::dim::DimStyleTable;
 use crate::dobject::DObject;
 use crate::layer::LayerTable;
 use crate::linetype::LinetypeTable;
+use crate::math::Vec2;
 use crate::pen::PenTable;
 use crate::text::TextStyleTable;
-use crate::dim::DimStyleTable;
-use crate::wallstyle::WallStyleTable;
-use crate::block::BlockTable;
-use crate::math::Vec2;
 use crate::units::Units;
+use crate::wallstyle::WallStyleTable;
 use std::sync::Arc;
 
 /// An embedded reference raster image — an underlay you draft over (NOT
@@ -27,35 +27,35 @@ use std::sync::Arc;
 /// default). Persisted in the native RSM file (v4+); DXF does not embed it.
 #[derive(Clone, Debug)]
 pub struct RasterImage {
-    pub name:    String,
-    pub data:    Arc<Vec<u8>>,
-    pub insert:  Vec2,
+    pub name: String,
+    pub data: Arc<Vec<u8>>,
+    pub insert: Vec2,
     pub world_w: f64,
     pub world_h: f64,
 }
 
 #[derive(Clone)]
 pub struct Document {
-    pub dobjects:    Vec<DObject>,
-    pub layers:      LayerTable,
-    pub linetypes:   LinetypeTable,
-    pub pens:        PenTable,
+    pub dobjects: Vec<DObject>,
+    pub layers: LayerTable,
+    pub linetypes: LinetypeTable,
+    pub pens: PenTable,
     /// Shared 24-bit color table. Dobjects with `Color::TrueColorRef(idx)`
     /// look up their RGB here. Dedup'd on `intern`, so a million dobjects
     /// in the same color cost ~4 bytes once.
-    pub truecolors:  TrueColorTable,
+    pub truecolors: TrueColorTable,
     /// Named text styles. Dobjects with `Geom::Text(t)` reference an
     /// entry via `t.style`. Index 0 is reserved STANDARD.
     pub text_styles: TextStyleTable,
     /// Named dimension styles. Dobjects with `Geom::Dimension(d)`
     /// reference an entry via `d.style`. Index 0 is reserved STANDARD.
-    pub dim_styles:  DimStyleTable,
+    pub dim_styles: DimStyleTable,
     /// Named wall styles (Dry Wall / Structural / …). Walls reference an
     /// entry via `w.style`. Index 0 is reserved STANDARD.
     pub wall_styles: WallStyleTable,
     /// Block definitions. Dobjects with `Geom::BlockRef(br)` reference an
     /// entry via `br.block`. No reserved id-0 entry — starts empty.
-    pub blocks:      BlockTable,
+    pub blocks: BlockTable,
     /// Embedded reference raster underlays. Drafted over, not vectorized;
     /// persisted in RSM (v4+). Empty by default.
     pub raster_images: Vec<RasterImage>,
@@ -75,8 +75,8 @@ pub struct Document {
     /// A FRESH default-styled dobject (`DObject::new`) picks these up in
     /// `push`; copies / derivatives (which carry an explicit style via
     /// `with_style`) do not. Sticky.
-    pub current_color:      crate::color::Color,
-    pub current_linetype:   u32,
+    pub current_color: crate::color::Color,
+    pub current_linetype: u32,
     pub current_lineweight: crate::lineweight::Lineweight,
     /// What one drawing unit is worth in the real world. Serves BOTH worlds:
     /// the 3D Factory, renderer and lux engine multiply by `metres_per_unit`
@@ -123,29 +123,29 @@ pub struct Document {
 impl Default for Document {
     fn default() -> Self {
         Self {
-            dobjects:    Vec::new(),
-            layers:      LayerTable::with_defaults(),
-            linetypes:   LinetypeTable::with_defaults(),
-            pens:        PenTable::default(),
-            truecolors:  TrueColorTable::new(),
+            dobjects: Vec::new(),
+            layers: LayerTable::with_defaults(),
+            linetypes: LinetypeTable::with_defaults(),
+            pens: PenTable::default(),
+            truecolors: TrueColorTable::new(),
             text_styles: TextStyleTable::with_defaults(),
-            dim_styles:  DimStyleTable::with_defaults(),
+            dim_styles: DimStyleTable::with_defaults(),
             wall_styles: WallStyleTable::with_defaults(),
-            blocks:      BlockTable::default(),
+            blocks: BlockTable::default(),
             raster_images: Vec::new(),
             plot_styles: crate::plotstyle::PlotStyleTable::default(),
             layouts: Vec::new(),
             active_layout: None,
-            current_color:      crate::color::Color::ByLayer,
-            current_linetype:   LinetypeTable::BYLAYER,
+            current_color: crate::color::Color::ByLayer,
+            current_linetype: LinetypeTable::BYLAYER,
             current_lineweight: crate::lineweight::Lineweight::ByLayer,
-            units:       Units::default(),
-            groups:             Vec::new(),
-            layer_states:       Vec::new(),
-            ucs_list:           Vec::new(),
-            current_ucs:        0,
-            page_setup:         crate::pagesetup::PageSetup::default(),
-            extra_blobs:        Vec::new(),
+            units: Units::default(),
+            groups: Vec::new(),
+            layer_states: Vec::new(),
+            ucs_list: Vec::new(),
+            current_ucs: 0,
+            page_setup: crate::pagesetup::PageSetup::default(),
+            extra_blobs: Vec::new(),
         }
     }
 }
@@ -231,11 +231,18 @@ impl Document {
             .blocks
             .blocks
             .iter()
-            .map(|b| b.name.capacity() + b.dobjects.iter().map(|d| d.geom.approx_bytes()).sum::<usize>())
+            .map(|b| {
+                b.name.capacity()
+                    + b.dobjects
+                        .iter()
+                        .map(|d| d.geom.approx_bytes())
+                        .sum::<usize>()
+            })
             .sum();
         // The per-DObject overhead beyond its geom (handle, style, flags) rides on the struct size.
-        let per_obj = self.dobjects.capacity() * (std::mem::size_of::<crate::dobject::DObject>()
-            - std::mem::size_of::<crate::geom::Geom>());
+        let per_obj = self.dobjects.capacity()
+            * (std::mem::size_of::<crate::dobject::DObject>()
+                - std::mem::size_of::<crate::geom::Geom>());
         objs + blocks + per_obj + std::mem::size_of::<Document>()
     }
 
@@ -255,19 +262,29 @@ impl Document {
     }
 
     /// Count of layers (always ≥ 1 thanks to layer "0").
-    pub fn layer_count(&self) -> usize { self.layers.len() }
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
 
     /// Convenience — does this Dobject pass per-layer render gating?
     pub fn is_visible(&self, dobj_index: usize) -> bool {
-        let Some(d) = self.dobjects.get(dobj_index) else { return false; };
-        if !d.style.visible { return false; }
+        let Some(d) = self.dobjects.get(dobj_index) else {
+            return false;
+        };
+        if !d.style.visible {
+            return false;
+        }
         self.layers.renders(d.style.layer)
     }
 
     /// Convenience — can this Dobject be selected / edited?
     pub fn is_selectable(&self, dobj_index: usize) -> bool {
-        let Some(d) = self.dobjects.get(dobj_index) else { return false; };
-        if !d.style.visible { return false; }
+        let Some(d) = self.dobjects.get(dobj_index) else {
+            return false;
+        };
+        if !d.style.visible {
+            return false;
+        }
         self.layers.selectable(d.style.layer)
     }
 
@@ -296,35 +313,46 @@ impl Document {
     pub fn erase_dobjects(&mut self, mut indices: Vec<usize>) -> Vec<usize> {
         indices.sort_unstable();
         indices.dedup();
-        if indices.is_empty() { return Vec::new(); }
+        if indices.is_empty() {
+            return Vec::new();
+        }
         let mut by_handle: std::collections::HashMap<u64, usize> =
             std::collections::HashMap::with_capacity(self.dobjects.len());
         for (i, d) in self.dobjects.iter().enumerate() {
             by_handle.insert(d.handle, i);
         }
-        let erasing: std::collections::HashSet<usize> =
-            indices.iter().copied().collect();
+        let erasing: std::collections::HashSet<usize> = indices.iter().copied().collect();
         let is_aux = |i: usize| {
-            self.dobjects.get(i).map(|d| d.style.hatch_aux).unwrap_or(false)
+            self.dobjects
+                .get(i)
+                .map(|d| d.style.hatch_aux)
+                .unwrap_or(false)
         };
         // Single pass over surviving dobjects: which aux boundaries are
         // still referenced by a hatch that survives this erase?
-        let mut still_used: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
+        let mut still_used: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for (hi, d) in self.dobjects.iter().enumerate() {
-            if erasing.contains(&hi) { continue; }
+            if erasing.contains(&hi) {
+                continue;
+            }
             if let crate::geom::Geom::Hatch(h) = &d.geom {
                 for bh in &h.boundary_handles {
                     if let Some(&bi) = by_handle.get(bh) {
-                        if is_aux(bi) { still_used.insert(bi); }
+                        if is_aux(bi) {
+                            still_used.insert(bi);
+                        }
                     }
                 }
             }
         }
         let mut orphans: Vec<usize> = Vec::new();
         for &i in &indices {
-            let Some(d) = self.dobjects.get(i) else { continue };
-            let crate::geom::Geom::Hatch(h) = &d.geom else { continue };
+            let Some(d) = self.dobjects.get(i) else {
+                continue;
+            };
+            let crate::geom::Geom::Hatch(h) = &d.geom else {
+                continue;
+            };
             for bh in &h.boundary_handles {
                 if let Some(&bi) = by_handle.get(bh) {
                     if is_aux(bi) && !still_used.contains(&bi) && !erasing.contains(&bi) {
@@ -340,7 +368,9 @@ impl Document {
         all.sort_unstable();
         all.dedup();
         for &i in all.iter().rev() {
-            if i < self.dobjects.len() { self.dobjects.remove(i); }
+            if i < self.dobjects.len() {
+                self.dobjects.remove(i);
+            }
         }
         orphans
     }
@@ -360,24 +390,34 @@ mod tests {
         // fresh-draw commit (`CadApp::stamp_fresh_style`), not here.
         let mut doc = Document::default();
         let walls = doc.layers.add(Layer {
-            name: "WALLS".into(), ..Layer::layer_zero()
+            name: "WALLS".into(),
+            ..Layer::layer_zero()
         });
         doc.layers.active = walls;
         let i = doc.push(DObject::new(Geom::Circle(Circle {
-            center: Vec2::ZERO, radius: 5.0,
+            center: Vec2::ZERO,
+            radius: 5.0,
         })));
-        assert_eq!(doc.dobjects[i].style.layer, LayerTable::LAYER_ZERO,
-            "push must NOT inherit the active layer any more");
+        assert_eq!(
+            doc.dobjects[i].style.layer,
+            LayerTable::LAYER_ZERO,
+            "push must NOT inherit the active layer any more"
+        );
     }
 
     #[test]
     fn invisible_layer_hides_dobject() {
         let mut doc = Document::default();
         let hidden = doc.layers.add(Layer {
-            name: "HIDDEN".into(), visible: false, ..Layer::layer_zero()
+            name: "HIDDEN".into(),
+            visible: false,
+            ..Layer::layer_zero()
         });
         // push is pure now — set the layer explicitly (was: active-layer inherit).
-        let mut d = DObject::new(Geom::Circle(Circle { center: Vec2::ZERO, radius: 5.0 }));
+        let mut d = DObject::new(Geom::Circle(Circle {
+            center: Vec2::ZERO,
+            radius: 5.0,
+        }));
         d.style.layer = hidden;
         let i = doc.push(d);
         assert!(!doc.is_visible(i));
@@ -388,9 +428,14 @@ mod tests {
     fn locked_layer_blocks_selection_but_renders() {
         let mut doc = Document::default();
         let locked = doc.layers.add(Layer {
-            name: "LOCKED".into(), locked: true, ..Layer::layer_zero()
+            name: "LOCKED".into(),
+            locked: true,
+            ..Layer::layer_zero()
         });
-        let mut d = DObject::new(Geom::Circle(Circle { center: Vec2::ZERO, radius: 5.0 }));
+        let mut d = DObject::new(Geom::Circle(Circle {
+            center: Vec2::ZERO,
+            radius: 5.0,
+        }));
         d.style.layer = locked;
         let i = doc.push(d);
         assert!(doc.is_visible(i));

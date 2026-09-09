@@ -68,7 +68,9 @@ impl CalcStore {
     /// `calc_vars.txt`). Missing/unreadable file → empty store, no error.
     pub fn load_from(path: Option<&std::path::Path>) -> Self {
         let Some(p) = path else { return Self::new() };
-        let Ok(text) = std::fs::read_to_string(p) else { return Self::new() };
+        let Ok(text) = std::fs::read_to_string(p) else {
+            return Self::new();
+        };
         let mut map = BTreeMap::new();
         for line in text.lines() {
             let line = line.trim();
@@ -161,7 +163,10 @@ struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     fn new(src: &'a str) -> Self {
-        Lexer { s: src.as_bytes(), i: 0 }
+        Lexer {
+            s: src.as_bytes(),
+            i: 0,
+        }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -195,9 +200,18 @@ impl<'a> Lexer<'a> {
                     out.push(Tok::Op(c as char));
                     self.i += 1;
                 }
-                b'(' => { out.push(Tok::LParen); self.i += 1; }
-                b')' => { out.push(Tok::RParen); self.i += 1; }
-                b',' => { out.push(Tok::Comma); self.i += 1; }
+                b'(' => {
+                    out.push(Tok::LParen);
+                    self.i += 1;
+                }
+                b')' => {
+                    out.push(Tok::RParen);
+                    self.i += 1;
+                }
+                b',' => {
+                    out.push(Tok::Comma);
+                    self.i += 1;
+                }
                 _ => return Err(CalcError::Syntax("unexpected character")),
             }
         }
@@ -242,7 +256,10 @@ impl<'a> Lexer<'a> {
 
     fn ident(&mut self) -> String {
         let start = self.i;
-        while matches!(self.peek(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')) {
+        while matches!(
+            self.peek(),
+            Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+        ) {
             self.i += 1;
         }
         String::from_utf8_lossy(&self.s[start..self.i]).into_owned()
@@ -264,9 +281,8 @@ enum Node {
 }
 
 const FUNCS: &[&str] = &[
-    "sqrt", "abs", "round", "floor", "ceil", "min", "max",
-    "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
-    "exp", "ln", "log10",
+    "sqrt", "abs", "round", "floor", "ceil", "min", "max", "sin", "cos", "tan", "asin", "acos",
+    "atan", "atan2", "exp", "ln", "log10",
 ];
 
 fn is_func(name: &str) -> Option<&'static str> {
@@ -439,7 +455,11 @@ impl Parser {
 /// parser consumes, so end-of-input only shows up where an operand belongs.
 fn parse(src: &str) -> Result<Node, CalcError> {
     let toks = Lexer::new(src).run()?;
-    let mut p = Parser { toks, i: 0, depth: 0 };
+    let mut p = Parser {
+        toks,
+        i: 0,
+        depth: 0,
+    };
     let node = p.expr()?;
     // Trailing input must not be silently ignored.
     match p.peek() {
@@ -521,36 +541,34 @@ fn eval_node(
                 _ => 1,
             };
             if n != want {
-                return Err(CalcError::Syntax(
-                    match n {
-                        0 => "missing argument",
-                        _ => "wrong number of arguments",
-                    },
-                ));
+                return Err(CalcError::Syntax(match n {
+                    0 => "missing argument",
+                    _ => "wrong number of arguments",
+                }));
             }
             let mut vals = Vec::with_capacity(n);
             for a in args {
                 vals.push(eval_node(store, a, chain, cache)?);
             }
             let r = match *f {
-                "sqrt"   => vals[0].sqrt(),
-                "abs"    => vals[0].abs(),
-                "round"  => vals[0].round(),
-                "floor"  => vals[0].floor(),
-                "ceil"   => vals[0].ceil(),
-                "min"    => vals[0].min(vals[1]),
-                "max"    => vals[0].max(vals[1]),
+                "sqrt" => vals[0].sqrt(),
+                "abs" => vals[0].abs(),
+                "round" => vals[0].round(),
+                "floor" => vals[0].floor(),
+                "ceil" => vals[0].ceil(),
+                "min" => vals[0].min(vals[1]),
+                "max" => vals[0].max(vals[1]),
                 // Trig in DEGREES.
-                "sin"    => (vals[0].to_radians()).sin(),
-                "cos"    => (vals[0].to_radians()).cos(),
-                "tan"    => (vals[0].to_radians()).tan(),
-                "asin"   => vals[0].asin().to_degrees(),
-                "acos"   => vals[0].acos().to_degrees(),
-                "atan"   => vals[0].atan().to_degrees(),
-                "atan2"  => vals[0].atan2(vals[1]).to_degrees(),
-                "exp"    => vals[0].exp(),
-                "ln"     => vals[0].ln(),
-                "log10"  => vals[0].log10(),
+                "sin" => (vals[0].to_radians()).sin(),
+                "cos" => (vals[0].to_radians()).cos(),
+                "tan" => (vals[0].to_radians()).tan(),
+                "asin" => vals[0].asin().to_degrees(),
+                "acos" => vals[0].acos().to_degrees(),
+                "atan" => vals[0].atan().to_degrees(),
+                "atan2" => vals[0].atan2(vals[1]).to_degrees(),
+                "exp" => vals[0].exp(),
+                "ln" => vals[0].ln(),
+                "log10" => vals[0].log10(),
                 _ => unreachable!("call node only built for known functions"),
             };
             check_finite(r)
@@ -609,8 +627,12 @@ pub fn looks_like_expr(store: &CalcStore, s: &str) -> bool {
     if t.is_empty() {
         return false;
     }
-    if t.bytes().any(|b| matches!(b, b'+' | b'-' | b'*' | b'/' | b'^' | b'%' | b'(' | b')' | b','))
-    {
+    if t.bytes().any(|b| {
+        matches!(
+            b,
+            b'+' | b'-' | b'*' | b'/' | b'^' | b'%' | b'(' | b')' | b','
+        )
+    }) {
         return true;
     }
     if t == "pi" || t == "e" || t == "ans" || store.vars.contains_key(t) {
@@ -630,8 +652,12 @@ pub fn looks_like_expr_token(s: &str) -> bool {
     if t.is_empty() {
         return false;
     }
-    if t.bytes().any(|b| matches!(b, b'+' | b'-' | b'*' | b'/' | b'^' | b'%' | b'(' | b')' | b','))
-    {
+    if t.bytes().any(|b| {
+        matches!(
+            b,
+            b'+' | b'-' | b'*' | b'/' | b'^' | b'%' | b'(' | b')' | b','
+        )
+    }) {
         return true;
     }
     FUNCS.iter().any(|f| t.starts_with(f))
@@ -688,7 +714,11 @@ pub fn fmt_value(v: f64) -> String {
     }
     let s = format!("{v:.6}");
     let s = s.trim_end_matches('0').trim_end_matches('.').to_string();
-    if s == "-0" { "0".to_string() } else { s }
+    if s == "-0" {
+        "0".to_string()
+    } else {
+        s
+    }
 }
 
 /// Parse a DragValue's typed text: plain number first, then the calculator
@@ -732,7 +762,7 @@ mod tests {
         assert_eq!(e(&s, "2*3%4"), 2.0);
         assert_eq!(e(&s, "10/4"), 2.5);
         assert_eq!(e(&s, "2^3^2"), 512.0); // right-assoc
-        assert_eq!(e(&s, "-2^2"), 4.0);    // unary binds tighter than ^
+        assert_eq!(e(&s, "-2^2"), 4.0); // unary binds tighter than ^
         assert_eq!(e(&s, "2^-2"), 0.25);
         assert_eq!(e(&s, "1+-2"), -1.0);
         assert_eq!(e(&s, "-(-3)"), 3.0);
@@ -825,8 +855,21 @@ mod tests {
     #[test]
     fn malformed_input() {
         let s = CalcStore::new();
-        for bad in ["2+", "*3", "(1", "1)", "2..3", "sqrt", "sqrt(1,2)", "min(1)",
-                     "1 2", "2+*3", "sin()", "1e999", "foo(1)"] {
+        for bad in [
+            "2+",
+            "*3",
+            "(1",
+            "1)",
+            "2..3",
+            "sqrt",
+            "sqrt(1,2)",
+            "min(1)",
+            "1 2",
+            "2+*3",
+            "sin()",
+            "1e999",
+            "foo(1)",
+        ] {
             assert!(eval(&s, bad).is_err(), "{bad:?} should fail");
         }
         // Error KIND checks.
@@ -835,7 +878,10 @@ mod tests {
         assert_eq!(eval(&s, "sqrt(-1)").unwrap_err(), CalcError::NonFinite);
         assert_eq!(eval(&s, "ln(-1)").unwrap_err(), CalcError::NonFinite);
         assert_eq!(eval(&s, "ln(0)").unwrap_err(), CalcError::NonFinite);
-        assert_eq!(eval(&s, "nope").unwrap_err(), CalcError::UnknownVar("nope".into()));
+        assert_eq!(
+            eval(&s, "nope").unwrap_err(),
+            CalcError::UnknownVar("nope".into())
+        );
         assert!(eval(&s, "1e999").is_err(), "literal overflow is non-finite");
     }
 
@@ -958,7 +1004,11 @@ mod tests {
         assert_eq!(parse_drag(&s, "nope"), None);
         assert_eq!(parse_drag_int(&s, "4", 0, 100), Some(4));
         assert_eq!(parse_drag_int(&s, "2*2", 0, 100), Some(4));
-        assert_eq!(parse_drag_int(&s, "2.5*1", 0, 100), None, "no silent rounding");
+        assert_eq!(
+            parse_drag_int(&s, "2.5*1", 0, 100),
+            None,
+            "no silent rounding"
+        );
         assert_eq!(parse_drag_int(&s, "2.5", 0, 100), None);
         assert_eq!(parse_drag_int(&s, "500", 0, 100), None, "out of range");
     }
@@ -1020,5 +1070,4 @@ mod tests {
         try_assign(&mut s, "x1=3").unwrap();
         assert_eq!(e(&s, "x40"), 3.0 * 2.0f64.powi(39));
     }
-
 }

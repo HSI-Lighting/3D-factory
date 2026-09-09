@@ -32,7 +32,9 @@ pub enum PlotWidth {
     Fixed(f32),
 }
 impl Default for PlotWidth {
-    fn default() -> Self { PlotWidth::UseObject }
+    fn default() -> Self {
+        PlotWidth::UseObject
+    }
 }
 
 /// Plotted COLOR for a color. `UseObject` = the entity's own color; `Black`;
@@ -45,7 +47,9 @@ pub enum PlotColor {
     Rgb(u8, u8, u8),
 }
 impl Default for PlotColor {
-    fn default() -> Self { PlotColor::UseObject }
+    fn default() -> Self {
+        PlotColor::UseObject
+    }
 }
 
 /// Plotted LINETYPE for a color: keep the object's, or force a table linetype id.
@@ -55,7 +59,9 @@ pub enum PlotLinetype {
     Id(u32),
 }
 impl Default for PlotLinetype {
-    fn default() -> Self { PlotLinetype::UseObject }
+    fn default() -> Self {
+        PlotLinetype::UseObject
+    }
 }
 
 /// Legacy pen-plotter pen number (physical or virtual). Stored for CTB fidelity;
@@ -66,7 +72,9 @@ pub enum PenNum {
     N(u16),
 }
 impl Default for PenNum {
-    fn default() -> Self { PenNum::Automatic }
+    fn default() -> Self {
+        PenNum::Automatic
+    }
 }
 
 /// Line END-cap style. `UseObject` keeps the renderer default.
@@ -79,7 +87,9 @@ pub enum EndStyle {
     Diamond,
 }
 impl Default for EndStyle {
-    fn default() -> Self { EndStyle::UseObject }
+    fn default() -> Self {
+        EndStyle::UseObject
+    }
 }
 
 /// Line JOIN style.
@@ -92,7 +102,9 @@ pub enum JoinStyle {
     Diamond,
 }
 impl Default for JoinStyle {
-    fn default() -> Self { JoinStyle::UseObject }
+    fn default() -> Self {
+        JoinStyle::UseObject
+    }
 }
 
 /// FILL style for wide/filled entities. MVP effective = Solid; the rest store.
@@ -110,24 +122,26 @@ pub enum FillStyle {
     VerticalBars,
 }
 impl Default for FillStyle {
-    fn default() -> Self { FillStyle::UseObject }
+    fn default() -> Self {
+        FillStyle::UseObject
+    }
 }
 
 /// One color's full plot style — the 12 CTB properties, Form-View order.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlotStyle {
-    pub plot_color:  PlotColor,      // ✅ honoured
-    pub dither:      bool,           // ◻ stored (no PDF effect)
-    pub grayscale:   bool,           // ✅ honoured
-    pub pen_number:  PenNum,         // ◻ stored (legacy)
-    pub virtual_pen: PenNum,         // ◻ stored (legacy)
-    pub screening:   u8,             // ✅ honoured (0..=100 % ink)
-    pub linetype:    PlotLinetype,   // ✅ honoured
-    pub adaptive:    bool,           // ◻ stored
-    pub lineweight:  PlotWidth,      // ✅ honoured — THE pen width
-    pub end_style:   EndStyle,       // ✅ honoured (PDF line cap)
-    pub join_style:  JoinStyle,      // ✅ honoured (PDF line join)
-    pub fill_style:  FillStyle,      // ◻ stored (MVP: Solid)
+    pub plot_color: PlotColor,  // ✅ honoured
+    pub dither: bool,           // ◻ stored (no PDF effect)
+    pub grayscale: bool,        // ✅ honoured
+    pub pen_number: PenNum,     // ◻ stored (legacy)
+    pub virtual_pen: PenNum,    // ◻ stored (legacy)
+    pub screening: u8,          // ✅ honoured (0..=100 % ink)
+    pub linetype: PlotLinetype, // ✅ honoured
+    pub adaptive: bool,         // ◻ stored
+    pub lineweight: PlotWidth,  // ✅ honoured — THE pen width
+    pub end_style: EndStyle,    // ✅ honoured (PDF line cap)
+    pub join_style: JoinStyle,  // ✅ honoured (PDF line join)
+    pub fill_style: FillStyle,  // ◻ stored (MVP: Solid)
 }
 
 impl Default for PlotStyle {
@@ -135,18 +149,18 @@ impl Default for PlotStyle {
     /// adaptive on. This is the "no pen assigned yet" state.
     fn default() -> Self {
         Self {
-            plot_color:  PlotColor::UseObject,
-            dither:      false,
-            grayscale:   false,
-            pen_number:  PenNum::Automatic,
+            plot_color: PlotColor::UseObject,
+            dither: false,
+            grayscale: false,
+            pen_number: PenNum::Automatic,
             virtual_pen: PenNum::Automatic,
-            screening:   100,
-            linetype:    PlotLinetype::UseObject,
-            adaptive:    true,
-            lineweight:  PlotWidth::UseObject,
-            end_style:   EndStyle::UseObject,
-            join_style:  JoinStyle::UseObject,
-            fill_style:  FillStyle::UseObject,
+            screening: 100,
+            linetype: PlotLinetype::UseObject,
+            adaptive: true,
+            lineweight: PlotWidth::UseObject,
+            end_style: EndStyle::UseObject,
+            join_style: JoinStyle::UseObject,
+            fill_style: FillStyle::UseObject,
         }
     }
 }
@@ -155,22 +169,22 @@ impl Default for PlotStyle {
 /// every Lineweight dropdown; a shop can customise it via "Edit Lineweights…".
 /// `0.00` = thinnest renderable hairline; a `UseObject` sentinel is added by the UI.
 pub const AUTOCAD_LADDER: [f32; 23] = [
-    0.00, 0.05, 0.09, 0.13, 0.15, 0.18, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50,
-    0.53, 0.60, 0.70, 0.80, 0.90, 1.00, 1.06, 1.20, 1.40, 2.00, 2.11,
+    0.00, 0.05, 0.09, 0.13, 0.15, 0.18, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.53, 0.60, 0.70, 0.80,
+    0.90, 1.00, 1.06, 1.20, 1.40, 2.00, 2.11,
 ];
 
 /// A full color→pen table (255 usable colors) plus the General-tab metadata and
 /// the customisable lineweight ladder.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlotStyleTable {
-    pub name:                 String,
-    pub description:          String,
+    pub name: String,
+    pub description: String,
     pub apply_global_ltscale: bool,
-    pub ltscale_percent:      f32,
-    pub lineweight_ladder:    Vec<f32>,
+    pub ltscale_percent: f32,
+    pub lineweight_ladder: Vec<f32>,
     /// Index = ACI 1..=255; index 0 is the DXF ByBlock sentinel (unused by the
     /// resolver, kept so `by_aci[aci]` is always in-bounds for a valid ACI).
-    pub by_aci:               Box<[PlotStyle; 256]>,
+    pub by_aci: Box<[PlotStyle; 256]>,
 }
 
 impl Default for PlotStyleTable {
@@ -178,12 +192,12 @@ impl Default for PlotStyleTable {
     /// ladder = `AUTOCAD_LADDER`, global LT-scale off at 100%.
     fn default() -> Self {
         Self {
-            name:                 "Default".into(),
-            description:          String::new(),
+            name: "Default".into(),
+            description: String::new(),
             apply_global_ltscale: false,
-            ltscale_percent:      100.0,
-            lineweight_ladder:    AUTOCAD_LADDER.to_vec(),
-            by_aci:               Box::new(std::array::from_fn(|_| PlotStyle::default())),
+            ltscale_percent: 100.0,
+            lineweight_ladder: AUTOCAD_LADDER.to_vec(),
+            by_aci: Box::new(std::array::from_fn(|_| PlotStyle::default())),
         }
     }
 }
@@ -191,7 +205,10 @@ impl Default for PlotStyleTable {
 impl PlotStyleTable {
     /// A fresh default table with a given name.
     pub fn named(name: impl Into<String>) -> Self {
-        Self { name: name.into(), ..Self::default() }
+        Self {
+            name: name.into(),
+            ..Self::default()
+        }
     }
 
     /// The pen for an ACI color.
@@ -253,29 +270,33 @@ impl PlotStyleTable {
 // (missing/extra entries pad/truncate to the default, so old files load clean).
 #[derive(Serialize, Deserialize)]
 struct PlotStyleTableDto {
-    name:                 String,
+    name: String,
     #[serde(default)]
-    description:          String,
+    description: String,
     #[serde(default)]
     apply_global_ltscale: bool,
     #[serde(default = "default_ltscale_percent")]
-    ltscale_percent:      f32,
+    ltscale_percent: f32,
     #[serde(default = "default_ladder")]
-    lineweight_ladder:    Vec<f32>,
-    by_aci:               Vec<PlotStyle>,
+    lineweight_ladder: Vec<f32>,
+    by_aci: Vec<PlotStyle>,
 }
-fn default_ltscale_percent() -> f32 { 100.0 }
-fn default_ladder() -> Vec<f32> { AUTOCAD_LADDER.to_vec() }
+fn default_ltscale_percent() -> f32 {
+    100.0
+}
+fn default_ladder() -> Vec<f32> {
+    AUTOCAD_LADDER.to_vec()
+}
 
 impl Serialize for PlotStyleTable {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let dto = PlotStyleTableDto {
-            name:                 self.name.clone(),
-            description:          self.description.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
             apply_global_ltscale: self.apply_global_ltscale,
-            ltscale_percent:      self.ltscale_percent,
-            lineweight_ladder:    self.lineweight_ladder.clone(),
-            by_aci:               self.by_aci.to_vec(),
+            ltscale_percent: self.ltscale_percent,
+            lineweight_ladder: self.lineweight_ladder.clone(),
+            by_aci: self.by_aci.to_vec(),
         };
         dto.serialize(s)
     }
@@ -295,11 +316,11 @@ impl<'de> Deserialize<'de> for PlotStyleTable {
             dto.lineweight_ladder
         };
         Ok(PlotStyleTable {
-            name:                 dto.name,
-            description:          dto.description,
+            name: dto.name,
+            description: dto.description,
             apply_global_ltscale: dto.apply_global_ltscale,
-            ltscale_percent:      dto.ltscale_percent,
-            lineweight_ladder:    ladder,
+            ltscale_percent: dto.ltscale_percent,
+            lineweight_ladder: ladder,
             by_aci,
         })
     }
@@ -318,14 +339,14 @@ impl<'de> Deserialize<'de> for PlotStyleTable {
 /// scale (0.25 mm prints 0.25 mm at 1:1 and 1:100). `cfg.lw_scale` is applied by
 /// the caller, not here.
 pub fn plot_width_mm(
-    table:     &PlotStyleTable,
-    aci:       u8,
+    table: &PlotStyleTable,
+    aci: u8,
     entity_lw: Lineweight,
-    layer:     u32,
-    layers:    &LayerTable,
+    layer: u32,
+    layers: &LayerTable,
 ) -> f32 {
     match table.style(aci).lineweight {
-        PlotWidth::Fixed(w)  => w,
+        PlotWidth::Fixed(w) => w,
         PlotWidth::UseObject => resolve_lineweight(entity_lw, layer, layers),
     }
 }
@@ -344,7 +365,12 @@ pub enum PlotTarget {
 /// Standard paper sizes (mm). `dims_mm` returns the PORTRAIT (w, h).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PaperSize {
-    A4, A3, A2, A1, A0, Letter,
+    A4,
+    A3,
+    A2,
+    A1,
+    A0,
+    Letter,
     Custom { w_mm: f32, h_mm: f32 },
 }
 
@@ -352,11 +378,11 @@ impl PaperSize {
     /// Portrait width × height in millimetres.
     pub fn dims_mm(self) -> (f32, f32) {
         match self {
-            PaperSize::A4     => (210.0, 297.0),
-            PaperSize::A3     => (297.0, 420.0),
-            PaperSize::A2     => (420.0, 594.0),
-            PaperSize::A1     => (594.0, 841.0),
-            PaperSize::A0     => (841.0, 1189.0),
+            PaperSize::A4 => (210.0, 297.0),
+            PaperSize::A3 => (297.0, 420.0),
+            PaperSize::A2 => (420.0, 594.0),
+            PaperSize::A1 => (594.0, 841.0),
+            PaperSize::A0 => (841.0, 1189.0),
             PaperSize::Letter => (216.0, 279.0),
             PaperSize::Custom { w_mm, h_mm } => (w_mm, h_mm),
         }
@@ -364,7 +390,10 @@ impl PaperSize {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Orientation { Portrait, Landscape }
+pub enum Orientation {
+    Portrait,
+    Landscape,
+}
 
 /// Which part of the drawing to plot.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -393,18 +422,18 @@ pub enum Offset {
 /// (per-doc) and is passed to `plot()` separately — not owned here.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlotConfig {
-    pub output:      PlotTarget,
-    pub paper:       PaperSize,
+    pub output: PlotTarget,
+    pub paper: PaperSize,
     pub orientation: Orientation,
-    pub area:        PlotArea,
-    pub scale:       PlotScale,
-    pub offset:      Offset,
+    pub area: PlotArea,
+    pub scale: PlotScale,
+    pub offset: Offset,
     /// Global thickness multiplier (default 1.0). Deliberate — distinct from the
     /// plot scale, which must NOT affect physical lineweight.
-    pub lw_scale:    f32,
-    pub monochrome:  bool,
+    pub lw_scale: f32,
+    pub monochrome: bool,
     /// Printable inset from each paper edge (mm). Default ~5.
-    pub margins_mm:  f32,
+    pub margins_mm: f32,
     /// When `Some(i)`, plot the LAYOUT at index `i` instead of model space:
     /// 1:1 paper-mm — paper border + paper-space entities + every viewport's
     /// model content through its own camera, with the layout's and each
@@ -423,17 +452,17 @@ pub struct PlotConfig {
 impl Default for PlotConfig {
     fn default() -> Self {
         Self {
-            output:      PlotTarget::PdfFile(PathBuf::new()),
-            paper:       PaperSize::A3,
+            output: PlotTarget::PdfFile(PathBuf::new()),
+            paper: PaperSize::A3,
             orientation: Orientation::Landscape,
-            area:        PlotArea::Extents,
-            scale:       PlotScale::Fit,
-            offset:      Offset::Center,
-            lw_scale:    1.0,
-            monochrome:  false,
-            margins_mm:  5.0,
+            area: PlotArea::Extents,
+            scale: PlotScale::Fit,
+            offset: Offset::Center,
+            lw_scale: 1.0,
+            monochrome: false,
+            margins_mm: 5.0,
             plot_layout_index: None,
-            ctb_tables:  std::collections::BTreeMap::new(),
+            ctb_tables: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -483,25 +512,40 @@ mod tests {
         let layers = LayerTable::with_defaults();
         let mut t = PlotStyleTable::default();
         t.set_fixed_width(1, 0.70);
-        assert_eq!(plot_width_mm(&t, 1, Lineweight::Custom(0.25), 0, &layers), 0.70);
+        assert_eq!(
+            plot_width_mm(&t, 1, Lineweight::Custom(0.25), 0, &layers),
+            0.70
+        );
     }
 
     #[test]
     fn useobject_falls_through_to_lineweight() {
         let layers = LayerTable::with_defaults();
         let t = PlotStyleTable::default();
-        assert_eq!(plot_width_mm(&t, 3, Lineweight::Custom(0.13), 0, &layers), 0.13);
-        assert_eq!(plot_width_mm(&t, 3, Lineweight::Default, 0, &layers), DEFAULT_LINEWEIGHT_MM);
+        assert_eq!(
+            plot_width_mm(&t, 3, Lineweight::Custom(0.13), 0, &layers),
+            0.13
+        );
+        assert_eq!(
+            plot_width_mm(&t, 3, Lineweight::Default, 0, &layers),
+            DEFAULT_LINEWEIGHT_MM
+        );
     }
 
     #[test]
     fn useobject_reads_layer_lineweight_via_bylayer() {
         let mut layers = LayerTable::with_defaults();
         let id = layers.add(Layer {
-            name: "HEAVY".into(), color: Color::ByLayer, linetype: 0,
+            name: "HEAVY".into(),
+            color: Color::ByLayer,
+            linetype: 0,
             lineweight: Lineweight::Custom(1.0),
-            visible: true, locked: false, frozen: false, plottable: true,
-            order:      0,});
+            visible: true,
+            locked: false,
+            frozen: false,
+            plottable: true,
+            order: 0,
+        });
         let t = PlotStyleTable::default();
         assert_eq!(plot_width_mm(&t, 7, Lineweight::ByLayer, id, &layers), 1.0);
     }
@@ -528,7 +572,11 @@ mod tests {
         assert_eq!(g.1, g.2);
         // screening tints toward white.
         let s = t.apply_color(Some(3), (200, 100, 50));
-        assert!(s.0 > 200 && s.1 > 100 && s.2 > 50, "screening must lighten: {:?}", s);
+        assert!(
+            s.0 > 200 && s.1 > 100 && s.2 > 50,
+            "screening must lighten: {:?}",
+            s
+        );
         // truecolor (aci None) passes through unchanged.
         assert_eq!(t.apply_color(None, (10, 20, 30)), (10, 20, 30));
     }
@@ -537,18 +585,18 @@ mod tests {
     fn each_enum_round_trips_json() {
         // A representative style exercising every enum + flag.
         let s = PlotStyle {
-            plot_color:  PlotColor::Rgb(10, 20, 30),
-            dither:      true,
-            grayscale:   true,
-            pen_number:  PenNum::N(7),
+            plot_color: PlotColor::Rgb(10, 20, 30),
+            dither: true,
+            grayscale: true,
+            pen_number: PenNum::N(7),
             virtual_pen: PenNum::N(42),
-            screening:   50,
-            linetype:    PlotLinetype::Id(3),
-            adaptive:    false,
-            lineweight:  PlotWidth::Fixed(0.53),
-            end_style:   EndStyle::Round,
-            join_style:  JoinStyle::Bevel,
-            fill_style:  FillStyle::Crosshatch,
+            screening: 50,
+            linetype: PlotLinetype::Id(3),
+            adaptive: false,
+            lineweight: PlotWidth::Fixed(0.53),
+            end_style: EndStyle::Round,
+            join_style: JoinStyle::Bevel,
+            fill_style: FillStyle::Crosshatch,
         };
         let js = serde_json::to_string(&s).unwrap();
         let back: PlotStyle = serde_json::from_str(&js).unwrap();

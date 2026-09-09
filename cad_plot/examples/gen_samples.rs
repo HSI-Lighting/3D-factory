@@ -21,8 +21,15 @@ use std::path::PathBuf;
 
 fn line(a: (f64, f64), b: (f64, f64), aci: u8, mm: f32, h: u64) -> DObject {
     DObject {
-        geom: Geom::Line(Line { a: Vec2::new(a.0, a.1), b: Vec2::new(b.0, b.1) }),
-        style: Style { color: Color::Aci(aci), lineweight: Lineweight::Custom(mm), ..Style::default() },
+        geom: Geom::Line(Line {
+            a: Vec2::new(a.0, a.1),
+            b: Vec2::new(b.0, b.1),
+        }),
+        style: Style {
+            color: Color::Aci(aci),
+            lineweight: Lineweight::Custom(mm),
+            ..Style::default()
+        },
         handle: h,
     }
 }
@@ -32,17 +39,33 @@ fn demo_doc() -> Document {
     // ACI 1 (red) rectangle outline via a closed polyline.
     let rect = Polyline {
         vertices: vec![
-            PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-            PolyVertex { pos: Vec2::new(120.0, 0.0), bulge: 0.0 },
-            PolyVertex { pos: Vec2::new(120.0, 80.0), bulge: 0.0 },
-            PolyVertex { pos: Vec2::new(0.0, 80.0), bulge: 0.0 },
+            PolyVertex {
+                pos: Vec2::new(0.0, 0.0),
+                bulge: 0.0,
+            },
+            PolyVertex {
+                pos: Vec2::new(120.0, 0.0),
+                bulge: 0.0,
+            },
+            PolyVertex {
+                pos: Vec2::new(120.0, 80.0),
+                bulge: 0.0,
+            },
+            PolyVertex {
+                pos: Vec2::new(0.0, 80.0),
+                bulge: 0.0,
+            },
         ],
         closed: true,
         widths: Vec::new(),
     };
     doc.push(DObject {
         geom: Geom::Polyline(rect),
-        style: Style { color: Color::Aci(1), lineweight: Lineweight::Custom(0.25), ..Style::default() },
+        style: Style {
+            color: Color::Aci(1),
+            lineweight: Lineweight::Custom(0.25),
+            ..Style::default()
+        },
         handle: 1,
     });
     // ACI 3 (green) diagonal.
@@ -51,8 +74,15 @@ fn demo_doc() -> Document {
     doc.push(line((0.0, 80.0), (120.0, 0.0), 3, 0.25, 3));
     // ACI 5 (blue) circle in the middle.
     doc.push(DObject {
-        geom: Geom::Circle(Circle { center: Vec2::new(60.0, 40.0), radius: 28.0 }),
-        style: Style { color: Color::Aci(5), lineweight: Lineweight::Custom(0.25), ..Style::default() },
+        geom: Geom::Circle(Circle {
+            center: Vec2::new(60.0, 40.0),
+            radius: 28.0,
+        }),
+        style: Style {
+            color: Color::Aci(5),
+            lineweight: Lineweight::Custom(0.25),
+            ..Style::default()
+        },
         handle: 4,
     });
     doc
@@ -81,19 +111,51 @@ fn main() {
     let doc = demo_doc();
 
     // 1 — default table, Fit.
-    let out = cad_plot::plot(&doc, &PlotStyleTable::default(), &base_cfg(dir.join("1_default.pdf"), PlotScale::Fit)).unwrap();
-    println!("1_default.pdf   {} bytes, {} prims", out.bytes, out.prim_count);
+    let out = cad_plot::plot(
+        &doc,
+        &PlotStyleTable::default(),
+        &base_cfg(dir.join("1_default.pdf"), PlotScale::Fit),
+    )
+    .unwrap();
+    println!(
+        "1_default.pdf   {} bytes, {} prims",
+        out.bytes, out.prim_count
+    );
 
     // 2 — per-color pens: ACI-1 → 0.70, ACI-3 → 0.13.
     let mut table = PlotStyleTable::default();
     table.set_fixed_width(1, 0.70);
     table.set_fixed_width(3, 0.13);
-    let out = cad_plot::plot(&doc, &table, &base_cfg(dir.join("2_pens.pdf"), PlotScale::Fit)).unwrap();
-    println!("2_pens.pdf      {} bytes, {} prims", out.bytes, out.prim_count);
+    let out = cad_plot::plot(
+        &doc,
+        &table,
+        &base_cfg(dir.join("2_pens.pdf"), PlotScale::Fit),
+    )
+    .unwrap();
+    println!(
+        "2_pens.pdf      {} bytes, {} prims",
+        out.bytes, out.prim_count
+    );
 
     // 3a / 3b — Fit vs 1:100 (identical stroke mm).
-    cad_plot::plot(&doc, &PlotStyleTable::default(), &base_cfg(dir.join("3a_fit.pdf"), PlotScale::Fit)).unwrap();
-    cad_plot::plot(&doc, &PlotStyleTable::default(), &base_cfg(dir.join("3b_1to100.pdf"), PlotScale::Ratio { model: 100.0, paper_mm: 1.0 })).unwrap();
+    cad_plot::plot(
+        &doc,
+        &PlotStyleTable::default(),
+        &base_cfg(dir.join("3a_fit.pdf"), PlotScale::Fit),
+    )
+    .unwrap();
+    cad_plot::plot(
+        &doc,
+        &PlotStyleTable::default(),
+        &base_cfg(
+            dir.join("3b_1to100.pdf"),
+            PlotScale::Ratio {
+                model: 100.0,
+                paper_mm: 1.0,
+            },
+        ),
+    )
+    .unwrap();
     println!("3a_fit.pdf / 3b_1to100.pdf written (same stroke mm, different size)");
 
     // 4 — monochrome.

@@ -52,7 +52,15 @@ pub struct Principled {
 impl Default for Principled {
     fn default() -> Self {
         // Blender's Principled BSDF defaults.
-        Self { base_color: [0.8, 0.8, 0.8], metallic: 0.0, roughness: 0.5, ior: 1.5, alpha: 1.0, emission: [0.0, 0.0, 0.0], emission_strength: 0.0 }
+        Self {
+            base_color: [0.8, 0.8, 0.8],
+            metallic: 0.0,
+            roughness: 0.5,
+            ior: 1.5,
+            alpha: 1.0,
+            emission: [0.0, 0.0, 0.0],
+            emission_strength: 0.0,
+        }
     }
 }
 
@@ -233,7 +241,12 @@ impl MaterialGraph {
             return false; // no such socket, or type mismatch
         }
         self.edges.retain(|e| !(e.to == to && e.to_in == to_in));
-        self.edges.push(Edge { from, from_out, to, to_in });
+        self.edges.push(Edge {
+            from,
+            from_out,
+            to,
+            to_in,
+        });
         true
     }
 
@@ -247,7 +260,11 @@ impl MaterialGraph {
     pub fn remove(&mut self, id: NodeId) -> bool {
         let is_spine = self
             .node(id)
-            .map(|n| matches!(n.kind, NodeKind::Output) || (matches!(n.kind, NodeKind::Principled(_)) && self.principled_id() == Some(id)))
+            .map(|n| {
+                matches!(n.kind, NodeKind::Output)
+                    || (matches!(n.kind, NodeKind::Principled(_))
+                        && self.principled_id() == Some(id))
+            })
             .unwrap_or(false);
         if is_spine {
             return false;
@@ -259,7 +276,10 @@ impl MaterialGraph {
 
     /// The Output node's id (the first one).
     pub fn output_id(&self) -> Option<NodeId> {
-        self.nodes.iter().find(|n| matches!(n.kind, NodeKind::Output)).map(|n| n.id)
+        self.nodes
+            .iter()
+            .find(|n| matches!(n.kind, NodeKind::Output))
+            .map(|n| n.id)
     }
 
     /// The Principled feeding the Output's Surface, else the first Principled in the graph.
@@ -271,7 +291,10 @@ impl MaterialGraph {
                 }
             }
         }
-        self.nodes.iter().find(|n| matches!(n.kind, NodeKind::Principled(_))).map(|n| n.id)
+        self.nodes
+            .iter()
+            .find(|n| matches!(n.kind, NodeKind::Principled(_)))
+            .map(|n| n.id)
     }
 
     /// Flatten the graph to the renderer parameters. Walks Output ← Principled ← source nodes,
@@ -280,7 +303,13 @@ impl MaterialGraph {
         let pid = self.principled_id();
         let pr = pid
             .and_then(|id| self.node(id))
-            .and_then(|n| if let NodeKind::Principled(p) = &n.kind { Some(*p) } else { None })
+            .and_then(|n| {
+                if let NodeKind::Principled(p) = &n.kind {
+                    Some(*p)
+                } else {
+                    None
+                }
+            })
             .unwrap_or_default();
 
         // Base colour: procedural node → proc; image node → own bitmap; RGB node → its colour; else
@@ -307,21 +336,36 @@ impl MaterialGraph {
 
         // Scalars: a wired Value node overrides the socket default.
         let val_at = |slot: u8| -> Option<f32> {
-            pid.and_then(|pid| self.source_of(pid, slot))
-                .and_then(|n| if let NodeKind::Value(v) = n.kind { Some(v) } else { None })
+            pid.and_then(|pid| self.source_of(pid, slot)).and_then(|n| {
+                if let NodeKind::Value(v) = n.kind {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
         };
-        let roughness = val_at(pin::ROUGHNESS).unwrap_or(pr.roughness).clamp(0.0, 1.0);
+        let roughness = val_at(pin::ROUGHNESS)
+            .unwrap_or(pr.roughness)
+            .clamp(0.0, 1.0);
         let metallic = val_at(pin::METALLIC).unwrap_or(pr.metallic).clamp(0.0, 1.0);
         let ior = val_at(pin::IOR).unwrap_or(pr.ior).clamp(1.0, 4.0);
         let opacity = val_at(pin::ALPHA).unwrap_or(pr.alpha).clamp(0.0, 1.0);
-        let emission_strength = val_at(pin::EMISSION_STR).unwrap_or(pr.emission_strength).max(0.0);
-        let emission = match pid.and_then(|pid| self.source_of(pid, pin::EMISSION)).map(|n| &n.kind) {
+        let emission_strength = val_at(pin::EMISSION_STR)
+            .unwrap_or(pr.emission_strength)
+            .max(0.0);
+        let emission = match pid
+            .and_then(|pid| self.source_of(pid, pin::EMISSION))
+            .map(|n| &n.kind)
+        {
             Some(NodeKind::Rgb(c)) => *c,
             _ => pr.emission,
         };
 
         // Normal: a Normal Map node feeds a tangent-space map index.
-        let normal_map = match pid.and_then(|pid| self.source_of(pid, pin::NORMAL)).map(|n| &n.kind) {
+        let normal_map = match pid
+            .and_then(|pid| self.source_of(pid, pin::NORMAL))
+            .map(|n| &n.kind)
+        {
             Some(NodeKind::NormalMap { tex, .. }) => *tex,
             _ => None,
         };
@@ -350,8 +394,16 @@ impl MaterialGraph {
 
 /// A canonical starter graph: `Source → Principled → Output`, laid out left-to-right. `source` is the
 /// node feeding Base Color (procedural, image, or an RGB swatch). Reused by [`MaterialGraph::from_texture`].
-fn spine(principled: Principled, source: NodeKind, source_is_normal_seed: Option<(Option<usize>, f32)>) -> MaterialGraph {
-    let mut g = MaterialGraph { nodes: Vec::new(), edges: Vec::new(), next_id: 0 };
+fn spine(
+    principled: Principled,
+    source: NodeKind,
+    source_is_normal_seed: Option<(Option<usize>, f32)>,
+) -> MaterialGraph {
+    let mut g = MaterialGraph {
+        nodes: Vec::new(),
+        edges: Vec::new(),
+        next_id: 0,
+    };
     let out = g.add(NodeKind::Output, [520.0, 120.0]);
     let bsdf = g.add(NodeKind::Principled(principled), [250.0, 90.0]);
     g.connect(bsdf, 0, out, 0);
@@ -391,7 +443,11 @@ impl MaterialGraph {
 
     /// A brand-new default material graph (grey Principled fed by an oak procedural), for "New material".
     pub fn new_default() -> Self {
-        spine(Principled::default(), NodeKind::Procedural(ProcDef::oak()), None)
+        spine(
+            Principled::default(),
+            NodeKind::Procedural(ProcDef::oak()),
+            None,
+        )
     }
 
     /// Convenience for the palette: the node kinds a user can add (spine nodes excluded).
@@ -401,7 +457,10 @@ impl MaterialGraph {
             NodeKind::Value(0.5),
             NodeKind::Procedural(ProcDef::oak()),
             NodeKind::ImageTex,
-            NodeKind::NormalMap { tex: None, strength: 1.0 },
+            NodeKind::NormalMap {
+                tex: None,
+                strength: 1.0,
+            },
         ]
     }
 }
@@ -430,7 +489,11 @@ mod tests {
     #[test]
     fn principled_defaults_flow_through_when_nothing_wired() {
         // A lone Principled → Output, no source wired: its socket defaults are the result.
-        let mut g = MaterialGraph { nodes: Vec::new(), edges: Vec::new(), next_id: 0 };
+        let mut g = MaterialGraph {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            next_id: 0,
+        };
         let out = g.add(NodeKind::Output, [0.0, 0.0]);
         let mut p = Principled::default();
         p.roughness = 0.2;
@@ -442,10 +505,16 @@ mod tests {
         assert!((c.roughness - 0.2).abs() < 1e-6);
         assert!((c.metallic - 1.0).abs() < 1e-6);
         assert!((c.opacity - 0.5).abs() < 1e-6);
-        assert_eq!(c.reflect, 1.0, "the environment lobe is kept in full; f0 carries metallic");
+        assert_eq!(
+            c.reflect, 1.0,
+            "the environment lobe is kept in full; f0 carries metallic"
+        );
         // A plain Principled colour compiles to a SOLID procedural (so it updates live).
         assert!(!c.use_image, "no bitmap");
-        assert!(c.proc.map(|p| p.is_solid()).unwrap_or(false), "flat colour → solid proc");
+        assert!(
+            c.proc.map(|p| p.is_solid()).unwrap_or(false),
+            "flat colour → solid proc"
+        );
         assert_eq!(c.base_color, p.base_color);
     }
 
@@ -454,11 +523,15 @@ mod tests {
     /// roughness 0.035 is a mirror; it must not compile to "matte".
     #[test]
     fn a_polished_dielectric_still_reflects() {
-        let mut g = MaterialGraph { nodes: Vec::new(), edges: Vec::new(), next_id: 0 };
+        let mut g = MaterialGraph {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            next_id: 0,
+        };
         let out = g.add(NodeKind::Output, [0.0, 0.0]);
         let mut p = Principled::default();
         p.roughness = 0.035; // pool water
-        p.metallic = 0.0;    // …and it is not a metal
+        p.metallic = 0.0; // …and it is not a metal
         let bsdf = g.add(NodeKind::Principled(p), [0.0, 0.0]);
         g.connect(bsdf, 0, out, 0);
         let c = g.compile();
@@ -471,20 +544,30 @@ mod tests {
         let mut g = MaterialGraph::new_default();
         let pid = g.principled_id().unwrap();
         let v = g.add(NodeKind::Value(0.05), [0.0, 0.0]);
-        assert!(g.connect(v, 0, pid, pin::ROUGHNESS), "Float → Roughness connects");
+        assert!(
+            g.connect(v, 0, pid, pin::ROUGHNESS),
+            "Float → Roughness connects"
+        );
         assert!((g.compile().roughness - 0.05).abs() < 1e-6);
     }
 
     #[test]
     fn image_source_keeps_the_bitmap() {
-        let mut g = MaterialGraph { nodes: Vec::new(), edges: Vec::new(), next_id: 0 };
+        let mut g = MaterialGraph {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            next_id: 0,
+        };
         let out = g.add(NodeKind::Output, [0.0, 0.0]);
         let bsdf = g.add(NodeKind::Principled(Principled::default()), [0.0, 0.0]);
         g.connect(bsdf, 0, out, 0);
         let img = g.add(NodeKind::ImageTex, [0.0, 0.0]);
         g.connect(img, 0, bsdf, pin::BASE_COLOR);
         let c = g.compile();
-        assert!(c.use_image && c.proc.is_none(), "image node keeps the bound bitmap");
+        assert!(
+            c.use_image && c.proc.is_none(),
+            "image node keeps the bound bitmap"
+        );
     }
 
     #[test]
@@ -493,14 +576,27 @@ mod tests {
         let pid = g.principled_id().unwrap();
         // A Value (Float) may NOT drive Base Color (Color).
         let v = g.add(NodeKind::Value(0.5), [0.0, 0.0]);
-        assert!(!g.connect(v, 0, pid, pin::BASE_COLOR), "Float↛Color rejected");
+        assert!(
+            !g.connect(v, 0, pid, pin::BASE_COLOR),
+            "Float↛Color rejected"
+        );
         // Two RGBs into Base Color: the second replaces the first (one wire per input).
         let a = g.add(NodeKind::Rgb([1.0, 0.0, 0.0]), [0.0, 0.0]);
         let b = g.add(NodeKind::Rgb([0.0, 1.0, 0.0]), [0.0, 0.0]);
         g.connect(a, 0, pid, pin::BASE_COLOR);
         g.connect(b, 0, pid, pin::BASE_COLOR);
-        assert_eq!(g.edges.iter().filter(|e| e.to == pid && e.to_in == pin::BASE_COLOR).count(), 1);
-        assert_eq!(g.compile().base_color, [0.0, 1.0, 0.0], "the later wire wins");
+        assert_eq!(
+            g.edges
+                .iter()
+                .filter(|e| e.to == pid && e.to_in == pin::BASE_COLOR)
+                .count(),
+            1
+        );
+        assert_eq!(
+            g.compile().base_color,
+            [0.0, 1.0, 0.0],
+            "the later wire wins"
+        );
     }
 
     #[test]

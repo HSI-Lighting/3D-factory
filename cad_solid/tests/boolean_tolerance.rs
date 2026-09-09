@@ -14,8 +14,8 @@ fn volume(m: &cad_solid::SolidMesh) -> f64 {
     for t in p.chunks_exact(3) {
         let (a, b, c) = (t[0], t[1], t[2]);
         v += (a[0] as f64) * ((b[1] as f64) * (c[2] as f64) - (b[2] as f64) * (c[1] as f64))
-           - (a[1] as f64) * ((b[0] as f64) * (c[2] as f64) - (b[2] as f64) * (c[0] as f64))
-           + (a[2] as f64) * ((b[0] as f64) * (c[1] as f64) - (b[1] as f64) * (c[0] as f64));
+            - (a[1] as f64) * ((b[0] as f64) * (c[2] as f64) - (b[2] as f64) * (c[0] as f64))
+            + (a[2] as f64) * ((b[0] as f64) * (c[1] as f64) - (b[1] as f64) * (c[0] as f64));
     }
     (v / 6.0).abs()
 }
@@ -35,7 +35,8 @@ fn volume(m: &cad_solid::SolidMesh) -> f64 {
 fn the_ambient_tolerance_came_from_the_build() {
     let ambient = csgrs::float_types::tolerance();
     assert_eq!(
-        ambient, cad_solid::BOOLEAN_TOLERANCE,
+        ambient,
+        cad_solid::BOOLEAN_TOLERANCE,
         "the build did not pick up CSGRS_TOLERANCE — this binary is testing 1e-6 behaviour while \
          the app ships {:e}. Check that .cargo/config.toml is above the invocation directory.",
         cad_solid::BOOLEAN_TOLERANCE,
@@ -88,9 +89,9 @@ fn the_tolerance_is_actually_in_force_after_init() {
 fn a_small_plate_cut_by_a_hole_has_the_right_volume() {
     cad_solid::init_boolean_tolerance().expect("init");
 
-    const S: f32 = 0.01;     // 10 mm plate
-    const T: f32 = 0.001;    // 1 mm thick
-    const R: f32 = S / 6.0;  // hole radius
+    const S: f32 = 0.01; // 10 mm plate
+    const T: f32 = 0.001; // 1 mm thick
+    const R: f32 = S / 6.0; // hole radius
 
     let mut m = Model::default();
     m.push(
@@ -103,7 +104,11 @@ fn a_small_plate_cut_by_a_hole_has_the_right_volume() {
         BoolOp::Difference,
         Plane::default(),
         cad_solid::Placement::default(),
-        Primitive::Cylinder { r: R, h: T * 4.0, sides: 64 },
+        Primitive::Cylinder {
+            r: R,
+            h: T * 4.0,
+            sides: 64,
+        },
     );
 
     let mesh = m.eval();

@@ -262,7 +262,9 @@ mod tests {
             "RTL-capable font must be offered in the picker: {names:?}"
         );
         assert!(
-            names.iter().any(|n| n.eq_ignore_ascii_case("Liberation Sans")),
+            names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case("Liberation Sans")),
             "embedded default must be offered in the picker: {names:?}"
         );
     }
@@ -272,13 +274,19 @@ mod tests {
         // Resolution falls back system → embedded default; never empty.
         let mut fm = FontManager::new();
         let g = fm.render(&req("NoSuchFontFamily", FillMode::Fill));
-        assert!(!g.fills.is_empty(), "unknown font must fall back and render");
+        assert!(
+            !g.fills.is_empty(),
+            "unknown font must fall back and render"
+        );
     }
 
     #[test]
     fn arabic_text_renders_with_default_style() {
         let mut fm = FontManager::new();
-        let g = fm.render(&req("\u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629}", FillMode::Fill));
+        let g = fm.render(&req(
+            "\u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629}",
+            FillMode::Fill,
+        ));
         assert!(
             !g.fills.is_empty(),
             "Arabic must render even when the default font lacks Arabic glyphs"
@@ -299,7 +307,10 @@ mod tests {
         // Arabic embedded in a Latin line — bidi run reordering + the RTL
         // fallback face must both work without panicking.
         let mut fm = FontManager::new();
-        let g = fm.render(&req("abc \u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629} 123", FillMode::Fill));
+        let g = fm.render(&req(
+            "abc \u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629} 123",
+            FillMode::Fill,
+        ));
         assert!(!g.fills.is_empty());
         assert!(g.advance > 0.0);
         let (min, max) = g.bbox;
@@ -310,7 +321,10 @@ mod tests {
     fn rtl_text_renders_in_explicit_rtl_font() {
         // Requesting the RTL-capable font by name renders Arabic directly.
         let mut fm = FontManager::new();
-        let mut r = req("\u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629}", FillMode::Fill);
+        let mut r = req(
+            "\u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629}",
+            FillMode::Fill,
+        );
         r.font_name = "DejaVu Sans";
         let g = fm.render(&r);
         assert!(!g.fills.is_empty());

@@ -25,7 +25,11 @@ pub struct LayoutCamera {
 
 impl Default for LayoutCamera {
     fn default() -> Self {
-        Self { zoom: 1.0, pan_x: 0.0, pan_y: 0.0 }
+        Self {
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+        }
     }
 }
 
@@ -112,7 +116,11 @@ pub struct Layout {
 }
 
 impl Layout {
-    pub fn new(name: impl Into<String>, paper: PaperSize, orientation: crate::plotstyle::Orientation) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        paper: PaperSize,
+        orientation: crate::plotstyle::Orientation,
+    ) -> Self {
         let (pw0, ph0) = paper.dims_mm();
         let (page_w_mm, page_h_mm) = match orientation {
             crate::plotstyle::Orientation::Portrait => (pw0 as f64, ph0 as f64),
@@ -145,12 +153,16 @@ impl Layout {
 
     /// Find a viewport by its shape handle.
     pub fn viewport_by_shape(&self, handle: u64) -> Option<&ViewportData> {
-        self.viewports.iter().find(|vp| vp.shape_handle == Some(handle))
+        self.viewports
+            .iter()
+            .find(|vp| vp.shape_handle == Some(handle))
     }
 
     /// Find a viewport by its shape handle (mutable).
     pub fn viewport_by_shape_mut(&mut self, handle: u64) -> Option<&mut ViewportData> {
-        self.viewports.iter_mut().find(|vp| vp.shape_handle == Some(handle))
+        self.viewports
+            .iter_mut()
+            .find(|vp| vp.shape_handle == Some(handle))
     }
 
     /// Sync viewport rect from its Geom::Viewport entity.
@@ -178,14 +190,24 @@ impl Layout {
                 if let Some(d) = self.entities.iter().find(|e| e.handle == h) {
                     if let crate::geom::Geom::Viewport(v) = &d.geom {
                         let (mn, mx) = v.bbox_world();
-                        to_update.push((h, (mn.x, mn.y), (mx.x, mx.y),
-                            (v.model_center.x, v.model_center.y), v.model_zoom, v.model_scale));
+                        to_update.push((
+                            h,
+                            (mn.x, mn.y),
+                            (mx.x, mx.y),
+                            (v.model_center.x, v.model_center.y),
+                            v.model_zoom,
+                            v.model_scale,
+                        ));
                     }
                 }
             }
         }
         for (h, mn, mx, mc, zoom, scale) in to_update {
-            if let Some(vp) = self.viewports.iter_mut().find(|v| v.shape_handle == Some(h)) {
+            if let Some(vp) = self
+                .viewports
+                .iter_mut()
+                .find(|v| v.shape_handle == Some(h))
+            {
                 vp.rect_min = mn;
                 vp.rect_max = mx;
                 vp.model_center = mc;
@@ -229,12 +251,7 @@ impl ViewportGeom {
     /// Four corners of the viewport rectangle (paper mm, bottom-left origin).
     pub fn corners(&self) -> [Vec2; 4] {
         let (mn, mx) = self.bbox_world();
-        [
-            mn,
-            Vec2::new(mx.x, mn.y),
-            mx,
-            Vec2::new(mn.x, mx.y),
-        ]
+        [mn, Vec2::new(mx.x, mn.y), mx, Vec2::new(mn.x, mx.y)]
     }
 }
 

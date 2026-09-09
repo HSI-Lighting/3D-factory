@@ -41,7 +41,11 @@ impl Symmetry {
             2 => Symmetry::C0C180,
             3 => Symmetry::C90C270,
             4 => Symmetry::Quadrant,
-            other => return Err(format!("unknown EULUMDAT symmetry Isym={other} (expected 0..4)")),
+            other => {
+                return Err(format!(
+                    "unknown EULUMDAT symmetry Isym={other} (expected 0..4)"
+                ))
+            }
         })
     }
 
@@ -62,7 +66,10 @@ pub fn parse(contents: &str) -> Result<IesProfile, String> {
     // harmless; blank lines in the middle are not, and would shift everything after them.
     let lines: Vec<&str> = contents.lines().map(|l| l.trim()).collect();
     if lines.len() < 42 {
-        return Err(format!("not EULUMDAT: {} lines, expected at least 42", lines.len()));
+        return Err(format!(
+            "not EULUMDAT: {} lines, expected at least 42",
+            lines.len()
+        ));
     }
 
     let at = |i: usize| -> &str { lines.get(i).copied().unwrap_or("") };
@@ -73,9 +80,8 @@ pub fn parse(contents: &str) -> Result<IesProfile, String> {
             .parse::<f64>()
             .map_err(|_| format!("line {} ({what}): expected a number, found {s:?}", i + 1))
     };
-    let int = |i: usize, what: &str| -> Result<i32, String> {
-        num(i, what).map(|v| v.round() as i32)
-    };
+    let int =
+        |i: usize, what: &str| -> Result<i32, String> { num(i, what).map(|v| v.round() as i32) };
 
     let isym = Symmetry::from_code(int(2, "Isym")?)?;
     let mc = int(3, "Mc — number of C-planes")?;
@@ -87,7 +93,11 @@ pub fn parse(contents: &str) -> Result<IesProfile, String> {
 
     let name = {
         let n = at(8);
-        if n.is_empty() { at(7).to_string() } else { n.to_string() }
+        if n.is_empty() {
+            at(7).to_string()
+        } else {
+            n.to_string()
+        }
     };
     // Records 13–15: overall size in MILLIMETRES. The engine works in metres.
     let width_mm = num(13, "luminaire width").unwrap_or(0.0);
@@ -105,8 +115,11 @@ pub fn parse(contents: &str) -> Result<IesProfile, String> {
     // than to nothing: an area of zero would divide by zero downstream.
     let lum_len_mm = num(15, "luminous area length/diameter").unwrap_or(0.0);
     let lum_wid_mm = num(16, "luminous area width").unwrap_or(0.0);
-    let (lum_len_mm, lum_wid_mm) =
-        if lum_len_mm > 0.0 { (lum_len_mm, lum_wid_mm) } else { (length_mm, width_mm) };
+    let (lum_len_mm, lum_wid_mm) = if lum_len_mm > 0.0 {
+        (lum_len_mm, lum_wid_mm)
+    } else {
+        (length_mm, width_mm)
+    };
 
     // Record 26 is the number of lamp sets; each set then occupies 6 lines, and record 27's direct
     // ratios (10 values) follow. Everything after that is angles and intensities, so getting this
@@ -219,22 +232,35 @@ fn mirror_index(isym: Symmetry, ci: usize, mc: usize, stored: usize, _angle: f64
         Symmetry::Vertical => 0,
         // Stored C0..C180; C180..C360 mirrors back down.
         Symmetry::C0C180 => {
-            if ci < stored { ci } else { mc - ci }
+            if ci < stored {
+                ci
+            } else {
+                mc - ci
+            }
         }
         // Stored C90..C270. Shift so the stored block starts at 0, then mirror.
         Symmetry::C90C270 => {
             let q = mc / 4; // index of C90
             let rel = (ci + mc - q) % mc;
-            if rel < stored { rel } else { mc - rel }
+            if rel < stored {
+                rel
+            } else {
+                mc - rel
+            }
         }
         // Stored one quadrant, C0..C90: mirror into each of the other three.
         Symmetry::Quadrant => {
             let q = mc / 4;
             let r = ci % mc;
-            if r <= q { r }
-            else if r <= 2 * q { 2 * q - r }
-            else if r <= 3 * q { r - 2 * q }
-            else { mc - r }
+            if r <= q {
+                r
+            } else if r <= 2 * q {
+                2 * q - r
+            } else if r <= 3 * q {
+                r - 2 * q
+            } else {
+                mc - r
+            }
         }
     };
     idx.min(stored.saturating_sub(1))
@@ -247,37 +273,47 @@ mod tests {
     /// A minimal but complete EULUMDAT file: axially symmetric, 24 C-planes, 3 gamma angles.
     fn minimal_ldt(isym: i32, mc: usize, ng: usize, flux: f64, intensities: &[f64]) -> String {
         let mut l: Vec<String> = Vec::new();
-        l.push("Test Manufacturer".into());   // 1  company
-        l.push("1".into());                   // 2  Ityp
-        l.push(isym.to_string());             // 3  Isym
-        l.push(mc.to_string());               // 4  Mc
+        l.push("Test Manufacturer".into()); // 1  company
+        l.push("1".into()); // 2  Ityp
+        l.push(isym.to_string()); // 3  Isym
+        l.push(mc.to_string()); // 4  Mc
         l.push((360.0 / mc as f64).to_string()); // 5 Dc
-        l.push(ng.to_string());               // 6  Ng
+        l.push(ng.to_string()); // 6  Ng
         l.push((90.0 / (ng - 1) as f64).to_string()); // 7 Dg
-        l.push("REPORT-1".into());            // 8  measurement report
-        l.push("Test Luminaire".into());      // 9  luminaire name
-        l.push("LUM-001".into());             // 10 luminaire number
-        l.push("test.ldt".into());            // 11 file name
-        l.push("2026-08-10".into());          // 12 date/user
-        l.push("600".into());                 // 13 length/diameter mm
-        l.push("300".into());                 // 14 width mm
-        l.push("80".into());                  // 15 height mm
-        for _ in 0..6 { l.push("0".into()); } // 16-21 luminous area
-        l.push("100".into());                 // 22 DFF %
-        l.push("100".into());                 // 23 LORL %
-        l.push("1".into());                   // 24 conversion factor
-        l.push("0".into());                   // 25 tilt
-        l.push("1".into());                   // 26 number of lamp sets
-        l.push("1".into());                   // 26a number of lamps
-        l.push("LED".into());                 // 26b type
-        l.push(flux.to_string());             // 26c total flux lm
-        l.push("4000".into());                // 26d colour temp
-        l.push("80".into());                  // 26e CRI
-        l.push("36".into());                  // 26f wattage
-        for _ in 0..10 { l.push("0".into()); } // 27 direct ratios
-        for i in 0..mc { l.push((i as f64 * 360.0 / mc as f64).to_string()); }
-        for i in 0..ng { l.push((i as f64 * 90.0 / (ng - 1) as f64).to_string()); }
-        for v in intensities { l.push(v.to_string()); }
+        l.push("REPORT-1".into()); // 8  measurement report
+        l.push("Test Luminaire".into()); // 9  luminaire name
+        l.push("LUM-001".into()); // 10 luminaire number
+        l.push("test.ldt".into()); // 11 file name
+        l.push("2026-08-10".into()); // 12 date/user
+        l.push("600".into()); // 13 length/diameter mm
+        l.push("300".into()); // 14 width mm
+        l.push("80".into()); // 15 height mm
+        for _ in 0..6 {
+            l.push("0".into());
+        } // 16-21 luminous area
+        l.push("100".into()); // 22 DFF %
+        l.push("100".into()); // 23 LORL %
+        l.push("1".into()); // 24 conversion factor
+        l.push("0".into()); // 25 tilt
+        l.push("1".into()); // 26 number of lamp sets
+        l.push("1".into()); // 26a number of lamps
+        l.push("LED".into()); // 26b type
+        l.push(flux.to_string()); // 26c total flux lm
+        l.push("4000".into()); // 26d colour temp
+        l.push("80".into()); // 26e CRI
+        l.push("36".into()); // 26f wattage
+        for _ in 0..10 {
+            l.push("0".into());
+        } // 27 direct ratios
+        for i in 0..mc {
+            l.push((i as f64 * 360.0 / mc as f64).to_string());
+        }
+        for i in 0..ng {
+            l.push((i as f64 * 90.0 / (ng - 1) as f64).to_string());
+        }
+        for v in intensities {
+            l.push(v.to_string());
+        }
         l.join("\r\n")
     }
 
@@ -290,10 +326,16 @@ mod tests {
         let p = parse(&text).expect("parses");
         assert_eq!(p.lumens, 4000.0);
         // 100 cd/klm at 4000 lm = 400 cd.
-        assert!((p.intensity(0.0, 0.0) - 400.0).abs() < 1e-6,
-            "nadir should be 400 cd, got {}", p.intensity(0.0, 0.0));
-        assert!((p.intensity(45.0, 0.0) - 200.0).abs() < 1e-6,
-            "45 deg should be 200 cd, got {}", p.intensity(45.0, 0.0));
+        assert!(
+            (p.intensity(0.0, 0.0) - 400.0).abs() < 1e-6,
+            "nadir should be 400 cd, got {}",
+            p.intensity(0.0, 0.0)
+        );
+        assert!(
+            (p.intensity(45.0, 0.0) - 200.0).abs() < 1e-6,
+            "45 deg should be 200 cd, got {}",
+            p.intensity(45.0, 0.0)
+        );
     }
 
     /// Axial symmetry stores ONE plane and it must apply in every direction.
@@ -301,10 +343,17 @@ mod tests {
     fn axial_symmetry_expands_to_every_c_plane() {
         let text = minimal_ldt(1, 24, 3, 1000.0, &[100.0, 50.0, 0.0]);
         let p = parse(&text).expect("parses");
-        assert_eq!(p.horizontal_angles.len(), 24, "all 24 C-planes must be present");
+        assert_eq!(
+            p.horizontal_angles.len(),
+            24,
+            "all 24 C-planes must be present"
+        );
         for c in [0.0, 90.0, 180.0, 270.0] {
-            assert!((p.intensity(0.0, c) - 100.0).abs() < 1e-6,
-                "C{c} should match C0 under axial symmetry, got {}", p.intensity(0.0, c));
+            assert!(
+                (p.intensity(0.0, c) - 100.0).abs() < 1e-6,
+                "C{c} should match C0 under axial symmetry, got {}",
+                p.intensity(0.0, c)
+            );
         }
     }
 
@@ -312,18 +361,27 @@ mod tests {
     #[test]
     fn half_symmetry_mirrors_the_stored_planes() {
         // 4 C-planes (0/90/180/270) => stored = 4/2 + 1 = 3 planes, 2 gamma angles each.
-        let text = minimal_ldt(2, 4, 2, 1000.0, &[
-            10.0, 1.0, // C0
-            20.0, 2.0, // C90
-            30.0, 3.0, // C180
-        ]);
+        let text = minimal_ldt(
+            2,
+            4,
+            2,
+            1000.0,
+            &[
+                10.0, 1.0, // C0
+                20.0, 2.0, // C90
+                30.0, 3.0, // C180
+            ],
+        );
         let p = parse(&text).expect("parses");
         assert!((p.intensity(0.0, 0.0) - 10.0).abs() < 1e-6);
         assert!((p.intensity(0.0, 90.0) - 20.0).abs() < 1e-6);
         assert!((p.intensity(0.0, 180.0) - 30.0).abs() < 1e-6);
         // C270 is C90 mirrored across C0-C180.
-        assert!((p.intensity(0.0, 270.0) - 20.0).abs() < 1e-6,
-            "C270 must mirror C90, got {}", p.intensity(0.0, 270.0));
+        assert!(
+            (p.intensity(0.0, 270.0) - 20.0).abs() < 1e-6,
+            "C270 must mirror C90, got {}",
+            p.intensity(0.0, 270.0)
+        );
     }
 
     /// Millimetres become metres — the engine measures the room in metres, and an 0.6 m fitting
@@ -331,9 +389,21 @@ mod tests {
     #[test]
     fn dimensions_convert_to_metres() {
         let p = parse(&minimal_ldt(1, 24, 3, 1000.0, &[100.0, 50.0, 0.0])).expect("parses");
-        assert!((p.length - 0.6).abs() < 1e-6, "600 mm should be 0.6 m, got {}", p.length);
-        assert!((p.width - 0.3).abs() < 1e-6, "300 mm should be 0.3 m, got {}", p.width);
-        assert!((p.height - 0.08).abs() < 1e-6, "80 mm should be 0.08 m, got {}", p.height);
+        assert!(
+            (p.length - 0.6).abs() < 1e-6,
+            "600 mm should be 0.6 m, got {}",
+            p.length
+        );
+        assert!(
+            (p.width - 0.3).abs() < 1e-6,
+            "300 mm should be 0.3 m, got {}",
+            p.width
+        );
+        assert!(
+            (p.height - 0.08).abs() < 1e-6,
+            "80 mm should be 0.08 m, got {}",
+            p.height
+        );
     }
 
     /// A file that is too short is REJECTED, not read into nonsense. A fixed-order format has no
@@ -341,12 +411,22 @@ mod tests {
     /// happened to be on those lines.
     #[test]
     fn a_truncated_file_is_rejected() {
-        assert!(parse("Company\n1\n0\n24\n15\n").is_err(), "5 lines is not a EULUMDAT file");
+        assert!(
+            parse("Company\n1\n0\n24\n15\n").is_err(),
+            "5 lines is not a EULUMDAT file"
+        );
         // Complete header, but the intensity block is cut short.
         let full = minimal_ldt(1, 24, 3, 1000.0, &[100.0, 50.0, 0.0]);
-        let cut = full.lines().take(full.lines().count() - 2).collect::<Vec<_>>().join("\r\n");
+        let cut = full
+            .lines()
+            .take(full.lines().count() - 2)
+            .collect::<Vec<_>>()
+            .join("\r\n");
         let err = parse(&cut).unwrap_err();
-        assert!(err.contains("ends early"), "expected a truncation error, got: {err}");
+        assert!(
+            err.contains("ends early"),
+            "expected a truncation error, got: {err}"
+        );
     }
 
     /// Zero flux cannot be converted, and saying so beats returning a profile of all zeros that
@@ -473,7 +553,10 @@ mod the_header_reaches_the_schedule {
         let p = parse(&file()).expect("a valid EULUMDAT");
         assert_eq!(p.manufacturer, "HSI Lighting", "record 1 is the company");
         assert_eq!(p.catalogue, "OG20-36", "record 10 is the luminaire NUMBER");
-        assert_eq!(p.name, "OCULUS GRANDE 2.0", "record 9 is the name, and stays the name");
+        assert_eq!(
+            p.name, "OCULUS GRANDE 2.0",
+            "record 9 is the name, and stays the name"
+        );
         assert!(
             p.lamp.contains("LED") && p.lamp.contains("3000K") && p.lamp.contains("CRI 90"),
             "the lamp description is {:?}",
@@ -489,7 +572,15 @@ mod the_header_reaches_the_schedule {
         lines[0] = String::new();
         lines[10 - 1] = String::new();
         let p = parse(&lines.join("\n")).expect("still valid");
-        assert!(p.manufacturer.is_empty(), "invented a manufacturer: {:?}", p.manufacturer);
-        assert!(p.catalogue.is_empty(), "invented a catalogue number: {:?}", p.catalogue);
+        assert!(
+            p.manufacturer.is_empty(),
+            "invented a manufacturer: {:?}",
+            p.manufacturer
+        );
+        assert!(
+            p.catalogue.is_empty(),
+            "invented a catalogue number: {:?}",
+            p.catalogue
+        );
     }
 }

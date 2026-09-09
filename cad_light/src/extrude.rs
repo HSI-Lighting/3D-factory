@@ -21,21 +21,36 @@ fn vtx(p: Vec2, z: f32, k: f64) -> Vertex {
 
 fn surface(a: Vec2, b: Vec2, height: f32, material: MaterialId, k: f64) -> Mesh {
     Mesh {
-        vertices: vec![vtx(a, 0.0, k), vtx(b, 0.0, k), vtx(b, height, k), vtx(a, height, k)],
+        vertices: vec![
+            vtx(a, 0.0, k),
+            vtx(b, 0.0, k),
+            vtx(b, height, k),
+            vtx(a, height, k),
+        ],
         triangles: vec![Triangle { a: 0, b: 1, c: 2 }, Triangle { a: 0, b: 2, c: 3 }],
         material,
     }
 }
 
 fn cap(poly: &[Vec2], z: f32, material: MaterialId, out: &mut Vec<Mesh>, k: f64) {
-    let p2: Vec<[f32; 2]> = poly.iter().map(|v| [(v.x * k) as f32, (v.y * k) as f32]).collect();
+    let p2: Vec<[f32; 2]> = poly
+        .iter()
+        .map(|v| [(v.x * k) as f32, (v.y * k) as f32])
+        .collect();
     let tris = triangulate(&p2);
     if tris.is_empty() {
         return;
     }
     out.push(Mesh {
         vertices: p2.iter().map(|p| Vertex::new(p[0], p[1], z)).collect(),
-        triangles: tris.iter().map(|t| Triangle { a: t[0] as u32, b: t[1] as u32, c: t[2] as u32 }).collect(),
+        triangles: tris
+            .iter()
+            .map(|t| Triangle {
+                a: t[0] as u32,
+                b: t[1] as u32,
+                c: t[2] as u32,
+            })
+            .collect(),
         material,
     });
 }
@@ -111,7 +126,10 @@ fn arc_pts(a: &KArc) -> Vec<Vec2> {
         .map(|i| {
             let t = i as f64 / CURVE_SEGMENTS as f64;
             let ang = a.start_angle + a.sweep_angle * t;
-            Vec2::new(a.center.x + a.radius * ang.cos(), a.center.y + a.radius * ang.sin())
+            Vec2::new(
+                a.center.x + a.radius * ang.cos(),
+                a.center.y + a.radius * ang.sin(),
+            )
         })
         .collect()
 }
@@ -190,8 +208,14 @@ pub fn bbox(doc: &Document) -> Option<(f32, f32, f32, f32)> {
     };
     for d in &doc.dobjects {
         match &d.geom {
-            Geom::Line(l) => { add(l.a); add(l.b); }
-            Geom::Wall(w) => { add(w.start); add(w.end); }
+            Geom::Line(l) => {
+                add(l.a);
+                add(l.b);
+            }
+            Geom::Wall(w) => {
+                add(w.start);
+                add(w.end);
+            }
             Geom::Polyline(p) => p.vertices.iter().for_each(|x| add(x.pos)),
             Geom::Circle(c) => {
                 add(Vec2::new(c.center.x - c.radius, c.center.y - c.radius));
@@ -221,11 +245,35 @@ pub fn box_room(width: f32, depth: f32, height: f32) -> Vec<Mesh> {
     };
     let v = Vertex::new;
     vec![
-        quad(v(0.0, 0.0, 0.0), v(w, 0.0, 0.0), v(w, d, 0.0), v(0.0, d, 0.0), FLOOR),
-        quad(v(0.0, 0.0, h), v(0.0, d, h), v(w, d, h), v(w, 0.0, h), CEILING),
-        quad(v(0.0, 0.0, 0.0), v(0.0, d, 0.0), v(0.0, d, h), v(0.0, 0.0, h), WALL),
+        quad(
+            v(0.0, 0.0, 0.0),
+            v(w, 0.0, 0.0),
+            v(w, d, 0.0),
+            v(0.0, d, 0.0),
+            FLOOR,
+        ),
+        quad(
+            v(0.0, 0.0, h),
+            v(0.0, d, h),
+            v(w, d, h),
+            v(w, 0.0, h),
+            CEILING,
+        ),
+        quad(
+            v(0.0, 0.0, 0.0),
+            v(0.0, d, 0.0),
+            v(0.0, d, h),
+            v(0.0, 0.0, h),
+            WALL,
+        ),
         quad(v(w, 0.0, 0.0), v(w, 0.0, h), v(w, d, h), v(w, d, 0.0), WALL),
-        quad(v(0.0, 0.0, 0.0), v(0.0, 0.0, h), v(w, 0.0, h), v(w, 0.0, 0.0), WALL),
+        quad(
+            v(0.0, 0.0, 0.0),
+            v(0.0, 0.0, h),
+            v(w, 0.0, h),
+            v(w, 0.0, 0.0),
+            WALL,
+        ),
         quad(v(0.0, d, 0.0), v(w, d, 0.0), v(w, d, h), v(0.0, d, h), WALL),
     ]
 }
@@ -303,16 +351,23 @@ pub fn triangulate(poly: &[[f32; 2]]) -> Vec<[usize; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cad_kernel::{DObject, Polyline, PolyVertex};
+    use cad_kernel::{DObject, PolyVertex, Polyline};
 
     #[test]
     fn closed_polyline_extrudes_with_caps() {
         let mut doc = Document::default();
         let verts: Vec<PolyVertex> = [(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 3.0)]
             .iter()
-            .map(|&(x, y)| PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 })
+            .map(|&(x, y)| PolyVertex {
+                pos: Vec2::new(x, y),
+                bulge: 0.0,
+            })
             .collect();
-        doc.push(DObject::new(Geom::Polyline(Polyline { vertices: verts, closed: true, widths: Vec::new() })));
+        doc.push(DObject::new(Geom::Polyline(Polyline {
+            vertices: verts,
+            closed: true,
+            widths: Vec::new(),
+        })));
         let m = extrude(&doc, 3.0);
         // 4 wall surfaces + floor + ceiling.
         assert_eq!(m.len(), 6);
@@ -322,7 +377,10 @@ mod tests {
 
     #[test]
     fn triangulate_square() {
-        assert_eq!(triangulate(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]).len(), 2);
+        assert_eq!(
+            triangulate(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]).len(),
+            2
+        );
     }
 
     // ── THE SAME ROOM IN DIFFERENT UNITS IS THE SAME ROOM ──────────────────────────────────
@@ -346,10 +404,15 @@ mod tests {
         d.units = cad_kernel::Units::from_metres_per_unit(unit_m, cad_kernel::UnitSource::Declared);
         let verts: Vec<PolyVertex> = [(0.0, 0.0), (side, 0.0), (side, side), (0.0, side)]
             .iter()
-            .map(|&(x, y)| PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 })
+            .map(|&(x, y)| PolyVertex {
+                pos: Vec2::new(x, y),
+                bulge: 0.0,
+            })
             .collect();
         d.push(DObject::new(Geom::Polyline(Polyline {
-            vertices: verts, closed: true, widths: Vec::new(),
+            vertices: verts,
+            closed: true,
+            widths: Vec::new(),
         })));
         d
     }
@@ -362,17 +425,27 @@ mod tests {
         let in_metres = extrude(&room_doc(1.0, 4.0), 2.7);
         let in_mm = extrude(&room_doc(0.001, 4000.0), 2.7);
 
-        assert_eq!(in_metres.len(), in_mm.len(), "same room, different mesh count");
+        assert_eq!(
+            in_metres.len(),
+            in_mm.len(),
+            "same room, different mesh count"
+        );
         for (a, b) in in_metres.iter().zip(in_mm.iter()) {
             assert_eq!(a.material, b.material);
             assert_eq!(a.vertices.len(), b.vertices.len());
             for (va, vb) in a.vertices.iter().zip(b.vertices.iter()) {
                 assert!(
-                    (va.x - vb.x).abs() < 1e-3 && (va.y - vb.y).abs() < 1e-3
+                    (va.x - vb.x).abs() < 1e-3
+                        && (va.y - vb.y).abs() < 1e-3
                         && (va.z - vb.z).abs() < 1e-3,
                     "unit scaling lost: metres gave ({:.4}, {:.4}, {:.4}), \
                      millimetres gave ({:.4}, {:.4}, {:.4})",
-                    va.x, va.y, va.z, vb.x, vb.y, vb.z,
+                    va.x,
+                    va.y,
+                    va.z,
+                    vb.x,
+                    vb.y,
+                    vb.z,
                 );
             }
         }
@@ -384,7 +457,8 @@ mod tests {
     fn drafting_units_reach_the_engine_as_metres() {
         for (unit_m, side) in [(1.0, 4.0), (0.001, 4000.0), (0.01, 400.0)] {
             let meshes = extrude(&room_doc(unit_m, side), 2.7);
-            let max_x = meshes.iter()
+            let max_x = meshes
+                .iter()
                 .flat_map(|m| m.vertices.iter())
                 .fold(f32::MIN, |acc, v| acc.max(v.x));
             assert!(
@@ -402,8 +476,10 @@ mod tests {
         for (unit_m, side) in [(1.0, 4.0), (0.001, 4000.0), (0.01, 400.0)] {
             let (mnx, mny, mxx, mxy) = bbox(&room_doc(unit_m, side)).expect("a room has a bbox");
             assert!(
-                mnx.abs() < 1e-3 && mny.abs() < 1e-3
-                    && (mxx - 4.0).abs() < 1e-3 && (mxy - 4.0).abs() < 1e-3,
+                mnx.abs() < 1e-3
+                    && mny.abs() < 1e-3
+                    && (mxx - 4.0).abs() < 1e-3
+                    && (mxy - 4.0).abs() < 1e-3,
                 "bbox at {unit_m} m/unit came out ({mnx}, {mny})..({mxx}, {mxy}), not 0..4 metres",
             );
         }
@@ -416,10 +492,14 @@ mod tests {
         let doc = room_doc(0.001, 4000.0);
         let handles: Vec<u64> = doc.dobjects.iter().map(|d| d.handle).collect();
         let meshes = extrude_handles(&doc, &handles, 2.7);
-        let max_x = meshes.iter()
+        let max_x = meshes
+            .iter()
             .flat_map(|m| m.vertices.iter())
             .fold(f32::MIN, |acc, v| acc.max(v.x));
-        assert!((max_x - 4.0).abs() < 1e-3, "extrude_handles ignored the unit: {max_x} m");
+        assert!(
+            (max_x - 4.0).abs() < 1e-3,
+            "extrude_handles ignored the unit: {max_x} m"
+        );
     }
 
     // ── A ROOM IS A ROOM WHATEVER IT WAS DRAWN WITH ────────────────────────────────────────
@@ -438,8 +518,7 @@ mod tests {
         // The fixture geometries are written in METRE numbers (a 4 m spline room),
         // but a default document is now millimetre space — declare metres or the
         // bbox tests measure the room 1000x too small.
-        d.units = cad_kernel::Units::from_metres_per_unit(
-            1.0, cad_kernel::UnitSource::Declared);
+        d.units = cad_kernel::Units::from_metres_per_unit(1.0, cad_kernel::UnitSource::Declared);
         d.push(DObject::new(geom));
         d
     }
@@ -448,7 +527,10 @@ mod tests {
     /// without this pair the ellipse assertion could pass for the wrong reason.
     #[test]
     fn a_circular_room_has_walls() {
-        let c = cad_kernel::Circle { center: Vec2::new(0.0, 0.0), radius: 3.0 };
+        let c = cad_kernel::Circle {
+            center: Vec2::new(0.0, 0.0),
+            radius: 3.0,
+        };
         assert!(!extrude(&doc_with(cad_kernel::Geom::Circle(c)), 2.7).is_empty());
     }
 
@@ -472,7 +554,11 @@ mod tests {
             major: Vec2::new(4.0, 0.0),
             ratio: 0.6,
         };
-        let ea = cad_kernel::EllipseArc { ellipse: e, start_param: 0.0, sweep_param: 1.2 };
+        let ea = cad_kernel::EllipseArc {
+            ellipse: e,
+            start_param: 0.0,
+            sweep_param: 1.2,
+        };
         assert!(!extrude(&doc_with(cad_kernel::Geom::EllipseArc(ea)), 2.7).is_empty());
     }
 
@@ -504,7 +590,11 @@ mod tests {
     fn closed_spline(side: f64) -> cad_kernel::Spline {
         let nudge = side * 1e-5;
         let pts = [
-            (0.0, 0.0), (side, 0.0), (side, side), (0.0, side), (nudge, nudge),
+            (0.0, 0.0),
+            (side, 0.0),
+            (side, side),
+            (0.0, side),
+            (nudge, nudge),
         ];
         let ctrl: Vec<Vec2> = pts.iter().map(|&(x, y)| Vec2::new(x, y)).collect();
         let w = vec![1.0; ctrl.len()];
@@ -513,7 +603,10 @@ mod tests {
 
     fn open_spline() -> cad_kernel::Spline {
         let ctrl = vec![
-            Vec2::new(0.0, 0.0), Vec2::new(2.0, 3.0), Vec2::new(5.0, 1.0), Vec2::new(8.0, 4.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(2.0, 3.0),
+            Vec2::new(5.0, 1.0),
+            Vec2::new(8.0, 4.0),
         ];
         cad_kernel::Spline::new(3, ctrl, vec![1.0; 4])
     }
@@ -546,7 +639,8 @@ mod tests {
         let m = extrude(&doc_with(cad_kernel::Geom::Spline(open_spline())), 2.7);
         assert!(!m.is_empty(), "an open spline wall vanished");
         assert!(
-            !m.iter().any(|x| x.material == FLOOR || x.material == CEILING),
+            !m.iter()
+                .any(|x| x.material == FLOOR || x.material == CEILING),
             "an open spline was capped — it sealed a space the drafter left open",
         );
     }
@@ -557,10 +651,13 @@ mod tests {
     /// measured, which is the same wrong answer arriving by a different route.
     #[test]
     fn the_calc_plane_reaches_a_spline_room() {
-        let (mnx, mny, mxx, mxy) =
-            bbox(&doc_with(cad_kernel::Geom::Spline(closed_spline(4.0)))).expect("a room has a bbox");
+        let (mnx, mny, mxx, mxy) = bbox(&doc_with(cad_kernel::Geom::Spline(closed_spline(4.0))))
+            .expect("a room has a bbox");
         assert!(
-            mnx.abs() < 0.05 && mny.abs() < 0.05 && (mxx - 4.0).abs() < 0.05 && (mxy - 4.0).abs() < 0.05,
+            mnx.abs() < 0.05
+                && mny.abs() < 0.05
+                && (mxx - 4.0).abs() < 0.05
+                && (mxy - 4.0).abs() < 0.05,
             "the calc plane came out ({mnx}, {mny})..({mxx}, {mxy}) for a 4 m spline room",
         );
     }
@@ -573,14 +670,18 @@ mod tests {
     fn a_spline_room_closes_whatever_unit_it_was_drafted_in() {
         for (unit_m, side) in [(1.0, 4.0), (0.001, 4000.0), (0.01, 400.0)] {
             let mut d = Document::default();
-            d.units = cad_kernel::Units::from_metres_per_unit(unit_m, cad_kernel::UnitSource::Declared);
+            d.units =
+                cad_kernel::Units::from_metres_per_unit(unit_m, cad_kernel::UnitSource::Declared);
             d.push(DObject::new(cad_kernel::Geom::Spline(closed_spline(side))));
             let m = extrude(&d, 2.7);
             assert!(
                 m.iter().any(|x| x.material == FLOOR),
                 "a spline room drafted at {unit_m} m/unit did not close",
             );
-            let max_x = m.iter().flat_map(|x| x.vertices.iter()).fold(f32::MIN, |a, v| a.max(v.x));
+            let max_x = m
+                .iter()
+                .flat_map(|x| x.vertices.iter())
+                .fold(f32::MIN, |a, v| a.max(v.x));
             assert!(
                 (max_x - 4.0).abs() < 1e-2,
                 "a 4 m spline room at {unit_m} m/unit reached the engine {max_x} m across",

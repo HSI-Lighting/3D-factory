@@ -31,7 +31,9 @@ const POLYLINE_EFFECTIVELY_CLOSED_EPS: f64 = 1e-3;
 pub fn resolve_hatch_loops(hatch: &crate::geom::Hatch, doc: &Document) -> Vec<Vec<Vec2>> {
     let mut loops: Vec<Vec<Vec2>> = Vec::with_capacity(hatch.boundary_handles.len());
     for handle in &hatch.boundary_handles {
-        let Some(d) = doc.find_by_handle(*handle) else { continue; };
+        let Some(d) = doc.find_by_handle(*handle) else {
+            continue;
+        };
         // Issue #17 — boundaries on INVISIBLE or FROZEN layers don't
         // contribute to the fill (matches the selection/render gating:
         // `renders` = layer visible && !frozen, plus the dobject's own
@@ -43,7 +45,9 @@ pub fn resolve_hatch_loops(hatch: &crate::geom::Hatch, doc: &Document) -> Vec<Ve
         // boundary to reference. They are invisible BY DESIGN (they must
         // never draw), but the hatch fill must still resolve them.
         let user_hidden = !d.style.visible && !d.style.hatch_aux;
-        if user_hidden || !doc.layers.renders(d.style.layer) { continue; }
+        if user_hidden || !doc.layers.renders(d.style.layer) {
+            continue;
+        }
         let loop_verts: Option<Vec<Vec2>> = match &d.geom {
             Geom::Polyline(p) if polyline_is_effectively_closed(p) => {
                 Some(closed_dobject_polygon(&d.geom))
@@ -67,7 +71,10 @@ fn tessellate_circle_loop(centre: Vec2, radius: f64, n: usize) -> Vec<Vec2> {
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let t = (i as f64) / (n as f64) * std::f64::consts::TAU;
-        out.push(Vec2::new(centre.x + radius * t.cos(), centre.y + radius * t.sin()));
+        out.push(Vec2::new(
+            centre.x + radius * t.cos(),
+            centre.y + radius * t.sin(),
+        ));
     }
     out
 }
@@ -85,8 +92,12 @@ fn tessellate_ellipse_loop(e: &Ellipse, n: usize) -> Vec<Vec2> {
 /// True if `p` should be treated as a closed loop: `closed` set, OR first≈last
 /// within `POLYLINE_EFFECTIVELY_CLOSED_EPS`. Needs ≥3 vertices to form a loop.
 fn polyline_is_effectively_closed(p: &Polyline) -> bool {
-    if p.vertices.len() < 3 { return false; }
-    if p.closed { return true; }
+    if p.vertices.len() < 3 {
+        return false;
+    }
+    if p.closed {
+        return true;
+    }
     let first = p.vertices.first().map(|v| v.pos);
     let last = p.vertices.last().map(|v| v.pos);
     match (first, last) {
@@ -99,7 +110,9 @@ fn polyline_is_effectively_closed(p: &Polyline) -> bool {
 /// first ≈ last control point (CAD "Close" appends the first cp).
 fn spline_is_effectively_closed(s: &Spline) -> bool {
     let n = s.control_points.len();
-    if n < 3 { return false; }
+    if n < 3 {
+        return false;
+    }
     (s.control_points[0] - s.control_points[n - 1]).len() < POLYLINE_EFFECTIVELY_CLOSED_EPS
 }
 
@@ -113,7 +126,11 @@ fn closed_dobject_polygon(g: &Geom) -> Vec<Vec2> {
             let effective_n = if !p.closed {
                 let f = p.vertices[0].pos;
                 let l = p.vertices[n - 1].pos;
-                if (f - l).len() < POLYLINE_EFFECTIVELY_CLOSED_EPS { n - 1 } else { n }
+                if (f - l).len() < POLYLINE_EFFECTIVELY_CLOSED_EPS {
+                    n - 1
+                } else {
+                    n
+                }
             } else {
                 n
             };
@@ -132,7 +149,9 @@ fn closed_dobject_polygon(g: &Geom) -> Vec<Vec2> {
             let mut v = s.tessellate(64);
             if v.len() >= 2 {
                 let (f, l) = (v[0], v[v.len() - 1]);
-                if (f - l).len() < POLYLINE_EFFECTIVELY_CLOSED_EPS { v.pop(); }
+                if (f - l).len() < POLYLINE_EFFECTIVELY_CLOSED_EPS {
+                    v.pop();
+                }
             }
             v
         }
@@ -190,10 +209,22 @@ mod tests {
     fn closed_rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Polyline {
         Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(x0, y0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(x1, y0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(x1, y1), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(x0, y1), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(x0, y0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(x1, y0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(x1, y1),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(x0, y1),
+                    bulge: 0.0,
+                },
             ],
             closed: true,
             widths: Vec::new(),
@@ -214,8 +245,15 @@ mod tests {
         // closed_dobject_polygon repeats the first vertex as the closing one, so
         // a 4-corner rectangle resolves to 5 points (v0..v3,v0); the DXF writer
         // drops that trailing duplicate.
-        assert_eq!(loops[0].len(), 5, "rectangle → 4 corners + duplicated close");
-        assert_eq!(loops[0][0], loops[0][4], "loop closes back on its first vertex");
+        assert_eq!(
+            loops[0].len(),
+            5,
+            "rectangle → 4 corners + duplicated close"
+        );
+        assert_eq!(
+            loops[0][0], loops[0][4],
+            "loop closes back on its first vertex"
+        );
     }
 
     #[test]
@@ -223,7 +261,13 @@ mod tests {
         let mut doc = Document::default();
         let oi = doc.push(Geom::Polyline(closed_rect(0.0, 0.0, 10.0, 10.0)).into());
         let outer = doc.dobjects[oi].handle;
-        let ci = doc.push(Geom::Circle(Circle { center: Vec2::new(5.0, 5.0), radius: 2.0 }).into());
+        let ci = doc.push(
+            Geom::Circle(Circle {
+                center: Vec2::new(5.0, 5.0),
+                radius: 2.0,
+            })
+            .into(),
+        );
         let hole = doc.dobjects[ci].handle;
         let hatch = crate::geom::Hatch {
             boundary_handles: vec![outer, hole],
@@ -231,7 +275,11 @@ mod tests {
         };
         let loops = resolve_hatch_loops(&hatch, &doc);
         assert_eq!(loops.len(), 2, "outer + hole → two loops");
-        assert_eq!(loops[0].len(), 5, "outer rectangle → 4 corners + duplicated close");
+        assert_eq!(
+            loops[0].len(),
+            5,
+            "outer rectangle → 4 corners + duplicated close"
+        );
         assert_eq!(loops[1].len(), 64, "circle hole → 64 samples");
     }
 
@@ -241,8 +289,14 @@ mod tests {
         // A dangling handle (never in the doc) + an open 2-point polyline.
         let open = Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(1.0, 0.0), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(0.0, 0.0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(1.0, 0.0),
+                    bulge: 0.0,
+                },
             ],
             closed: false,
             widths: Vec::new(),
@@ -250,11 +304,14 @@ mod tests {
         let oi = doc.push(Geom::Polyline(open).into());
         let open_h = doc.dobjects[oi].handle;
         let hatch = crate::geom::Hatch {
-            boundary_handles: vec![u64::MAX, open_h],   // Handle = u64; MAX never allocated
+            boundary_handles: vec![u64::MAX, open_h], // Handle = u64; MAX never allocated
             pattern: crate::geom::HatchPattern::Solid,
         };
         let loops = resolve_hatch_loops(&hatch, &doc);
-        assert!(loops.is_empty(), "dangling + open boundaries resolve to nothing");
+        assert!(
+            loops.is_empty(),
+            "dangling + open boundaries resolve to nothing"
+        );
     }
 
     #[test]
@@ -265,9 +322,15 @@ mod tests {
         // A layer that is invisible + one that is frozen.
         let mut mk_layer = |name: &str, visible: bool, frozen: bool| {
             doc.layers.add(crate::layer::Layer {
-                name: name.into(), color: crate::color::Color::Aci(7),
-                linetype: 0, lineweight: crate::lineweight::Lineweight::Default,
-                visible, locked: false, frozen, plottable: true, order: 0,
+                name: name.into(),
+                color: crate::color::Color::Aci(7),
+                linetype: 0,
+                lineweight: crate::lineweight::Lineweight::Default,
+                visible,
+                locked: false,
+                frozen,
+                plottable: true,
+                order: 0,
             })
         };
         let off_id = mk_layer("OFF", false, false);
@@ -305,7 +368,11 @@ mod tests {
             pattern: crate::geom::HatchPattern::Solid,
         };
         let loops = resolve_hatch_loops(&hatch, &doc);
-        assert_eq!(loops.len(), 2, "only the visible + the aux boundary contribute");
+        assert_eq!(
+            loops.len(),
+            2,
+            "only the visible + the aux boundary contribute"
+        );
         assert_eq!(loops[0][0], Vec2::new(0.0, 0.0));
         assert_eq!(loops[0][2], Vec2::new(5.0, 5.0));
         assert_eq!(loops[1][2], Vec2::new(40.0, 5.0), "aux boundary resolves");

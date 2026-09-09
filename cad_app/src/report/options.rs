@@ -120,7 +120,6 @@ impl Section {
     }
 }
 
-
 /// How the false-colour plot's scale is decided.
 ///
 /// THE APP USED TO DECIDE IT and the report simply followed. Two reports of the same room at
@@ -178,7 +177,10 @@ pub const DEFAULT_BAND_COLOURS: [[u8; 3]; 5] = [
 
 impl Default for Scale {
     fn default() -> Self {
-        Self { top: None, bands: DEFAULT_BANDS.to_vec() }
+        Self {
+            top: None,
+            bands: DEFAULT_BANDS.to_vec(),
+        }
     }
 }
 
@@ -432,7 +434,10 @@ impl Options {
             None => {
                 let order = Section::all();
                 let rank = |x: Section| order.iter().position(|y| *y == x).unwrap_or(usize::MAX);
-                self.sections.iter().position(|x| rank(*x) > rank(s)).unwrap_or(self.sections.len())
+                self.sections
+                    .iter()
+                    .position(|x| rank(*x) > rank(s))
+                    .unwrap_or(self.sections.len())
             }
         };
         self.sections.insert(at, s);
@@ -440,7 +445,9 @@ impl Options {
 
     /// Move a section one place earlier or later. Returns whether anything moved.
     pub fn move_section(&mut self, s: Section, delta: i32) -> bool {
-        let Some(i) = self.sections.iter().position(|x| *x == s) else { return false };
+        let Some(i) = self.sections.iter().position(|x| *x == s) else {
+            return false;
+        };
         let j = i as i32 + delta;
         if j < 0 || j as usize >= self.sections.len() {
             return false;
@@ -451,11 +458,14 @@ impl Options {
 
     /// The file the report will be written to.
     pub fn out_path(&self) -> std::path::PathBuf {
-        let stem = if self.file_stem.trim().is_empty() { "report" } else { self.file_stem.trim() };
+        let stem = if self.file_stem.trim().is_empty() {
+            "report"
+        } else {
+            self.file_stem.trim()
+        };
         std::path::Path::new(&self.out_dir).join(format!("{stem}.{}", self.format.ext()))
     }
 }
-
 
 /// The report settings that outlive one project.
 ///
@@ -516,7 +526,11 @@ impl Prefs {
             band_colours: o.band_colours.clone(),
             sections: o.sections.clone(),
             hidden: o.hidden.clone(),
-            logos: o.logos.iter().map(|l| (l.path.clone(), l.caption.clone())).collect(),
+            logos: o
+                .logos
+                .iter()
+                .map(|l| (l.path.clone(), l.caption.clone()))
+                .collect(),
             header_image: o.header_image,
             footer_image: o.footer_image,
         }
@@ -569,7 +583,11 @@ impl Prefs {
         o.logos = self
             .logos
             .into_iter()
-            .map(|(path, caption)| ReportImage { path, caption, jpeg: None })
+            .map(|(path, caption)| ReportImage {
+                path,
+                caption,
+                jpeg: None,
+            })
             .collect();
         // A logo index that no longer names anything is dropped rather than left pointing past the
         // end of a list a person has since shortened.
@@ -639,7 +657,11 @@ mod tests {
         assert_eq!(o.sections[0], Section::Renders);
         o.set(Section::Summary, false);
         o.set(Section::Summary, true);
-        assert_eq!(o.sections[0], Section::Renders, "an unrelated toggle undid the move");
+        assert_eq!(
+            o.sections[0],
+            Section::Renders,
+            "an unrelated toggle undid the move"
+        );
     }
 
     /// MOVING STOPS AT THE ENDS rather than wrapping — a list that jumps from top to bottom on one
@@ -662,7 +684,13 @@ mod tests {
         let mut o = Options::default();
         o.set(Section::Summary, true);
         o.set(Section::Summary, true);
-        assert_eq!(o.sections.iter().filter(|s| **s == Section::Summary).count(), 1);
+        assert_eq!(
+            o.sections
+                .iter()
+                .filter(|s| **s == Section::Summary)
+                .count(),
+            1
+        );
     }
 
     /// THE EXTENSION FOLLOWS THE FORMAT. A PDF written as `.html` opens in a browser as a wall of
@@ -670,7 +698,11 @@ mod tests {
     #[test]
     fn the_file_name_follows_the_format() {
         let mut o = Options::default();
-        o.out_dir = if cfg!(windows) { "C:\\out".into() } else { "/out".into() };
+        o.out_dir = if cfg!(windows) {
+            "C:\\out".into()
+        } else {
+            "/out".into()
+        };
         o.file_stem = "gym".into();
         assert!(o.out_path().to_string_lossy().ends_with("gym.pdf"));
         o.format = Format::Html;
@@ -681,7 +713,11 @@ mod tests {
     #[test]
     fn a_blank_name_falls_back() {
         let mut o = Options::default();
-        o.out_dir = if cfg!(windows) { "C:\\out".into() } else { "/out".into() };
+        o.out_dir = if cfg!(windows) {
+            "C:\\out".into()
+        } else {
+            "/out".into()
+        };
         o.file_stem = "   ".into();
         assert!(o.out_path().to_string_lossy().ends_with("report.pdf"));
     }
@@ -704,12 +740,23 @@ mod the_report_settings_are_kept {
         o.header = "HSI Lighting · Project 2214".into();
         o.footer = "confidential".into();
         o.page_numbers = false;
-        o.scale = Scale { top: Some(750.0), bands: vec![50.0, 200.0] };
+        o.scale = Scale {
+            top: Some(750.0),
+            bands: vec![50.0, 200.0],
+        };
         o.move_section(Section::Renders, -1);
         o.set(Section::Surfaces, false);
         o.logos = vec![
-            ReportImage { path: "D:/brand/hsi.png".into(), caption: "HSI".into(), jpeg: None },
-            ReportImage { path: "D:/brand/iso.png".into(), caption: String::new(), jpeg: None },
+            ReportImage {
+                path: "D:/brand/hsi.png".into(),
+                caption: "HSI".into(),
+                jpeg: None,
+            },
+            ReportImage {
+                path: "D:/brand/iso.png".into(),
+                caption: String::new(),
+                jpeg: None,
+            },
         ];
         o.header_image = Some(0);
         o.footer_image = Some(1);
@@ -736,8 +783,14 @@ mod the_report_settings_are_kept {
         assert!(!back.page_numbers);
         assert_eq!(back.scale.top, Some(750.0));
         assert_eq!(back.scale.bands, vec![50.0, 200.0]);
-        assert_eq!(back.sections, src.sections, "the section order was not kept");
-        assert!(!back.has(Section::Surfaces), "a switched-off section came back on");
+        assert_eq!(
+            back.sections, src.sections,
+            "the section order was not kept"
+        );
+        assert!(
+            !back.has(Section::Surfaces),
+            "a switched-off section came back on"
+        );
         assert_eq!(back.logos.len(), 2, "the logos were not kept");
         assert_eq!(back.logos[0].path, "D:/brand/hsi.png");
         assert_eq!(back.logos[0].caption, "HSI");
@@ -756,10 +809,26 @@ mod the_report_settings_are_kept {
         let mut back = Options::default();
         Prefs::of(&src).apply(&mut back);
 
-        assert!(back.title.is_empty(), "the project name followed: {:?}", back.title);
-        assert!(back.subtitle.is_empty(), "the cover line followed: {:?}", back.subtitle);
-        assert!(back.out_dir.is_empty(), "the output folder followed: {:?}", back.out_dir);
-        assert!(back.file_stem.is_empty(), "the file name followed: {:?}", back.file_stem);
+        assert!(
+            back.title.is_empty(),
+            "the project name followed: {:?}",
+            back.title
+        );
+        assert!(
+            back.subtitle.is_empty(),
+            "the cover line followed: {:?}",
+            back.subtitle
+        );
+        assert!(
+            back.out_dir.is_empty(),
+            "the output folder followed: {:?}",
+            back.out_dir
+        );
+        assert!(
+            back.file_stem.is_empty(),
+            "the file name followed: {:?}",
+            back.file_stem
+        );
         assert!(back.images.is_empty(), "the renders followed");
     }
 
@@ -771,8 +840,15 @@ mod the_report_settings_are_kept {
         o.logos[0].jpeg = Some((vec![0xAB; 4096], 800, 200));
         let json = serde_json::to_string(&Prefs::of(&o)).expect("serialises");
         assert!(json.contains("hsi.png"), "the path is the record");
-        assert!(!json.contains("171,171,171"), "the image bytes went into the file");
-        assert!(json.len() < 2000, "the preferences file is {} bytes", json.len());
+        assert!(
+            !json.contains("171,171,171"),
+            "the image bytes went into the file"
+        );
+        assert!(
+            json.len() < 2000,
+            "the preferences file is {} bytes",
+            json.len()
+        );
     }
 
     /// A FILE FROM AN OLDER BUILD RESTORES WHAT IT HAS and defaults the rest, rather than blanking
@@ -788,7 +864,10 @@ mod the_report_settings_are_kept {
         assert_eq!(o.page, defaults.page, "the paper size was blanked");
         assert_eq!(o.cover, defaults.cover, "the cover was switched off");
         assert_eq!(o.sections, defaults.sections, "the sections were emptied");
-        assert_eq!(o.scale.bands, defaults.scale.bands, "the bands were blanked");
+        assert_eq!(
+            o.scale.bands, defaults.scale.bands,
+            "the bands were blanked"
+        );
     }
 
     /// AN EMPTY SECTION LIST IS NOT A PREFERENCE. A file that never held one must not produce a
@@ -798,7 +877,11 @@ mod the_report_settings_are_kept {
         let p: Prefs = serde_json::from_str(r#"{"sections":[]}"#).expect("parses");
         let mut o = Options::default();
         p.apply(&mut o);
-        assert_eq!(o.sections, Section::all(), "an empty list emptied the report");
+        assert_eq!(
+            o.sections,
+            Section::all(),
+            "an empty list emptied the report"
+        );
     }
 
     /// A LOGO INDEX THAT NO LONGER NAMES ANYTHING IS DROPPED, not left pointing past the end of a
@@ -810,7 +893,10 @@ mod the_report_settings_are_kept {
         let mut o = Options::default();
         p.apply(&mut o);
         assert_eq!(o.header_image, Some(0), "the surviving logo kept its slot");
-        assert_eq!(o.footer_image, None, "the footer pointed past the end of the list");
+        assert_eq!(
+            o.footer_image, None,
+            "the footer pointed past the end of the list"
+        );
     }
 
     /// A CORRUPT FILE IS NOT AN ERROR TO SHOW ANYBODY. Nothing here is irreplaceable — the worst
@@ -921,7 +1007,13 @@ mod the_viewport_and_the_report_agree_about_colour {
         o.scale.bands = vec![50.0, 100.0, 200.0, 300.0];
         // Deliberately NOT the palette and deliberately all different, so an off-by-one in the band
         // index is a different byte rather than a slightly different shade of the right one.
-        o.band_colours = vec![[10, 11, 12], [20, 21, 22], [30, 31, 32], [40, 41, 42], [50, 51, 52]];
+        o.band_colours = vec![
+            [10, 11, 12],
+            [20, 21, 22],
+            [30, 31, 32],
+            [40, 41, 42],
+            [50, 51, 52],
+        ];
         o
     }
 
@@ -939,7 +1031,7 @@ mod the_viewport_and_the_report_agree_about_colour {
         for (lux, want) in [
             (0.0, [10, 11, 12]),
             (49.9, [10, 11, 12]),
-            (50.0, [20, 21, 22]),  // ON a threshold belongs to the band ABOVE it
+            (50.0, [20, 21, 22]), // ON a threshold belongs to the band ABOVE it
             (99.9, [20, 21, 22]),
             (100.0, [30, 31, 32]),
             (199.9, [30, 31, 32]),

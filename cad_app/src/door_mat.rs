@@ -253,7 +253,9 @@ impl DoorMaterials {
 
     /// One number that changes whenever any slot does.
     pub fn key(&self) -> u64 {
-        Slot::ALL.iter().fold(0u64, |a, s| a * 16 + self.get(*s).key() + 1)
+        Slot::ALL
+            .iter()
+            .fold(0u64, |a, s| a * 16 + self.get(*s).key() + 1)
     }
 
     /// True when any component is glazed — the door then needs the renderer's blended pass.
@@ -278,16 +280,29 @@ mod tests {
     #[test]
     fn the_slots_cover_every_joinery_part_exactly_once() {
         use cad_solid::door::Part;
-        let mut seen: Vec<u32> = Slot::ALL.iter().flat_map(|s| s.parts().iter().copied()).collect();
+        let mut seen: Vec<u32> = Slot::ALL
+            .iter()
+            .flat_map(|s| s.parts().iter().copied())
+            .collect();
         let n = seen.len();
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), n, "no part belongs to two slots");
-        for p in [Part::Leaf, Part::Panel, Part::Lining, Part::Stop, Part::ArchFront, Part::ArchBack] {
+        for p in [
+            Part::Leaf,
+            Part::Panel,
+            Part::Lining,
+            Part::Stop,
+            Part::ArchFront,
+            Part::ArchBack,
+        ] {
             assert!(seen.contains(&(p as u32)), "{p:?} has a material slot");
         }
         for p in [Part::Hinge, Part::Handle] {
-            assert!(!seen.contains(&(p as u32)), "{p:?} is ironmongery, not joinery");
+            assert!(
+                !seen.contains(&(p as u32)),
+                "{p:?} is ironmongery, not joinery"
+            );
             assert!(p as u32 >= FIRST_HARDWARE_PART);
         }
     }
@@ -304,13 +319,24 @@ mod tests {
         };
         for slot in Slot::ALL {
             for &p in slot.parts() {
-                assert_eq!(mats.for_part(p), Some(mats.get(slot)), "part {p} → {slot:?}");
+                assert_eq!(
+                    mats.for_part(p),
+                    Some(mats.get(slot)),
+                    "part {p} → {slot:?}"
+                );
             }
         }
-        assert_eq!(mats.for_part(FIRST_HARDWARE_PART), None, "hardware has no joinery material");
+        assert_eq!(
+            mats.for_part(FIRST_HARDWARE_PART),
+            None,
+            "hardware has no joinery material"
+        );
         assert_eq!(mats.for_part(999), None, "an unknown part has none either");
         assert!(mats.has_glass(), "a glazed panel counts as glass");
-        assert!(!DoorMaterials::default().has_glass(), "an all-oak door does not");
+        assert!(
+            !DoorMaterials::default().has_glass(),
+            "an all-oak door does not"
+        );
     }
 
     /// The preview and the built material must agree about the colour, the roughness and the
@@ -327,11 +353,26 @@ mod tests {
             assert_eq!(t.avg, srgb, "{m:?}: same base colour");
             assert!((t.roughness - rough).abs() < 1e-6, "{m:?}: same roughness");
             assert!((t.opacity - opacity).abs() < 1e-6, "{m:?}: same opacity");
-            assert!((look.opacity - t.opacity).abs() < 1e-6, "{m:?}: the preview is as see-through");
-            assert_eq!(look.proc.is_some(), t.proc.is_some(), "{m:?}: both have the grain, or neither");
-            assert_eq!(m.is_glass(), t.opacity < 0.999, "{m:?}: glass is the transparent one");
+            assert!(
+                (look.opacity - t.opacity).abs() < 1e-6,
+                "{m:?}: the preview is as see-through"
+            );
+            assert_eq!(
+                look.proc.is_some(),
+                t.proc.is_some(),
+                "{m:?}: both have the grain, or neither"
+            );
+            assert_eq!(
+                m.is_glass(),
+                t.opacity < 0.999,
+                "{m:?}: glass is the transparent one"
+            );
             // The preview shades in LINEAR light; the library stores the authored sRGB.
-            assert_eq!(look.albedo, crate::color::srgb_to_linear3(srgb), "{m:?}: decoded once");
+            assert_eq!(
+                look.albedo,
+                crate::color::srgb_to_linear3(srgb),
+                "{m:?}: decoded once"
+            );
         }
     }
 

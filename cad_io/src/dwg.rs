@@ -92,8 +92,7 @@ pub fn convert(src: &acadrust::CadDocument) -> (Document, Tally) {
     // an explicit absence of a claim rather than a claim of metres, and an exotic code is left
     // unmapped because a wrong guess beats no guess only if it is right.
     if let Some(m) = insunits_to_metres(src.header.insertion_units as i32) {
-        doc.units = cad_kernel::Units::from_metres_per_unit(
-            m, cad_kernel::UnitSource::Declared);
+        doc.units = cad_kernel::Units::from_metres_per_unit(m, cad_kernel::UnitSource::Declared);
     }
 
     // ---- layers, before the entities that name them -----------------------------------------
@@ -190,12 +189,14 @@ fn build(
 ) -> Option<DObject> {
     use acadrust::EntityType as E;
     let geom = match e {
-        E::Line(l) => {
-            Geom::Line(Line { a: Vec2::new(l.start.x, l.start.y), b: Vec2::new(l.end.x, l.end.y) })
-        }
-        E::Circle(c) => {
-            Geom::Circle(Circle { center: Vec2::new(c.center.x, c.center.y), radius: c.radius })
-        }
+        E::Line(l) => Geom::Line(Line {
+            a: Vec2::new(l.start.x, l.start.y),
+            b: Vec2::new(l.end.x, l.end.y),
+        }),
+        E::Circle(c) => Geom::Circle(Circle {
+            center: Vec2::new(c.center.x, c.center.y),
+            radius: c.radius,
+        }),
         E::Arc(a) => {
             // DWG STORES THESE IN RADIANS, unlike DXF's degrees — the single easiest thing to get
             // wrong here, and it would produce arcs that look plausible and are not.
@@ -203,7 +204,11 @@ fn build(
             // A sweep of exactly zero means a full circle rather than an empty arc, the same rule
             // the DXF reader follows.
             let sweep = (a.end_angle - a.start_angle).rem_euclid(std::f64::consts::TAU);
-            let sweep = if sweep < 1e-9 { std::f64::consts::TAU } else { sweep };
+            let sweep = if sweep < 1e-9 {
+                std::f64::consts::TAU
+            } else {
+                sweep
+            };
             Geom::Arc(Arc {
                 center: Vec2::new(a.center.x, a.center.y),
                 radius: a.radius,
@@ -222,7 +227,10 @@ fn build(
             vertices: p
                 .vertices
                 .iter()
-                .map(|v| PolyVertex { pos: Vec2::new(v.location.x, v.location.y), bulge: v.bulge })
+                .map(|v| PolyVertex {
+                    pos: Vec2::new(v.location.x, v.location.y),
+                    bulge: v.bulge,
+                })
                 .collect(),
             closed: p.is_closed,
             widths: Vec::new(),
@@ -231,7 +239,10 @@ fn build(
             vertices: p
                 .vertices
                 .iter()
-                .map(|v| PolyVertex { pos: Vec2::new(v.location.x, v.location.y), bulge: v.bulge })
+                .map(|v| PolyVertex {
+                    pos: Vec2::new(v.location.x, v.location.y),
+                    bulge: v.bulge,
+                })
                 .collect(),
             closed: p.is_closed(),
             widths: Vec::new(),
@@ -347,7 +358,11 @@ mod tests {
     #[test]
     fn unitless_stays_unclaimed() {
         assert_eq!(insunits_to_metres(0), None);
-        assert_eq!(insunits_to_metres(6), Some(1.0), "…but a real claim of metres is taken");
+        assert_eq!(
+            insunits_to_metres(6),
+            Some(1.0),
+            "…but a real claim of metres is taken"
+        );
     }
 }
 
@@ -393,8 +408,15 @@ mod the_real_drawings {
                 t.elapsed().as_millis(),
                 doc.units.metres_per_unit,
             );
-            assert!(tally.kept > 0, "{f} produced no geometry — a blank canvas reported as success");
-            assert_eq!(tally.kept, doc.dobjects.len(), "{f}: the tally must match what was pushed");
+            assert!(
+                tally.kept > 0,
+                "{f} produced no geometry — a blank canvas reported as success"
+            );
+            assert_eq!(
+                tally.kept,
+                doc.dobjects.len(),
+                "{f}: the tally must match what was pushed"
+            );
         }
     }
 
@@ -423,17 +445,33 @@ mod the_real_drawings {
             t.kept,
             t.skipped,
             doc.blocks.blocks.len(),
-            doc.dobjects.iter().filter(|d| matches!(d.geom, cad_kernel::Geom::BlockRef(_))).count(),
+            doc.dobjects
+                .iter()
+                .filter(|d| matches!(d.geom, cad_kernel::Geom::BlockRef(_)))
+                .count(),
         );
         assert_eq!(t.kept, 5_577, "model space is 5 577 entities on this file");
-        assert!(t.skipped > 25_000, "the definitions must be excluded, not drawn: {}", t.skipped);
+        assert!(
+            t.skipped > 25_000,
+            "the definitions must be excluded, not drawn: {}",
+            t.skipped
+        );
 
         // AND THE REFERENCES SURVIVED. Filtering to model space without resolving INSERTs would
         // be a net loss -- it would take every furniture and fitting symbol with it.
-        let refs =
-            doc.dobjects.iter().filter(|d| matches!(d.geom, cad_kernel::Geom::BlockRef(_))).count();
-        assert_eq!(refs, 231, "every block reference in model space must resolve");
-        assert!(!doc.blocks.blocks.is_empty(), "…against definitions that were actually built");
+        let refs = doc
+            .dobjects
+            .iter()
+            .filter(|d| matches!(d.geom, cad_kernel::Geom::BlockRef(_)))
+            .count();
+        assert_eq!(
+            refs, 231,
+            "every block reference in model space must resolve"
+        );
+        assert!(
+            !doc.blocks.blocks.is_empty(),
+            "…against definitions that were actually built"
+        );
     }
 
     /// THE DRAWING IS BUILDING-SIZED IN ITS OWN DECLARED UNIT — which is the invariant that
@@ -447,26 +485,29 @@ mod the_real_drawings {
     #[test]
     #[ignore]
     fn every_drawing_is_building_sized_in_its_own_unit() {
-        for f in ["for3dfactorygym.dwg", "villa mashrabya.dwg", "1 Mashrabiya.dwg"] {
-        let p = std::path::Path::new(DIR).join(f);
-        if !p.exists() {
-            continue;
-        }
-        let (doc, _) = super::read_dwg(&p).expect("opens");
-        let (mut lo, mut hi) = ((f64::MAX, f64::MAX), (f64::MIN, f64::MIN));
-        for d in &doc.dobjects {
-            let (a, b) = d.geom.bbox();
-            lo = (lo.0.min(a.x), lo.1.min(a.y));
-            hi = (hi.0.max(b.x), hi.1.max(b.y));
-        }
-        let k = doc.units.metres_per_unit;
-        let (w, d) = ((hi.0 - lo.0) * k, (hi.1 - lo.1) * k);
-        eprintln!("{f:32} {w:.1} x {d:.1} m  (unit {k})");
-        assert!(
+        for f in [
+            "for3dfactorygym.dwg",
+            "villa mashrabya.dwg",
+            "1 Mashrabiya.dwg",
+        ] {
+            let p = std::path::Path::new(DIR).join(f);
+            if !p.exists() {
+                continue;
+            }
+            let (doc, _) = super::read_dwg(&p).expect("opens");
+            let (mut lo, mut hi) = ((f64::MAX, f64::MAX), (f64::MIN, f64::MIN));
+            for d in &doc.dobjects {
+                let (a, b) = d.geom.bbox();
+                lo = (lo.0.min(a.x), lo.1.min(a.y));
+                hi = (hi.0.max(b.x), hi.1.max(b.y));
+            }
+            let k = doc.units.metres_per_unit;
+            let (w, d) = ((hi.0 - lo.0) * k, (hi.1 - lo.1) * k);
+            eprintln!("{f:32} {w:.1} x {d:.1} m  (unit {k})");
+            assert!(
             (1.0..5_000.0).contains(&w) && (1.0..5_000.0).contains(&d),
             "{f} reads as {w:.1} x {d:.1} m, which is not a building -- the unit or the \n             coordinates came through wrong",
         );
         }
     }
 }
-

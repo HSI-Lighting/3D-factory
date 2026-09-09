@@ -61,7 +61,11 @@ fn v_smith(n_o_v: f32, n_o_l: f32, a: f32) -> f32 {
 
 fn f_schlick(f0: [f32; 3], u: f32) -> [f32; 3] {
     let k = (1.0 - u).clamp(0.0, 1.0).powi(5);
-    [f0[0] + (1.0 - f0[0]) * k, f0[1] + (1.0 - f0[1]) * k, f0[2] + (1.0 - f0[2]) * k]
+    [
+        f0[0] + (1.0 - f0[0]) * k,
+        f0[1] + (1.0 - f0[1]) * k,
+        f0[2] + (1.0 - f0[2]) * k,
+    ]
 }
 
 /// The surface response at one shading point. Public because the path tracer and the tests both
@@ -92,7 +96,11 @@ pub fn shade_point(
         f0d + (albedo[1] - f0d) * metallic,
         f0d + (albedo[2] - f0d) * metallic,
     ];
-    let diff = [albedo[0] * (1.0 - metallic), albedo[1] * (1.0 - metallic), albedo[2] * (1.0 - metallic)];
+    let diff = [
+        albedo[0] * (1.0 - metallic),
+        albedo[1] * (1.0 - metallic),
+        albedo[2] * (1.0 - metallic),
+    ];
     let a = (roughness * roughness).max(1e-3);
     let n_o_v = n.dot(v).max(1e-4);
     let n_o_l = n.dot(sun_dir).max(0.0);
@@ -105,7 +113,8 @@ pub fn shade_point(
     if n_o_l > 0.0 {
         let h = (sun_dir + v).normalize();
         let f = f_schlick(f0, v.dot(h).max(0.0));
-        let s = d_ggx(n.dot(h).max(0.0), a) * v_smith(n_o_v, n_o_l, a) * n_o_l * std::f32::consts::PI;
+        let s =
+            d_ggx(n.dot(h).max(0.0), a) * v_smith(n_o_v, n_o_l, a) * n_o_l * std::f32::consts::PI;
         for i in 0..3 {
             col[i] += f[i] * s * sun_col[i];
         }
@@ -133,7 +142,14 @@ pub fn shade_point(
 /// WORLD space, so the ball shows the pattern at the scale it would appear on a one-metre object.
 /// A preview that quietly rescaled the pattern to fit would be the most misleading thing it could
 /// possibly do.
-pub fn render(mat: &Preview, sky: &Sky, sh: &[[f32; 3]; 9], sun_col: [f32; 3], color: ColorPipeline, size: usize) -> Vec<u8> {
+pub fn render(
+    mat: &Preview,
+    sky: &Sky,
+    sh: &[[f32; 3]; 9],
+    sun_col: [f32; 3],
+    color: ColorPipeline,
+    size: usize,
+) -> Vec<u8> {
     let size = size.max(8);
     let mut out = vec![0u8; size * size * 4];
     let eye = Vec3::new(0.0, -3.2, 0.55);
@@ -170,7 +186,19 @@ pub fn render(mat: &Preview, sky: &Sky, sh: &[[f32; 3]; 9], sun_col: [f32; 3], c
                         }
                         None => (mat.albedo, mat.roughness),
                     };
-                    let mut col = shade_point(albedo, rough, mat.metallic, mat.ior, n, v, sun_dir, sun_col, sky, sh, 1.0);
+                    let mut col = shade_point(
+                        albedo,
+                        rough,
+                        mat.metallic,
+                        mat.ior,
+                        n,
+                        v,
+                        sun_dir,
+                        sun_col,
+                        sky,
+                        sh,
+                        1.0,
+                    );
                     for i in 0..3 {
                         col[i] += mat.emission[i];
                     }
@@ -204,7 +232,10 @@ pub fn render(mat: &Preview, sky: &Sky, sh: &[[f32; 3]; 9], sun_col: [f32; 3], c
 /// A sky for previews: a fixed three-quarter sun, so every material in the library is judged under
 /// the same light regardless of what the scene's daylight happens to be set to.
 pub fn preview_sky() -> (Sky, [[f32; 3]; 9], [f32; 3]) {
-    let mut sky = Sky::new(Vec3::new(-0.45, -0.35, 0.82).normalize(), env::DEFAULT_TURBIDITY);
+    let mut sky = Sky::new(
+        Vec3::new(-0.45, -0.35, 0.82).normalize(),
+        env::DEFAULT_TURBIDITY,
+    );
     let sun_col = [2.6, 2.5, 2.35];
     sky.calibrate([0.85, 0.92, 1.10], [0.24, 0.23, 0.20], sun_col);
     let sh = sky.sh9();
@@ -221,7 +252,15 @@ mod tests {
     }
 
     fn base() -> Preview {
-        Preview { albedo: [0.5, 0.5, 0.5], roughness: 0.5, metallic: 0.0, ior: 1.5, opacity: 1.0, emission: [0.0; 3], proc: None }
+        Preview {
+            albedo: [0.5, 0.5, 0.5],
+            roughness: 0.5,
+            metallic: 0.0,
+            ior: 1.5,
+            opacity: 1.0,
+            emission: [0.0; 3],
+            proc: None,
+        }
     }
 
     /// The centre pixel must be the sphere and the corner must be the sky. If the camera framing
@@ -236,16 +275,24 @@ mod tests {
         };
         let mid = at(n / 2, n / 2);
         let corner = at(1, 1);
-        assert_ne!(mid, corner, "the sphere must be distinguishable from the backdrop");
+        assert_ne!(
+            mid, corner,
+            "the sphere must be distinguishable from the backdrop"
+        );
         assert!(img.chunks_exact(4).all(|p| p[3] == 255), "opaque output");
         // The sphere occupies a sensible share of the frame — not a speck, not the whole image.
         // Detected by "differs from the corner colour", which the sky gradient alone would not.
-        let sphere_px = (0..n * n).filter(|i| {
-            let (x, y) = (i % n, i / n);
-            let (cx, cy) = (x as f32 - n as f32 / 2.0, y as f32 - n as f32 / 2.0);
-            (cx * cx + cy * cy).sqrt() < n as f32 * 0.3
-        }).count();
-        assert!(sphere_px > n * n / 12, "the ball should fill a useful part of the frame");
+        let sphere_px = (0..n * n)
+            .filter(|i| {
+                let (x, y) = (i % n, i / n);
+                let (cx, cy) = (x as f32 - n as f32 / 2.0, y as f32 - n as f32 / 2.0);
+                (cx * cx + cy * cy).sqrt() < n as f32 * 0.3
+            })
+            .count();
+        assert!(
+            sphere_px > n * n / 12,
+            "the ball should fill a useful part of the frame"
+        );
     }
 
     /// A metal must reflect its own colour and a dielectric must not. This is the single property
@@ -262,25 +309,70 @@ mod tests {
         // whole shaded colours does not test this: with a dielectric the diffuse term carries the
         // base colour and swamps the specular, so the total tint says nothing about F0.
         let env_spec = |albedo: [f32; 3], metallic: f32| {
-            let a = shade_point(albedo, 0.15, metallic, 1.5, n, v, sky.sun_dir, sun, &sky, &sh, 1.0);
-            let b = shade_point(albedo, 0.15, metallic, 1.5, n, v, sky.sun_dir, sun, &sky, &sh, 0.0);
+            let a = shade_point(
+                albedo,
+                0.15,
+                metallic,
+                1.5,
+                n,
+                v,
+                sky.sun_dir,
+                sun,
+                &sky,
+                &sh,
+                1.0,
+            );
+            let b = shade_point(
+                albedo,
+                0.15,
+                metallic,
+                1.5,
+                n,
+                v,
+                sky.sun_dir,
+                sun,
+                &sky,
+                &sh,
+                0.0,
+            );
             [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
         };
         // A DIELECTRIC's specular is white — it does not depend on the base colour at all.
         let (gd, wd) = (env_spec(gold, 0.0), env_spec(white, 0.0));
         for i in 0..3 {
-            assert!((gd[i] - wd[i]).abs() < 1e-5, "a dielectric's reflection must not take its albedo: {gd:?} vs {wd:?}");
+            assert!(
+                (gd[i] - wd[i]).abs() < 1e-5,
+                "a dielectric's reflection must not take its albedo: {gd:?} vs {wd:?}"
+            );
         }
         // A CONDUCTOR's specular IS its base colour: gold returns ~a sixth of the blue a white
         // metal does, and all of the red.
         let (gm, wm) = (env_spec(gold, 1.0), env_spec(white, 1.0));
         let blue = gm[2] / wm[2].max(1e-9);
         let red = gm[0] / wm[0].max(1e-9);
-        assert!(blue < red * 0.5, "gold must reflect far less blue than white metal: blue {blue:.3} vs red {red:.3}");
+        assert!(
+            blue < red * 0.5,
+            "gold must reflect far less blue than white metal: blue {blue:.3} vs red {red:.3}"
+        );
         // …and a metal has no diffuse at all, so it is black where nothing is being reflected.
         let away = -v;
-        let m_dark = shade_point(gold, 0.15, 1.0, 1.5, away, v, sky.sun_dir, sun, &sky, &sh, 0.0);
-        assert!(m_dark.iter().all(|c| *c < 0.02), "a metal with no environment has no diffuse: {m_dark:?}");
+        let m_dark = shade_point(
+            gold,
+            0.15,
+            1.0,
+            1.5,
+            away,
+            v,
+            sky.sun_dir,
+            sun,
+            &sky,
+            &sh,
+            0.0,
+        );
+        assert!(
+            m_dark.iter().all(|c| *c < 0.02),
+            "a metal with no environment has no diffuse: {m_dark:?}"
+        );
     }
 
     /// Roughness must actually change the picture, monotonically: a mirror concentrates the sun
@@ -288,15 +380,31 @@ mod tests {
     #[test]
     fn roughness_spreads_the_highlight() {
         let peak = |r: f32| {
-            let img = ball(&Preview { roughness: r, metallic: 1.0, albedo: [0.9, 0.9, 0.9], ..base() });
+            let img = ball(&Preview {
+                roughness: r,
+                metallic: 1.0,
+                albedo: [0.9, 0.9, 0.9],
+                ..base()
+            });
             img.chunks_exact(4).map(|p| p[0]).max().unwrap()
         };
         let bright = |r: f32| {
-            let img = ball(&Preview { roughness: r, metallic: 1.0, albedo: [0.9, 0.9, 0.9], ..base() });
+            let img = ball(&Preview {
+                roughness: r,
+                metallic: 1.0,
+                albedo: [0.9, 0.9, 0.9],
+                ..base()
+            });
             img.chunks_exact(4).filter(|p| p[0] > 200).count()
         };
-        assert!(peak(0.05) >= peak(0.8), "a mirror must reach at least as bright as a rough surface");
-        assert!(bright(0.6) > bright(0.05), "and a rough surface must spread that brightness wider");
+        assert!(
+            peak(0.05) >= peak(0.8),
+            "a mirror must reach at least as bright as a rough surface"
+        );
+        assert!(
+            bright(0.6) > bright(0.05),
+            "and a rough surface must spread that brightness wider"
+        );
     }
 
     /// An emissive material glows regardless of the light on it — including on the side facing away
@@ -305,12 +413,30 @@ mod tests {
     fn emission_glows_on_the_dark_side() {
         let (sky, sh, sun) = preview_sky();
         let dark = -sky.sun_dir;
-        let plain = shade_point([0.5; 3], 0.5, 0.0, 1.5, dark, -dark, sky.sun_dir, sun, &sky, &sh, 0.0);
-        let mat = Preview { emission: [4.0, 3.4, 2.4], ..base() };
+        let plain = shade_point(
+            [0.5; 3],
+            0.5,
+            0.0,
+            1.5,
+            dark,
+            -dark,
+            sky.sun_dir,
+            sun,
+            &sky,
+            &sh,
+            0.0,
+        );
+        let mat = Preview {
+            emission: [4.0, 3.4, 2.4],
+            ..base()
+        };
         let img = render(&mat, &sky, &sh, sun, ColorPipeline::default(), 32);
         let o = (16 * 32 + 16) * 4;
         assert!(img[o] > 200, "an emitter should read bright: {}", img[o]);
-        assert!(plain[0] < 1.0, "the same surface without emission is not bright: {plain:?}");
+        assert!(
+            plain[0] < 1.0,
+            "the same surface without emission is not bright: {plain:?}"
+        );
     }
 
     /// The preview and the viewport must be the same shader. `shade_point` is the Rust copy of the
@@ -319,19 +445,49 @@ mod tests {
     #[test]
     fn the_preview_agrees_with_the_viewports_brdf() {
         let glsl = crate::light3d::tex_fs_for_test();
-        assert!(glsl.contains("v_smith(NoV, NoL, a) * NoL * sh * PI) * u_sun_col"), "the specular's PI factor moved");
-        assert!(glsl.contains("mix(vec3(f0d), albedo, metallic)"), "F0 blend changed");
-        assert!(glsl.contains("albedo * (1.0 - metallic)"), "the diffuse/metallic split changed");
-        assert!(glsl.contains("mix(sky_with_sun(R), sh_ambient(R), clamp(rough * 1.4, 0.0, 1.0))"), "env_sample changed");
-        assert!(glsl.contains("f0 * ab.x + ab.y"), "the split-sum weighting changed");
+        assert!(
+            glsl.contains("v_smith(NoV, NoL, a) * NoL * sh * PI) * u_sun_col"),
+            "the specular's PI factor moved"
+        );
+        assert!(
+            glsl.contains("mix(vec3(f0d), albedo, metallic)"),
+            "F0 blend changed"
+        );
+        assert!(
+            glsl.contains("albedo * (1.0 - metallic)"),
+            "the diffuse/metallic split changed"
+        );
+        assert!(
+            glsl.contains("mix(sky_with_sun(R), sh_ambient(R), clamp(rough * 1.4, 0.0, 1.0))"),
+            "env_sample changed"
+        );
+        assert!(
+            glsl.contains("f0 * ab.x + ab.y"),
+            "the split-sum weighting changed"
+        );
         // And the numbers agree at a point we can compute both ways: a perfect mirror facing the
         // viewer reflects the environment with essentially all of F0.
         let (sky, sh, sun) = preview_sky();
         let n = Vec3::new(0.0, -1.0, 0.0);
-        let c = shade_point([0.9, 0.9, 0.9], 0.02, 1.0, 1.5, n, n, sky.sun_dir, sun, &sky, &sh, 1.0);
+        let c = shade_point(
+            [0.9, 0.9, 0.9],
+            0.02,
+            1.0,
+            1.5,
+            n,
+            n,
+            sky.sun_dir,
+            sun,
+            &sky,
+            &sh,
+            1.0,
+        );
         let env_here = sky.radiance_with_sun(n);
         for i in 0..3 {
-            assert!(c[i] >= env_here[i] * 0.8, "a mirror should return most of what it sees: {c:?} vs {env_here:?}");
+            assert!(
+                c[i] >= env_here[i] * 0.8,
+                "a mirror should return most of what it sees: {c:?} vs {env_here:?}"
+            );
         }
     }
 
@@ -340,17 +496,33 @@ mod tests {
     #[test]
     fn a_procedural_shows_its_grain() {
         let oak = crate::factory::ProcDef::oak();
-        let img = ball(&Preview { proc: Some(oak), ..base() });
+        let img = ball(&Preview {
+            proc: Some(oak),
+            ..base()
+        });
         // Sample a horizontal line across the middle of the ball and measure the spread.
         let n = 48;
-        let row: Vec<u8> = (n / 4..3 * n / 4).map(|x| img[((n / 2) * n + x) * 4]).collect();
+        let row: Vec<u8> = (n / 4..3 * n / 4)
+            .map(|x| img[((n / 2) * n + x) * 4])
+            .collect();
         let (lo, hi) = (*row.iter().min().unwrap(), *row.iter().max().unwrap());
-        assert!(hi as i32 - lo as i32 > 20, "the grain must be visible across the ball: {lo}..{hi}");
+        assert!(
+            hi as i32 - lo as i32 > 20,
+            "the grain must be visible across the ball: {lo}..{hi}"
+        );
         // A SOLID procedural of the same average must not — it has no pattern to show.
         let flat = crate::factory::ProcDef::solid([0.5, 0.4, 0.28]);
-        let img2 = ball(&Preview { proc: Some(flat), ..base() });
-        let row2: Vec<u8> = (2 * n / 5..3 * n / 5).map(|x| img2[((n / 2) * n + x) * 4]).collect();
+        let img2 = ball(&Preview {
+            proc: Some(flat),
+            ..base()
+        });
+        let row2: Vec<u8> = (2 * n / 5..3 * n / 5)
+            .map(|x| img2[((n / 2) * n + x) * 4])
+            .collect();
         let (lo2, hi2) = (*row2.iter().min().unwrap(), *row2.iter().max().unwrap());
-        assert!((hi2 as i32 - lo2 as i32) < 30, "a flat colour must stay smooth across the ball: {lo2}..{hi2}");
+        assert!(
+            (hi2 as i32 - lo2 as i32) < 30,
+            "a flat colour must stay smooth across the ball: {lo2}..{hi2}"
+        );
     }
 }

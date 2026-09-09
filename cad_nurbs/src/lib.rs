@@ -24,10 +24,15 @@
 /// a circular reference. Convert to/from `cad_kernel::Vec2` at the
 /// call site (both are plain {x, y} structs).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Vec2 { pub x: f64, pub y: f64 }
+pub struct Vec2 {
+    pub x: f64,
+    pub y: f64,
+}
 
 impl Vec2 {
-    pub const fn new(x: f64, y: f64) -> Self { Self { x, y } }
+    pub const fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
+    }
 }
 
 // ============================================================================
@@ -63,13 +68,18 @@ impl KnotVector {
     /// Panics if `n_ctrl <= degree` — fewer control points than the
     /// curve's degree leaves no valid spans.
     pub fn clamped_uniform(degree: usize, n_ctrl: usize) -> Self {
-        assert!(n_ctrl > degree,
+        assert!(
+            n_ctrl > degree,
             "NURBS: need n_ctrl > degree (got n_ctrl={} degree={})",
-            n_ctrl, degree);
-        let m = n_ctrl + degree;       // knot count is m+1
+            n_ctrl,
+            degree
+        );
+        let m = n_ctrl + degree; // knot count is m+1
         let mut knots = Vec::with_capacity(m + 1);
         // First p+1 knots = 0.
-        for _ in 0..=degree { knots.push(0.0); }
+        for _ in 0..=degree {
+            knots.push(0.0);
+        }
         // Interior knots — evenly spaced in (0, 1).
         // There are (m + 1) - 2 * (degree + 1) = n_ctrl - degree - 1 of them.
         let n_internal = n_ctrl.saturating_sub(degree + 1);
@@ -77,7 +87,9 @@ impl KnotVector {
             knots.push(i as f64 / (n_internal + 1) as f64);
         }
         // Last p+1 knots = 1.
-        for _ in 0..=degree { knots.push(1.0); }
+        for _ in 0..=degree {
+            knots.push(1.0);
+        }
         Self { knots, degree }
     }
 
@@ -87,17 +99,27 @@ impl KnotVector {
         Self { knots, degree }
     }
 
-    pub fn knots(&self) -> &[f64] { &self.knots }
-    pub fn degree(&self) -> usize { self.degree }
-    pub fn len(&self) -> usize { self.knots.len() }
-    pub fn is_empty(&self) -> bool { self.knots.is_empty() }
+    pub fn knots(&self) -> &[f64] {
+        &self.knots
+    }
+    pub fn degree(&self) -> usize {
+        self.degree
+    }
+    pub fn len(&self) -> usize {
+        self.knots.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.knots.is_empty()
+    }
 
     /// Parameter domain — `[knots[degree], knots[n - degree - 1]]`. For
     /// a clamped knot vector this is the range over which the curve is
     /// actually defined; values outside return endpoints when clamped.
     pub fn domain(&self) -> (f64, f64) {
-        (self.knots[self.degree],
-         self.knots[self.knots.len() - self.degree - 1])
+        (
+            self.knots[self.degree],
+            self.knots[self.knots.len() - self.degree - 1],
+        )
     }
 
     /// Algorithm A2.1 — find the knot span index `i` such that
@@ -139,10 +161,10 @@ fn basis_funs(span: usize, u: f64, degree: usize, knots: &[f64]) -> Vec<f64> {
     let p = degree;
     let mut n = vec![0.0_f64; p + 1];
     n[0] = 1.0;
-    let mut left  = vec![0.0_f64; p + 1];
+    let mut left = vec![0.0_f64; p + 1];
     let mut right = vec![0.0_f64; p + 1];
     for j in 1..=p {
-        left[j]  = u - knots[span + 1 - j];
+        left[j] = u - knots[span + 1 - j];
         right[j] = knots[span + j] - u;
         let mut saved = 0.0;
         for r in 0..j {
@@ -150,7 +172,11 @@ fn basis_funs(span: usize, u: f64, degree: usize, knots: &[f64]) -> Vec<f64> {
             // Knots can coincide at the endpoints of a clamped curve; the
             // basis is well-defined in the limit (0/0 → 0) so we just
             // skip the term.
-            let temp = if denom.abs() < 1e-18 { 0.0 } else { n[r] / denom };
+            let temp = if denom.abs() < 1e-18 {
+                0.0
+            } else {
+                n[r] / denom
+            };
             n[r] = saved + right[r + 1] * temp;
             saved = left[j - r] * temp;
         }
@@ -168,9 +194,9 @@ fn basis_funs(span: usize, u: f64, degree: usize, knots: &[f64]) -> Vec<f64> {
 /// in 3D homogeneous space then projects back.
 #[derive(Clone, Debug)]
 pub struct BSplineCurve {
-    pub degree:         usize,
+    pub degree: usize,
     pub control_points: Vec<Vec2>,
-    pub knots:          KnotVector,
+    pub knots: KnotVector,
 }
 
 impl BSplineCurve {
@@ -180,20 +206,33 @@ impl BSplineCurve {
     pub fn new_clamped(degree: usize, control_points: Vec<Vec2>) -> Self {
         let n_ctrl = control_points.len();
         let knots = KnotVector::clamped_uniform(degree, n_ctrl);
-        Self { degree, control_points, knots }
+        Self {
+            degree,
+            control_points,
+            knots,
+        }
     }
 
     /// Build with a caller-supplied knot vector. Use this for advanced
     /// cases (non-uniform spacing, knot insertion results, etc.).
     /// Panics if the knot vector length doesn't match n_ctrl + p + 1.
     pub fn new(degree: usize, control_points: Vec<Vec2>, knots: KnotVector) -> Self {
-        assert_eq!(knots.len(), control_points.len() + degree + 1,
-            "NURBS: knot vector length mismatch");
-        Self { degree, control_points, knots }
+        assert_eq!(
+            knots.len(),
+            control_points.len() + degree + 1,
+            "NURBS: knot vector length mismatch"
+        );
+        Self {
+            degree,
+            control_points,
+            knots,
+        }
     }
 
     /// Curve domain (start..=end parameter values).
-    pub fn domain(&self) -> (f64, f64) { self.knots.domain() }
+    pub fn domain(&self) -> (f64, f64) {
+        self.knots.domain()
+    }
 
     /// Insert the knot `u` once (Algorithm A5.1, De Boor). Returns the new
     /// control points and knot vector (one more of each). No-op when `u`
@@ -239,31 +278,39 @@ impl BSplineCurve {
         let u = u.clamp(u_min, u_max);
         let p = self.degree;
         if u <= u_min + 1e-9 || u >= u_max - 1e-9 {
-            return (self.clone(), self.clone());   // degenerate split at an end
+            return (self.clone(), self.clone()); // degenerate split at an end
         }
         let mut pts = self.control_points.clone();
         let mut knots = self.knots.clone();
         // Insert u until its multiplicity reaches the degree (C⁰ at the cut).
         loop {
             let s = knots.find_span(u, pts.len());
-            let m = knots.knots()[..=s].iter()
-                .filter(|&&k| (k - u).abs() < 1e-9).count();
-            if m >= p { break; }
-            let curve = BSplineCurve { degree: p, control_points: pts, knots };
+            let m = knots.knots()[..=s]
+                .iter()
+                .filter(|&&k| (k - u).abs() < 1e-9)
+                .count();
+            if m >= p {
+                break;
+            }
+            let curve = BSplineCurve {
+                degree: p,
+                control_points: pts,
+                knots,
+            };
             let (np, nk) = curve.insert_knot(u);
             pts = np;
             knots = nk;
         }
         let U = knots.knots().to_vec();
         let n = pts.len();
-        let s = knots.find_span(u, n);   // u's last copy index (multiplicity p)
-        // With multiplicity p at u the window sits at s-p+1..s; the sub-curve
-        // extractions (validated numerically for degrees 1-3, exact to 1e-15):
-        //   LEFT:  control points P_0..P_{s-p};  knots U_0..U_s then one more u
-        //          (the window's p copies + the appended one clamp the end).
-        //   RIGHT: control points P_{s-p}..P_{n-1}; knots p+1 copies of u then
-        //          the knots after the window (U_{s+1}.., ending in the
-        //          original's u_max run, so the right end stays clamped).
+        let s = knots.find_span(u, n); // u's last copy index (multiplicity p)
+                                       // With multiplicity p at u the window sits at s-p+1..s; the sub-curve
+                                       // extractions (validated numerically for degrees 1-3, exact to 1e-15):
+                                       //   LEFT:  control points P_0..P_{s-p};  knots U_0..U_s then one more u
+                                       //          (the window's p copies + the appended one clamp the end).
+                                       //   RIGHT: control points P_{s-p}..P_{n-1}; knots p+1 copies of u then
+                                       //          the knots after the window (U_{s+1}.., ending in the
+                                       //          original's u_max run, so the right end stays clamped).
         let left_pts = pts[..=s - p].to_vec();
         let mut lk = U[..=s].to_vec();
         lk.push(u);
@@ -298,7 +345,9 @@ impl BSplineCurve {
     /// parameter domain (inclusive on both ends). 0 or 1 samples
     /// return a single-point or empty Vec respectively.
     pub fn tessellate(&self, n_samples: usize) -> Vec<Vec2> {
-        if n_samples == 0 { return Vec::new(); }
+        if n_samples == 0 {
+            return Vec::new();
+        }
         if n_samples == 1 {
             let (u_min, _) = self.domain();
             return vec![self.evaluate(u_min)];
@@ -338,8 +387,11 @@ pub struct NurbsCurve {
 
 impl NurbsCurve {
     pub fn new(bspline: BSplineCurve, weights: Vec<f64>) -> Self {
-        assert_eq!(weights.len(), bspline.control_points.len(),
-            "NURBS: weight count must match control-point count");
+        assert_eq!(
+            weights.len(),
+            bspline.control_points.len(),
+            "NURBS: weight count must match control-point count"
+        );
         Self { bspline, weights }
     }
 
@@ -350,7 +402,9 @@ impl NurbsCurve {
         Self::new(BSplineCurve::new_clamped(degree, control_points), weights)
     }
 
-    pub fn domain(&self) -> (f64, f64) { self.bspline.domain() }
+    pub fn domain(&self) -> (f64, f64) {
+        self.bspline.domain()
+    }
 
     /// Evaluate the NURBS curve at parameter `u` — Algorithm A4.1.
     pub fn evaluate(&self, u: f64) -> Vec2 {
@@ -363,13 +417,13 @@ impl NurbsCurve {
         let mut num = Vec2::new(0.0, 0.0);
         let mut den = 0.0_f64;
         for i in 0..=p {
-            let idx  = span - p + i;
-            let wi   = self.weights[idx];
+            let idx = span - p + i;
+            let wi = self.weights[idx];
             let ctrl = self.bspline.control_points[idx];
             let w_ni = n[i] * wi;
             num.x += w_ni * ctrl.x;
             num.y += w_ni * ctrl.y;
-            den   += w_ni;
+            den += w_ni;
         }
         if den.abs() < 1e-18 {
             // Pathological — all basis * weight contributions sum to zero.
@@ -382,7 +436,9 @@ impl NurbsCurve {
     }
 
     pub fn tessellate(&self, n_samples: usize) -> Vec<Vec2> {
-        if n_samples == 0 { return Vec::new(); }
+        if n_samples == 0 {
+            return Vec::new();
+        }
         if n_samples == 1 {
             let (u_min, _) = self.domain();
             return vec![self.evaluate(u_min)];
@@ -405,7 +461,9 @@ impl NurbsCurve {
 mod tests {
     use super::*;
 
-    fn approx(a: f64, b: f64, tol: f64) -> bool { (a - b).abs() < tol }
+    fn approx(a: f64, b: f64, tol: f64) -> bool {
+        (a - b).abs() < tol
+    }
     fn approx_v(a: Vec2, b: Vec2, tol: f64) -> bool {
         approx(a.x, b.x, tol) && approx(a.y, b.y, tol)
     }
@@ -449,12 +507,20 @@ mod tests {
         // Clamped curves pass through first and last control points
         // for ANY degree.
         for &p in &[2_usize, 3, 4] {
-            let cps: Vec<Vec2> = (0..=p+1).map(|i| Vec2::new(i as f64, (i as f64).sin())).collect();
+            let cps: Vec<Vec2> = (0..=p + 1)
+                .map(|i| Vec2::new(i as f64, (i as f64).sin()))
+                .collect();
             let c = BSplineCurve::new_clamped(p, cps.clone());
-            assert!(approx_v(c.evaluate(c.domain().0), cps[0], 1e-12),
-                "degree {} start endpoint", p);
-            assert!(approx_v(c.evaluate(c.domain().1), *cps.last().unwrap(), 1e-12),
-                "degree {} end endpoint", p);
+            assert!(
+                approx_v(c.evaluate(c.domain().0), cps[0], 1e-12),
+                "degree {} start endpoint",
+                p
+            );
+            assert!(
+                approx_v(c.evaluate(c.domain().1), *cps.last().unwrap(), 1e-12),
+                "degree {} end endpoint",
+                p
+            );
         }
     }
 
@@ -470,8 +536,7 @@ mod tests {
             let span = kv.find_span(u, n_ctrl);
             let n = basis_funs(span, u, p, kv.knots());
             let sum: f64 = n.iter().sum();
-            assert!(approx(sum, 1.0, 1e-12),
-                "basis at u={} sums to {}", u, sum);
+            assert!(approx(sum, 1.0, 1e-12), "basis at u={} sums to {}", u, sum);
         }
     }
 
@@ -499,19 +564,28 @@ mod tests {
 
         // Mid-parameter point lies on the circle and bisects the arc.
         let mid = c.evaluate(0.5);
-        let r2  = mid.x * mid.x + mid.y * mid.y;
+        let r2 = mid.x * mid.x + mid.y * mid.y;
         assert!(approx(r2, 1.0, 1e-12), "midpoint not on circle: r²={}", r2);
         // Quarter-circle midpoint by symmetry = (cos 45°, sin 45°)
         // = (√2/2, √2/2).
         let s = std::f64::consts::FRAC_1_SQRT_2;
-        assert!(approx_v(mid, Vec2::new(s, s), 1e-12),
-            "midpoint expected (√½, √½), got ({}, {})", mid.x, mid.y);
+        assert!(
+            approx_v(mid, Vec2::new(s, s), 1e-12),
+            "midpoint expected (√½, √½), got ({}, {})",
+            mid.x,
+            mid.y
+        );
 
         // Every sample on the curve must lie on the unit circle.
         for sample in c.tessellate(33) {
             let r2 = sample.x * sample.x + sample.y * sample.y;
-            assert!(approx(r2, 1.0, 1e-10),
-                "off-circle sample: ({}, {}) r²={}", sample.x, sample.y, r2);
+            assert!(
+                approx(r2, 1.0, 1e-10),
+                "off-circle sample: ({}, {}) r²={}",
+                sample.x,
+                sample.y,
+                r2
+            );
         }
     }
 
@@ -545,9 +619,15 @@ mod tests {
             let u = k as f64 / 20.0;
             let pb = b.evaluate(u);
             let pn = n.evaluate(u);
-            assert!(approx_v(pb, pn, 1e-12),
+            assert!(
+                approx_v(pb, pn, 1e-12),
                 "B-spline vs unit-weight NURBS diverge at u={}: ({},{}) vs ({},{})",
-                u, pb.x, pb.y, pn.x, pn.y);
+                u,
+                pb.x,
+                pb.y,
+                pn.x,
+                pn.y
+            );
         }
     }
 
@@ -572,9 +652,15 @@ mod tests {
             let lp = l.control_points.clone();
             let rp = r.control_points.clone();
             assert!(approx_v(l.evaluate(l0), lp[0], 1e-9), "left start clamped");
-            assert!(approx_v(l.evaluate(l1), *lp.last().unwrap(), 1e-9), "left end clamped");
+            assert!(
+                approx_v(l.evaluate(l1), *lp.last().unwrap(), 1e-9),
+                "left end clamped"
+            );
             assert!(approx_v(r.evaluate(r0), rp[0], 1e-9), "right start clamped");
-            assert!(approx_v(r.evaluate(r1), *rp.last().unwrap(), 1e-9), "right end clamped");
+            assert!(
+                approx_v(r.evaluate(r1), *rp.last().unwrap(), 1e-9),
+                "right end clamped"
+            );
             // The halves meet at C(u) and agree with the original curve.
             let meet = l.evaluate(l1);
             assert!(approx_v(meet, r.evaluate(r0), 1e-9), "halves meet at C(u)");
@@ -584,10 +670,11 @@ mod tests {
                 let t = i as f64 / 40.0;
                 let orig = c.evaluate(t);
                 let half = if t <= u { l.evaluate(t) } else { r.evaluate(t) };
-                assert!(approx_v(orig, half, 1e-8),
-                    "degree {p}: original vs half diverge at t={t}");
+                assert!(
+                    approx_v(orig, half, 1e-8),
+                    "degree {p}: original vs half diverge at t={t}"
+                );
             }
         }
     }
-
 }

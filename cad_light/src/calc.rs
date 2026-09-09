@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use crate::ies::IesProfile;
 use crate::rt::{cosine_sample, Ray, Rng, RtScene, Tri};
 use crate::types::{
-    CalcPlane, LuxGrid, Luminaire, Maintenance, Material, MaterialId, Mesh, RaySettings, Vertex,
+    CalcPlane, Luminaire, LuxGrid, Maintenance, Material, MaterialId, Mesh, RaySettings, Vertex,
 };
 
 const EPS: f32 = 1e-3;
@@ -69,7 +69,11 @@ impl<'a> Evaluator<'a> {
     }
 
     fn reflectance(&self, id: MaterialId) -> f64 {
-        self.materials.iter().find(|m| m.id == id).map(|m| m.reflectance as f64).unwrap_or(0.5)
+        self.materials
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.reflectance as f64)
+            .unwrap_or(0.5)
     }
 
     /// A deterministic RNG for a point, so the same query always gives the same answer.
@@ -79,8 +83,7 @@ impl<'a> Evaluator<'a> {
     /// sampling noise.
     fn rng_at(&self, p: Vec3, salt: u64) -> Rng {
         let q = |f: f32| (f as f64 * 8192.0) as i64 as u64;
-        let h = q(p.x)
-            .wrapping_mul(0x9E3779B9_7F4A7C15)
+        let h = q(p.x).wrapping_mul(0x9E3779B9_7F4A7C15)
             ^ q(p.y).wrapping_mul(0xC2B2AE3D_27D4EB4F)
             ^ q(p.z).wrapping_mul(0x1656_67B1_9E37_79F9)
             ^ salt.wrapping_mul(0xD1B5_4A32_D192_ED03);
@@ -362,10 +365,19 @@ impl Split {
 /// The `π` that appeared twice — dividing to turn illuminance into Lambertian radiance, multiplying
 /// to integrate the cosine-weighted hemisphere — cancels, so it is absent here by cancellation and
 /// not by omission.
-fn illuminance_split(ev: &Evaluator, point: Vec3, normal: Vec3, bounces: u32, rng: &mut Rng) -> Split {
+fn illuminance_split(
+    ev: &Evaluator,
+    point: Vec3,
+    normal: Vec3,
+    bounces: u32,
+    rng: &mut Rng,
+) -> Split {
     let e = direct(ev, point, normal);
     if bounces == 0 {
-        return Split { direct: e, indirect: 0.0 };
+        return Split {
+            direct: e,
+            indirect: 0.0,
+        };
     }
     let n = ev.settings.rays_per_point.max(1);
     let mut acc = 0.0;
@@ -376,21 +388,31 @@ fn illuminance_split(ev: &Evaluator, point: Vec3, normal: Vec3, bounces: u32, rn
         let mut nrm = normal;
         for _ in 0..bounces {
             let w = cosine_sample(nrm, rng);
-            let Some(hit) = ev.scene.closest_hit(&Ray { o: o + nrm * EPS, d: w }) else {
+            let Some(hit) = ev.scene.closest_hit(&Ray {
+                o: o + nrm * EPS,
+                d: w,
+            }) else {
                 break; // the ray left the room: nothing further can come back along it
             };
             let rho = ev.reflectance(hit.material);
             if rho <= 0.0 {
                 break; // a perfect absorber ends the path
             }
-            let wn = if hit.normal.dot(w) < 0.0 { hit.normal } else { -hit.normal };
+            let wn = if hit.normal.dot(w) < 0.0 {
+                hit.normal
+            } else {
+                -hit.normal
+            };
             throughput *= rho;
             acc += throughput * direct(ev, hit.point, wn);
             o = hit.point;
             nrm = wn;
         }
     }
-    Split { direct: e, indirect: acc / n as f64 }
+    Split {
+        direct: e,
+        indirect: acc / n as f64,
+    }
 }
 
 /// Total illuminance (direct + up to `bounces` diffuse reflections) at a point.
@@ -410,7 +432,12 @@ fn build_tris(meshes: &[Mesh]) -> Vec<Tri> {
             ) else {
                 continue;
             };
-            tris.push(Tri { a: v3(*a), b: v3(*b), c: v3(*c), material: m.material });
+            tris.push(Tri {
+                a: v3(*a),
+                b: v3(*b),
+                c: v3(*c),
+                material: m.material,
+            });
         }
     }
     tris
@@ -429,7 +456,15 @@ pub fn calculate(
     plane: &CalcPlane,
     settings: &RaySettings,
 ) -> LuxGrid {
-    calculate_maintained(meshes, luminaires, profiles, materials, plane, settings, Maintenance::INITIAL)
+    calculate_maintained(
+        meshes,
+        luminaires,
+        profiles,
+        materials,
+        plane,
+        settings,
+        Maintenance::INITIAL,
+    )
 }
 
 /// Compute the MAINTAINED lux grid over `plane`, with the direct/indirect split.
@@ -450,7 +485,14 @@ pub fn calculate_maintained(
     settings: &RaySettings,
     maintenance: Maintenance,
 ) -> LuxGrid {
-    let ev = Evaluator::new(meshes, luminaires, profiles, materials, *settings, maintenance);
+    let ev = Evaluator::new(
+        meshes,
+        luminaires,
+        profiles,
+        materials,
+        *settings,
+        maintenance,
+    );
     calculate_on(&ev, plane, maintenance)
 }
 
@@ -515,14 +557,48 @@ mod tests {
         }
     }
 
-    fn scene(bounces: u32) -> (Vec<Mesh>, HashMap<String, IesProfile>, Vec<Luminaire>, CalcPlane, RaySettings) {
+    fn scene(
+        bounces: u32,
+    ) -> (
+        Vec<Mesh>,
+        HashMap<String, IesProfile>,
+        Vec<Luminaire>,
+        CalcPlane,
+        RaySettings,
+    ) {
         let (w, d, h) = (4.0f32, 4.0f32, 3.0f32);
         let meshes = extrude::box_room(w, d, h);
         let mut profiles = HashMap::new();
         profiles.insert("flat".into(), flat_1000cd());
-        let lums = vec![Luminaire { id: 1, profile: "flat".into(), position: Vertex::new(w / 2.0, d / 2.0, h), rotation_deg: 0.0, tilt_deg: 0.0, dimming: 1.0, watts_override: None, flux_override: None, from_block: None }];
-        let plane = CalcPlane { origin: Vertex::new(0.0, 0.0, 0.0), width: w, depth: d, cols: 24, rows: 24 };
-        (meshes, profiles, lums, plane, RaySettings { rays_per_point: 64, max_bounces: bounces, shadows: true })
+        let lums = vec![Luminaire {
+            id: 1,
+            profile: "flat".into(),
+            position: Vertex::new(w / 2.0, d / 2.0, h),
+            rotation_deg: 0.0,
+            tilt_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        }];
+        let plane = CalcPlane {
+            origin: Vertex::new(0.0, 0.0, 0.0),
+            width: w,
+            depth: d,
+            cols: 24,
+            rows: 24,
+        };
+        (
+            meshes,
+            profiles,
+            lums,
+            plane,
+            RaySettings {
+                rays_per_point: 64,
+                max_bounces: bounces,
+                shadows: true,
+            },
+        )
     }
 
     #[test]
@@ -538,7 +614,12 @@ mod tests {
         let d = calculate(&m, &l, &pr, &default_materials(), &pl, &s0);
         let (m1, pr1, l1, pl1, s1) = scene(1);
         let b = calculate(&m1, &l1, &pr1, &default_materials(), &pl1, &s1);
-        assert!(b.avg > d.avg * 1.02, "indirect {} > direct {}", b.avg, d.avg);
+        assert!(
+            b.avg > d.avg * 1.02,
+            "indirect {} > direct {}",
+            b.avg,
+            d.avg
+        );
     }
 
     /// The maintenance factor scales EVERY cell by exactly its own product, and the grid records
@@ -550,12 +631,24 @@ mod tests {
     fn maintenance_scales_every_cell_by_its_factor() {
         let (m, pr, l, pl, s) = scene(1);
         let initial = calculate(&m, &l, &pr, &default_materials(), &pl, &s);
-        let mf = Maintenance { llmf: 0.95, lsf: 1.0, lmf: 0.90, rsmf: 0.94 };
+        let mf = Maintenance {
+            llmf: 0.95,
+            lsf: 1.0,
+            lmf: 0.90,
+            rsmf: 0.94,
+        };
         let kept = calculate_maintained(&m, &l, &pr, &default_materials(), &pl, &s, mf);
 
-        assert!((initial.maintenance - 1.0).abs() < 1e-12, "calculate() is the INITIAL condition");
+        assert!(
+            (initial.maintenance - 1.0).abs() < 1e-12,
+            "calculate() is the INITIAL condition"
+        );
         assert!((kept.maintenance - mf.factor()).abs() < 1e-12);
-        assert!((mf.factor() - 0.8037).abs() < 1e-3, "0.95 x 1.0 x 0.90 x 0.94, got {}", mf.factor());
+        assert!(
+            (mf.factor() - 0.8037).abs() < 1e-3,
+            "0.95 x 1.0 x 0.90 x 0.94, got {}",
+            mf.factor()
+        );
 
         assert_eq!(initial.values.len(), kept.values.len());
         for (i, (a, b)) in initial.values.iter().zip(kept.values.iter()).enumerate() {
@@ -566,7 +659,12 @@ mod tests {
             );
         }
         // …and therefore the design is DIMmer, which is the entire point.
-        assert!(kept.avg < initial.avg, "maintained {} < initial {}", kept.avg, initial.avg);
+        assert!(
+            kept.avg < initial.avg,
+            "maintained {} < initial {}",
+            kept.avg,
+            initial.avg
+        );
     }
 
     /// The split is exhaustive: direct + indirect is the value, cell for cell. If it were not, one
@@ -574,18 +672,31 @@ mod tests {
     #[test]
     fn direct_and_indirect_sum_to_the_total() {
         let (m, pr, l, pl, s) = scene(2);
-        let g = calculate_maintained(&m, &l, &pr, &default_materials(), &pl, &s, Maintenance::INITIAL);
+        let g = calculate_maintained(
+            &m,
+            &l,
+            &pr,
+            &default_materials(),
+            &pl,
+            &s,
+            Maintenance::INITIAL,
+        );
         assert_eq!(g.direct.len(), g.values.len());
         assert_eq!(g.indirect.len(), g.values.len());
         for i in 0..g.values.len() {
             assert!(
                 (g.direct[i] + g.indirect[i] - g.values[i]).abs() < 1e-9,
                 "cell {i}: {} + {} != {}",
-                g.direct[i], g.indirect[i], g.values[i]
+                g.direct[i],
+                g.indirect[i],
+                g.values[i]
             );
         }
         let f = g.direct_fraction().expect("the split was computed");
-        assert!(f > 0.0 && f < 1.0, "a bounced room is lit by both, got direct fraction {f}");
+        assert!(
+            f > 0.0 && f < 1.0,
+            "a bounced room is lit by both, got direct fraction {f}"
+        );
     }
 
     /// With no bounces there is nothing indirect — the split's zero point, and the check that it
@@ -593,7 +704,15 @@ mod tests {
     #[test]
     fn without_bounces_every_lux_is_direct() {
         let (m, pr, l, pl, s) = scene(0);
-        let g = calculate_maintained(&m, &l, &pr, &default_materials(), &pl, &s, Maintenance::INITIAL);
+        let g = calculate_maintained(
+            &m,
+            &l,
+            &pr,
+            &default_materials(),
+            &pl,
+            &s,
+            Maintenance::INITIAL,
+        );
         assert!(g.indirect.iter().all(|&v| v == 0.0));
         assert!((g.direct_fraction().unwrap() - 1.0).abs() < 1e-12);
     }
@@ -656,7 +775,12 @@ mod tests {
         let meshes = extrude::box_room(w, d, h);
         // ONE reflectance everywhere — the closed form assumes a uniform enclosure.
         let mats: Vec<Material> = (0..3)
-            .map(|id| Material { id, name: format!("s{id}"), reflectance: RHO, color: [1.0; 3] })
+            .map(|id| Material {
+                id,
+                name: format!("s{id}"),
+                reflectance: RHO,
+                color: [1.0; 3],
+            })
             .collect();
         let mut profiles = HashMap::new();
         profiles.insert("iso".to_string(), isotropic(I));
@@ -677,19 +801,30 @@ mod tests {
         let expected = flux / (area * (1.0 - RHO as f64));
 
         // Ten bounces: the truncated series leaves ρ¹¹ ≈ 0.05% on the table, far inside tolerance.
-        let settings = RaySettings { rays_per_point: 256, max_bounces: 10, shadows: true };
-        let ev = Evaluator::new(&meshes, &lums, &profiles, &mats, settings, Maintenance::INITIAL);
+        let settings = RaySettings {
+            rays_per_point: 256,
+            max_bounces: 10,
+            shadows: true,
+        };
+        let ev = Evaluator::new(
+            &meshes,
+            &lums,
+            &profiles,
+            &mats,
+            settings,
+            Maintenance::INITIAL,
+        );
 
         // Area-weighted average over all six faces, each sampled on its own grid. The faces have
         // different areas, so an unweighted mean would quietly answer a different question.
         let faces: [(Vec3, Vec3, Vec3, Vec3); 6] = [
             // (corner, edge u, edge v, INWARD normal)
-            (Vec3::ZERO, Vec3::X * w, Vec3::Y * d, Vec3::Z),                       // floor
-            (Vec3::new(0.0, 0.0, h), Vec3::X * w, Vec3::Y * d, -Vec3::Z),           // ceiling
-            (Vec3::ZERO, Vec3::X * w, Vec3::Z * h, Vec3::Y),                        // y = 0
-            (Vec3::new(0.0, d, 0.0), Vec3::X * w, Vec3::Z * h, -Vec3::Y),           // y = d
-            (Vec3::ZERO, Vec3::Y * d, Vec3::Z * h, Vec3::X),                        // x = 0
-            (Vec3::new(w, 0.0, 0.0), Vec3::Y * d, Vec3::Z * h, -Vec3::X),           // x = w
+            (Vec3::ZERO, Vec3::X * w, Vec3::Y * d, Vec3::Z), // floor
+            (Vec3::new(0.0, 0.0, h), Vec3::X * w, Vec3::Y * d, -Vec3::Z), // ceiling
+            (Vec3::ZERO, Vec3::X * w, Vec3::Z * h, Vec3::Y), // y = 0
+            (Vec3::new(0.0, d, 0.0), Vec3::X * w, Vec3::Z * h, -Vec3::Y), // y = d
+            (Vec3::ZERO, Vec3::Y * d, Vec3::Z * h, Vec3::X), // x = 0
+            (Vec3::new(w, 0.0, 0.0), Vec3::Y * d, Vec3::Z * h, -Vec3::X), // x = w
         ];
         const N: u32 = 12;
         let (mut flux_sum, mut area_sum) = (0.0, 0.0);
@@ -731,7 +866,10 @@ mod tests {
         pl.rows = 16;
         let mats = default_materials();
         let base = RaySettings::default();
-        let deeper = RaySettings { max_bounces: base.max_bounces * 2, ..base };
+        let deeper = RaySettings {
+            max_bounces: base.max_bounces * 2,
+            ..base
+        };
 
         let a = calculate(&m, &l, &pr, &mats, &pl, &base);
         let b = calculate(&m, &l, &pr, &mats, &pl, &deeper);
@@ -740,20 +878,42 @@ mod tests {
             gap < 0.03,
             "the default ({} bounces, {:.1} lx) should be within 3% of {} bounces ({:.1} lx); \
              it is {:.1}% out",
-            base.max_bounces, a.avg, deeper.max_bounces, b.avg, gap * 100.0
+            base.max_bounces,
+            a.avg,
+            deeper.max_bounces,
+            b.avg,
+            gap * 100.0
         );
         // …and one bounce is NOT enough, which is why the default moved.
-        let one = calculate(&m, &l, &pr, &mats, &pl, &RaySettings { max_bounces: 1, ..base });
+        let one = calculate(
+            &m,
+            &l,
+            &pr,
+            &mats,
+            &pl,
+            &RaySettings {
+                max_bounces: 1,
+                ..base
+            },
+        );
         assert!(
             one.avg < a.avg * 0.9,
             "one bounce ({:.1} lx) materially under-reads the converged room ({:.1} lx)",
-            one.avg, a.avg
+            one.avg,
+            a.avg
         );
     }
 
     /// A bare isotropic source in empty space, so every metric has a closed form to be checked
     /// against. No geometry at all: nothing to reflect off, nothing to occlude.
-    fn free_field(i: f64) -> (Vec<Mesh>, HashMap<String, IesProfile>, Vec<Luminaire>, RaySettings) {
+    fn free_field(
+        i: f64,
+    ) -> (
+        Vec<Mesh>,
+        HashMap<String, IesProfile>,
+        Vec<Luminaire>,
+        RaySettings,
+    ) {
         let mut profiles = HashMap::new();
         profiles.insert("iso".to_string(), isotropic(i));
         let lums = vec![Luminaire {
@@ -767,7 +927,16 @@ mod tests {
             flux_override: None,
             from_block: None,
         }];
-        (Vec::new(), profiles, lums, RaySettings { rays_per_point: 1, max_bounces: 0, shadows: false })
+        (
+            Vec::new(),
+            profiles,
+            lums,
+            RaySettings {
+                rays_per_point: 1,
+                max_bounces: 0,
+                shadows: false,
+            },
+        )
     }
 
     /// **Each directional quantity against its closed form**, for a point source at distance `d`
@@ -795,19 +964,34 @@ mod tests {
         let p = Vec3::new(D, 0.0, 0.0);
         let close = |got: f64, want: f64, what: &str| {
             let err = (got - want).abs() / want.max(1e-9);
-            assert!(err < 0.02, "{what}: got {got:.2}, expected {want:.2} ({:.1}% out)", err * 100.0);
+            assert!(
+                err < 0.02,
+                "{what}: got {got:.2}, expected {want:.2} ({:.1}% out)",
+                err * 100.0
+            );
         };
 
         // Planar, facing straight back at the source.
-        close(ev.illuminance(p, -Vec3::X), e_perp, "planar facing the source");
+        close(
+            ev.illuminance(p, -Vec3::X),
+            e_perp,
+            "planar facing the source",
+        );
         // …and facing away from it: nothing, since the source is behind the plane.
-        assert!(ev.illuminance(p, Vec3::X) < 1e-9, "a plane facing away receives nothing");
+        assert!(
+            ev.illuminance(p, Vec3::X) < 1e-9,
+            "a plane facing away receives nothing"
+        );
 
         // Scalar: a quarter of the perpendicular illuminance.
         close(ev.scalar(p), e_perp / 4.0, "scalar illuminance");
 
         // Cylindrical with the source on the horizon: 1/π of it.
-        close(ev.cylindrical(p), e_perp / PI, "cylindrical, source on the horizon");
+        close(
+            ev.cylindrical(p),
+            e_perp / PI,
+            "cylindrical, source on the horizon",
+        );
 
         // Cylindrical with the source directly overhead: zero, at every height.
         let below = Vec3::new(0.0, 0.0, -D);
@@ -817,7 +1001,11 @@ mod tests {
             ev.cylindrical(below)
         );
         // …while the horizontal plane there gets the full I/d².
-        close(ev.illuminance(below, Vec3::Z), e_perp, "horizontal under the source");
+        close(
+            ev.illuminance(below, Vec3::Z),
+            e_perp,
+            "horizontal under the source",
+        );
     }
 
     /// Semi-cylindrical illuminance is DIRECTIONAL: facing the source and facing away give
@@ -835,13 +1023,22 @@ mod tests {
 
         let toward = ev.semi_cylindrical(p, 180.0);
         let away = ev.semi_cylindrical(p, 0.0);
-        assert!(toward > away, "facing the source ({toward:.1}) must beat facing away ({away:.1})");
-        assert!(away < 1e-6, "facing away from the only source, a half-cylinder sees nothing");
+        assert!(
+            toward > away,
+            "facing the source ({toward:.1}) must beat facing away ({away:.1})"
+        );
+        assert!(
+            away < 1e-6,
+            "facing away from the only source, a half-cylinder sees nothing"
+        );
 
         let mean = 0.5 * (toward + away);
         let cyl = ev.cylindrical(p);
         let err = (mean - cyl).abs() / cyl;
-        assert!(err < 0.02, "the two halves ({mean:.2}) should average to cylindrical ({cyl:.2})");
+        assert!(
+            err < 0.02,
+            "the two halves ({mean:.2}) should average to cylindrical ({cyl:.2})"
+        );
     }
 
     /// Luminance of a diffuse surface is `ρE/π`, and it tracks the illuminance that produced it.
@@ -868,17 +1065,34 @@ mod tests {
     fn maintenance_reaches_every_quantity_not_only_the_work_plane() {
         const I: f64 = 1000.0;
         let (m, pr, l, s) = free_field(I);
-        let mf = Maintenance { llmf: 0.9, lsf: 1.0, lmf: 0.9, rsmf: 1.0 };
+        let mf = Maintenance {
+            llmf: 0.9,
+            lsf: 1.0,
+            lmf: 0.9,
+            rsmf: 1.0,
+        };
         let initial = Evaluator::new(&m, &l, &pr, &[], s, Maintenance::INITIAL);
         let kept = Evaluator::new(&m, &l, &pr, &[], s, mf);
         let p = Vec3::new(2.0, 0.0, 0.0);
         let f = mf.factor();
         for (a, b, what) in [
-            (initial.illuminance(p, -Vec3::X), kept.illuminance(p, -Vec3::X), "planar"),
+            (
+                initial.illuminance(p, -Vec3::X),
+                kept.illuminance(p, -Vec3::X),
+                "planar",
+            ),
             (initial.cylindrical(p), kept.cylindrical(p), "cylindrical"),
-            (initial.semi_cylindrical(p, 180.0), kept.semi_cylindrical(p, 180.0), "semi-cylindrical"),
+            (
+                initial.semi_cylindrical(p, 180.0),
+                kept.semi_cylindrical(p, 180.0),
+                "semi-cylindrical",
+            ),
             (initial.scalar(p), kept.scalar(p), "scalar"),
-            (initial.luminance(p, -Vec3::X, 0.5), kept.luminance(p, -Vec3::X, 0.5), "luminance"),
+            (
+                initial.luminance(p, -Vec3::X, 0.5),
+                kept.luminance(p, -Vec3::X, 0.5),
+                "luminance",
+            ),
         ] {
             assert!((b - a * f).abs() < 1e-9, "{what}: {b} should be {a} x {f}");
         }
@@ -893,14 +1107,21 @@ mod tests {
         pl.cols = 6;
         pl.rows = 6;
         let mats = default_materials();
-        let s = RaySettings { rays_per_point: 32, max_bounces: 3, shadows: true };
+        let s = RaySettings {
+            rays_per_point: 32,
+            max_bounces: 3,
+            shadows: true,
+        };
         let ev = Evaluator::new(&m, &l, &pr, &mats, s, Maintenance::INITIAL);
         let p = Vec3::new(2.0, 2.0, 0.8);
         assert_eq!(ev.illuminance(p, Vec3::Z), ev.illuminance(p, Vec3::Z));
         assert_eq!(ev.cylindrical(p), ev.cylindrical(p));
         let a = calculate(&m, &l, &pr, &mats, &pl, &s);
         let b = calculate(&m, &l, &pr, &mats, &pl, &s);
-        assert_eq!(a.values, b.values, "the whole grid is reproducible, not just one point");
+        assert_eq!(
+            a.values, b.values,
+            "the whole grid is reproducible, not just one point"
+        );
     }
 
     /// How the cost of a bounce actually scales. Run with:
@@ -919,8 +1140,13 @@ mod tests {
             let t = std::time::Instant::now();
             let g = calculate(&m, &l, &pr, &mats, &pl, &s);
             let ms = t.elapsed().as_secs_f64() * 1000.0;
-            let ratio = prev.map(|p| format!("{:.1}x", ms / p)).unwrap_or_else(|| "-".into());
-            println!("bounces {b}: {ms:9.1} ms  ({ratio:>6})  avg {:.1} lx", g.avg);
+            let ratio = prev
+                .map(|p| format!("{:.1}x", ms / p))
+                .unwrap_or_else(|| "-".into());
+            println!(
+                "bounces {b}: {ms:9.1} ms  ({ratio:>6})  avg {:.1} lx",
+                g.avg
+            );
             prev = Some(ms.max(0.01));
         }
     }
@@ -932,7 +1158,12 @@ mod tests {
     fn diversity_is_never_kinder_than_uniformity() {
         let (m, pr, l, pl, s) = scene(1);
         let g = calculate(&m, &l, &pr, &default_materials(), &pl, &s);
-        assert!(g.u1() <= g.u0() + 1e-12, "U1 {} must be <= U0 {}", g.u1(), g.u0());
+        assert!(
+            g.u1() <= g.u0() + 1e-12,
+            "U1 {} must be <= U0 {}",
+            g.u1(),
+            g.u0()
+        );
         assert!(g.u0() > 0.0 && g.u0() <= 1.0);
     }
 
@@ -965,9 +1196,22 @@ mod tests {
         let (meshes, profiles, lums, plane, settings) = scene(1);
         let mats = default_materials();
         let own = calculate_maintained(
-            &meshes, &lums, &profiles, &mats, &plane, &settings, Maintenance::INITIAL,
+            &meshes,
+            &lums,
+            &profiles,
+            &mats,
+            &plane,
+            &settings,
+            Maintenance::INITIAL,
         );
-        let ev = Evaluator::new(&meshes, &lums, &profiles, &mats, settings, Maintenance::INITIAL);
+        let ev = Evaluator::new(
+            &meshes,
+            &lums,
+            &profiles,
+            &mats,
+            settings,
+            Maintenance::INITIAL,
+        );
         let shared = calculate_on(&ev, &plane, Maintenance::INITIAL);
 
         assert_eq!((own.cols, own.rows), (shared.cols, shared.rows));
@@ -986,9 +1230,22 @@ mod tests {
         let (meshes, profiles, lums, _plane, settings) = scene(1);
         let mats = default_materials();
         let own = surface_report(
-            &meshes, &lums, &profiles, &mats, &settings, Maintenance::INITIAL, 1.0,
+            &meshes,
+            &lums,
+            &profiles,
+            &mats,
+            &settings,
+            Maintenance::INITIAL,
+            1.0,
         );
-        let ev = Evaluator::new(&meshes, &lums, &profiles, &mats, settings, Maintenance::INITIAL);
+        let ev = Evaluator::new(
+            &meshes,
+            &lums,
+            &profiles,
+            &mats,
+            settings,
+            Maintenance::INITIAL,
+        );
         let shared = surface_report_on(&ev, &meshes, &lums, &mats, 1.0);
 
         assert_eq!(own.len(), shared.len(), "a surface went missing");
@@ -998,7 +1255,9 @@ mod tests {
             assert!(
                 (a.e_avg - b.e_avg).abs() < 1e-9,
                 "{}: {:.6} lx against {:.6} lx",
-                a.name, a.e_avg, b.e_avg,
+                a.name,
+                a.e_avg,
+                b.e_avg,
             );
         }
     }
@@ -1010,20 +1269,40 @@ mod tests {
     fn the_maintenance_factor_survives_the_shared_route() {
         let (meshes, profiles, lums, plane, settings) = scene(1);
         let mats = default_materials();
-        let mf = Maintenance { llmf: 0.9, lsf: 1.0, lmf: 0.9, rsmf: 1.0 };
-        assert!(mf.factor() < 0.9, "the fixture must actually derate: {}", mf.factor());
+        let mf = Maintenance {
+            llmf: 0.9,
+            lsf: 1.0,
+            lmf: 0.9,
+            rsmf: 1.0,
+        };
+        assert!(
+            mf.factor() < 0.9,
+            "the fixture must actually derate: {}",
+            mf.factor()
+        );
 
         let ev = Evaluator::new(&meshes, &lums, &profiles, &mats, settings, mf);
         let maintained = calculate_on(&ev, &plane, mf);
-        let ev0 = Evaluator::new(&meshes, &lums, &profiles, &mats, settings, Maintenance::INITIAL);
+        let ev0 = Evaluator::new(
+            &meshes,
+            &lums,
+            &profiles,
+            &mats,
+            settings,
+            Maintenance::INITIAL,
+        );
         let initial = calculate_on(&ev0, &plane, Maintenance::INITIAL);
 
         assert!(
             (maintained.avg / initial.avg - mf.factor()).abs() < 1e-6,
             "maintained/initial came to {:.4}, not the factor {:.4}",
-            maintained.avg / initial.avg, mf.factor(),
+            maintained.avg / initial.avg,
+            mf.factor(),
         );
-        assert!((maintained.maintenance - mf.factor()).abs() < 1e-9, "the grid mislabels its MF");
+        assert!(
+            (maintained.maintenance - mf.factor()).abs() < 1e-9,
+            "the grid mislabels its MF"
+        );
     }
 }
 
@@ -1104,7 +1383,14 @@ pub fn surface_report(
     maintenance: Maintenance,
     samples_per_m2: f64,
 ) -> Vec<SurfaceResult> {
-    let ev = Evaluator::new(meshes, luminaires, profiles, materials, *settings, maintenance);
+    let ev = Evaluator::new(
+        meshes,
+        luminaires,
+        profiles,
+        materials,
+        *settings,
+        maintenance,
+    );
     surface_report_on(&ev, meshes, luminaires, materials, samples_per_m2)
 }
 
@@ -1192,7 +1478,10 @@ pub fn surface_report_on(
             //
             // The mapping is the standard one for a uniform point in a triangle. The `sqrt` on the
             // first coordinate is what corrects for the triangle narrowing towards `a`.
-            let (u1, u2) = (radical_inverse(k as u64 + 1, 2), radical_inverse(k as u64 + 1, 3));
+            let (u1, u2) = (
+                radical_inverse(k as u64 + 1, 2),
+                radical_inverse(k as u64 + 1, 3),
+            );
             let su = u1.sqrt();
             let (w0, w1, w2) = (1.0 - su, su * (1.0 - u2), su * u2);
             let p = a * w0 as f32 + b * w1 as f32 + c * w2 as f32;
@@ -1206,7 +1495,6 @@ pub fn surface_report_on(
         }
     }
 
-
     acc.into_iter()
         .map(|(id, (area, sum, min, max, samples))| {
             let mat = materials.iter().find(|m| m.id == id);
@@ -1214,7 +1502,9 @@ pub fn surface_report_on(
             let e_avg = if area > 0.0 { sum / area } else { 0.0 };
             SurfaceResult {
                 material: id,
-                name: mat.map(|m| m.name.clone()).unwrap_or_else(|| format!("material {id}")),
+                name: mat
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|| format!("material {id}")),
                 area_m2: area,
                 e_avg,
                 e_min: if min.is_finite() { min } else { 0.0 },
@@ -1296,11 +1586,20 @@ mod surface_tests {
         let expected = flux / (area * (1.0 - RHO as f64));
 
         let meshes = box_room(S, S, S);
-        let materials: Vec<Material> =
-            default_materials().into_iter().map(|m| Material { reflectance: RHO, ..m }).collect();
+        let materials: Vec<Material> = default_materials()
+            .into_iter()
+            .map(|m| Material {
+                reflectance: RHO,
+                ..m
+            })
+            .collect();
         // Enough bounces for a rho = 0.5 room to converge (mean path is 1/(1-rho) = 2), and enough
         // rays to average out; more of either only costs seconds.
-        let settings = RaySettings { rays_per_point: 384, max_bounces: 14, shadows: true };
+        let settings = RaySettings {
+            rays_per_point: 384,
+            max_bounces: 14,
+            shadows: true,
+        };
         let rows = surface_report(
             &meshes,
             &lamp(S * 0.5, S * 0.5, S * 0.5),
@@ -1312,8 +1611,7 @@ mod surface_tests {
         );
 
         let total_area: f64 = rows.iter().map(|r| r.area_m2).sum();
-        let weighted =
-            rows.iter().map(|r| r.e_avg * r.area_m2).sum::<f64>() / total_area;
+        let weighted = rows.iter().map(|r| r.e_avg * r.area_m2).sum::<f64>() / total_area;
         assert!(
             (total_area - area).abs() < 1e-3,
             "the six faces should total {area} m2, got {total_area}",
@@ -1330,7 +1628,11 @@ mod surface_tests {
     fn luminance_follows_reflectance_not_just_illuminance() {
         let meshes = box_room(4.0, 4.0, 3.0);
         let materials = default_materials(); // floor 0.20, wall 0.50, ceiling 0.70
-        let settings = RaySettings { rays_per_point: 512, max_bounces: 6, shadows: true };
+        let settings = RaySettings {
+            rays_per_point: 512,
+            max_bounces: 6,
+            shadows: true,
+        };
         let rows = surface_report(
             &meshes,
             &lamp(2.0, 2.0, 1.5),
@@ -1359,8 +1661,16 @@ mod surface_tests {
         );
         // And every row carries the identity it claims.
         for r in &rows {
-            let rho = materials.iter().find(|m| m.id == r.material).unwrap().reflectance as f64;
-            assert!((r.l_avg - rho * r.e_avg / PI).abs() < 1e-9, "{} broke L = rho E / pi", r.name);
+            let rho = materials
+                .iter()
+                .find(|m| m.id == r.material)
+                .unwrap()
+                .reflectance as f64;
+            assert!(
+                (r.l_avg - rho * r.e_avg / PI).abs() < 1e-9,
+                "{} broke L = rho E / pi",
+                r.name
+            );
         }
     }
 
@@ -1370,7 +1680,11 @@ mod surface_tests {
     fn every_surface_is_accounted_for() {
         let meshes = box_room(4.0, 5.0, 3.0);
         let materials = default_materials();
-        let settings = RaySettings { rays_per_point: 128, max_bounces: 2, shadows: true };
+        let settings = RaySettings {
+            rays_per_point: 128,
+            max_bounces: 2,
+            shadows: true,
+        };
         let rows = surface_report(
             &meshes,
             &lamp(2.0, 2.5, 1.5),
@@ -1385,9 +1699,17 @@ mod surface_tests {
         assert!((get("Floor").area_m2 - 20.0).abs() < 1e-3);
         assert!((get("Ceiling").area_m2 - 20.0).abs() < 1e-3);
         // Four walls: 2*(4*3) + 2*(5*3) = 54 m2.
-        assert!((get("Wall").area_m2 - 54.0).abs() < 1e-3, "got {}", get("Wall").area_m2);
+        assert!(
+            (get("Wall").area_m2 - 54.0).abs() < 1e-3,
+            "got {}",
+            get("Wall").area_m2
+        );
         for r in &rows {
-            assert!(r.samples > 0 && r.e_avg > 0.0, "{} was never sampled", r.name);
+            assert!(
+                r.samples > 0 && r.e_avg > 0.0,
+                "{} was never sampled",
+                r.name
+            );
             assert!(
                 r.e_min <= r.e_avg && r.e_avg <= r.e_max,
                 "{}: min/avg/max out of order",
@@ -1417,24 +1739,23 @@ mod surface_tests {
                     for t in &m.triangles {
                         let (ia, ib, ic) = (t.a as usize, t.b as usize, t.c as usize);
                         let mid = |p: Vertex, q: Vertex| {
-                            Vertex::new(
-                                0.5 * (p.x + q.x),
-                                0.5 * (p.y + q.y),
-                                0.5 * (p.z + q.z),
-                            )
+                            Vertex::new(0.5 * (p.x + q.x), 0.5 * (p.y + q.y), 0.5 * (p.z + q.z))
                         };
                         let base = verts.len() as u32;
                         verts.push(mid(m.vertices[ia], m.vertices[ib]));
                         verts.push(mid(m.vertices[ib], m.vertices[ic]));
                         verts.push(mid(m.vertices[ic], m.vertices[ia]));
                         let (ab, bc, ca) = (base, base + 1, base + 2);
-                        for (a, b, c) in [
-                            (t.a, ab, ca), (ab, t.b, bc), (ca, bc, t.c), (ab, bc, ca),
-                        ] {
+                        for (a, b, c) in [(t.a, ab, ca), (ab, t.b, bc), (ca, bc, t.c), (ab, bc, ca)]
+                        {
                             tris.push(crate::types::Triangle { a, b, c });
                         }
                     }
-                    Mesh { vertices: verts, triangles: tris, material: m.material }
+                    Mesh {
+                        vertices: verts,
+                        triangles: tris,
+                        material: m.material,
+                    }
                 })
                 .collect();
         }
@@ -1449,7 +1770,11 @@ mod surface_tests {
             &lamp(2.0, 2.0, 2.5),
             &profiles,
             &default_materials(),
-            &RaySettings { rays_per_point: 16, max_bounces: 1, shadows: true },
+            &RaySettings {
+                rays_per_point: 16,
+                max_bounces: 1,
+                shadows: true,
+            },
             Maintenance::INITIAL,
             per_m2,
         )
@@ -1466,7 +1791,11 @@ mod surface_tests {
         let fine = subdivide(&coarse, 3); // 4^3 = 64x the triangles, the same room
         let coarse_tris: usize = coarse.iter().map(|m| m.triangles.len()).sum();
         let fine_tris: usize = fine.iter().map(|m| m.triangles.len()).sum();
-        assert_eq!(fine_tris, coarse_tris * 64, "the fixture must really subdivide");
+        assert_eq!(
+            fine_tris,
+            coarse_tris * 64,
+            "the fixture must really subdivide"
+        );
 
         let a: usize = report_of(&coarse).iter().map(|s| s.samples).sum();
         let b: usize = report_of(&fine).iter().map(|s| s.samples).sum();
@@ -1496,12 +1825,16 @@ mod surface_tests {
             assert!(
                 (x.area_m2 - y.area_m2).abs() < 1e-3,
                 "{}: area {:.3} m² became {:.3} m² under subdivision",
-                x.name, x.area_m2, y.area_m2,
+                x.name,
+                x.area_m2,
+                y.area_m2,
             );
             assert!(
                 (x.e_avg - y.e_avg).abs() <= 0.02 * x.e_avg.max(1.0),
                 "{}: {:.1} lx became {:.1} lx under subdivision",
-                x.name, x.e_avg, y.e_avg,
+                x.name,
+                x.e_avg,
+                y.e_avg,
             );
         }
     }
@@ -1516,7 +1849,9 @@ mod surface_tests {
             assert!(
                 s.samples <= MAX_SURFACE_SAMPLES,
                 "{} took {} samples against a budget of {}",
-                s.name, s.samples, MAX_SURFACE_SAMPLES,
+                s.name,
+                s.samples,
+                MAX_SURFACE_SAMPLES,
             );
         }
     }
@@ -1536,7 +1871,10 @@ mod surface_tests {
             "a 200 x 200 m floor reported {:.0} m²",
             floor.area_m2,
         );
-        assert!(floor.samples <= MAX_SURFACE_SAMPLES, "…and was still capped");
+        assert!(
+            floor.samples <= MAX_SURFACE_SAMPLES,
+            "…and was still capped"
+        );
     }
 
     /// SAMPLES FOLLOW AREA. A wall ten times the size of its neighbour must get about ten times
@@ -1547,7 +1885,9 @@ mod surface_tests {
         let small = report_of(&box_room(2.0, 2.0, 3.0));
         let big = report_of(&box_room(20.0, 20.0, 3.0));
         let floor = |v: &[SurfaceResult]| {
-            v.iter().find(|s| s.name.eq_ignore_ascii_case("floor")).map(|s| (s.area_m2, s.samples))
+            v.iter()
+                .find(|s| s.name.eq_ignore_ascii_case("floor"))
+                .map(|s| (s.area_m2, s.samples))
         };
         let (sa, ss) = floor(&small).expect("small floor");
         let (ba, bs) = floor(&big).expect("big floor");
@@ -1568,7 +1908,13 @@ mod surface_tests {
         let (a, b) = (report_of(&room), report_of(&room));
         for (x, y) in a.iter().zip(b.iter()) {
             assert_eq!(x.samples, y.samples, "{}: sample count wobbled", x.name);
-            assert!((x.e_avg - y.e_avg).abs() < 1e-9, "{}: {} vs {}", x.name, x.e_avg, y.e_avg);
+            assert!(
+                (x.e_avg - y.e_avg).abs() < 1e-9,
+                "{}: {} vs {}",
+                x.name,
+                x.e_avg,
+                y.e_avg
+            );
         }
     }
 }
@@ -1638,10 +1984,13 @@ mod a_luminaire_is_not_a_point {
             flux_override: None,
             from_block: None,
         }];
-        let settings = RaySettings { rays_per_point: 1, max_bounces: 0, shadows: false };
+        let settings = RaySettings {
+            rays_per_point: 1,
+            max_bounces: 0,
+            shadows: false,
+        };
         let mats = default_materials();
-        let ev =
-            Evaluator::new(&[], &lums, &profiles, &mats, settings, Maintenance::INITIAL);
+        let ev = Evaluator::new(&[], &lums, &profiles, &mats, settings, Maintenance::INITIAL);
         ev.illuminance(p, Vec3::Z)
     }
 
@@ -1652,9 +2001,9 @@ mod a_luminaire_is_not_a_point {
     #[test]
     fn a_two_metre_batten_lights_an_ellipse_not_a_circle() {
         let at = Vertex::new(0.0, 0.0, 2.0); // 2 m above the plane, as a real ceiling is
-        // 1.5 m out, where the ridge is unmistakable. Measured: 112.6 lx along against 93.3 lx
-        // across, a ratio of 1.21. Directly underneath the two are equal by symmetry, which is
-        // correct and says nothing — a test taken there could not fail.
+                                             // 1.5 m out, where the ridge is unmistakable. Measured: 112.6 lx along against 93.3 lx
+                                             // across, a ratio of 1.21. Directly underneath the two are equal by symmetry, which is
+                                             // correct and says nothing — a test taken there could not fail.
         let along = lit(2.0, at, 0.0, Vec3::new(1.5, 0.0, 0.0));
         let across = lit(2.0, at, 0.0, Vec3::new(0.0, 1.5, 0.0));
         assert!(
@@ -1692,7 +2041,14 @@ mod a_luminaire_is_not_a_point {
             e
         };
         let at = Vertex::new(0.0, 0.0, H as f32);
-        for (x, y) in [(0.0_f32, 0.0_f32), (0.9, 0.0), (0.0, 0.9), (1.5, 0.0), (0.0, 1.5), (1.2, 1.2)] {
+        for (x, y) in [
+            (0.0_f32, 0.0_f32),
+            (0.9, 0.0),
+            (0.0, 0.9),
+            (1.5, 0.0),
+            (0.0, 1.5),
+            (1.2, 1.2),
+        ] {
             let p = Vec3::new(x, y, 0.0);
             let got = lit(LEN, at, 0.0, p);
             let want = reference(p);
@@ -1727,10 +2083,25 @@ mod a_luminaire_is_not_a_point {
     /// figure anybody can read.
     #[test]
     fn a_downlight_is_not_subdivided() {
-        assert_eq!(segments_for(0.06, 2.0), 1, "a 60 mm downlight at 2 m was broken up");
-        assert_eq!(segments_for(0.0, 2.0), 1, "a fitting with no declared size was broken up");
-        assert_eq!(segments_for(2.0, 20.0), 1, "a 2 m batten 20 m away is a point");
-        assert!(segments_for(2.0, 2.0) > 1, "a 2 m batten at 2 m must be broken up");
+        assert_eq!(
+            segments_for(0.06, 2.0),
+            1,
+            "a 60 mm downlight at 2 m was broken up"
+        );
+        assert_eq!(
+            segments_for(0.0, 2.0),
+            1,
+            "a fitting with no declared size was broken up"
+        );
+        assert_eq!(
+            segments_for(2.0, 20.0),
+            1,
+            "a 2 m batten 20 m away is a point"
+        );
+        assert!(
+            segments_for(2.0, 2.0) > 1,
+            "a 2 m batten at 2 m must be broken up"
+        );
         assert!(
             segments_for(2.0, 0.5) <= MAX_SEGMENTS,
             "the subdivision is unbounded — a point directly on the fitting would spin",
@@ -1796,7 +2167,6 @@ mod a_luminaire_is_not_a_point {
     }
 }
 
-
 /// AIMING A LUMINAIRE.
 ///
 /// Asked for as: *"in the luminaries tab i want a aim tool, the use of the tool will be to aim the
@@ -1817,7 +2187,10 @@ mod a_luminaire_can_be_aimed {
     /// one.
     fn spot() -> IesProfile {
         let va: Vec<f64> = (0..=90).map(|d| d as f64).collect();
-        let cd: Vec<f64> = va.iter().map(|g| if *g <= 20.0 { 10_000.0 } else { 0.0 }).collect();
+        let cd: Vec<f64> = va
+            .iter()
+            .map(|g| if *g <= 20.0 { 10_000.0 } else { 0.0 })
+            .collect();
         IesProfile {
             manufacturer: String::new(),
             catalogue: String::new(),
@@ -1857,9 +2230,14 @@ mod a_luminaire_can_be_aimed {
         let mut profiles = HashMap::new();
         profiles.insert("spot".to_string(), spot());
         let lums = vec![l.clone()];
-        let s = RaySettings { rays_per_point: 1, max_bounces: 0, shadows: false };
+        let s = RaySettings {
+            rays_per_point: 1,
+            max_bounces: 0,
+            shadows: false,
+        };
         let mats = default_materials();
-        Evaluator::new(&[], &lums, &profiles, &mats, s, Maintenance::INITIAL).illuminance(p, Vec3::Z)
+        Evaluator::new(&[], &lums, &profiles, &mats, s, Maintenance::INITIAL)
+            .illuminance(p, Vec3::Z)
     }
 
     /// UNTILTED, NOTHING CHANGED. The property that keeps every existing project's numbers: the
@@ -1868,7 +2246,10 @@ mod a_luminaire_can_be_aimed {
     fn a_fitting_pointing_down_is_unaffected() {
         let l = fixture(0.0, 0.0);
         let (aim, c0, _) = l.frame();
-        assert!((aim - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-6, "aim is {aim:?}");
+        assert!(
+            (aim - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-6,
+            "aim is {aim:?}"
+        );
         assert!((c0 - Vec3::X).length() < 1e-6, "c0 is {c0:?}");
         // Straight beneath it is lit; well outside the 20° cone is not.
         assert!(lit(&l, Vec3::ZERO) > 100.0);
@@ -1884,8 +2265,14 @@ mod a_luminaire_can_be_aimed {
 
         assert!(lit(&l, target) < 1.0, "the target starts outside the beam");
         assert!(l.aim_at(target), "the aim was refused");
-        assert!(lit(&l, target) > 100.0, "the target is not lit after aiming at it");
-        assert!(lit(&l, Vec3::ZERO) < 1.0, "the beam did not leave where it was");
+        assert!(
+            lit(&l, target) > 100.0,
+            "the target is not lit after aiming at it"
+        );
+        assert!(
+            lit(&l, Vec3::ZERO) < 1.0,
+            "the beam did not leave where it was"
+        );
 
         assert_eq!(
             (before.x, before.y, before.z),
@@ -1924,7 +2311,10 @@ mod a_luminaire_can_be_aimed {
     #[test]
     fn a_target_that_is_not_below_is_refused() {
         let mut l = fixture(0.0, 0.0);
-        assert!(!l.aim_at(Vec3::new(2.0, 0.0, 3.0)), "level with the fitting");
+        assert!(
+            !l.aim_at(Vec3::new(2.0, 0.0, 3.0)),
+            "level with the fitting"
+        );
         assert!(!l.aim_at(Vec3::new(2.0, 0.0, 5.0)), "above the fitting");
         assert!(!l.aim_at(Vec3::new(0.0, 0.0, 3.0)), "the fitting itself");
         assert_eq!(l.tilt_deg, 0.0, "a refused aim still moved the fitting");
@@ -1939,7 +2329,9 @@ mod a_luminaire_can_be_aimed {
         p.horizontal_angles = vec![0.0, 90.0];
         let va = p.vertical_angles.clone();
         p.candela = vec![
-            va.iter().map(|g| if *g <= 40.0 { 10_000.0 } else { 0.0 }).collect(),
+            va.iter()
+                .map(|g| if *g <= 40.0 { 10_000.0 } else { 0.0 })
+                .collect(),
             vec![0.0; va.len()],
         ];
 
@@ -1947,7 +2339,11 @@ mod a_luminaire_can_be_aimed {
         profiles.insert("spot".to_string(), p);
         let shine = |l: &Luminaire, at: Vec3| -> f64 {
             let lums = vec![l.clone()];
-            let s = RaySettings { rays_per_point: 1, max_bounces: 0, shadows: false };
+            let s = RaySettings {
+                rays_per_point: 1,
+                max_bounces: 0,
+                shadows: false,
+            };
             let mats = default_materials();
             Evaluator::new(&[], &lums, &profiles, &mats, s, Maintenance::INITIAL)
                 .illuminance(at, Vec3::Z)
@@ -1958,6 +2354,8 @@ mod a_luminaire_can_be_aimed {
         assert!(shine(&flat, Vec3::new(1.5, 0.0, 0.0)) > shine(&flat, Vec3::new(0.0, 1.5, 0.0)));
         // Turned a quarter turn, it lies along y.
         let turned = fixture(90.0, 0.0);
-        assert!(shine(&turned, Vec3::new(0.0, 1.5, 0.0)) > shine(&turned, Vec3::new(1.5, 0.0, 0.0)));
+        assert!(
+            shine(&turned, Vec3::new(0.0, 1.5, 0.0)) > shine(&turned, Vec3::new(1.5, 0.0, 0.0))
+        );
     }
 }

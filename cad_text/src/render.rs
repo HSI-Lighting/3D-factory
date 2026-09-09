@@ -190,17 +190,18 @@ impl TextRenderer {
         let (sin, cos) = req.angle.sin_cos();
         let pos = req.position;
         let slant_tan = req.slant.tan();
-        let x_scale = if req.x_scale.abs() < 1e-6 { 1.0 } else { req.x_scale };
+        let x_scale = if req.x_scale.abs() < 1e-6 {
+            1.0
+        } else {
+            req.x_scale
+        };
         // Layout point (PRIMARY font units) → world: width-scale + italic
         // shear, then uniform scale by the primary's `s`, rotate, translate.
         let to_base = |lx: f64, ly: f64| -> Vec2 {
             let sheared_x = lx * x_scale + ly * slant_tan;
             let qx = sheared_x * s;
             let qy = ly * s;
-            Vec2::new(
-                pos.x + qx * cos - qy * sin,
-                pos.y + qx * sin + qy * cos,
-            )
+            Vec2::new(pos.x + qx * cos - qy * sin, pos.y + qx * sin + qy * cos)
         };
         // Glyph-local offset (ITS face's font units) added onto the base —
         // sheared/rotated identically, but scaled by the glyph's OWN `fs`.
@@ -208,10 +209,7 @@ impl TextRenderer {
             let sheared_x = px * x_scale + py * slant_tan;
             let qx = sheared_x * fs;
             let qy = py * fs;
-            Vec2::new(
-                base.x + qx * cos - qy * sin,
-                base.y + qx * sin + qy * cos,
-            )
+            Vec2::new(base.x + qx * cos - qy * sin, base.y + qx * sin + qy * cos)
         };
 
         let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
@@ -379,8 +377,9 @@ impl TextRenderer {
                 return;
             }
             let p = Vec2::new(x as f64, y as f64);
-            if cur.last().map_or(true, |q: &Vec2| (q.x - p.x).abs() > eps
-                || (q.y - p.y).abs() > eps) {
+            if cur.last().map_or(true, |q: &Vec2| {
+                (q.x - p.x).abs() > eps || (q.y - p.y).abs() > eps
+            }) {
                 cur.push(p);
             }
         };
@@ -397,8 +396,18 @@ impl TextRenderer {
                         add(&mut cur, l.to.x, l.to.y);
                     });
                 }
-                PathEvent::Cubic { from, ctrl1, ctrl2, to } => {
-                    let seg = lyon::geom::CubicBezierSegment { from, ctrl1, ctrl2, to };
+                PathEvent::Cubic {
+                    from,
+                    ctrl1,
+                    ctrl2,
+                    to,
+                } => {
+                    let seg = lyon::geom::CubicBezierSegment {
+                        from,
+                        ctrl1,
+                        ctrl2,
+                        to,
+                    };
                     seg.for_each_flattened(tol, &mut |l: &lyon::geom::LineSegment<f32>| {
                         add(&mut cur, l.to.x, l.to.y);
                     });
@@ -434,13 +443,17 @@ impl TextRenderer {
             let mut buffers: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
             let mut tess = FillTessellator::new();
             let opts = FillOptions::default().with_fill_rule(FillRule::NonZero);
-            if tess.tessellate_path(
-                &fill_path, &opts,
-                &mut BuffersBuilder::new(&mut buffers, |v: FillVertex| {
-                    let p = v.position();
-                    [p.x, p.y]
-                }),
-            ).is_ok() {
+            if tess
+                .tessellate_path(
+                    &fill_path,
+                    &opts,
+                    &mut BuffersBuilder::new(&mut buffers, |v: FillVertex| {
+                        let p = v.position();
+                        [p.x, p.y]
+                    }),
+                )
+                .is_ok()
+            {
                 let idx = &buffers.indices;
                 let vtx = &buffers.vertices;
                 let mut i = 0;
@@ -461,7 +474,11 @@ impl TextRenderer {
         // 3) Containment classification → (outer, holes) islands for TXTEXP.
         let polygons = classify_contours(&outlines);
 
-        GlyphGeom { fills, outlines, polygons }
+        GlyphGeom {
+            fills,
+            outlines,
+            polygons,
+        }
     }
 }
 
@@ -516,9 +533,7 @@ fn classify_contours(contours: &[Vec<Vec2>]) -> Vec<(Vec<Vec2>, Vec<Vec<Vec2>>)>
     // Outers (even depth), then attach each hole (odd depth) to the smallest
     // containing outer. A hole contained by NO outer (malformed glyph) is
     // promoted to an outer so its outline is never lost.
-    let outer_idx: Vec<usize> = (0..n)
-        .filter(|&i| containment[i].len() % 2 == 0)
-        .collect();
+    let outer_idx: Vec<usize> = (0..n).filter(|&i| containment[i].len() % 2 == 0).collect();
     let mut islands: Vec<(Vec<Vec2>, Vec<Vec<Vec2>>)> = outer_idx
         .iter()
         .map(|&i| (contours[i].clone(), Vec::new()))
@@ -576,7 +591,10 @@ struct OutlineCollector {
 
 impl OutlineCollector {
     fn new() -> Self {
-        OutlineCollector { builder: LPath::builder(), open: false }
+        OutlineCollector {
+            builder: LPath::builder(),
+            open: false,
+        }
     }
 
     fn finish(mut self) -> LPath {
@@ -601,11 +619,13 @@ impl ttf_parser::OutlineBuilder for OutlineCollector {
     }
 
     fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
-        self.builder.quadratic_bezier_to(lpoint(x1, y1), lpoint(x, y));
+        self.builder
+            .quadratic_bezier_to(lpoint(x1, y1), lpoint(x, y));
     }
 
     fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
-        self.builder.cubic_bezier_to(lpoint(x1, y1), lpoint(x2, y2), lpoint(x, y));
+        self.builder
+            .cubic_bezier_to(lpoint(x1, y1), lpoint(x2, y2), lpoint(x, y));
     }
 
     fn close(&mut self) {
@@ -641,13 +661,19 @@ mod tests {
         let (glyphs, width) = shape("abc");
         assert!(!glyphs.is_empty());
         assert!(width > 0.0);
-        assert!(glyphs.iter().all(|g| g.3 == 0), "Latin must use the primary face");
+        assert!(
+            glyphs.iter().all(|g| g.3 == 0),
+            "Latin must use the primary face"
+        );
     }
 
     #[test]
     fn arabic_run_falls_back_to_rtl_face() {
         let (glyphs, width) = shape("\u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629}");
-        assert!(!glyphs.is_empty(), "Arabic must produce glyphs, not .notdef boxes");
+        assert!(
+            !glyphs.is_empty(),
+            "Arabic must produce glyphs, not .notdef boxes"
+        );
         assert!(width > 0.0);
         assert!(
             glyphs.iter().all(|g| g.3 == 1),
@@ -662,13 +688,20 @@ mod tests {
         let (glyphs, width) = shape("\u{05e9}\u{05dc}\u{05d5}\u{05dd}");
         assert!(!glyphs.is_empty());
         assert!(width > 0.0);
-        assert!(glyphs.iter().all(|g| g.2.is_finite()), "positions must be finite");
+        assert!(
+            glyphs.iter().all(|g| g.2.is_finite()),
+            "positions must be finite"
+        );
     }
 
     #[test]
     fn mixed_ltr_rtl_line_shapes_both_faces_in_visual_order() {
-        let (glyphs, width) = shape("abc \u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629} def");
-        assert!(!glyphs.is_empty(), "mixed line must not panic (bidi run ordering)");
+        let (glyphs, width) =
+            shape("abc \u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629} def");
+        assert!(
+            !glyphs.is_empty(),
+            "mixed line must not panic (bidi run ordering)"
+        );
         assert!(width > 0.0);
         assert!(
             glyphs.iter().any(|g| g.3 == 0) && glyphs.iter().any(|g| g.3 == 1),
@@ -687,7 +720,8 @@ mod tests {
     fn rtl_paragraph_reorders_runs() {
         // RTL paragraph: logical "العربية only" displays "only" first (visual
         // order) — the runs must not panic and must produce glyphs.
-        let (glyphs, width) = shape("\u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629} only");
+        let (glyphs, width) =
+            shape("\u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629} only");
         assert!(!glyphs.is_empty());
         assert!(width > 0.0);
         let xs: Vec<f64> = glyphs.iter().map(|g| g.1).collect();
@@ -785,10 +819,16 @@ mod tests {
     fn arabic_sample_produces_polygons() {
         let mut r = liberation_with_dejavu_fallback();
         let g = r.render_with_polygons(
-            &fill_req("\u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629}", Vec2::ZERO),
+            &fill_req(
+                "\u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629}",
+                Vec2::ZERO,
+            ),
             true,
         );
-        assert!(!g.glyph_polygons.is_empty(), "Arabic must produce glyph polygons");
+        assert!(
+            !g.glyph_polygons.is_empty(),
+            "Arabic must produce glyph polygons"
+        );
         assert!(g.glyph_polygons.iter().any(|(o, _)| o.len() >= 3));
     }
 

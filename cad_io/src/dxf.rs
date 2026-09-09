@@ -13,9 +13,8 @@
 // and AutoCAD.
 
 use cad_kernel::{
-    Arc, Block, BlockRef, Circle, Color, DObject, Document, Ellipse, EllipseArc,
-    Geom, Layer, Line, Lineweight, Linetype, LinetypeTable, Point, PolyVertex,
-    Polyline, Vec2,
+    Arc, Block, BlockRef, Circle, Color, DObject, Document, Ellipse, EllipseArc, Geom, Layer, Line,
+    Linetype, LinetypeTable, Lineweight, Point, PolyVertex, Polyline, Vec2,
 };
 
 /// Named-objects dictionary the app's embedded extra data lives under (see
@@ -39,12 +38,24 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 fn b64_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
         out.push(B64[(n >> 18 & 63) as usize] as char);
         out.push(B64[(n >> 12 & 63) as usize] as char);
-        if chunk.len() > 1 { out.push(B64[(n >> 6 & 63) as usize] as char); } else { out.push('='); }
-        if chunk.len() > 2 { out.push(B64[(n & 63) as usize] as char); } else { out.push('='); }
+        if chunk.len() > 1 {
+            out.push(B64[(n >> 6 & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(B64[(n & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
     }
     out
 }
@@ -101,21 +112,21 @@ pub fn read_dxf_with_stats(text: &str) -> Result<(Document, usize), String> {
             let (c2, name) = pairs[i + 1];
             if c2 == 2 {
                 match name {
-                    "TABLES"   => i = read_tables(&pairs, i + 2, &mut doc),
+                    "TABLES" => i = read_tables(&pairs, i + 2, &mut doc),
                     // BLOCKS precedes ENTITIES in the file, so block defs land
                     // in the table before any INSERT in ENTITIES resolves them.
-                    "BLOCKS"   => i = read_blocks(&pairs, i + 2, &mut doc, &mut skipped),
+                    "BLOCKS" => i = read_blocks(&pairs, i + 2, &mut doc, &mut skipped),
                     "ENTITIES" => i = read_entities(&pairs, i + 2, &mut doc, &mut skipped),
                     // OBJECTS used to be skipped wholesale; it is walked now for
                     // the embedded-extra-data dictionary, and everything else in
                     // it is still passed over untouched.
-                    "OBJECTS"  => i = read_objects(&pairs, i + 2, &mut doc),
+                    "OBJECTS" => i = read_objects(&pairs, i + 2, &mut doc),
                     // HEADER carries $INSUNITS — the file's own statement of what one
                     // drawing unit means. Skipping it (which this reader once did) is
                     // why an architectural plan in millimetres arrived
                     // indistinguishable from one in metres, and so came into the 3D
                     // side 1000x too large.
-                    "HEADER"   => i = read_header(&pairs, i + 2, &mut doc),
+                    "HEADER" => i = read_header(&pairs, i + 2, &mut doc),
                     _ => i = skip_to_endsec(&pairs, i + 2),
                 }
                 continue;
@@ -142,10 +153,14 @@ fn parse_pairs(text: &str) -> Result<Vec<(i32, &str)>, String> {
     let mut out: Vec<(i32, &str)> = Vec::with_capacity(text.len() / 24 + 16);
     while let Some(code_line) = lines.next() {
         let code_str = code_line.trim();
-        if code_str.is_empty() { continue; }
-        let value_line = lines.next()
+        if code_str.is_empty() {
+            continue;
+        }
+        let value_line = lines
+            .next()
             .ok_or_else(|| "DXF: code line without value line".to_string())?;
-        let code: i32 = code_str.parse()
+        let code: i32 = code_str
+            .parse()
             .map_err(|_| format!("DXF: bad group code '{}'", code_str))?;
         out.push((code, value_line.trim()));
     }
@@ -171,14 +186,14 @@ pub(crate) fn insunits_to_metres_for_test(code: i32) -> Option<f64> {
 
 fn insunits_to_metres(code: i32) -> Option<f64> {
     Some(match code {
-        1  => 0.0254,      // inches
-        2  => 0.3048,      // feet
-        4  => 0.001,       // millimetres  ← the architectural default
-        5  => 0.01,        // centimetres
-        6  => 1.0,         // metres
-        10 => 0.9144,      // yards
-        14 => 0.1,         // decimetres
-        _  => return None, // 0 = unitless, and everything exotic
+        1 => 0.0254,      // inches
+        2 => 0.3048,      // feet
+        4 => 0.001,       // millimetres  ← the architectural default
+        5 => 0.01,        // centimetres
+        6 => 1.0,         // metres
+        10 => 0.9144,     // yards
+        14 => 0.1,        // decimetres
+        _ => return None, // 0 = unitless, and everything exotic
     })
 }
 
@@ -201,7 +216,9 @@ fn read_header(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> usize
                     // matters because an assumed unit must never be written
                     // back out as a positive claim.
                     doc.units = cad_kernel::Units::from_metres_per_unit(
-                        k, cad_kernel::UnitSource::Declared);
+                        k,
+                        cad_kernel::UnitSource::Declared,
+                    );
                 }
             }
             i += 2;
@@ -216,7 +233,9 @@ fn skip_to_endsec(pairs: &[(i32, &str)], start: usize) -> usize {
     let mut i = start;
     while i < pairs.len() {
         let (c, v) = pairs[i];
-        if c == 0 && v == "ENDSEC" { return i + 1; }
+        if c == 0 && v == "ENDSEC" {
+            return i + 1;
+        }
         i += 1;
     }
     pairs.len()
@@ -276,7 +295,7 @@ fn read_objects(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> usiz
                 if !o.handle.is_empty() {
                     objs.push(o);
                 }
-                continue;   // `i` is on the next object's 0 group — handled above
+                continue; // `i` is on the next object's 0 group — handled above
             }
         }
         i += 1;
@@ -293,8 +312,11 @@ fn read_objects(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> usiz
         .map(|(i, o)| (o.handle.as_str(), i))
         .collect();
     let data_dict = objs.iter().find_map(|o| {
-        if o.xrec { return None; }
-        o.kids.iter()
+        if o.xrec {
+            return None;
+        }
+        o.kids
+            .iter()
             .find(|(n, _)| n == SIMLUX_DATA_DICT)
             .map(|(_, h)| h.clone())
     });
@@ -310,9 +332,15 @@ fn read_objects(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> usiz
                 // An XRECORD is accepted only with the marker prefix — anything
                 // else is somebody else's data, and stays unread. The payload is
                 // base64 (see the writer), so decode restores the exact bytes.
-                let Some(&oi) = xrec_index.get(xh.as_str()) else { continue };
-                let Some(text) = objs[oi].text.strip_prefix(BLOB_MARKER) else { continue };
-                let Some(bytes) = b64_decode(text) else { continue };
+                let Some(&oi) = xrec_index.get(xh.as_str()) else {
+                    continue;
+                };
+                let Some(text) = objs[oi].text.strip_prefix(BLOB_MARKER) else {
+                    continue;
+                };
+                let Some(bytes) = b64_decode(text) else {
+                    continue;
+                };
                 doc.set_extra_blob(name, bytes);
             }
         }
@@ -331,14 +359,16 @@ fn read_tables(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> usize
     let mut i = start;
     while i < pairs.len() {
         let (c, v) = pairs[i];
-        if c == 0 && v == "ENDSEC" { return i + 1; }
+        if c == 0 && v == "ENDSEC" {
+            return i + 1;
+        }
         if c == 0 && v == "TABLE" && i + 1 < pairs.len() {
             let (c2, name) = pairs[i + 1];
             if c2 == 2 {
                 match name {
                     "LAYER" => i = read_layer_table(pairs, i + 2, doc),
                     "LTYPE" => i = read_ltype_table(pairs, i + 2, doc),
-                    _       => i = skip_to_endtab(pairs, i + 2),
+                    _ => i = skip_to_endtab(pairs, i + 2),
                 }
                 continue;
             }
@@ -352,7 +382,9 @@ fn skip_to_endtab(pairs: &[(i32, &str)], start: usize) -> usize {
     let mut i = start;
     while i < pairs.len() {
         let (c, v) = pairs[i];
-        if c == 0 && v == "ENDTAB" { return i + 1; }
+        if c == 0 && v == "ENDTAB" {
+            return i + 1;
+        }
         i += 1;
     }
     pairs.len()
@@ -362,25 +394,27 @@ fn read_layer_table(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> 
     let mut i = start;
     while i < pairs.len() {
         let (c, v) = pairs[i];
-        if c == 0 && v == "ENDTAB" { return i + 1; }
+        if c == 0 && v == "ENDTAB" {
+            return i + 1;
+        }
         if c == 0 && v == "LAYER" {
             // Accumulate this layer's fields until the next 0-group.
             let mut name = String::new();
-            let mut color = Color::Aci(7);   // ACI 7 = white default
+            let mut color = Color::Aci(7); // ACI 7 = white default
             let mut lt_name = String::from("Continuous");
             let mut flags: i32 = 0;
-            let mut off = false;   // negative 62 = layer OFF (kept apart from frozen)
+            let mut off = false; // negative 62 = layer OFF (kept apart from frozen)
             i += 1;
             while i < pairs.len() && pairs[i].0 != 0 {
                 match pairs[i].0 {
-                    2  => name    = pairs[i].1.to_string(),
+                    2 => name = pairs[i].1.to_string(),
                     62 => {
                         let aci: i32 = pairs[i].1.parse().unwrap_or(7);
                         // Negative ACI = layer off; magnitude = the color.
                         off = aci < 0;
                         color = Color::Aci(aci.unsigned_abs() as u8);
                     }
-                    6  => lt_name = pairs[i].1.to_string(),
+                    6 => lt_name = pairs[i].1.to_string(),
                     70 => flags |= pairs[i].1.parse::<i32>().unwrap_or(0),
                     _ => {}
                 }
@@ -393,28 +427,31 @@ fn read_layer_table(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> 
                 // it must NOT be folded into frozen (issue #41); the kernel's
                 // `LayerTable::renders` (visible && !frozen) keeps both
                 // semantics distinct, exactly like the layer panel does.
-                let lt_id = doc.linetypes.find(&lt_name)
+                let lt_id = doc
+                    .linetypes
+                    .find(&lt_name)
                     .unwrap_or(LinetypeTable::CONTINUOUS);
                 if let Some(existing) = doc.layers.find(&name) {
                     if let Some(l) = doc.layers.get_mut(existing) {
-                        l.color    = color;
+                        l.color = color;
                         l.linetype = lt_id;
-                        l.visible  = !off;
-                        l.frozen   = (flags & 0x01) != 0;
-                        l.locked   = (flags & 0x04) != 0;
+                        l.visible = !off;
+                        l.frozen = (flags & 0x01) != 0;
+                        l.locked = (flags & 0x04) != 0;
                         l.plottable = (flags & 0x10) == 0;
                     }
                 } else {
                     doc.layers.add(Layer {
                         name,
                         color,
-                        linetype:   lt_id,
+                        linetype: lt_id,
                         lineweight: Lineweight::Default,
-                        visible:    !off,
-                        locked:     (flags & 0x04) != 0,
-                        frozen:     (flags & 0x01) != 0,
-                        plottable:  (flags & 0x10) == 0,
-                        order:      0,});
+                        visible: !off,
+                        locked: (flags & 0x04) != 0,
+                        frozen: (flags & 0x01) != 0,
+                        plottable: (flags & 0x10) == 0,
+                        order: 0,
+                    });
                 }
             }
             continue;
@@ -428,7 +465,9 @@ fn read_ltype_table(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> 
     let mut i = start;
     while i < pairs.len() {
         let (c, v) = pairs[i];
-        if c == 0 && v == "ENDTAB" { return i + 1; }
+        if c == 0 && v == "ENDTAB" {
+            return i + 1;
+        }
         if c == 0 && v == "LTYPE" {
             let mut name = String::new();
             let mut desc = String::new();
@@ -436,8 +475,8 @@ fn read_ltype_table(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> 
             i += 1;
             while i < pairs.len() && pairs[i].0 != 0 {
                 match pairs[i].0 {
-                    2  => name = pairs[i].1.to_string(),
-                    3  => desc = pairs[i].1.to_string(),
+                    2 => name = pairs[i].1.to_string(),
+                    3 => desc = pairs[i].1.to_string(),
                     49 => {
                         // dash length (positive) or gap (negative) — convert to
                         // alternating positive lengths for our pattern repr
@@ -452,10 +491,14 @@ fn read_ltype_table(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> 
             // ByBlock / ByLayer are DXF sentinels, not real linetypes — never
             // add them as table entries (our writer emits them for AutoCAD; the
             // model represents them as Color/Linetype sentinels, not rows).
-            let is_sentinel = name.eq_ignore_ascii_case("ByBlock")
-                || name.eq_ignore_ascii_case("ByLayer");
+            let is_sentinel =
+                name.eq_ignore_ascii_case("ByBlock") || name.eq_ignore_ascii_case("ByLayer");
             if !name.is_empty() && !is_sentinel && doc.linetypes.find(&name).is_none() {
-                doc.linetypes.add(Linetype { name, description: desc, pattern });
+                doc.linetypes.add(Linetype {
+                    name,
+                    description: desc,
+                    pattern,
+                });
             }
             continue;
         }
@@ -464,11 +507,18 @@ fn read_ltype_table(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> 
     pairs.len()
 }
 
-fn read_entities(pairs: &[(i32, &str)], start: usize, doc: &mut Document, skipped: &mut usize) -> usize {
+fn read_entities(
+    pairs: &[(i32, &str)],
+    start: usize,
+    doc: &mut Document,
+    skipped: &mut usize,
+) -> usize {
     let mut i = start;
     while i < pairs.len() {
         let (c, v) = pairs[i];
-        if c == 0 && v == "ENDSEC" { return i + 1; }
+        if c == 0 && v == "ENDSEC" {
+            return i + 1;
+        }
         if c == 0 {
             let entity_kind = v.to_string();
             // Collect this entity's fields until the next 0-group.
@@ -482,10 +532,12 @@ fn read_entities(pairs: &[(i32, &str)], start: usize, doc: &mut Document, skippe
             if let Some(d) = main {
                 // Boundary dobjects land FIRST so the hatch (pushed after)
                 // can resolve them by handle in the same doc.
-                for s in sats { doc.push(s); }
+                for s in sats {
+                    doc.push(s);
+                }
                 doc.push(d);
             } else if sats.is_empty() {
-                *skipped += 1;   // unsupported entity type
+                *skipped += 1; // unsupported entity type
             }
             continue;
         }
@@ -500,7 +552,12 @@ fn read_entities(pairs: &[(i32, &str)], start: usize, doc: &mut Document, skippe
 /// (names starting with `*` — *Model_Space, *Paper_Space, *U### hatch/dim
 /// blocks) are skipped: their geometry already lives in ENTITIES, and importing
 /// them would duplicate it. INSERTs in ENTITIES resolve to these by name.
-fn read_blocks(pairs: &[(i32, &str)], start: usize, doc: &mut Document, skipped: &mut usize) -> usize {
+fn read_blocks(
+    pairs: &[(i32, &str)],
+    start: usize,
+    doc: &mut Document,
+    skipped: &mut usize,
+) -> usize {
     // TWO passes so nested INSERTs resolve regardless of definition order:
     //   pass 1 registers every real block name (empty placeholder, fixes ids);
     //   pass 2 fills each block's base + entities (build_entity now resolves
@@ -509,15 +566,25 @@ fn read_blocks(pairs: &[(i32, &str)], start: usize, doc: &mut Document, skipped:
     let end;
     let mut i = start;
     loop {
-        if i >= pairs.len() { end = pairs.len(); break; }
+        if i >= pairs.len() {
+            end = pairs.len();
+            break;
+        }
         let (c, v) = pairs[i];
-        if c == 0 && v == "ENDSEC" { end = i + 1; break; }
+        if c == 0 && v == "ENDSEC" {
+            end = i + 1;
+            break;
+        }
         if c == 0 && v == "BLOCK" {
             let name = block_name(pairs, i + 1);
             if is_real_block(&name) && doc.blocks.find(&name).is_none() {
                 doc.blocks.add(Block {
-                    name, base: Vec2::new(0.0, 0.0), dobjects: Vec::new(),
-                    smart: false, params: Vec::new(), cut_edges: Vec::new(),
+                    name,
+                    base: Vec2::new(0.0, 0.0),
+                    dobjects: Vec::new(),
+                    smart: false,
+                    params: Vec::new(),
+                    cut_edges: Vec::new(),
                 });
             }
             i = skip_to_endblk(pairs, i + 1);
@@ -535,10 +602,10 @@ fn read_blocks(pairs: &[(i32, &str)], start: usize, doc: &mut Document, skipped:
             let mut base = Vec2::new(0.0, 0.0);
             while i < pairs.len() && pairs[i].0 != 0 {
                 match pairs[i].0 {
-                    2  => name   = pairs[i].1.to_string(),
+                    2 => name = pairs[i].1.to_string(),
                     10 => base.x = pairs[i].1.parse().unwrap_or(0.0),
                     20 => base.y = pairs[i].1.parse().unwrap_or(0.0),
-                    _  => {}
+                    _ => {}
                 }
                 i += 1;
             }
@@ -546,7 +613,9 @@ fn read_blocks(pairs: &[(i32, &str)], start: usize, doc: &mut Document, skipped:
             while i < pairs.len() {
                 let (c2, v2) = pairs[i];
                 if c2 == 0 && (v2 == "ENDBLK" || v2 == "ENDSEC") {
-                    if v2 == "ENDBLK" { i += 1; }
+                    if v2 == "ENDBLK" {
+                        i += 1;
+                    }
                     break;
                 }
                 if c2 == 0 {
@@ -566,7 +635,7 @@ fn read_blocks(pairs: &[(i32, &str)], start: usize, doc: &mut Document, skipped:
                         dobjects.extend(sats);
                         dobjects.push(d);
                     } else if sats.is_empty() {
-                        *skipped += 1;   // unsupported entity type
+                        *skipped += 1; // unsupported entity type
                     }
                     continue;
                 }
@@ -587,7 +656,9 @@ fn read_blocks(pairs: &[(i32, &str)], start: usize, doc: &mut Document, skipped:
 fn block_name(pairs: &[(i32, &str)], start: usize) -> String {
     let mut i = start;
     while i < pairs.len() && pairs[i].0 != 0 {
-        if pairs[i].0 == 2 { return pairs[i].1.to_string(); }
+        if pairs[i].0 == 2 {
+            return pairs[i].1.to_string();
+        }
         i += 1;
     }
     String::new()
@@ -597,8 +668,12 @@ fn skip_to_endblk(pairs: &[(i32, &str)], start: usize) -> usize {
     let mut i = start;
     while i < pairs.len() {
         let (c, v) = pairs[i];
-        if c == 0 && v == "ENDBLK" { return i + 1; }
-        if c == 0 && v == "ENDSEC" { return i; }
+        if c == 0 && v == "ENDBLK" {
+            return i + 1;
+        }
+        if c == 0 && v == "ENDSEC" {
+            return i;
+        }
         i += 1;
     }
     pairs.len()
@@ -610,7 +685,9 @@ fn skip_to_endblk(pairs: &[(i32, &str)], start: usize) -> usize {
 /// blocks and groups) hold REAL geometry referenced by nested INSERTs, so they
 /// MUST be kept — skipping them scatters fixtures into missing parts.
 fn is_real_block(name: &str) -> bool {
-    if name.is_empty() { return false; }
+    if name.is_empty() {
+        return false;
+    }
     let u = name.to_ascii_uppercase();
     !(u.starts_with("*MODEL_SPACE") || u.starts_with("*PAPER_SPACE"))
 }
@@ -666,10 +743,18 @@ fn entity_ocs(fields: &[(i32, &str)]) -> Ocs {
     if nx.abs() >= 1.0 / 64.0 || ny.abs() >= 1.0 / 64.0 {
         return Ocs::Tilted;
     }
-    if nz < 0.0 { Ocs::MirroredX } else { Ocs::World }
+    if nz < 0.0 {
+        Ocs::MirroredX
+    } else {
+        Ocs::World
+    }
 }
 
-fn build_entity(kind: &str, fields: &[(i32, &str)], doc: &mut Document) -> (Option<DObject>, Vec<DObject>) {
+fn build_entity(
+    kind: &str,
+    fields: &[(i32, &str)],
+    doc: &mut Document,
+) -> (Option<DObject>, Vec<DObject>) {
     let mut layer_name = String::new();
     let mut color: Option<Color> = None;
     let mut raw_aci: Option<i32> = None;
@@ -679,22 +764,33 @@ fn build_entity(kind: &str, fields: &[(i32, &str)], doc: &mut Document) -> (Opti
     let mut ltscale: Option<f32> = None;
     // helpers — return None when the field is missing or unparseable
     let get_f = |code: i32| -> Option<f64> {
-        fields.iter().find(|(c, _)| *c == code).and_then(|(_, v)| v.parse().ok())
+        fields
+            .iter()
+            .find(|(c, _)| *c == code)
+            .and_then(|(_, v)| v.parse().ok())
     };
     let get_i = |code: i32| -> Option<i32> {
-        fields.iter().find(|(c, _)| *c == code).and_then(|(_, v)| v.parse().ok())
+        fields
+            .iter()
+            .find(|(c, _)| *c == code)
+            .and_then(|(_, v)| v.parse().ok())
     };
 
     for (c, v) in fields {
         match c {
-            8  => layer_name = v.to_string(),
+            8 => layer_name = v.to_string(),
             62 => {
                 if let Ok(aci) = v.parse::<i32>() {
                     raw_aci = Some(aci);
-                    color = Some(if aci == 256 { Color::ByLayer }
-                                 else if aci == 0 { Color::ByBlock }
-                                 else if aci < 0 { Color::Aci(aci.unsigned_abs() as u8) }
-                                 else { Color::Aci(aci as u8) });
+                    color = Some(if aci == 256 {
+                        Color::ByLayer
+                    } else if aci == 0 {
+                        Color::ByBlock
+                    } else if aci < 0 {
+                        Color::Aci(aci.unsigned_abs() as u8)
+                    } else {
+                        Color::Aci(aci as u8)
+                    });
                 }
             }
             // TrueColor (RGB packed 0xRRGGBB) — only meaningful when 62 is
@@ -704,25 +800,28 @@ fn build_entity(kind: &str, fields: &[(i32, &str)], doc: &mut Document) -> (Opti
                     truecolor_rgb = Some(packed & 0x00FF_FFFF);
                 }
             }
-            6  => linetype_name = Some(v.to_string()),
+            6 => linetype_name = Some(v.to_string()),
             48 => {
-                if let Ok(ls) = v.parse::<f32>() { ltscale = Some(ls); }
+                if let Ok(ls) = v.parse::<f32>() {
+                    ltscale = Some(ls);
+                }
             }
             60 => visible = v.parse::<i32>().unwrap_or(0) == 0,
-            _  => {}
+            _ => {}
         }
     }
 
     // Style resolution is shared by the entity and any satellite boundaries —
     // built before the geom match so the HATCH arm can clone it.
     let mut style = cad_kernel::Style::default();
-    if let Some(ls) = ltscale { style.linetype_scale = ls; }
+    if let Some(ls) = ltscale {
+        style.linetype_scale = ls;
+    }
     if let Some(c) = color {
         style.color = match (raw_aci, c, truecolor_rgb) {
             // 62 = -1 (TrueColor marker from our writer) + a 420 value
             // → intern the RGB into the doc's TrueColorTable.
-            (Some(-1), _, Some(rgb)) if rgb != 0 =>
-                Color::TrueColorRef(doc.truecolors.intern(rgb)),
+            (Some(-1), _, Some(rgb)) if rgb != 0 => Color::TrueColorRef(doc.truecolors.intern(rgb)),
             (_, c, _) => c,
         };
     } else if let Some(rgb) = truecolor_rgb {
@@ -761,521 +860,652 @@ fn build_entity(kind: &str, fields: &[(i32, &str)], doc: &mut Document) -> (Opti
         let ocs_pt = |p: Vec2| if flip { Vec2::new(-p.x, p.y) } else { p };
 
         let geom = match kind {
-        "LINE" => Geom::Line(Line {
-            a: Vec2::new(get_f(10)?, get_f(20)?),
-            b: Vec2::new(get_f(11)?, get_f(21)?),
-        }),
-        "CIRCLE" => Geom::Circle(Circle {
-            center: ocs_pt(Vec2::new(get_f(10)?, get_f(20)?)),
-            radius: get_f(40)?,
-        }),
-        "ARC" => {
-            let sa = get_f(50)?.to_radians();
-            let ea = get_f(51)?.to_radians();
-            // A MIRROR REVERSES THE SWEEP. An object angle θ is measured from
-            // `Ax` toward `Ay`, and under a −Z extrusion that pair maps to
-            // world (−1, 0) and (0, 1) — so θ arrives as π − θ, which runs the
-            // other way. Keeping the start and letting the sweep run the
-            // original way draws the COMPLEMENT of the arc: everything except
-            // the piece that is actually there.
-            let (sa, ea) = if flip {
-                (std::f64::consts::PI - ea, std::f64::consts::PI - sa)
-            } else {
-                (sa, ea)
-            };
-            // `start == end` is ambiguous: the RAW (un-wrapped) difference tells
-            // them apart. raw≈0 is a DEGENERATE zero-length arc — AutoCAD emits
-            // these from spline-fit / explode and renders nothing, so DROP it.
-            // raw≈±360 is a true full circle written as an arc → TAU. The old
-            // `sweep<1e-9 → TAU` collapsed BOTH to a full circle, so a degenerate
-            // arc imported as a spurious CIRCLE (bug: unwanted circle on block insert).
-            let raw = ea - sa;
-            let sweep = raw.rem_euclid(std::f64::consts::TAU);
-            let sweep = if sweep < 1e-9 {
-                if raw.abs() < 1e-6 { return None; }   // degenerate → skip
-                std::f64::consts::TAU                    // genuine full circle
-            } else { sweep };
-            Geom::Arc(Arc {
+            "LINE" => Geom::Line(Line {
+                a: Vec2::new(get_f(10)?, get_f(20)?),
+                b: Vec2::new(get_f(11)?, get_f(21)?),
+            }),
+            "CIRCLE" => Geom::Circle(Circle {
                 center: ocs_pt(Vec2::new(get_f(10)?, get_f(20)?)),
                 radius: get_f(40)?,
-                start_angle: sa.rem_euclid(std::f64::consts::TAU),
-                sweep_angle: sweep,
-            })
-        }
-        "ELLIPSE" => {
-            // 10/20 = center, 11/21 = major-axis vector (relative to center),
-            // 40 = ratio, 41 = start param, 42 = end param.
-            let center = Vec2::new(get_f(10)?, get_f(20)?);
-            let major  = Vec2::new(get_f(11)?, get_f(21)?);
-            let ratio  = get_f(40)?;
-            let el = Ellipse { center, major, ratio };
-            let sp = get_f(41).unwrap_or(0.0);
-            let ep = get_f(42).unwrap_or(std::f64::consts::TAU);
-            // Full ellipse <-> partial: if start ~= 0 and end ~= TAU, treat as full.
-            if (sp.abs() < 1e-9) && ((ep - std::f64::consts::TAU).abs() < 1e-9) {
-                Geom::Ellipse(el)
-            } else {
-                let sweep = (ep - sp).rem_euclid(std::f64::consts::TAU);
-                let sweep = if sweep < 1e-9 { std::f64::consts::TAU } else { sweep };
-                Geom::EllipseArc(EllipseArc {
-                    ellipse: el,
-                    start_param: sp.rem_euclid(std::f64::consts::TAU),
-                    sweep_param: sweep,
+            }),
+            "ARC" => {
+                let sa = get_f(50)?.to_radians();
+                let ea = get_f(51)?.to_radians();
+                // A MIRROR REVERSES THE SWEEP. An object angle θ is measured from
+                // `Ax` toward `Ay`, and under a −Z extrusion that pair maps to
+                // world (−1, 0) and (0, 1) — so θ arrives as π − θ, which runs the
+                // other way. Keeping the start and letting the sweep run the
+                // original way draws the COMPLEMENT of the arc: everything except
+                // the piece that is actually there.
+                let (sa, ea) = if flip {
+                    (std::f64::consts::PI - ea, std::f64::consts::PI - sa)
+                } else {
+                    (sa, ea)
+                };
+                // `start == end` is ambiguous: the RAW (un-wrapped) difference tells
+                // them apart. raw≈0 is a DEGENERATE zero-length arc — AutoCAD emits
+                // these from spline-fit / explode and renders nothing, so DROP it.
+                // raw≈±360 is a true full circle written as an arc → TAU. The old
+                // `sweep<1e-9 → TAU` collapsed BOTH to a full circle, so a degenerate
+                // arc imported as a spurious CIRCLE (bug: unwanted circle on block insert).
+                let raw = ea - sa;
+                let sweep = raw.rem_euclid(std::f64::consts::TAU);
+                let sweep = if sweep < 1e-9 {
+                    if raw.abs() < 1e-6 {
+                        return None;
+                    } // degenerate → skip
+                    std::f64::consts::TAU // genuine full circle
+                } else {
+                    sweep
+                };
+                Geom::Arc(Arc {
+                    center: ocs_pt(Vec2::new(get_f(10)?, get_f(20)?)),
+                    radius: get_f(40)?,
+                    start_angle: sa.rem_euclid(std::f64::consts::TAU),
+                    sweep_angle: sweep,
                 })
             }
-        }
-        "POINT" => Geom::Point(Point {
-            location: ocs_pt(Vec2::new(get_f(10)?, get_f(20)?)),
-            style: 0, size: 0.0,
-        }),
-        "MTEXT" => {
-            // FULL MTEXT round-trip: the string may carry \P/\C/\H/\f
-            // codes — stored verbatim (the renderer parses runs). \P →
-            // \n; DXF-escaped backslashes (\\ in the file) unescape.
-            let mut text = fields.iter().find(|(c, _)| *c == 1)
-                .map(|(_, v)| v.to_string()).unwrap_or_default();
-            // MTEXT stores \\ for a literal backslash and \P for breaks;
-            // our storage uses plain \n — convert the paragraph breaks back.
-            text = text.replace("\\P", "\n").replace("\\\\", "\\");
-            let height = get_f(40).unwrap_or(0.18);
-            let angle = get_f(50).unwrap_or(0.0).to_radians();
-            let bold = false;
-            let mut outline_only = false;
-            let mut underline = false;
-            // AutoRASM XDATA (our own export) restores the exact specs.
-            let mut font_name = String::new();
-            let mut outline_width = 0.0;
-            for (c, v) in fields {
-                match c {
-                    1001 if *v == "AutoRASM" => {}
-                    1070 => {
-                        let f = v.parse().unwrap_or(0);
-                        outline_only = (f & 2) != 0;
-                        underline = (f & 4) != 0;
-                    }
-                    1040 => outline_width = v.parse().unwrap_or(0.0),
-                    1000 => font_name = v.to_string(),
-                    _ => {}
-                }
-            }
-            Geom::Text(cad_kernel::Text {
-                position: Vec2::new(get_f(10)?, get_f(20)?),
-                height,
-                angle,
-                text,
-                h_align: cad_kernel::TextHAlign::Left,
-                v_align: cad_kernel::TextVAlign::Baseline,
-                style: cad_kernel::TextStyleTable::STANDARD,
-                font_name,
-                bold,
-                oblique: 0.0,
-                width_factor: 1.0,
-                outline_only,
-                outline_width,
-                underline,
-                list_mode: cad_kernel::TextListKind::None,
-                line_spacing: 1.5,
-            })
-        }
-        "DIMENSION" => {
-            // REAL DIMENSION entity — mirror of the writer. 70&7 = type,
-            // 10/20 = def point, 11/21 = text mid, 13/14 = extension origins,
-            // 15 = chord/arc point, 3 = style name, 1 = text override
-            // ("<>" = measured). Linear 50 = rotation (0/90 → H/V).
-            let ty = get_i(70).unwrap_or(0) & 0x0F;
-            let p10 = Vec2::new(get_f(10)?, get_f(20)?);
-            let p11 = Vec2::new(get_f(11).unwrap_or(0.0), get_f(21).unwrap_or(0.0));
-            let p13 = Vec2::new(get_f(13).unwrap_or(0.0), get_f(23).unwrap_or(0.0));
-            let p14 = Vec2::new(get_f(14).unwrap_or(0.0), get_f(24).unwrap_or(0.0));
-            let p15 = Vec2::new(get_f(15).unwrap_or(0.0), get_f(25).unwrap_or(0.0));
-            let style_name = fields.iter().find(|(c, _)| *c == 3)
-                .map(|(_, v)| v.to_string()).unwrap_or_default();
-            let style = doc.dim_styles.styles.iter()
-                .position(|st| st.name.eq_ignore_ascii_case(&style_name))
-                .unwrap_or(cad_kernel::DimStyleTable::STANDARD as usize) as u32;
-            let text_override = fields.iter().find(|(c, _)| *c == 1)
-                .map(|(_, v)| v.to_string())
-                .filter(|v| !v.is_empty() && v != "<>");
-            let kind = match ty {
-                1 => cad_kernel::DimKind::Linear {
-                    p1: p13, p2: p14, dimline_pos: p10,
-                    ortho: cad_kernel::LinearOrtho::Aligned,
-                },
-                0 => {
-                    let ang = get_f(50).unwrap_or(0.0).to_radians();
-                    let ortho = if (ang - std::f64::consts::FRAC_PI_2).abs() < 0.01 {
-                        cad_kernel::LinearOrtho::Vertical
+            "ELLIPSE" => {
+                // 10/20 = center, 11/21 = major-axis vector (relative to center),
+                // 40 = ratio, 41 = start param, 42 = end param.
+                let center = Vec2::new(get_f(10)?, get_f(20)?);
+                let major = Vec2::new(get_f(11)?, get_f(21)?);
+                let ratio = get_f(40)?;
+                let el = Ellipse {
+                    center,
+                    major,
+                    ratio,
+                };
+                let sp = get_f(41).unwrap_or(0.0);
+                let ep = get_f(42).unwrap_or(std::f64::consts::TAU);
+                // Full ellipse <-> partial: if start ~= 0 and end ~= TAU, treat as full.
+                if (sp.abs() < 1e-9) && ((ep - std::f64::consts::TAU).abs() < 1e-9) {
+                    Geom::Ellipse(el)
+                } else {
+                    let sweep = (ep - sp).rem_euclid(std::f64::consts::TAU);
+                    let sweep = if sweep < 1e-9 {
+                        std::f64::consts::TAU
                     } else {
-                        cad_kernel::LinearOrtho::Horizontal
+                        sweep
                     };
-                    cad_kernel::DimKind::Linear {
-                        p1: p13, p2: p14, dimline_pos: p10, ortho,
-                    }
-                }
-                2 => cad_kernel::DimKind::Angular {
-                    vertex: p10, p1: p13, p2: p14, arc_pos: p15,
-                },
-                3 => cad_kernel::DimKind::Diameter {
-                    center: p10, on_circle: p15, leader_end: p11,
-                },
-                4 => cad_kernel::DimKind::Radius {
-                    center: p10, on_circle: p15, leader_end: p11,
-                },
-                8 => {
-                    // Arc-length: 10 = center, 40 = radius, 13/14 = arc
-                    // start/end points (start_angle/sweep derived).
-                    let center = p10;
-                    let radius = get_f(41).or_else(|| get_f(40)).unwrap_or(1.0);
-                    let s13 = Vec2::new(get_f(13).unwrap_or(center.x),
-                                        get_f(23).unwrap_or(center.y));
-                    let s14 = Vec2::new(get_f(14).unwrap_or(s13.x),
-                                        get_f(24).unwrap_or(s13.y));
-                    let start_angle = (s13 - center).angle();
-                    let mut sweep = (s14 - center).angle() - start_angle;
-                    if sweep < 0.0 { sweep += std::f64::consts::TAU; }
-                    cad_kernel::DimKind::ArcLen {
-                        center, radius, start_angle, sweep, leader_end: p11,
-                    }
-                }
-                6 => cad_kernel::DimKind::Ordinate {
-                    datum: Vec2::new(get_f(13).unwrap_or(0.0), get_f(23).unwrap_or(0.0)),
-                    point: p10, leader_end: p11,
-                    is_x: (get_i(70).unwrap_or(0) & 64) != 0,
-                },
-                _ => return None,
-            };
-            Geom::Dimension(cad_kernel::Dim {
-                kind, style, text_override,
-            })
-        }
-        "TEXT" => {
-            // Mirror the TEXT writer (~write side): 10/20 = insertion point,
-            // 40 = height, 1 = the string, 50 = rotation DEGREES, 72 = HAlign
-            // (0/1/2 = Left/Center/Right). Code 1 is textual, so read it straight
-            // off `fields` (get_f/get_i are numeric-only). Text style (code 7) and
-            // vertical alignment aren't emitted by the writer → default STANDARD /
-            // Baseline. NOTE: an exported DIMENSION is written as a TEXT entity, so
-            // it round-trips back here as a Text dobject carrying its label — the
-            // intended v1 behaviour (no Dimension reconstruction in this slice).
-            let text = fields.iter().find(|(c, _)| *c == 1)
-                .map(|(_, v)| v.to_string()).unwrap_or_default();
-            let h_align = match get_i(72).unwrap_or(0) {
-                1 => cad_kernel::TextHAlign::Center,
-                2 => cad_kernel::TextHAlign::Right,
-                _ => cad_kernel::TextHAlign::Left,
-            };
-            // Standard 51/41 + AutoRASM XDATA (1070 flags / 1040 width / 1000 font).
-            let flags = get_i(1070).unwrap_or(0);
-            let font_name = fields.iter().find(|(c, _)| *c == 1000)
-                .map(|(_, v)| v.to_string()).unwrap_or_default();
-            Geom::Text(cad_kernel::Text {
-                position: Vec2::new(get_f(10)?, get_f(20)?),
-                height:   get_f(40)?,
-                angle:    get_f(50).unwrap_or(0.0).to_radians(),
-                text,
-                h_align,
-                v_align:  cad_kernel::TextVAlign::Baseline,
-                style:    cad_kernel::TextStyleTable::STANDARD,
-                oblique:       get_f(51).unwrap_or(0.0).to_radians(),
-                width_factor:  get_f(41).unwrap_or(1.0),
-                bold:          flags & 1 != 0,
-                outline_only:  flags & 2 != 0,
-                outline_width: get_f(1040).unwrap_or(0.0),
-                underline:     flags & 4 != 0,
-                font_name,
-                // A DXF TEXT is a single line — paragraphs export as stacked
-                // TEXT records, so imports come back as single-line, no list.
-                list_mode:     cad_kernel::TextListKind::None,
-                line_spacing:  1.5,
-            })
-        }
-        "SPLINE" => {
-            // Round-trip mirror of the writer. Walk fields in order (like
-            // LWPOLYLINE): 71 = degree, 10/20 = control points (paired, in order),
-            // 41 = weights (in control-point order). Code 40 (knots) is IGNORED —
-            // the Spline constructor rebuilds a clamped-uniform knot vector, so a
-            // foreign non-uniform spline re-fits to clamped-uniform (v1 interop
-            // debt). Defensive: the constructors PANIC on degenerate input.
-            let Some(degree) = get_i(71) else { return None; };   // degree missing
-            let degree = degree as usize;
-            let mut ctrl: Vec<Vec2> = Vec::new();
-            let mut weights: Vec<f64> = Vec::new();
-            let mut cur: Option<Vec2> = None;
-            for (c, v) in fields {
-                match c {
-                    10 => {
-                        if let Some(p) = cur.take() { ctrl.push(p); }
-                        cur = Some(Vec2 { x: v.parse().unwrap_or(0.0), y: 0.0 });
-                    }
-                    20 => { if let Some(p) = cur.as_mut() { p.y = v.parse().unwrap_or(0.0); } }
-                    41 => weights.push(v.parse().unwrap_or(1.0)),
-                    _  => {}   // 40 (knots) and everything else ignored
+                    Geom::EllipseArc(EllipseArc {
+                        ellipse: el,
+                        start_param: sp.rem_euclid(std::f64::consts::TAU),
+                        sweep_param: sweep,
+                    })
                 }
             }
-            if let Some(p) = cur.take() { ctrl.push(p); }
-            // Guard the panicking constructors: need ctrl.len() > degree (and
-            // non-empty). A negative/huge degree fails this too.
-            if ctrl.is_empty() || ctrl.len() <= degree { return None; }
-            let spline = if weights.len() == ctrl.len() {
-                cad_kernel::Spline::new(degree, ctrl, weights)          // rational
-            } else {
-                cad_kernel::Spline::new_bspline(degree, ctrl)           // non-rational
-            };
-            Geom::Spline(spline)
-        }
-        "LWPOLYLINE" => {
-            let count = get_i(90).unwrap_or(0) as usize;
-            let flags = get_i(70).unwrap_or(0);
-            let closed = (flags & 0x01) != 0;
-            // For LWPOLYLINE, vertex coords are interleaved 10/20 group codes
-            // (and 42 for bulge per vertex). We walk fields in order and pair them.
-            let mut vertices: Vec<PolyVertex> = Vec::with_capacity(count);
-            let mut vwidths: Vec<(f64, f64)> = Vec::with_capacity(count);
-            let mut cur: Option<Vec2> = None;
-            let mut cur_bulge = 0.0_f64;
-            let mut cur_sw = 0.0_f64;   // 40 = start width of segment at this vertex
-            let mut cur_ew = 0.0_f64;   // 41 = end width
-            let mut const_w = 0.0_f64;  // 43 = constant width for the whole pline
-            for (c, v) in fields {
-                match c {
-                    10 => {
-                        if let Some(p) = cur.take() {
-                            vertices.push(PolyVertex { pos: ocs_pt(p), bulge: cur_bulge });
-                            vwidths.push((cur_sw, cur_ew));
-                            cur_bulge = 0.0; cur_sw = 0.0; cur_ew = 0.0;
+            "POINT" => Geom::Point(Point {
+                location: ocs_pt(Vec2::new(get_f(10)?, get_f(20)?)),
+                style: 0,
+                size: 0.0,
+            }),
+            "MTEXT" => {
+                // FULL MTEXT round-trip: the string may carry \P/\C/\H/\f
+                // codes — stored verbatim (the renderer parses runs). \P →
+                // \n; DXF-escaped backslashes (\\ in the file) unescape.
+                let mut text = fields
+                    .iter()
+                    .find(|(c, _)| *c == 1)
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_default();
+                // MTEXT stores \\ for a literal backslash and \P for breaks;
+                // our storage uses plain \n — convert the paragraph breaks back.
+                text = text.replace("\\P", "\n").replace("\\\\", "\\");
+                let height = get_f(40).unwrap_or(0.18);
+                let angle = get_f(50).unwrap_or(0.0).to_radians();
+                let bold = false;
+                let mut outline_only = false;
+                let mut underline = false;
+                // AutoRASM XDATA (our own export) restores the exact specs.
+                let mut font_name = String::new();
+                let mut outline_width = 0.0;
+                for (c, v) in fields {
+                    match c {
+                        1001 if *v == "AutoRASM" => {}
+                        1070 => {
+                            let f = v.parse().unwrap_or(0);
+                            outline_only = (f & 2) != 0;
+                            underline = (f & 4) != 0;
                         }
-                        cur = Some(Vec2 { x: v.parse().unwrap_or(0.0), y: 0.0 });
+                        1040 => outline_width = v.parse().unwrap_or(0.0),
+                        1000 => font_name = v.to_string(),
+                        _ => {}
                     }
-                    20 => {
-                        if let Some(p) = cur.as_mut() {
-                            p.y = v.parse().unwrap_or(0.0);
+                }
+                Geom::Text(cad_kernel::Text {
+                    position: Vec2::new(get_f(10)?, get_f(20)?),
+                    height,
+                    angle,
+                    text,
+                    h_align: cad_kernel::TextHAlign::Left,
+                    v_align: cad_kernel::TextVAlign::Baseline,
+                    style: cad_kernel::TextStyleTable::STANDARD,
+                    font_name,
+                    bold,
+                    oblique: 0.0,
+                    width_factor: 1.0,
+                    outline_only,
+                    outline_width,
+                    underline,
+                    list_mode: cad_kernel::TextListKind::None,
+                    line_spacing: 1.5,
+                })
+            }
+            "DIMENSION" => {
+                // REAL DIMENSION entity — mirror of the writer. 70&7 = type,
+                // 10/20 = def point, 11/21 = text mid, 13/14 = extension origins,
+                // 15 = chord/arc point, 3 = style name, 1 = text override
+                // ("<>" = measured). Linear 50 = rotation (0/90 → H/V).
+                let ty = get_i(70).unwrap_or(0) & 0x0F;
+                let p10 = Vec2::new(get_f(10)?, get_f(20)?);
+                let p11 = Vec2::new(get_f(11).unwrap_or(0.0), get_f(21).unwrap_or(0.0));
+                let p13 = Vec2::new(get_f(13).unwrap_or(0.0), get_f(23).unwrap_or(0.0));
+                let p14 = Vec2::new(get_f(14).unwrap_or(0.0), get_f(24).unwrap_or(0.0));
+                let p15 = Vec2::new(get_f(15).unwrap_or(0.0), get_f(25).unwrap_or(0.0));
+                let style_name = fields
+                    .iter()
+                    .find(|(c, _)| *c == 3)
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_default();
+                let style = doc
+                    .dim_styles
+                    .styles
+                    .iter()
+                    .position(|st| st.name.eq_ignore_ascii_case(&style_name))
+                    .unwrap_or(cad_kernel::DimStyleTable::STANDARD as usize)
+                    as u32;
+                let text_override = fields
+                    .iter()
+                    .find(|(c, _)| *c == 1)
+                    .map(|(_, v)| v.to_string())
+                    .filter(|v| !v.is_empty() && v != "<>");
+                let kind = match ty {
+                    1 => cad_kernel::DimKind::Linear {
+                        p1: p13,
+                        p2: p14,
+                        dimline_pos: p10,
+                        ortho: cad_kernel::LinearOrtho::Aligned,
+                    },
+                    0 => {
+                        let ang = get_f(50).unwrap_or(0.0).to_radians();
+                        let ortho = if (ang - std::f64::consts::FRAC_PI_2).abs() < 0.01 {
+                            cad_kernel::LinearOrtho::Vertical
+                        } else {
+                            cad_kernel::LinearOrtho::Horizontal
+                        };
+                        cad_kernel::DimKind::Linear {
+                            p1: p13,
+                            p2: p14,
+                            dimline_pos: p10,
+                            ortho,
                         }
                     }
-                    40 => cur_sw = v.parse().unwrap_or(0.0),
-                    41 => cur_ew = v.parse().unwrap_or(0.0),
-                    42 => {
-                        let b = v.parse().unwrap_or(0.0);
-                        // A MIRROR FLIPS THE ARC'S BOW DIRECTION: bulge is
-                        // signed CCW-positive, and under a −Z extrusion the
-                        // vertex order reverses, so the same bulge value would
-                        // arc into the wall instead of out of it.
-                        cur_bulge = if flip { -b } else { b };
-                    }
-                    43 => const_w = v.parse().unwrap_or(0.0),
-                    _ => {}
-                }
-            }
-            if let Some(p) = cur.take() {
-                vertices.push(PolyVertex { pos: ocs_pt(p), bulge: cur_bulge });
-                vwidths.push((cur_sw, cur_ew));
-            }
-            if vertices.is_empty() { return None; }
-            // Map to per-SEGMENT widths (n-1 open, n closed). Prefer per-vertex
-            // 40/41; fall back to constant width 43; empty when all zero.
-            let seg_count = if closed { vertices.len() } else { vertices.len().saturating_sub(1) };
-            vwidths.truncate(seg_count);
-            let widths = if vwidths.iter().any(|&(a, b)| a.abs() > 1e-12 || b.abs() > 1e-12) {
-                vwidths
-            } else if const_w.abs() > 1e-12 {
-                vec![(const_w, const_w); seg_count]
-            } else {
-                Vec::new()
-            };
-            Geom::Polyline(Polyline { vertices, closed, widths })
-        }
-        "INSERT" => {
-            // Block reference: 2 = block name, 10/20 = insertion point,
-            // 41/42 = x/y scale, 50 = rotation (degrees). MINSERT arrays
-            // (70/71) ignored. A negative axis scale = a MIRROR — encode it as
-            // a positive magnitude + mirror_x + a rotation adjustment so the
-            // |sx|==|sy| (similarity) case (the common furniture mirror) is
-            // exact. Non-uniform |sx|≠|sy| isn't modelled (uses |41|).
-            let bname = fields.iter().find(|(c, _)| *c == 2).map(|(_, v)| v.to_string())?;
-            let block = doc.blocks.find(&bname)?;   // unknown/skipped block → drop
-            let sx = get_f(41).unwrap_or(1.0);
-            let sy = get_f(42).unwrap_or(1.0);
-            // Factor signs out into mirror_x + a π rotation; the per-axis
-            // MAGNITUDES go to scale / scale_y (non-uniform → ellipses).
-            let mirror_x = (sx < 0.0) != (sy < 0.0);
-            let extra = if sy < 0.0 { std::f64::consts::PI } else { 0.0 };
-            Geom::BlockRef(BlockRef {
-                block,
-                insert:   ocs_pt(Vec2::new(get_f(10)?, get_f(20)?)),
-                scale:    sx.abs().max(1e-9),
-                scale_y:  sy.abs().max(1e-9),
-                rotation: get_f(50).unwrap_or(0.0).to_radians() + extra,
-                mirror_x,
-                param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
-                attr_values: Vec::new(),
-            })
-        }
-        "LEADER" => {
-            // Mirror of the writer: 71 arrow flag, 72 path type, 73 vertex
-            // count, then one 10/20/30 per vertex. The annotation TEXT that
-            // follows (a separate TEXT entity) becomes the label position.
-            let arrow = get_i(71).unwrap_or(1) != 0;
-            let n = get_i(73).unwrap_or(0).max(0) as usize;
-            let mut pts: Vec<Vec2> = Vec::with_capacity(n);
-            let mut pi = 0usize;
-            while pi < n {
-                let x = fields.iter().filter(|(c, _)| *c == 10).nth(pi)
-                    .and_then(|(_, v)| v.parse::<f64>().ok());
-                let y = fields.iter().filter(|(c, _)| *c == 20).nth(pi)
-                    .and_then(|(_, v)| v.parse::<f64>().ok());
-                match (x, y) {
-                    (Some(x), Some(y)) => pts.push(Vec2::new(x, y)),
-                    _ => break,
-                }
-                pi += 1;
-            }
-            if pts.len() < 2 { return None; }
-            let label = cad_kernel::Text {
-                position: *pts.last().unwrap(),
-                height: 0.25,
-                angle: 0.0,
-                text: String::new(),
-                h_align: cad_kernel::TextHAlign::Left,
-                v_align: cad_kernel::TextVAlign::Baseline,
-                style: cad_kernel::TextStyleTable::STANDARD,
-                font_name: String::new(), bold: false, oblique: 0.0,
-                width_factor: 1.0, outline_only: false, outline_width: 0.0,
-                underline: false, list_mode: cad_kernel::TextListKind::None,
-                line_spacing: 1.5,
-            };
-            Geom::Leader(cad_kernel::Leader { pts, label, arrow })
-        }
-        "ATTDEF" => {
-            // Mirror of the writer: 2 = tag, 3 = prompt, 1 = default,
-            // 10/20 = position, 40 = height, 50 = angle.
-            let tag = fields.iter().find(|(c, _)| *c == 2)
-                .map(|(_, v)| v.to_string()).unwrap_or_default();
-            let prompt = fields.iter().find(|(c, _)| *c == 3)
-                .map(|(_, v)| v.to_string()).unwrap_or_default();
-            let default = fields.iter().find(|(c, _)| *c == 1)
-                .map(|(_, v)| v.to_string()).unwrap_or_default();
-            Geom::AttrDef(cad_kernel::AttrDef {
-                tag,
-                prompt,
-                default,
-                position: Vec2::new(get_f(10)?, get_f(20)?),
-                height: get_f(40).unwrap_or(0.25),
-                angle: get_f(50).unwrap_or(0.0).to_radians(),
-                style: cad_kernel::TextStyleTable::STANDARD,
-                visible: true,
-            })
-        }
-        "XLINE" => {
-            // 10/20 base point, 11/21 direction vector.
-            let base = Vec2::new(get_f(10)?, get_f(20)?);
-            let dir = Vec2::new(
-                get_f(11).unwrap_or(1.0),
-                get_f(21).unwrap_or(0.0),
-            );
-            Geom::Xline(cad_kernel::Xline::new(base, dir))
-        }
-        "RAY" => {
-            let base = Vec2::new(get_f(10)?, get_f(20)?);
-            let dir = Vec2::new(
-                get_f(11).unwrap_or(1.0),
-                get_f(21).unwrap_or(0.0),
-            );
-            Geom::Ray(cad_kernel::Ray::new(base, dir))
-        }
-        "CENTERMARK" => {
-            // Mirror of the writer: 10/20 center, 40 arm size, 50 rotation.
-            Geom::CenterMark(cad_kernel::CenterMark {
-                center: Vec2::new(get_f(10)?, get_f(20)?),
-                size: get_f(40).unwrap_or(0.25),
-                rotation: get_f(50).unwrap_or(0.0).to_radians(),
-            })
-        }
-        "HATCH" => {
-            // then per path: 92 flags, 72 has_bulge, 73 closed, 93 vertex
-            // count, 10/20 (+42 bulge) vertices, 97 source count; then 75
-            // style, 76 type, 98 seed count. Our `Hatch` stores boundary
-            // HANDLES, not vertices — so each polyline path is materialized
-            // as a closed Polyline satellite dobject in the same container,
-            // and the hatch references it by handle (matches how the app
-            // represents hatches: boundary dobjects + handle refs).
-            let pattern_name = fields.iter().find(|(c, _)| *c == 2)
-                .map(|(_, v)| v.to_string()).unwrap_or_default();
-            let mut paths: Vec<Vec<PolyVertex>> = Vec::new();
-            let mut cur: Option<Vec<PolyVertex>> = None;
-            let mut accepting = false;   // only polyline paths (92 bit 1)
-            let mut past_seed = false;   // 98 seen → 10/20 are seed points
-            for (c, v) in fields {
-                match c {
-                    92 => {
-                        if let Some(p) = cur.take() {
-                            if accepting && p.len() >= 3 { paths.push(p); }
+                    2 => cad_kernel::DimKind::Angular {
+                        vertex: p10,
+                        p1: p13,
+                        p2: p14,
+                        arc_pos: p15,
+                    },
+                    3 => cad_kernel::DimKind::Diameter {
+                        center: p10,
+                        on_circle: p15,
+                        leader_end: p11,
+                    },
+                    4 => cad_kernel::DimKind::Radius {
+                        center: p10,
+                        on_circle: p15,
+                        leader_end: p11,
+                    },
+                    8 => {
+                        // Arc-length: 10 = center, 40 = radius, 13/14 = arc
+                        // start/end points (start_angle/sweep derived).
+                        let center = p10;
+                        let radius = get_f(41).or_else(|| get_f(40)).unwrap_or(1.0);
+                        let s13 =
+                            Vec2::new(get_f(13).unwrap_or(center.x), get_f(23).unwrap_or(center.y));
+                        let s14 = Vec2::new(get_f(14).unwrap_or(s13.x), get_f(24).unwrap_or(s13.y));
+                        let start_angle = (s13 - center).angle();
+                        let mut sweep = (s14 - center).angle() - start_angle;
+                        if sweep < 0.0 {
+                            sweep += std::f64::consts::TAU;
                         }
-                        accepting = (v.parse::<i32>().unwrap_or(0) & 2) != 0;
-                        cur = if accepting { Some(Vec::new()) } else { None };
+                        cad_kernel::DimKind::ArcLen {
+                            center,
+                            radius,
+                            start_angle,
+                            sweep,
+                            leader_end: p11,
+                        }
                     }
-                    10 => {
-                        if accepting && !past_seed {
+                    6 => cad_kernel::DimKind::Ordinate {
+                        datum: Vec2::new(get_f(13).unwrap_or(0.0), get_f(23).unwrap_or(0.0)),
+                        point: p10,
+                        leader_end: p11,
+                        is_x: (get_i(70).unwrap_or(0) & 64) != 0,
+                    },
+                    _ => return None,
+                };
+                Geom::Dimension(cad_kernel::Dim {
+                    kind,
+                    style,
+                    text_override,
+                })
+            }
+            "TEXT" => {
+                // Mirror the TEXT writer (~write side): 10/20 = insertion point,
+                // 40 = height, 1 = the string, 50 = rotation DEGREES, 72 = HAlign
+                // (0/1/2 = Left/Center/Right). Code 1 is textual, so read it straight
+                // off `fields` (get_f/get_i are numeric-only). Text style (code 7) and
+                // vertical alignment aren't emitted by the writer → default STANDARD /
+                // Baseline. NOTE: an exported DIMENSION is written as a TEXT entity, so
+                // it round-trips back here as a Text dobject carrying its label — the
+                // intended v1 behaviour (no Dimension reconstruction in this slice).
+                let text = fields
+                    .iter()
+                    .find(|(c, _)| *c == 1)
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_default();
+                let h_align = match get_i(72).unwrap_or(0) {
+                    1 => cad_kernel::TextHAlign::Center,
+                    2 => cad_kernel::TextHAlign::Right,
+                    _ => cad_kernel::TextHAlign::Left,
+                };
+                // Standard 51/41 + AutoRASM XDATA (1070 flags / 1040 width / 1000 font).
+                let flags = get_i(1070).unwrap_or(0);
+                let font_name = fields
+                    .iter()
+                    .find(|(c, _)| *c == 1000)
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_default();
+                Geom::Text(cad_kernel::Text {
+                    position: Vec2::new(get_f(10)?, get_f(20)?),
+                    height: get_f(40)?,
+                    angle: get_f(50).unwrap_or(0.0).to_radians(),
+                    text,
+                    h_align,
+                    v_align: cad_kernel::TextVAlign::Baseline,
+                    style: cad_kernel::TextStyleTable::STANDARD,
+                    oblique: get_f(51).unwrap_or(0.0).to_radians(),
+                    width_factor: get_f(41).unwrap_or(1.0),
+                    bold: flags & 1 != 0,
+                    outline_only: flags & 2 != 0,
+                    outline_width: get_f(1040).unwrap_or(0.0),
+                    underline: flags & 4 != 0,
+                    font_name,
+                    // A DXF TEXT is a single line — paragraphs export as stacked
+                    // TEXT records, so imports come back as single-line, no list.
+                    list_mode: cad_kernel::TextListKind::None,
+                    line_spacing: 1.5,
+                })
+            }
+            "SPLINE" => {
+                // Round-trip mirror of the writer. Walk fields in order (like
+                // LWPOLYLINE): 71 = degree, 10/20 = control points (paired, in order),
+                // 41 = weights (in control-point order). Code 40 (knots) is IGNORED —
+                // the Spline constructor rebuilds a clamped-uniform knot vector, so a
+                // foreign non-uniform spline re-fits to clamped-uniform (v1 interop
+                // debt). Defensive: the constructors PANIC on degenerate input.
+                let Some(degree) = get_i(71) else {
+                    return None;
+                }; // degree missing
+                let degree = degree as usize;
+                let mut ctrl: Vec<Vec2> = Vec::new();
+                let mut weights: Vec<f64> = Vec::new();
+                let mut cur: Option<Vec2> = None;
+                for (c, v) in fields {
+                    match c {
+                        10 => {
+                            if let Some(p) = cur.take() {
+                                ctrl.push(p);
+                            }
+                            cur = Some(Vec2 {
+                                x: v.parse().unwrap_or(0.0),
+                                y: 0.0,
+                            });
+                        }
+                        20 => {
                             if let Some(p) = cur.as_mut() {
-                                p.push(PolyVertex {
-                                    pos: Vec2 { x: v.parse().unwrap_or(0.0), y: 0.0 },
-                                    bulge: 0.0,
+                                p.y = v.parse().unwrap_or(0.0);
+                            }
+                        }
+                        41 => weights.push(v.parse().unwrap_or(1.0)),
+                        _ => {} // 40 (knots) and everything else ignored
+                    }
+                }
+                if let Some(p) = cur.take() {
+                    ctrl.push(p);
+                }
+                // Guard the panicking constructors: need ctrl.len() > degree (and
+                // non-empty). A negative/huge degree fails this too.
+                if ctrl.is_empty() || ctrl.len() <= degree {
+                    return None;
+                }
+                let spline = if weights.len() == ctrl.len() {
+                    cad_kernel::Spline::new(degree, ctrl, weights) // rational
+                } else {
+                    cad_kernel::Spline::new_bspline(degree, ctrl) // non-rational
+                };
+                Geom::Spline(spline)
+            }
+            "LWPOLYLINE" => {
+                let count = get_i(90).unwrap_or(0) as usize;
+                let flags = get_i(70).unwrap_or(0);
+                let closed = (flags & 0x01) != 0;
+                // For LWPOLYLINE, vertex coords are interleaved 10/20 group codes
+                // (and 42 for bulge per vertex). We walk fields in order and pair them.
+                let mut vertices: Vec<PolyVertex> = Vec::with_capacity(count);
+                let mut vwidths: Vec<(f64, f64)> = Vec::with_capacity(count);
+                let mut cur: Option<Vec2> = None;
+                let mut cur_bulge = 0.0_f64;
+                let mut cur_sw = 0.0_f64; // 40 = start width of segment at this vertex
+                let mut cur_ew = 0.0_f64; // 41 = end width
+                let mut const_w = 0.0_f64; // 43 = constant width for the whole pline
+                for (c, v) in fields {
+                    match c {
+                        10 => {
+                            if let Some(p) = cur.take() {
+                                vertices.push(PolyVertex {
+                                    pos: ocs_pt(p),
+                                    bulge: cur_bulge,
                                 });
+                                vwidths.push((cur_sw, cur_ew));
+                                cur_bulge = 0.0;
+                                cur_sw = 0.0;
+                                cur_ew = 0.0;
+                            }
+                            cur = Some(Vec2 {
+                                x: v.parse().unwrap_or(0.0),
+                                y: 0.0,
+                            });
+                        }
+                        20 => {
+                            if let Some(p) = cur.as_mut() {
+                                p.y = v.parse().unwrap_or(0.0);
                             }
                         }
+                        40 => cur_sw = v.parse().unwrap_or(0.0),
+                        41 => cur_ew = v.parse().unwrap_or(0.0),
+                        42 => {
+                            let b = v.parse().unwrap_or(0.0);
+                            // A MIRROR FLIPS THE ARC'S BOW DIRECTION: bulge is
+                            // signed CCW-positive, and under a −Z extrusion the
+                            // vertex order reverses, so the same bulge value would
+                            // arc into the wall instead of out of it.
+                            cur_bulge = if flip { -b } else { b };
+                        }
+                        43 => const_w = v.parse().unwrap_or(0.0),
+                        _ => {}
                     }
-                    20 => {
-                        if accepting && !past_seed {
-                            if let Some(p) = cur.as_mut() {
-                                if let Some(last) = p.last_mut() {
-                                    last.pos.y = v.parse().unwrap_or(0.0);
+                }
+                if let Some(p) = cur.take() {
+                    vertices.push(PolyVertex {
+                        pos: ocs_pt(p),
+                        bulge: cur_bulge,
+                    });
+                    vwidths.push((cur_sw, cur_ew));
+                }
+                if vertices.is_empty() {
+                    return None;
+                }
+                // Map to per-SEGMENT widths (n-1 open, n closed). Prefer per-vertex
+                // 40/41; fall back to constant width 43; empty when all zero.
+                let seg_count = if closed {
+                    vertices.len()
+                } else {
+                    vertices.len().saturating_sub(1)
+                };
+                vwidths.truncate(seg_count);
+                let widths = if vwidths
+                    .iter()
+                    .any(|&(a, b)| a.abs() > 1e-12 || b.abs() > 1e-12)
+                {
+                    vwidths
+                } else if const_w.abs() > 1e-12 {
+                    vec![(const_w, const_w); seg_count]
+                } else {
+                    Vec::new()
+                };
+                Geom::Polyline(Polyline {
+                    vertices,
+                    closed,
+                    widths,
+                })
+            }
+            "INSERT" => {
+                // Block reference: 2 = block name, 10/20 = insertion point,
+                // 41/42 = x/y scale, 50 = rotation (degrees). MINSERT arrays
+                // (70/71) ignored. A negative axis scale = a MIRROR — encode it as
+                // a positive magnitude + mirror_x + a rotation adjustment so the
+                // |sx|==|sy| (similarity) case (the common furniture mirror) is
+                // exact. Non-uniform |sx|≠|sy| isn't modelled (uses |41|).
+                let bname = fields
+                    .iter()
+                    .find(|(c, _)| *c == 2)
+                    .map(|(_, v)| v.to_string())?;
+                let block = doc.blocks.find(&bname)?; // unknown/skipped block → drop
+                let sx = get_f(41).unwrap_or(1.0);
+                let sy = get_f(42).unwrap_or(1.0);
+                // Factor signs out into mirror_x + a π rotation; the per-axis
+                // MAGNITUDES go to scale / scale_y (non-uniform → ellipses).
+                let mirror_x = (sx < 0.0) != (sy < 0.0);
+                let extra = if sy < 0.0 { std::f64::consts::PI } else { 0.0 };
+                Geom::BlockRef(BlockRef {
+                    block,
+                    insert: ocs_pt(Vec2::new(get_f(10)?, get_f(20)?)),
+                    scale: sx.abs().max(1e-9),
+                    scale_y: sy.abs().max(1e-9),
+                    rotation: get_f(50).unwrap_or(0.0).to_radians() + extra,
+                    mirror_x,
+                    param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+                    attr_values: Vec::new(),
+                })
+            }
+            "LEADER" => {
+                // Mirror of the writer: 71 arrow flag, 72 path type, 73 vertex
+                // count, then one 10/20/30 per vertex. The annotation TEXT that
+                // follows (a separate TEXT entity) becomes the label position.
+                let arrow = get_i(71).unwrap_or(1) != 0;
+                let n = get_i(73).unwrap_or(0).max(0) as usize;
+                let mut pts: Vec<Vec2> = Vec::with_capacity(n);
+                let mut pi = 0usize;
+                while pi < n {
+                    let x = fields
+                        .iter()
+                        .filter(|(c, _)| *c == 10)
+                        .nth(pi)
+                        .and_then(|(_, v)| v.parse::<f64>().ok());
+                    let y = fields
+                        .iter()
+                        .filter(|(c, _)| *c == 20)
+                        .nth(pi)
+                        .and_then(|(_, v)| v.parse::<f64>().ok());
+                    match (x, y) {
+                        (Some(x), Some(y)) => pts.push(Vec2::new(x, y)),
+                        _ => break,
+                    }
+                    pi += 1;
+                }
+                if pts.len() < 2 {
+                    return None;
+                }
+                let label = cad_kernel::Text {
+                    position: *pts.last().unwrap(),
+                    height: 0.25,
+                    angle: 0.0,
+                    text: String::new(),
+                    h_align: cad_kernel::TextHAlign::Left,
+                    v_align: cad_kernel::TextVAlign::Baseline,
+                    style: cad_kernel::TextStyleTable::STANDARD,
+                    font_name: String::new(),
+                    bold: false,
+                    oblique: 0.0,
+                    width_factor: 1.0,
+                    outline_only: false,
+                    outline_width: 0.0,
+                    underline: false,
+                    list_mode: cad_kernel::TextListKind::None,
+                    line_spacing: 1.5,
+                };
+                Geom::Leader(cad_kernel::Leader { pts, label, arrow })
+            }
+            "ATTDEF" => {
+                // Mirror of the writer: 2 = tag, 3 = prompt, 1 = default,
+                // 10/20 = position, 40 = height, 50 = angle.
+                let tag = fields
+                    .iter()
+                    .find(|(c, _)| *c == 2)
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_default();
+                let prompt = fields
+                    .iter()
+                    .find(|(c, _)| *c == 3)
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_default();
+                let default = fields
+                    .iter()
+                    .find(|(c, _)| *c == 1)
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_default();
+                Geom::AttrDef(cad_kernel::AttrDef {
+                    tag,
+                    prompt,
+                    default,
+                    position: Vec2::new(get_f(10)?, get_f(20)?),
+                    height: get_f(40).unwrap_or(0.25),
+                    angle: get_f(50).unwrap_or(0.0).to_radians(),
+                    style: cad_kernel::TextStyleTable::STANDARD,
+                    visible: true,
+                })
+            }
+            "XLINE" => {
+                // 10/20 base point, 11/21 direction vector.
+                let base = Vec2::new(get_f(10)?, get_f(20)?);
+                let dir = Vec2::new(get_f(11).unwrap_or(1.0), get_f(21).unwrap_or(0.0));
+                Geom::Xline(cad_kernel::Xline::new(base, dir))
+            }
+            "RAY" => {
+                let base = Vec2::new(get_f(10)?, get_f(20)?);
+                let dir = Vec2::new(get_f(11).unwrap_or(1.0), get_f(21).unwrap_or(0.0));
+                Geom::Ray(cad_kernel::Ray::new(base, dir))
+            }
+            "CENTERMARK" => {
+                // Mirror of the writer: 10/20 center, 40 arm size, 50 rotation.
+                Geom::CenterMark(cad_kernel::CenterMark {
+                    center: Vec2::new(get_f(10)?, get_f(20)?),
+                    size: get_f(40).unwrap_or(0.25),
+                    rotation: get_f(50).unwrap_or(0.0).to_radians(),
+                })
+            }
+            "HATCH" => {
+                // then per path: 92 flags, 72 has_bulge, 73 closed, 93 vertex
+                // count, 10/20 (+42 bulge) vertices, 97 source count; then 75
+                // style, 76 type, 98 seed count. Our `Hatch` stores boundary
+                // HANDLES, not vertices — so each polyline path is materialized
+                // as a closed Polyline satellite dobject in the same container,
+                // and the hatch references it by handle (matches how the app
+                // represents hatches: boundary dobjects + handle refs).
+                let pattern_name = fields
+                    .iter()
+                    .find(|(c, _)| *c == 2)
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_default();
+                let mut paths: Vec<Vec<PolyVertex>> = Vec::new();
+                let mut cur: Option<Vec<PolyVertex>> = None;
+                let mut accepting = false; // only polyline paths (92 bit 1)
+                let mut past_seed = false; // 98 seen → 10/20 are seed points
+                for (c, v) in fields {
+                    match c {
+                        92 => {
+                            if let Some(p) = cur.take() {
+                                if accepting && p.len() >= 3 {
+                                    paths.push(p);
+                                }
+                            }
+                            accepting = (v.parse::<i32>().unwrap_or(0) & 2) != 0;
+                            cur = if accepting { Some(Vec::new()) } else { None };
+                        }
+                        10 => {
+                            if accepting && !past_seed {
+                                if let Some(p) = cur.as_mut() {
+                                    p.push(PolyVertex {
+                                        pos: Vec2 {
+                                            x: v.parse().unwrap_or(0.0),
+                                            y: 0.0,
+                                        },
+                                        bulge: 0.0,
+                                    });
                                 }
                             }
                         }
-                    }
-                    42 => {
-                        if accepting && !past_seed {
-                            if let Some(p) = cur.as_mut() {
-                                if let Some(last) = p.last_mut() {
-                                    last.bulge = v.parse().unwrap_or(0.0);
+                        20 => {
+                            if accepting && !past_seed {
+                                if let Some(p) = cur.as_mut() {
+                                    if let Some(last) = p.last_mut() {
+                                        last.pos.y = v.parse().unwrap_or(0.0);
+                                    }
                                 }
                             }
                         }
-                    }
-                    97 => {
-                        if let Some(p) = cur.take() {
-                            if accepting && p.len() >= 3 { paths.push(p); }
+                        42 => {
+                            if accepting && !past_seed {
+                                if let Some(p) = cur.as_mut() {
+                                    if let Some(last) = p.last_mut() {
+                                        last.bulge = v.parse().unwrap_or(0.0);
+                                    }
+                                }
+                            }
                         }
+                        97 => {
+                            if let Some(p) = cur.take() {
+                                if accepting && p.len() >= 3 {
+                                    paths.push(p);
+                                }
+                            }
+                        }
+                        98 => past_seed = true,
+                        _ => {}
                     }
-                    98 => past_seed = true,
-                    _ => {}
                 }
-            }
-            if let Some(p) = cur.take() {
-                if accepting && p.len() >= 3 { paths.push(p); }
-            }
-            // Materialize each loop as a closed boundary polyline.
-            let mut handles: Vec<u64> = Vec::with_capacity(paths.len());
-            for path in paths {
-                let bd = DObject::with_style(Geom::Polyline(Polyline {
-                    vertices: path,
-                    closed: true,
-                    widths: Vec::new(),
-                }), style.clone());
-                handles.push(bd.handle);
-                satellites.push(bd);
-            }
-            let pattern = if pattern_name.eq_ignore_ascii_case("SOLID") {
-                cad_kernel::HatchPattern::Solid
-            } else {
-                cad_kernel::HatchPattern::Pattern {
-                    name: if pattern_name.is_empty() { "ANSI31".into() } else { pattern_name },
-                    scale: get_f(41).unwrap_or(1.0),
-                    angle_deg: get_f(52).unwrap_or(0.0),
+                if let Some(p) = cur.take() {
+                    if accepting && p.len() >= 3 {
+                        paths.push(p);
+                    }
                 }
-            };
-            Geom::Hatch(cad_kernel::Hatch { boundary_handles: handles, pattern })
-        }
-        _ => return None,   // unknown entity type — counted as skipped
-    };
+                // Materialize each loop as a closed boundary polyline.
+                let mut handles: Vec<u64> = Vec::with_capacity(paths.len());
+                for path in paths {
+                    let bd = DObject::with_style(
+                        Geom::Polyline(Polyline {
+                            vertices: path,
+                            closed: true,
+                            widths: Vec::new(),
+                        }),
+                        style.clone(),
+                    );
+                    handles.push(bd.handle);
+                    satellites.push(bd);
+                }
+                let pattern = if pattern_name.eq_ignore_ascii_case("SOLID") {
+                    cad_kernel::HatchPattern::Solid
+                } else {
+                    cad_kernel::HatchPattern::Pattern {
+                        name: if pattern_name.is_empty() {
+                            "ANSI31".into()
+                        } else {
+                            pattern_name
+                        },
+                        scale: get_f(41).unwrap_or(1.0),
+                        angle_deg: get_f(52).unwrap_or(0.0),
+                    }
+                };
+                Geom::Hatch(cad_kernel::Hatch {
+                    boundary_handles: handles,
+                    pattern,
+                })
+            }
+            _ => return None, // unknown entity type — counted as skipped
+        };
 
         Some(DObject::with_style(geom, style))
     })();
@@ -1321,14 +1551,34 @@ pub fn dxf_export_degradations(doc: &Document) -> Vec<String> {
             Geom::Viewport(_) => viewports += 1,
             _ => {}
         }
-        if matches!(d.style.color, Color::TrueColorRef(_)) { truecolor += 1; }
+        if matches!(d.style.color, Color::TrueColorRef(_)) {
+            truecolor += 1;
+        }
     }
     let mut out = Vec::new();
-    if hatches > 0   { out.push(format!("{hatches} hatch(es) exported as SOLID fill (pattern lost)")); }
-    if dims > 0      { out.push(format!("{dims} dimension(s) exported as plain TEXT (structure lost)")); }
-    if walls > 0     { out.push(format!("{walls} wall(s) exported as 2 LINES (smart wall lost)")); }
-    if viewports > 0 { out.push(format!("{viewports} viewport(s) not exported")); }
-    if truecolor > 0 { out.push(format!("{truecolor} TrueColor object(s) downgraded to ByLayer")); }
+    if hatches > 0 {
+        out.push(format!(
+            "{hatches} hatch(es) exported as SOLID fill (pattern lost)"
+        ));
+    }
+    if dims > 0 {
+        out.push(format!(
+            "{dims} dimension(s) exported as plain TEXT (structure lost)"
+        ));
+    }
+    if walls > 0 {
+        out.push(format!(
+            "{walls} wall(s) exported as 2 LINES (smart wall lost)"
+        ));
+    }
+    if viewports > 0 {
+        out.push(format!("{viewports} viewport(s) not exported"));
+    }
+    if truecolor > 0 {
+        out.push(format!(
+            "{truecolor} TrueColor object(s) downgraded to ByLayer"
+        ));
+    }
     out
 }
 
@@ -1343,10 +1593,10 @@ pub fn write_dxf(doc: &Document) -> String {
     let obj = ObjectHandles::alloc(&mut h, doc.extra_blobs.len());
     let mut body = String::with_capacity(64 * 1024);
     let brt = write_tables(&mut body, doc, &mut h, &obj);
-    write_blocks(&mut body, doc, &mut h, &brt);   // MUST precede ENTITIES —
-                                                  // read_dxf dispatches sections
-                                                  // in file order; an INSERT
-                                                  // resolves its block by name.
+    write_blocks(&mut body, doc, &mut h, &brt); // MUST precede ENTITIES —
+                                                // read_dxf dispatches sections
+                                                // in file order; an INSERT
+                                                // resolves its block by name.
     write_entities(&mut body, doc, &mut h, &brt);
     write_objects(&mut body, &obj, &doc.extra_blobs); // after ENTITIES (standard order)
 
@@ -1371,13 +1621,23 @@ fn pair_i(s: &mut String, code: i32, v: i32) {
 /// a unique hex handle (group `5`), and `$HANDSEED` must exceed them all.
 /// Synthesized here and never persisted (the reader ignores handles), so they
 /// need not be stable across round-trips.
-struct HandleGen { next: u64 }
+struct HandleGen {
+    next: u64,
+}
 impl HandleGen {
-    fn new() -> Self { HandleGen { next: 0x100 } }
+    fn new() -> Self {
+        HandleGen { next: 0x100 }
+    }
     /// Next unique handle — uppercase hex, no `0x`.
-    fn alloc(&mut self) -> String { let n = self.next; self.next += 1; format!("{:X}", n) }
+    fn alloc(&mut self) -> String {
+        let n = self.next;
+        self.next += 1;
+        format!("{:X}", n)
+    }
     /// `$HANDSEED` value — one past the highest handle handed out so far.
-    fn seed(&self) -> String { format!("{:X}", self.next) }
+    fn seed(&self) -> String {
+        format!("{:X}", self.next)
+    }
 }
 
 /// BLOCK_RECORD handles, so entity / BLOCK ownership (`330`) is coherent within
@@ -1386,12 +1646,13 @@ impl HandleGen {
 struct BlockRecords {
     model_space: String,
     paper_space: String,
-    real:        Vec<(String, String)>,   // (block name, BLOCK_RECORD handle)
+    real: Vec<(String, String)>, // (block name, BLOCK_RECORD handle)
 }
 impl BlockRecords {
     /// Owning BLOCK_RECORD handle for a block name (falls back to model space).
     fn owner_for(&self, name: &str) -> &str {
-        self.real.iter()
+        self.real
+            .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, hh)| hh.as_str())
             .unwrap_or(&self.model_space)
@@ -1403,9 +1664,9 @@ impl BlockRecords {
 /// `ACAD_GROUP` dictionary, the `ACAD_PLOTSTYLENAME` dictionary, and the single
 /// `Normal` plot-style placeholder every layer points at.
 struct ObjectHandles {
-    root:        String,
-    group:       String,
-    psns:        String,
+    root: String,
+    group: String,
+    psns: String,
     placeholder: String,
     /// The embedded-extra-data graph — the `SIMLUX_DATA` dictionary + one XRECORD
     /// per payload blob — allocated only when the document carries blobs.
@@ -1414,7 +1675,7 @@ struct ObjectHandles {
 /// Handles for the embedded extra-data graph (see [`write_objects`]).
 struct BlobHandles {
     dict: String,
-    xr:   Vec<String>,   // one XRECORD handle per blob, aligned with `blobs`
+    xr: Vec<String>, // one XRECORD handle per blob, aligned with `blobs`
 }
 impl ObjectHandles {
     fn alloc(h: &mut HandleGen, blob_count: usize) -> Self {
@@ -1427,9 +1688,9 @@ impl ObjectHandles {
             None
         };
         ObjectHandles {
-            root:        h.alloc(),
-            group:       h.alloc(),
-            psns:        h.alloc(),
+            root: h.alloc(),
+            group: h.alloc(),
+            psns: h.alloc(),
             placeholder: h.alloc(),
             blobs,
         }
@@ -1458,10 +1719,13 @@ fn write_objects(s: &mut String, o: &ObjectHandles, blobs: &[(String, Vec<u8>)])
     pair(s, 330, "0");
     pair(s, 100, "AcDbDictionary");
     pair_i(s, 281, 1);
-    pair(s, 3, "ACAD_GROUP");         pair(s, 350, &o.group);
-    pair(s, 3, "ACAD_PLOTSTYLENAME"); pair(s, 350, &o.psns);
+    pair(s, 3, "ACAD_GROUP");
+    pair(s, 350, &o.group);
+    pair(s, 3, "ACAD_PLOTSTYLENAME");
+    pair(s, 350, &o.psns);
     if let Some(bh) = &o.blobs {
-        pair(s, 3, SIMLUX_DATA_DICT); pair(s, 350, &bh.dict);
+        pair(s, 3, SIMLUX_DATA_DICT);
+        pair(s, 350, &bh.dict);
     }
 
     // ACAD_GROUP — empty dictionary.
@@ -1477,7 +1741,8 @@ fn write_objects(s: &mut String, o: &ObjectHandles, blobs: &[(String, Vec<u8>)])
     pair(s, 330, &o.root);
     pair(s, 100, "AcDbDictionary");
     pair_i(s, 281, 1);
-    pair(s, 3, "Normal"); pair(s, 350, &o.placeholder);
+    pair(s, 3, "Normal");
+    pair(s, 350, &o.placeholder);
     pair(s, 100, "AcDbDictionaryWithDefault");
     pair(s, 340, &o.placeholder);
 
@@ -1495,7 +1760,8 @@ fn write_objects(s: &mut String, o: &ObjectHandles, blobs: &[(String, Vec<u8>)])
         pair(s, 100, "AcDbDictionary");
         pair_i(s, 281, 1);
         for ((name, _), xh) in extra.iter().zip(bh.xr.iter()) {
-            pair(s, 3, name); pair(s, 350, xh);
+            pair(s, 3, name);
+            pair(s, 350, xh);
         }
         for ((_, bytes), xh) in extra.iter().zip(bh.xr.iter()) {
             // Base64 keeps the payload byte-exact through the chunking and any
@@ -1506,14 +1772,14 @@ fn write_objects(s: &mut String, o: &ObjectHandles, blobs: &[(String, Vec<u8>)])
             pair(s, 5, xh);
             pair(s, 330, &bh.dict);
             pair(s, 100, "AcDbXrecord");
-            pair_i(s, 280, 1);        // duplicate-record-cloning flag
-            pair(s, 1, BLOB_MARKER);  // its own line: no copy of the payload
-            // Walk the base64 string BY OFFSET — the reader concatenates every
-            // code-1 line, so the marker line above is simply the first chunk.
-            // Slicing by offset (base64 is pure ASCII, every byte a char
-            // boundary) keeps this O(n): re-owning the shrinking remainder on
-            // every iteration would copy the whole payload n/250 times, which
-            // is quadratic on the hundreds-of-MB payloads this exists for.
+            pair_i(s, 280, 1); // duplicate-record-cloning flag
+            pair(s, 1, BLOB_MARKER); // its own line: no copy of the payload
+                                     // Walk the base64 string BY OFFSET — the reader concatenates every
+                                     // code-1 line, so the marker line above is simply the first chunk.
+                                     // Slicing by offset (base64 is pure ASCII, every byte a char
+                                     // boundary) keeps this O(n): re-owning the shrinking remainder on
+                                     // every iteration would copy the whole payload n/250 times, which
+                                     // is quadratic on the hundreds-of-MB payloads this exists for.
             let mut start = 0;
             while start < text.len() {
                 let end = (start + BLOB_CHUNK).min(text.len());
@@ -1529,22 +1795,28 @@ fn write_objects(s: &mut String, o: &ObjectHandles, blobs: &[(String, Vec<u8>)])
 fn write_header(s: &mut String, h: &HandleGen, doc: &Document) {
     pair(s, 0, "SECTION");
     pair(s, 2, "HEADER");
-    pair(s, 9, "$ACADVER");     pair(s, 1, "AC1015");   // AutoCAD 2000 ASCII level
-    pair(s, 9, "$HANDSEED");    pair(s, 5, &h.seed());  // > every handle in the file
-    // $INSUNITS — but ONLY a unit somebody actually stated. A drawing whose
-    // unit was merely ASSUMED (every file made before units existed) writes 0
-    // = unitless, which is what this writer effectively emitted before by
-    // omitting the variable entirely. Stamping such a file "6 = metres" would
-    // turn a default nobody chose into a positive claim, and autosave would do
-    // it silently to every .dxf the user has open.
+    pair(s, 9, "$ACADVER");
+    pair(s, 1, "AC1015"); // AutoCAD 2000 ASCII level
+    pair(s, 9, "$HANDSEED");
+    pair(s, 5, &h.seed()); // > every handle in the file
+                           // $INSUNITS — but ONLY a unit somebody actually stated. A drawing whose
+                           // unit was merely ASSUMED (every file made before units existed) writes 0
+                           // = unitless, which is what this writer effectively emitted before by
+                           // omitting the variable entirely. Stamping such a file "6 = metres" would
+                           // turn a default nobody chose into a positive claim, and autosave would do
+                           // it silently to every .dxf the user has open.
     let code = match doc.units.source {
         cad_kernel::UnitSource::Assumed => 0,
         _ => metres_to_insunits(doc.units.metres_per_unit),
     };
-    pair(s, 9, "$INSUNITS");    pair_i(s, 70, code);
-    pair(s, 9, "$DWGCODEPAGE"); pair(s, 3, "ANSI_1252");
-    pair(s, 9, "$PSTYLEMODE");  pair_i(s, 290, 1);      // color-dependent plot styles
-    pair(s, 9, "$LTSCALE");     pair_f(s, 40, 1.0);     // global linetype scale
+    pair(s, 9, "$INSUNITS");
+    pair_i(s, 70, code);
+    pair(s, 9, "$DWGCODEPAGE");
+    pair(s, 3, "ANSI_1252");
+    pair(s, 9, "$PSTYLEMODE");
+    pair_i(s, 290, 1); // color-dependent plot styles
+    pair(s, 9, "$LTSCALE");
+    pair_f(s, 40, 1.0); // global linetype scale
     pair(s, 0, "ENDSEC");
 }
 
@@ -1552,8 +1824,15 @@ fn write_header(s: &mut String, h: &HandleGen, doc: &Document) {
 /// standard unit, since inventing a nearest match would misstate the drawing.
 fn metres_to_insunits(m: f64) -> i32 {
     const NEAR: f64 = 1e-9;
-    for (code, metres) in [(1, 0.0254), (2, 0.3048), (4, 0.001), (5, 0.01),
-                           (6, 1.0), (10, 0.9144), (14, 0.1)] {
+    for (code, metres) in [
+        (1, 0.0254),
+        (2, 0.3048),
+        (4, 0.001),
+        (5, 0.01),
+        (6, 1.0),
+        (10, 0.9144),
+        (14, 0.1),
+    ] {
         if (m - metres).abs() < NEAR {
             return code;
         }
@@ -1568,7 +1847,7 @@ fn begin_table(s: &mut String, h: &mut HandleGen, name: &str, count: i32) -> Str
     pair(s, 0, "TABLE");
     pair(s, 2, name);
     pair(s, 5, &th);
-    pair(s, 330, "0");                       // owned by the implicit root
+    pair(s, 330, "0"); // owned by the implicit root
     pair(s, 100, "AcDbSymbolTable");
     pair_i(s, 70, count);
     th
@@ -1577,8 +1856,14 @@ fn begin_table(s: &mut String, h: &mut HandleGen, name: &str, count: i32) -> Str
 /// Open a table RECORD with handle + owner + subclass markers. `handle_code` is
 /// `5` for every table EXCEPT DIMSTYLE (historically `105`). Returns the record
 /// handle. The caller emits the record's `2 name` / `70 flags` / type fields.
-fn begin_record(s: &mut String, h: &mut HandleGen, kind: &str, owner: &str,
-                subclass: &str, handle_code: i32) -> String {
+fn begin_record(
+    s: &mut String,
+    h: &mut HandleGen,
+    kind: &str,
+    owner: &str,
+    subclass: &str,
+    handle_code: i32,
+) -> String {
     let rh = h.alloc();
     pair(s, 0, kind);
     pair(s, handle_code, &rh);
@@ -1595,7 +1880,10 @@ fn effective_text_font(t: &cad_kernel::Text, doc: &Document) -> Option<String> {
     let f = if !t.font_name.is_empty() {
         t.font_name.clone()
     } else {
-        doc.text_styles.get(t.style).map(|s| s.font_name.clone()).unwrap_or_default()
+        doc.text_styles
+            .get(t.style)
+            .map(|s| s.font_name.clone())
+            .unwrap_or_default()
     };
     let fl = f.to_lowercase();
     if f.is_empty() || fl == "standard" || fl == "monospace" {
@@ -1605,40 +1893,72 @@ fn effective_text_font(t: &cad_kernel::Text, doc: &Document) -> Option<String> {
     }
 }
 
-fn write_tables(s: &mut String, doc: &Document, h: &mut HandleGen, obj: &ObjectHandles) -> BlockRecords {
+fn write_tables(
+    s: &mut String,
+    doc: &Document,
+    h: &mut HandleGen,
+    obj: &ObjectHandles,
+) -> BlockRecords {
     pair(s, 0, "SECTION");
     pair(s, 2, "TABLES");
 
     // ---- VPORT (AutoCAD needs the *Active viewport) ----
     let vt = begin_table(s, h, "VPORT", 1);
     begin_record(s, h, "VPORT", &vt, "AcDbViewportTableRecord", 5);
-    pair(s, 2, "*Active"); pair_i(s, 70, 0);
-    pair_f(s, 10, 0.0); pair_f(s, 20, 0.0);       // lower-left corner
-    pair_f(s, 11, 1.0); pair_f(s, 21, 1.0);       // upper-right corner
-    pair_f(s, 12, 0.0); pair_f(s, 22, 0.0);       // view center
-    pair_f(s, 13, 0.0); pair_f(s, 23, 0.0);       // snap base
-    pair_f(s, 14, 10.0); pair_f(s, 24, 10.0);     // snap spacing
-    pair_f(s, 15, 10.0); pair_f(s, 25, 10.0);     // grid spacing
-    pair_f(s, 16, 0.0); pair_f(s, 26, 0.0); pair_f(s, 36, 1.0);   // view direction
-    pair_f(s, 17, 0.0); pair_f(s, 27, 0.0); pair_f(s, 37, 0.0);   // view target
-    pair_f(s, 40, 297.0); pair_f(s, 41, 1.5); pair_f(s, 42, 50.0);
-    pair_f(s, 43, 0.0); pair_f(s, 44, 0.0);
-    pair_f(s, 50, 0.0); pair_f(s, 51, 0.0);
-    pair_i(s, 71, 0); pair_i(s, 72, 100); pair_i(s, 73, 1); pair_i(s, 74, 3);
-    pair_i(s, 75, 0); pair_i(s, 76, 1); pair_i(s, 77, 0); pair_i(s, 78, 0);
+    pair(s, 2, "*Active");
+    pair_i(s, 70, 0);
+    pair_f(s, 10, 0.0);
+    pair_f(s, 20, 0.0); // lower-left corner
+    pair_f(s, 11, 1.0);
+    pair_f(s, 21, 1.0); // upper-right corner
+    pair_f(s, 12, 0.0);
+    pair_f(s, 22, 0.0); // view center
+    pair_f(s, 13, 0.0);
+    pair_f(s, 23, 0.0); // snap base
+    pair_f(s, 14, 10.0);
+    pair_f(s, 24, 10.0); // snap spacing
+    pair_f(s, 15, 10.0);
+    pair_f(s, 25, 10.0); // grid spacing
+    pair_f(s, 16, 0.0);
+    pair_f(s, 26, 0.0);
+    pair_f(s, 36, 1.0); // view direction
+    pair_f(s, 17, 0.0);
+    pair_f(s, 27, 0.0);
+    pair_f(s, 37, 0.0); // view target
+    pair_f(s, 40, 297.0);
+    pair_f(s, 41, 1.5);
+    pair_f(s, 42, 50.0);
+    pair_f(s, 43, 0.0);
+    pair_f(s, 44, 0.0);
+    pair_f(s, 50, 0.0);
+    pair_f(s, 51, 0.0);
+    pair_i(s, 71, 0);
+    pair_i(s, 72, 100);
+    pair_i(s, 73, 1);
+    pair_i(s, 74, 3);
+    pair_i(s, 75, 0);
+    pair_i(s, 76, 1);
+    pair_i(s, 77, 0);
+    pair_i(s, 78, 0);
     pair(s, 0, "ENDTAB");
 
     // ---- LTYPE (ByBlock + ByLayer are mandatory; then our named linetypes) ----
     let lt_tbl = begin_table(s, h, "LTYPE", 2 + doc.linetypes.len() as i32);
     for special in ["ByBlock", "ByLayer"] {
         begin_record(s, h, "LTYPE", &lt_tbl, "AcDbLinetypeTableRecord", 5);
-        pair(s, 2, special); pair_i(s, 70, 0);
-        pair(s, 3, ""); pair_i(s, 72, 65); pair_i(s, 73, 0); pair_f(s, 40, 0.0);
+        pair(s, 2, special);
+        pair_i(s, 70, 0);
+        pair(s, 3, "");
+        pair_i(s, 72, 65);
+        pair_i(s, 73, 0);
+        pair_f(s, 40, 0.0);
     }
     for lt in &doc.linetypes.linetypes {
         begin_record(s, h, "LTYPE", &lt_tbl, "AcDbLinetypeTableRecord", 5);
-        pair(s, 2, &lt.name); pair_i(s, 70, 0);
-        pair(s, 3, &lt.description); pair_i(s, 72, 65);   // alignment code 'A'
+        pair(s, 2, &lt.name);
+        pair_i(s, 70, 0);
+        pair(s, 3, &lt.description);
+        pair_i(s, 72, 65); // alignment code 'A'
         pair_i(s, 73, lt.pattern.len() as i32);
         let total: f32 = lt.pattern.iter().sum();
         pair_f(s, 40, total as f64);
@@ -1661,7 +1981,7 @@ fn write_tables(s: &mut String, doc: &Document, h: &mut HandleGen, obj: &ObjectH
     let ly_tbl = begin_table(s, h, "LAYER", layer_count);
     if !has_zero {
         begin_record(s, h, "LAYER", &ly_tbl, "AcDbLayerTableRecord", 5);
-        pair(s, 2, "0");                 // white / Continuous / thawed / unlocked
+        pair(s, 2, "0"); // white / Continuous / thawed / unlocked
         pair_i(s, 70, 0);
         pair_i(s, 62, 7);
         pair(s, 6, "Continuous");
@@ -1673,21 +1993,37 @@ fn write_tables(s: &mut String, doc: &Document, h: &mut HandleGen, obj: &ObjectH
         pair(s, 2, &layer.name);
         // Flags: bit 0 = frozen, bit 2 = locked, bit 4 = not plottable.
         let mut flags = 0_i32;
-        if layer.frozen { flags |= 0x01; }
-        if layer.locked { flags |= 0x04; }
-        if !layer.plottable { flags |= 0x10; }
+        if layer.frozen {
+            flags |= 0x01;
+        }
+        if layer.locked {
+            flags |= 0x04;
+        }
+        if !layer.plottable {
+            flags |= 0x10;
+        }
         pair_i(s, 70, flags);
         // Color: ACI index (negative = layer off). TrueColor → 7 fallback.
-        let aci = match layer.color { Color::Aci(i) => i as i32, _ => 7 };
-        let aci_signed = if layer.visible { aci } else { -aci.abs().max(1) };
+        let aci = match layer.color {
+            Color::Aci(i) => i as i32,
+            _ => 7,
+        };
+        let aci_signed = if layer.visible {
+            aci
+        } else {
+            -aci.abs().max(1)
+        };
         pair_i(s, 62, aci_signed);
-        let lt_name = doc.linetypes.get(layer.linetype)
-            .map(|l| l.name.clone()).unwrap_or_else(|| "Continuous".into());
+        let lt_name = doc
+            .linetypes
+            .get(layer.linetype)
+            .map(|l| l.name.clone())
+            .unwrap_or_else(|| "Continuous".into());
         pair(s, 6, &lt_name);
-        pair_i(s, 370, -3);           // lineweight = default
-        // 390 = hard-pointer to this layer's plot-style name object. AutoCAD's
-        // AC1015 LAYER reader REQUIRES it ("Did not receive PlotStyleName") — it
-        // points at the single Normal placeholder in the OBJECTS section.
+        pair_i(s, 370, -3); // lineweight = default
+                            // 390 = hard-pointer to this layer's plot-style name object. AutoCAD's
+                            // AC1015 LAYER reader REQUIRES it ("Did not receive PlotStyleName") — it
+                            // points at the single Normal placeholder in the OBJECTS section.
         pair(s, 390, &obj.placeholder);
     }
     pair(s, 0, "ENDTAB");
@@ -1707,17 +2043,27 @@ fn write_tables(s: &mut String, doc: &Document, h: &mut HandleGen, obj: &ObjectH
     }
     let st_tbl = begin_table(s, h, "STYLE", (1 + fonts.len()) as i32);
     begin_record(s, h, "STYLE", &st_tbl, "AcDbTextStyleTableRecord", 5);
-    pair(s, 2, "STANDARD"); pair_i(s, 70, 0);
-    pair_f(s, 40, 0.0); pair_f(s, 41, 1.0); pair_f(s, 50, 0.0);
-    pair_i(s, 71, 0); pair_f(s, 42, 2.5);
-    pair(s, 3, "txt"); pair(s, 4, "");
+    pair(s, 2, "STANDARD");
+    pair_i(s, 70, 0);
+    pair_f(s, 40, 0.0);
+    pair_f(s, 41, 1.0);
+    pair_f(s, 50, 0.0);
+    pair_i(s, 71, 0);
+    pair_f(s, 42, 2.5);
+    pair(s, 3, "txt");
+    pair(s, 4, "");
     for f in &fonts {
         begin_record(s, h, "STYLE", &st_tbl, "AcDbTextStyleTableRecord", 5);
-        pair(s, 2, f); pair_i(s, 70, 0);
-        pair_f(s, 40, 0.0); pair_f(s, 41, 1.0); pair_f(s, 50, 0.0);
-        pair_i(s, 71, 0); pair_f(s, 42, 2.5);
+        pair(s, 2, f);
+        pair_i(s, 70, 0);
+        pair_f(s, 40, 0.0);
+        pair_f(s, 41, 1.0);
+        pair_f(s, 50, 0.0);
+        pair_i(s, 71, 0);
+        pair_f(s, 42, 2.5);
         // TrueType: empty SHX file (3/4) + the typeface via the ACAD XDATA.
-        pair(s, 3, ""); pair(s, 4, "");
+        pair(s, 3, "");
+        pair(s, 4, "");
         pair(s, 1001, "ACAD");
         pair(s, 1000, f);
         pair_i(s, 1071, 34);
@@ -1725,45 +2071,61 @@ fn write_tables(s: &mut String, doc: &Document, h: &mut HandleGen, obj: &ObjectH
     pair(s, 0, "ENDTAB");
 
     // ---- VIEW / UCS (empty, but the tables must be present) ----
-    begin_table(s, h, "VIEW", 0); pair(s, 0, "ENDTAB");
-    begin_table(s, h, "UCS",  0); pair(s, 0, "ENDTAB");
+    begin_table(s, h, "VIEW", 0);
+    pair(s, 0, "ENDTAB");
+    begin_table(s, h, "UCS", 0);
+    pair(s, 0, "ENDTAB");
 
     // ---- APPID (ACAD + our XDATA app for per-entity text specs) ----
     let ap_tbl = begin_table(s, h, "APPID", 2);
     begin_record(s, h, "APPID", &ap_tbl, "AcDbRegAppTableRecord", 5);
-    pair(s, 2, "ACAD"); pair_i(s, 70, 0);
+    pair(s, 2, "ACAD");
+    pair_i(s, 70, 0);
     begin_record(s, h, "APPID", &ap_tbl, "AcDbRegAppTableRecord", 5);
-    pair(s, 2, "AutoRASM"); pair_i(s, 70, 0);
+    pair(s, 2, "AutoRASM");
+    pair_i(s, 70, 0);
     pair(s, 0, "ENDTAB");
 
     // ---- DIMSTYLE (STANDARD stub — record handle is code 105, not 5) ----
     let dt_tbl = begin_table(s, h, "DIMSTYLE", 1);
-    pair(s, 100, "AcDbDimStyleTable"); pair_i(s, 71, 0);   // R2000 DIMSTYLE quirk
+    pair(s, 100, "AcDbDimStyleTable");
+    pair_i(s, 71, 0); // R2000 DIMSTYLE quirk
     begin_record(s, h, "DIMSTYLE", &dt_tbl, "AcDbDimStyleTableRecord", 105);
-    pair(s, 2, "STANDARD"); pair_i(s, 70, 0);
+    pair(s, 2, "STANDARD");
+    pair_i(s, 70, 0);
     pair(s, 0, "ENDTAB");
 
     // ---- BLOCK_RECORD (*Model_Space, *Paper_Space, + one per real block) ----
-    let real_names: Vec<String> = doc.blocks.blocks.iter()
+    let real_names: Vec<String> = doc
+        .blocks
+        .blocks
+        .iter()
         .map(|b| b.name.clone())
         .filter(|n| is_real_block(n))
         .collect();
     let br_tbl = begin_table(s, h, "BLOCK_RECORD", 2 + real_names.len() as i32);
     let model_space = begin_record(s, h, "BLOCK_RECORD", &br_tbl, "AcDbBlockTableRecord", 5);
-    pair(s, 2, "*Model_Space"); pair_i(s, 70, 0);
+    pair(s, 2, "*Model_Space");
+    pair_i(s, 70, 0);
     let paper_space = begin_record(s, h, "BLOCK_RECORD", &br_tbl, "AcDbBlockTableRecord", 5);
-    pair(s, 2, "*Paper_Space"); pair_i(s, 70, 0);
+    pair(s, 2, "*Paper_Space");
+    pair_i(s, 70, 0);
     let mut real = Vec::with_capacity(real_names.len());
     for name in &real_names {
         let rh = begin_record(s, h, "BLOCK_RECORD", &br_tbl, "AcDbBlockTableRecord", 5);
-        pair(s, 2, name); pair_i(s, 70, 0);
+        pair(s, 2, name);
+        pair_i(s, 70, 0);
         real.push((name.clone(), rh));
     }
     pair(s, 0, "ENDTAB");
 
     pair(s, 0, "ENDSEC");
 
-    BlockRecords { model_space, paper_space, real }
+    BlockRecords {
+        model_space,
+        paper_space,
+        real,
+    }
 }
 
 /// BLOCKS section: one `BLOCK…ENDBLK` per definition, so `read_blocks` can
@@ -1781,11 +2143,13 @@ fn write_blocks(s: &mut String, doc: &Document, h: &mut HandleGen, brt: &BlockRe
     write_block_shell(s, h, "*Paper_Space", Vec2::new(0.0, 0.0), &brt.paper_space);
 
     for blk in &doc.blocks.blocks {
-        if !is_real_block(&blk.name) { continue; }
+        if !is_real_block(&blk.name) {
+            continue;
+        }
         let owner = brt.owner_for(&blk.name);
         write_block_begin(s, h, &blk.name, blk.base, owner);
         for cd in &blk.dobjects {
-            write_entity(s, cd, doc, h, owner);   // owned by THIS block's record
+            write_entity(s, cd, doc, h, owner); // owned by THIS block's record
         }
         write_block_end(s, h, owner);
     }
@@ -1806,10 +2170,12 @@ fn write_block_begin(s: &mut String, h: &mut HandleGen, name: &str, base: Vec2, 
     pair(s, 8, "0");
     pair(s, 100, "AcDbBlockBegin");
     pair(s, 2, name);
-    pair_i(s, 70, 0);                 // block-type flags: 0 = plain (non-anon/xref)
-    pair_f(s, 10, base.x); pair_f(s, 20, base.y); pair_f(s, 30, 0.0);
+    pair_i(s, 70, 0); // block-type flags: 0 = plain (non-anon/xref)
+    pair_f(s, 10, base.x);
+    pair_f(s, 20, base.y);
+    pair_f(s, 30, 0.0);
     pair(s, 3, name);
-    pair(s, 1, "");                   // xref path (none)
+    pair(s, 1, ""); // xref path (none)
 }
 
 fn write_block_end(s: &mut String, h: &mut HandleGen, owner: &str) {
@@ -1826,17 +2192,23 @@ fn write_entities(s: &mut String, doc: &Document, h: &mut HandleGen, brt: &Block
     pair(s, 2, "ENTITIES");
 
     for d in &doc.dobjects {
-        write_entity(s, d, doc, h, &brt.model_space);   // owned by *Model_Space
+        write_entity(s, d, doc, h, &brt.model_space); // owned by *Model_Space
     }
 
     pair(s, 0, "ENDSEC");
 }
 
 fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, owner: &str) {
-    let layer_name = doc.layers.get(d.style.layer)
-        .map(|l| l.name.clone()).unwrap_or_else(|| "0".into());
-    let linetype_name = doc.linetypes.get(d.style.linetype)
-        .map(|l| l.name.clone()).unwrap_or_else(|| "Continuous".into());
+    let layer_name = doc
+        .layers
+        .get(d.style.layer)
+        .map(|l| l.name.clone())
+        .unwrap_or_else(|| "0".into());
+    let linetype_name = doc
+        .linetypes
+        .get(d.style.linetype)
+        .map(|l| l.name.clone())
+        .unwrap_or_else(|| "Continuous".into());
     // Entity preamble: 0/type, 5/handle, 330/owner, 100 AcDbEntity, then the
     // common entity fields (layer / linetype / color / visibility). Each arm
     // below emits its own `100 AcDb<Subclass>` marker + geometry after this.
@@ -1858,36 +2230,44 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
             // when a viewer ignores 420.
             Color::TrueColorRef(idx) => {
                 pair_i(s, 62, -1);
-                if let Some((r, g, b)) =
-                    Color::TrueColorRef(idx).rgb_bytes(&doc.truecolors)
-                {
+                if let Some((r, g, b)) = Color::TrueColorRef(idx).rgb_bytes(&doc.truecolors) {
                     let packed = (r as u32) << 16 | (g as u32) << 8 | b as u32;
                     pair_i(s, 420, packed as i32);
                 }
             }
             Color::ByLayer => pair_i(s, 62, 256),
         }
-        if !d.style.visible { pair_i(s, 60, 1); }
+        if !d.style.visible {
+            pair_i(s, 60, 1);
+        }
     };
 
     match &d.geom {
         Geom::Line(l) => {
             common(s, h, "LINE");
             pair(s, 100, "AcDbLine");
-            pair_f(s, 10, l.a.x); pair_f(s, 20, l.a.y); pair_f(s, 30, 0.0);
-            pair_f(s, 11, l.b.x); pair_f(s, 21, l.b.y); pair_f(s, 31, 0.0);
+            pair_f(s, 10, l.a.x);
+            pair_f(s, 20, l.a.y);
+            pair_f(s, 30, 0.0);
+            pair_f(s, 11, l.b.x);
+            pair_f(s, 21, l.b.y);
+            pair_f(s, 31, 0.0);
         }
         Geom::Circle(c) => {
             common(s, h, "CIRCLE");
             pair(s, 100, "AcDbCircle");
-            pair_f(s, 10, c.center.x); pair_f(s, 20, c.center.y); pair_f(s, 30, 0.0);
+            pair_f(s, 10, c.center.x);
+            pair_f(s, 20, c.center.y);
+            pair_f(s, 30, 0.0);
             pair_f(s, 40, c.radius);
         }
         Geom::Arc(a) => {
             common(s, h, "ARC");
             // R2000 ARC = AcDbCircle (center+radius) THEN AcDbArc (angles).
             pair(s, 100, "AcDbCircle");
-            pair_f(s, 10, a.center.x); pair_f(s, 20, a.center.y); pair_f(s, 30, 0.0);
+            pair_f(s, 10, a.center.x);
+            pair_f(s, 20, a.center.y);
+            pair_f(s, 30, 0.0);
             pair_f(s, 40, a.radius);
             pair(s, 100, "AcDbArc");
             pair_f(s, 50, a.start_angle.to_degrees());
@@ -1896,8 +2276,12 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
         Geom::Ellipse(el) => {
             common(s, h, "ELLIPSE");
             pair(s, 100, "AcDbEllipse");
-            pair_f(s, 10, el.center.x); pair_f(s, 20, el.center.y); pair_f(s, 30, 0.0);
-            pair_f(s, 11, el.major.x);  pair_f(s, 21, el.major.y);  pair_f(s, 31, 0.0);
+            pair_f(s, 10, el.center.x);
+            pair_f(s, 20, el.center.y);
+            pair_f(s, 30, 0.0);
+            pair_f(s, 11, el.major.x);
+            pair_f(s, 21, el.major.y);
+            pair_f(s, 31, 0.0);
             pair_f(s, 40, el.ratio);
             pair_f(s, 41, 0.0);
             pair_f(s, 42, std::f64::consts::TAU);
@@ -1905,8 +2289,12 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
         Geom::EllipseArc(ea) => {
             common(s, h, "ELLIPSE");
             pair(s, 100, "AcDbEllipse");
-            pair_f(s, 10, ea.ellipse.center.x); pair_f(s, 20, ea.ellipse.center.y); pair_f(s, 30, 0.0);
-            pair_f(s, 11, ea.ellipse.major.x);  pair_f(s, 21, ea.ellipse.major.y);  pair_f(s, 31, 0.0);
+            pair_f(s, 10, ea.ellipse.center.x);
+            pair_f(s, 20, ea.ellipse.center.y);
+            pair_f(s, 30, 0.0);
+            pair_f(s, 11, ea.ellipse.major.x);
+            pair_f(s, 21, ea.ellipse.major.y);
+            pair_f(s, 31, 0.0);
             pair_f(s, 40, ea.ellipse.ratio);
             pair_f(s, 41, ea.start_param);
             pair_f(s, 42, ea.start_param + ea.sweep_param);
@@ -1914,7 +2302,9 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
         Geom::Point(pt) => {
             common(s, h, "POINT");
             pair(s, 100, "AcDbPoint");
-            pair_f(s, 10, pt.location.x); pair_f(s, 20, pt.location.y); pair_f(s, 30, 0.0);
+            pair_f(s, 10, pt.location.x);
+            pair_f(s, 20, pt.location.y);
+            pair_f(s, 30, 0.0);
         }
         Geom::Polyline(p) => {
             common(s, h, "LWPOLYLINE");
@@ -1947,36 +2337,46 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
         Geom::Hatch(hatch) => {
             let loops = cad_kernel::resolve_hatch_loops(hatch, doc);
             // Drop a repeated closing vertex per loop; skip degenerate (<3) loops.
-            let loops: Vec<&[cad_kernel::Vec2]> = loops.iter().map(|l| {
-                let mut n = l.len();
-                if n >= 2 && (l[0] - l[n - 1]).len() < 1e-9 { n -= 1; }
-                &l[..n]
-            }).filter(|l| l.len() >= 3).collect();
+            let loops: Vec<&[cad_kernel::Vec2]> = loops
+                .iter()
+                .map(|l| {
+                    let mut n = l.len();
+                    if n >= 2 && (l[0] - l[n - 1]).len() < 1e-9 {
+                        n -= 1;
+                    }
+                    &l[..n]
+                })
+                .filter(|l| l.len() >= 3)
+                .collect();
             if !loops.is_empty() {
                 common(s, h, "HATCH");
                 pair(s, 100, "AcDbHatch");
-                pair_f(s, 10, 0.0); pair_f(s, 20, 0.0); pair_f(s, 30, 0.0);  // elevation
-                pair_f(s, 210, 0.0); pair_f(s, 220, 0.0); pair_f(s, 230, 1.0); // normal +Z
-                pair(s, 2, "SOLID");        // hatch pattern name
-                pair_i(s, 70, 1);           // 1 = solid fill
-                pair_i(s, 71, 0);           // 0 = non-associative
-                pair_i(s, 91, loops.len() as i32);   // number of boundary paths
+                pair_f(s, 10, 0.0);
+                pair_f(s, 20, 0.0);
+                pair_f(s, 30, 0.0); // elevation
+                pair_f(s, 210, 0.0);
+                pair_f(s, 220, 0.0);
+                pair_f(s, 230, 1.0); // normal +Z
+                pair(s, 2, "SOLID"); // hatch pattern name
+                pair_i(s, 70, 1); // 1 = solid fill
+                pair_i(s, 71, 0); // 0 = non-associative
+                pair_i(s, 91, loops.len() as i32); // number of boundary paths
                 for (li, lp) in loops.iter().enumerate() {
                     // path type flag: 2 = polyline; bit 0 (=1) marks external.
                     let ext = if li == 0 { 1 } else { 0 };
                     pair_i(s, 92, 2 | ext);
-                    pair_i(s, 72, 0);       // has_bulge = 0 (already tessellated)
-                    pair_i(s, 73, 1);       // is_closed = 1
-                    pair_i(s, 93, lp.len() as i32);  // number of vertices
+                    pair_i(s, 72, 0); // has_bulge = 0 (already tessellated)
+                    pair_i(s, 73, 1); // is_closed = 1
+                    pair_i(s, 93, lp.len() as i32); // number of vertices
                     for v in lp.iter() {
                         pair_f(s, 10, v.x);
                         pair_f(s, 20, v.y);
                     }
-                    pair_i(s, 97, 0);       // number of source boundary objects
+                    pair_i(s, 97, 0); // number of source boundary objects
                 }
-                pair_i(s, 75, 1);           // hatch style: 1 = outermost
-                pair_i(s, 76, 1);           // pattern type: 1 = predefined
-                pair_i(s, 98, 0);           // number of seed points
+                pair_i(s, 75, 1); // hatch style: 1 = outermost
+                pair_i(s, 76, 1); // pattern type: 1 = predefined
+                pair_i(s, 98, 0); // number of seed points
             }
         }
         // DXF SPLINE. Emit degree + control points + weights + a valid
@@ -1989,16 +2389,16 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
             pair(s, 100, "AcDbSpline");
             let n = sp.control_points.len();
             let deg = sp.degree;
-            let rational = sp.weights.len() == n
-                && sp.weights.iter().any(|w| (w - 1.0).abs() > 1e-12);
+            let rational =
+                sp.weights.len() == n && sp.weights.iter().any(|w| (w - 1.0).abs() > 1e-12);
             pair_i(s, 70, 8 | if rational { 4 } else { 0 });
             pair_i(s, 71, deg as i32);
             let knot_count = n + deg + 1;
-            pair_i(s, 72, knot_count as i32);   // number of knots
-            pair_i(s, 73, n as i32);            // number of control points
-            pair_i(s, 74, 0);                   // number of fit points
-            // Clamped-uniform knot vector normalized to [0,1]: deg+1 leading 0s,
-            // deg+1 trailing 1s, interior evenly spaced.
+            pair_i(s, 72, knot_count as i32); // number of knots
+            pair_i(s, 73, n as i32); // number of control points
+            pair_i(s, 74, 0); // number of fit points
+                              // Clamped-uniform knot vector normalized to [0,1]: deg+1 leading 0s,
+                              // deg+1 trailing 1s, interior evenly spaced.
             let interior = knot_count.saturating_sub(2 * (deg + 1)); // = n - deg - 1
             for k in 0..knot_count {
                 let v = if k < deg + 1 {
@@ -2012,7 +2412,9 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
             }
             // Weights (rational only) — one 41 per control point, in order.
             if rational {
-                for w in &sp.weights { pair_f(s, 41, *w); }
+                for w in &sp.weights {
+                    pair_f(s, 41, *w);
+                }
             }
             // Control points, in order.
             for p in &sp.control_points {
@@ -2029,12 +2431,20 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
             if let (Some(l), Some(r)) = (w.left_line(), w.right_line()) {
                 common(s, h, "LINE");
                 pair(s, 100, "AcDbLine");
-                pair_f(s, 10, l.a.x); pair_f(s, 20, l.a.y); pair_f(s, 30, 0.0);
-                pair_f(s, 11, l.b.x); pair_f(s, 21, l.b.y); pair_f(s, 31, 0.0);
+                pair_f(s, 10, l.a.x);
+                pair_f(s, 20, l.a.y);
+                pair_f(s, 30, 0.0);
+                pair_f(s, 11, l.b.x);
+                pair_f(s, 21, l.b.y);
+                pair_f(s, 31, 0.0);
                 common(s, h, "LINE");
                 pair(s, 100, "AcDbLine");
-                pair_f(s, 10, r.a.x); pair_f(s, 20, r.a.y); pair_f(s, 30, 0.0);
-                pair_f(s, 11, r.b.x); pair_f(s, 21, r.b.y); pair_f(s, 31, 0.0);
+                pair_f(s, 10, r.a.x);
+                pair_f(s, 20, r.a.y);
+                pair_f(s, 30, 0.0);
+                pair_f(s, 11, r.b.x);
+                pair_f(s, 21, r.b.y);
+                pair_f(s, 31, 0.0);
             }
         }
         // DXF TEXT entity. Codes 10/20/30 = insertion point;
@@ -2043,12 +2453,12 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
         // (vertical alignment requires the second alignment point
         // at code 11/21/31 — skip for v1, defaults to Baseline).
         Geom::Text(t) => {
-            let flags = (t.bold as i32) | ((t.outline_only as i32) << 1)
-                | ((t.underline as i32) << 2);
+            let flags =
+                (t.bold as i32) | ((t.outline_only as i32) << 1) | ((t.underline as i32) << 2);
             let halign_code = match t.h_align {
-                cad_kernel::TextHAlign::Left   => 0,
+                cad_kernel::TextHAlign::Left => 0,
                 cad_kernel::TextHAlign::Center => 1,
-                cad_kernel::TextHAlign::Right  => 2,
+                cad_kernel::TextHAlign::Right => 2,
             };
             // FULL MTEXT: text carrying inline \C/\H/\f/\P codes (or any
             // newline) exports as ONE real MTEXT entity with the codes as the
@@ -2070,13 +2480,15 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
                 // AutoCAD stores "\\" for a literal backslash in the string.
                 pair(s, 1, &body);
                 pair_f(s, 50, t.angle.to_degrees());
-                if t.underline { pair_i(s, 77, 1); }
+                if t.underline {
+                    pair_i(s, 77, 1);
+                }
                 pair_f(s, 41, t.width_factor);
                 if t.oblique.abs() > 1e-9 {
                     pair_f(s, 51, t.oblique.to_degrees());
                 }
                 pair_i(s, 71, halign_code);
-                let attach = 1;  // top-left
+                let attach = 1; // top-left
                 if let Some(fname) = effective_text_font(t, doc) {
                     pair(s, 7, &fname);
                 }
@@ -2096,7 +2508,12 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
             // list marker (a render PROPERTY, never stored in `text`) is applied
             // here; numbered lists auto-number. Each record gets its own handle
             // via `common`. Single-line no-list text is byte-identical to before.
-            let dy = t.height * if t.line_spacing > 1e-6 { t.line_spacing } else { 1.5 };
+            let dy = t.height
+                * if t.line_spacing > 1e-6 {
+                    t.line_spacing
+                } else {
+                    1.5
+                };
             let raw_lines: Vec<&str> = if t.text.is_empty() {
                 vec![""]
             } else {
@@ -2107,12 +2524,16 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
             let mut idx = 0usize;
             for raw in raw_lines {
                 let trimmed = raw.trim_end();
-                if trimmed.trim().is_empty() { continue; }
+                if trimmed.trim().is_empty() {
+                    continue;
+                }
                 let line_text = match t.list_mode {
-                    cad_kernel::TextListKind::None     => trimmed.to_string(),
+                    cad_kernel::TextListKind::None => trimmed.to_string(),
                     cad_kernel::TextListKind::Bulleted => format!("• {trimmed}"),
                     cad_kernel::TextListKind::Numbered => {
-                        let x = format!("{num}. {trimmed}"); num += 1; x
+                        let x = format!("{num}. {trimmed}");
+                        num += 1;
+                        x
                     }
                 };
                 let py = t.position.y - dy * (idx as f64);
@@ -2165,17 +2586,25 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
             // Import reconstructs the DimKind from the same codes, so our
             // own DXF round-trips losslessly.
             use cad_kernel::DimKind;
-            let st = doc.dim_styles.get(d.style)
+            let st = doc
+                .dim_styles
+                .get(d.style)
                 .unwrap_or(doc.dim_styles.get(0).unwrap());
             let text_h = st.text_height * st.overall_scale;
             common(s, h, "DIMENSION");
             pair(s, 100, "AcDbDimension");
-            pair(s, 2, "");                        // anonymous block: none
-            let rg = d.render_geometry(st);        // text mid point
+            pair(s, 2, ""); // anonymous block: none
+            let rg = d.render_geometry(st); // text mid point
             match &d.kind {
-                DimKind::Linear { p1, p2, dimline_pos, ortho } => {
+                DimKind::Linear {
+                    p1,
+                    p2,
+                    dimline_pos,
+                    ortho,
+                } => {
                     let aligned = matches!(ortho, cad_kernel::LinearOrtho::Aligned);
-                    pair_f(s, 10, dimline_pos.x); pair_f(s, 20, dimline_pos.y);
+                    pair_f(s, 10, dimline_pos.x);
+                    pair_f(s, 20, dimline_pos.y);
                     pair_f(s, 30, 0.0);
                     pair_f(s, 11, rg.text_pos.x);
                     pair_f(s, 21, rg.text_pos.y);
@@ -2188,13 +2617,21 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
                     pair(s, 3, &st.name);
                     pair_f(s, 42, d.measured_value());
                     pair_f(s, 40, text_h.max(0.05));
-                    pair(s, 100, if aligned {
-                        "AcDbAlignedDimension"
-                    } else {
-                        "AcDbRotatedDimension"
-                    });
-                    pair_f(s, 13, p1.x); pair_f(s, 23, p1.y); pair_f(s, 33, 0.0);
-                    pair_f(s, 14, p2.x); pair_f(s, 24, p2.y); pair_f(s, 34, 0.0);
+                    pair(
+                        s,
+                        100,
+                        if aligned {
+                            "AcDbAlignedDimension"
+                        } else {
+                            "AcDbRotatedDimension"
+                        },
+                    );
+                    pair_f(s, 13, p1.x);
+                    pair_f(s, 23, p1.y);
+                    pair_f(s, 33, 0.0);
+                    pair_f(s, 14, p2.x);
+                    pair_f(s, 24, p2.y);
+                    pair_f(s, 34, 0.0);
                     if !aligned {
                         let angle = match ortho {
                             cad_kernel::LinearOrtho::Horizontal => 0.0,
@@ -2204,8 +2641,14 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
                         pair_f(s, 50, angle);
                     }
                 }
-                DimKind::Angular { vertex, p1, p2, arc_pos } => {
-                    pair_f(s, 10, vertex.x); pair_f(s, 20, vertex.y);
+                DimKind::Angular {
+                    vertex,
+                    p1,
+                    p2,
+                    arc_pos,
+                } => {
+                    pair_f(s, 10, vertex.x);
+                    pair_f(s, 20, vertex.y);
                     pair_f(s, 30, 0.0);
                     pair_f(s, 11, rg.text_pos.x);
                     pair_f(s, 21, rg.text_pos.y);
@@ -2219,14 +2662,27 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
                     pair_f(s, 42, d.measured_value());
                     pair_f(s, 40, text_h.max(0.05));
                     pair(s, 100, "AcDb2LineAngularDimension");
-                    pair_f(s, 13, p1.x); pair_f(s, 23, p1.y); pair_f(s, 33, 0.0);
-                    pair_f(s, 14, p2.x); pair_f(s, 24, p2.y); pair_f(s, 34, 0.0);
-                    pair_f(s, 15, arc_pos.x); pair_f(s, 25, arc_pos.y); pair_f(s, 35, 0.0);
+                    pair_f(s, 13, p1.x);
+                    pair_f(s, 23, p1.y);
+                    pair_f(s, 33, 0.0);
+                    pair_f(s, 14, p2.x);
+                    pair_f(s, 24, p2.y);
+                    pair_f(s, 34, 0.0);
+                    pair_f(s, 15, arc_pos.x);
+                    pair_f(s, 25, arc_pos.y);
+                    pair_f(s, 35, 0.0);
                 }
-                DimKind::ArcLen { center, radius, start_angle, sweep, leader_end } => {
+                DimKind::ArcLen {
+                    center,
+                    radius,
+                    start_angle,
+                    sweep,
+                    leader_end,
+                } => {
                     // Arc-length (AcDbArcDimension, type 8): 10 = center,
                     // 11 = leader end, 40 = radius, 13/14 = arc start/end.
-                    pair_f(s, 10, center.x); pair_f(s, 20, center.y);
+                    pair_f(s, 10, center.x);
+                    pair_f(s, 20, center.y);
                     pair_f(s, 30, 0.0);
                     pair_f(s, 11, leader_end.x);
                     pair_f(s, 21, leader_end.y);
@@ -2250,10 +2706,16 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
                     pair_f(s, 24, center.y + a1.sin() * radius);
                     pair_f(s, 34, 0.0);
                 }
-                DimKind::Ordinate { datum, point, leader_end, is_x } => {
+                DimKind::Ordinate {
+                    datum,
+                    point,
+                    leader_end,
+                    is_x,
+                } => {
                     // Ordinate (AcDbOrdinateDimension, type 6): 10 = the
                     // feature point, 11 = leader end, 13 = datum.
-                    pair_f(s, 10, point.x); pair_f(s, 20, point.y);
+                    pair_f(s, 10, point.x);
+                    pair_f(s, 20, point.y);
                     pair_f(s, 30, 0.0);
                     pair_f(s, 11, leader_end.x);
                     pair_f(s, 21, leader_end.y);
@@ -2268,14 +2730,21 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
                     pair_f(s, 42, d.measured_value());
                     pair_f(s, 40, text_h.max(0.05));
                     pair(s, 100, "AcDbOrdinateDimension");
-                    pair_f(s, 13, datum.x); pair_f(s, 23, datum.y);
+                    pair_f(s, 13, datum.x);
+                    pair_f(s, 23, datum.y);
                     pair_f(s, 33, 0.0);
                 }
-                DimKind::JoggedRadius { center, on_circle, leader_end, jog_pos } => {
+                DimKind::JoggedRadius {
+                    center,
+                    on_circle,
+                    leader_end,
+                    jog_pos,
+                } => {
                     // Jogged radius (AcDbRadialDimensionLarge, type 4 with
                     // a jog): 10 = center, 11 = leader end, 15 = on-circle,
                     // 40 = radius, 71 = jog point.
-                    pair_f(s, 10, center.x); pair_f(s, 20, center.y);
+                    pair_f(s, 10, center.x);
+                    pair_f(s, 20, center.y);
                     pair_f(s, 30, 0.0);
                     pair_f(s, 11, leader_end.x);
                     pair_f(s, 21, leader_end.y);
@@ -2289,12 +2758,19 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
                     pair_f(s, 42, d.measured_value());
                     pair_f(s, 40, text_h.max(0.05));
                     pair(s, 100, "AcDbRadialDimensionLarge");
-                    pair_f(s, 15, on_circle.x); pair_f(s, 25, on_circle.y);
+                    pair_f(s, 15, on_circle.x);
+                    pair_f(s, 25, on_circle.y);
                     pair_f(s, 35, 0.0);
-                    pair_f(s, 71, jog_pos.x); pair_f(s, 21, jog_pos.y);
+                    pair_f(s, 71, jog_pos.x);
+                    pair_f(s, 21, jog_pos.y);
                 }
-                DimKind::Radius { center, on_circle, leader_end } => {
-                    pair_f(s, 10, center.x); pair_f(s, 20, center.y);
+                DimKind::Radius {
+                    center,
+                    on_circle,
+                    leader_end,
+                } => {
+                    pair_f(s, 10, center.x);
+                    pair_f(s, 20, center.y);
                     pair_f(s, 30, 0.0);
                     pair_f(s, 11, leader_end.x);
                     pair_f(s, 21, leader_end.y);
@@ -2308,11 +2784,17 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
                     pair_f(s, 42, d.measured_value());
                     pair_f(s, 40, text_h.max(0.05));
                     pair(s, 100, "AcDbRadialDimension");
-                    pair_f(s, 15, on_circle.x); pair_f(s, 25, on_circle.y);
+                    pair_f(s, 15, on_circle.x);
+                    pair_f(s, 25, on_circle.y);
                     pair_f(s, 35, 0.0);
                 }
-                DimKind::Diameter { center, on_circle, leader_end } => {
-                    pair_f(s, 10, center.x); pair_f(s, 20, center.y);
+                DimKind::Diameter {
+                    center,
+                    on_circle,
+                    leader_end,
+                } => {
+                    pair_f(s, 10, center.x);
+                    pair_f(s, 20, center.y);
                     pair_f(s, 30, 0.0);
                     pair_f(s, 11, leader_end.x);
                     pair_f(s, 21, leader_end.y);
@@ -2326,7 +2808,8 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
                     pair_f(s, 42, d.measured_value());
                     pair_f(s, 40, text_h.max(0.05));
                     pair(s, 100, "AcDbDiametricDimension");
-                    pair_f(s, 15, on_circle.x); pair_f(s, 25, on_circle.y);
+                    pair_f(s, 15, on_circle.x);
+                    pair_f(s, 25, on_circle.y);
                     pair_f(s, 35, 0.0);
                 }
             }
@@ -2358,7 +2841,7 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
                 let (sy, rot) = if br.mirror_x {
                     (-br.scale_y, br.rotation - std::f64::consts::PI)
                 } else {
-                    ( br.scale_y, br.rotation)
+                    (br.scale_y, br.rotation)
                 };
                 // Emit 41/42/50 UNCONDITIONALLY — the reader's defaults
                 // (1.0/1.0/0°) only apply when absent, so writing them
@@ -2373,11 +2856,12 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
                 let mut attr_i = 0usize;
                 for child in &blk.dobjects {
                     if let Geom::AttrDef(ad) = &child.geom {
-                        let val = br.attr_values.get(attr_i)
+                        let val = br
+                            .attr_values
+                            .get(attr_i)
                             .cloned()
                             .unwrap_or_else(|| ad.default.clone());
-                        let wp = br.transform_geom(
-                            &Geom::AttrDef(ad.clone()), blk.base);
+                        let wp = br.transform_geom(&Geom::AttrDef(ad.clone()), blk.base);
                         if let Geom::AttrDef(wad) = wp {
                             let (x, y) = (wad.position.x, wad.position.y);
                             common(s, h, "ATTRIB");
@@ -2404,11 +2888,11 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
             // (DXF LEADER's annotation handle is an optional attachment).
             common(s, h, "LEADER");
             pair(s, 100, "AcDbLeader");
-            pair_i(s, 71, if l.arrow { 1 } else { 0 });  // arrowhead flag
-            pair_i(s, 72, 3);                            // straight-line path
+            pair_i(s, 71, if l.arrow { 1 } else { 0 }); // arrowhead flag
+            pair_i(s, 72, 3); // straight-line path
             pair_i(s, 73, l.pts.len() as i32);
-            pair_i(s, 74, 0);                            // no annotation hook
-            pair_i(s, 75, 0);                            // no arrowhead hook
+            pair_i(s, 74, 0); // no annotation hook
+            pair_i(s, 75, 0); // no arrowhead hook
             for p in &l.pts {
                 pair_f(s, 10, p.x);
                 pair_f(s, 20, p.y);
@@ -2466,12 +2950,20 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
             let [t0, t1, t2, t3] = cm.tips();
             common(s, h, "LINE");
             pair(s, 100, "AcDbLine");
-            pair_f(s, 10, t0.x);  pair_f(s, 20, t0.y);  pair_f(s, 30, 0.0);
-            pair_f(s, 11, t2.x);  pair_f(s, 21, t2.y);  pair_f(s, 31, 0.0);
+            pair_f(s, 10, t0.x);
+            pair_f(s, 20, t0.y);
+            pair_f(s, 30, 0.0);
+            pair_f(s, 11, t2.x);
+            pair_f(s, 21, t2.y);
+            pair_f(s, 31, 0.0);
             common(s, h, "LINE");
             pair(s, 100, "AcDbLine");
-            pair_f(s, 10, t1.x);  pair_f(s, 20, t1.y);  pair_f(s, 30, 0.0);
-            pair_f(s, 11, t3.x);  pair_f(s, 21, t3.y);  pair_f(s, 31, 0.0);
+            pair_f(s, 10, t1.x);
+            pair_f(s, 20, t1.y);
+            pair_f(s, 30, 0.0);
+            pair_f(s, 11, t3.x);
+            pair_f(s, 21, t3.y);
+            pair_f(s, 31, 0.0);
         }
         Geom::Xline(x) => {
             // XLINE (AcDbXline): 10/20/30 = base point, 11/21/31 =
@@ -2552,8 +3044,12 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document, h: &mut HandleGen, 
             for (a, b) in t.grid_lines() {
                 common(s, h, "LINE");
                 pair(s, 100, "AcDbLine");
-                pair_f(s, 10, a.x); pair_f(s, 20, a.y); pair_f(s, 30, 0.0);
-                pair_f(s, 11, b.x); pair_f(s, 21, b.y); pair_f(s, 31, 0.0);
+                pair_f(s, 10, a.x);
+                pair_f(s, 20, a.y);
+                pair_f(s, 30, 0.0);
+                pair_f(s, 11, b.x);
+                pair_f(s, 21, b.y);
+                pair_f(s, 31, 0.0);
             }
             for r in 0..t.n_rows {
                 for c in 0..t.n_cols {
@@ -2591,7 +3087,8 @@ mod tests {
 
     #[test]
     fn insunits_millimetres_is_read_from_the_header() {
-        let text = "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1015\n9\n$INSUNITS\n70\n4\n0\nENDSEC\n\
+        let text =
+            "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1015\n9\n$INSUNITS\n70\n4\n0\nENDSEC\n\
                     0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n";
         let doc = read_dxf(text).expect("parse");
         assert_eq!(doc.units.metres_per_unit, 0.001);
@@ -2625,18 +3122,30 @@ mod tests {
         assert_eq!(doc.units.source, cad_kernel::UnitSource::Assumed);
         let text = write_dxf(&doc);
         assert!(text.contains("$INSUNITS"), "the variable is written");
-        assert_eq!(round_trip(&doc).units.source, cad_kernel::UnitSource::Assumed);
+        assert_eq!(
+            round_trip(&doc).units.source,
+            cad_kernel::UnitSource::Assumed
+        );
     }
 
     /// A unit somebody DID state survives a full write → read cycle.
     #[test]
     fn a_declared_unit_survives_export_and_reimport() {
-        for (metres, _name) in [(0.001, "mm"), (0.01, "cm"), (1.0, "m"), (0.0254, "in"), (0.3048, "ft")] {
+        for (metres, _name) in [
+            (0.001, "mm"),
+            (0.01, "cm"),
+            (1.0, "m"),
+            (0.0254, "in"),
+            (0.3048, "ft"),
+        ] {
             let mut doc = Document::default();
-            doc.units = cad_kernel::Units::from_metres_per_unit(
-                metres, cad_kernel::UnitSource::User);
+            doc.units =
+                cad_kernel::Units::from_metres_per_unit(metres, cad_kernel::UnitSource::User);
             let back = round_trip(&doc);
-            assert_eq!(back.units.metres_per_unit, metres, "{metres} m/unit round-trips");
+            assert_eq!(
+                back.units.metres_per_unit, metres,
+                "{metres} m/unit round-trips"
+            );
             // It comes back DECLARED (the file said so) rather than User — the app cannot
             // know a file's unit was originally typed by a person.
             assert_eq!(back.units.source, cad_kernel::UnitSource::Declared);
@@ -2650,7 +3159,9 @@ mod tests {
             0\nCIRCLE\n8\n0\n10\n5.0\n20\n3.0\n30\n0.0\n40\n2.0\n\
             210\n0.0\n220\n0.0\n230\n-1.0\n0\nENDSEC\n0\nEOF\n";
         let doc = read_dxf(dxf).expect("parse");
-        let Geom::Circle(c) = &doc.dobjects[0].geom else { panic!("circle") };
+        let Geom::Circle(c) = &doc.dobjects[0].geom else {
+            panic!("circle")
+        };
         assert_eq!(c.center.x, -5.0, "x is mirrored");
         assert_eq!(c.center.y, 3.0, "y is untouched");
     }
@@ -2663,7 +3174,9 @@ mod tests {
             0\nARC\n8\n0\n10\n0.0\n20\n0.0\n40\n5.0\n\
             50\n30.0\n51\n120.0\n210\n0.0\n220\n0.0\n230\n-1.0\n0\nENDSEC\n0\nEOF\n";
         let doc = read_dxf(dxf).expect("parse");
-        let Geom::Arc(a) = &doc.dobjects[0].geom else { panic!("arc") };
+        let Geom::Arc(a) = &doc.dobjects[0].geom else {
+            panic!("arc")
+        };
         // Under the mirror the endpoints are (x,y) → (−x,y) of the original 30°…120° arc.
         // The sweep REVERSES under a mirror, so the stored (CCW, positive-sweep) arc
         // necessarily STARTS at the mirrored original END and ENDS at the mirrored
@@ -2706,7 +3219,9 @@ mod tests {
             10\n5.0\n20\n0.0\n42\n0.0\n\
             210\n0.0\n220\n0.0\n230\n-1.0\n0\nENDSEC\n0\nEOF\n";
         let doc = read_dxf(dxf).expect("parse");
-        let Geom::Polyline(pl) = &doc.dobjects[0].geom else { panic!("polyline") };
+        let Geom::Polyline(pl) = &doc.dobjects[0].geom else {
+            panic!("polyline")
+        };
         assert_eq!(pl.vertices[0].pos.x, -1.0, "first vertex mirrored");
         assert_eq!(pl.vertices[1].pos.x, -3.0, "second vertex mirrored");
         assert_eq!(pl.vertices[2].pos.x, -5.0, "third vertex mirrored");
@@ -2720,7 +3235,9 @@ mod tests {
             0\nLINE\n8\n0\n10\n1.0\n20\n2.0\n11\n3.0\n21\n4.0\n\
             210\n0.0\n220\n0.0\n230\n-1.0\n0\nENDSEC\n0\nEOF\n";
         let doc = read_dxf(dxf).expect("parse");
-        let Geom::Line(l) = &doc.dobjects[0].geom else { panic!("line") };
+        let Geom::Line(l) = &doc.dobjects[0].geom else {
+            panic!("line")
+        };
         assert_eq!(l.a, Vec2::new(1.0, 2.0));
         assert_eq!(l.b, Vec2::new(3.0, 4.0));
     }
@@ -2733,7 +3250,9 @@ mod tests {
             0\nCIRCLE\n8\n0\n10\n5.0\n20\n3.0\n40\n2.0\n\
             210\n0.5\n220\n0.0\n230\n0.866\n0\nENDSEC\n0\nEOF\n";
         let doc = read_dxf(dxf).expect("parse");
-        let Geom::Circle(c) = &doc.dobjects[0].geom else { panic!("circle") };
+        let Geom::Circle(c) = &doc.dobjects[0].geom else {
+            panic!("circle")
+        };
         assert_eq!(c.center.x, 5.0, "tilted extrusion is not mirrored");
     }
 
@@ -2743,7 +3262,9 @@ mod tests {
             0\nCIRCLE\n8\n0\n10\n5.0\n20\n3.0\n40\n2.0\n\
             210\n0.0\n220\n0.0\n230\n1.0\n0\nENDSEC\n0\nEOF\n";
         let doc = read_dxf(dxf).expect("parse");
-        let Geom::Circle(c) = &doc.dobjects[0].geom else { panic!("circle") };
+        let Geom::Circle(c) = &doc.dobjects[0].geom else {
+            panic!("circle")
+        };
         assert_eq!(c.center.x, 5.0);
     }
 
@@ -2757,8 +3278,10 @@ mod tests {
         let had_zero = doc.layers.layers.iter().any(|l| l.name == "0");
         let expected = doc.layers.len() + if had_zero { 0 } else { 1 };
         assert_eq!(back.layers.len(), expected);
-        assert!(back.layers.layers.iter().any(|l| l.name == "0"),
-            "round-trip must contain the default layer \"0\"");
+        assert!(
+            back.layers.layers.iter().any(|l| l.name == "0"),
+            "round-trip must contain the default layer \"0\""
+        );
         assert!(back.dobjects.is_empty());
     }
 
@@ -2804,14 +3327,28 @@ mod tests {
 0\nARC\n8\n0\n10\n10.0\n20\n0.0\n40\n1.0\n50\n0.0\n51\n90.0\n\
 0\nENDSEC\n0\nEOF\n";
         let doc = read_dxf(dxf).expect("parse");
-        let arcs: Vec<&Arc> = doc.dobjects.iter()
-            .filter_map(|d| if let Geom::Arc(a) = &d.geom { Some(a) } else { None })
+        let arcs: Vec<&Arc> = doc
+            .dobjects
+            .iter()
+            .filter_map(|d| {
+                if let Geom::Arc(a) = &d.geom {
+                    Some(a)
+                } else {
+                    None
+                }
+            })
             .collect();
         assert_eq!(arcs.len(), 2, "degenerate start==end arc must be dropped");
-        assert!(arcs.iter().any(|a| (a.sweep_angle - std::f64::consts::TAU).abs() < 1e-9),
-            "0..360 arc kept as a full circle");
-        assert!(arcs.iter().any(|a| (a.sweep_angle - std::f64::consts::FRAC_PI_2).abs() < 1e-9),
-            "0..90 arc kept as a quarter");
+        assert!(
+            arcs.iter()
+                .any(|a| (a.sweep_angle - std::f64::consts::TAU).abs() < 1e-9),
+            "0..360 arc kept as a full circle"
+        );
+        assert!(
+            arcs.iter()
+                .any(|a| (a.sweep_angle - std::f64::consts::FRAC_PI_2).abs() < 1e-9),
+            "0..90 arc kept as a quarter"
+        );
     }
 
     #[test]
@@ -2878,7 +3415,8 @@ mod tests {
     fn doc_with_chair() -> (Document, u32) {
         let mut doc = Document::default();
         let line = DObject::new(Geom::Line(Line {
-            a: Vec2::new(0.0, 0.0), b: Vec2::new(4.0, 0.0),
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(4.0, 0.0),
         }));
         let bid = doc.blocks.add(Block {
             name: "CHAIR".into(),
@@ -2906,25 +3444,29 @@ mod tests {
         doc.push(DObject::new(Geom::BlockRef(BlockRef {
             block: bid,
             insert: Vec2::new(10.0, 5.0),
-            scale: 2.0, scale_y: 2.0,
+            scale: 2.0,
+            scale_y: 2.0,
             rotation: rot,
             mirror_x: false,
             param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
-                attr_values: Vec::new(),
-            })));
+            attr_values: Vec::new(),
+        })));
         let back = round_trip(&doc);
 
         // Block definition survives (identity NOT exploded away).
         assert_eq!(back.blocks.blocks.len(), 1, "CHAIR block must round-trip");
         let bid2 = back.blocks.find("CHAIR").expect("CHAIR");
-        assert_eq!(back.blocks.blocks[bid2 as usize].dobjects.len(), 1,
-            "block's line must survive");
+        assert_eq!(
+            back.blocks.blocks[bid2 as usize].dobjects.len(),
+            1,
+            "block's line must survive"
+        );
         // The instance stayed a single BlockRef (not exploded into a line).
         assert_eq!(back.dobjects.len(), 1, "instance must stay ONE BlockRef");
         let br = only_blockref(&back);
         assert_eq!(br.block, bid2);
         assert_eq!(br.insert, Vec2::new(10.0, 5.0));
-        assert!((br.scale   - 2.0).abs() < 1e-9);
+        assert!((br.scale - 2.0).abs() < 1e-9);
         assert!((br.scale_y - 2.0).abs() < 1e-9);
         assert!((br.rotation - rot).abs() < 1e-9, "rotation must round-trip");
         assert!(!br.mirror_x, "non-mirrored must stay non-mirrored");
@@ -2938,23 +3480,30 @@ mod tests {
         doc.push(DObject::new(Geom::BlockRef(BlockRef {
             block: bid,
             insert: Vec2::new(-3.0, 7.0),
-            scale: 1.5, scale_y: 1.5,
+            scale: 1.5,
+            scale_y: 1.5,
             rotation: rot,
             mirror_x: true,
             param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
-                attr_values: Vec::new(),
-            })));
+            attr_values: Vec::new(),
+        })));
         let back = round_trip(&doc);
 
-        assert_eq!(back.dobjects.len(), 1, "mirrored instance must stay ONE BlockRef");
+        assert_eq!(
+            back.dobjects.len(),
+            1,
+            "mirrored instance must stay ONE BlockRef"
+        );
         let br = only_blockref(&back);
         assert_eq!(br.block, back.blocks.find("CHAIR").unwrap());
         assert_eq!(br.insert, Vec2::new(-3.0, 7.0));
-        assert!((br.scale   - 1.5).abs() < 1e-9);
+        assert!((br.scale - 1.5).abs() < 1e-9);
         assert!((br.scale_y - 1.5).abs() < 1e-9);
         assert!(br.mirror_x, "mirror flag must round-trip");
-        assert!((br.rotation - rot).abs() < 1e-9,
-            "mirrored rotation must round-trip exactly (writer −π ↔ reader +π)");
+        assert!(
+            (br.rotation - rot).abs() < 1e-9,
+            "mirrored rotation must round-trip exactly (writer −π ↔ reader +π)"
+        );
     }
 
     #[test]
@@ -2966,12 +3515,13 @@ mod tests {
         let nested = DObject::new(Geom::BlockRef(BlockRef {
             block: chair,
             insert: Vec2::new(1.0, 0.0),
-            scale: 1.0, scale_y: 1.0,
+            scale: 1.0,
+            scale_y: 1.0,
             rotation: 0.0,
             mirror_x: false,
             param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
-                attr_values: Vec::new(),
-            }));
+            attr_values: Vec::new(),
+        }));
         let frame = doc.blocks.add(Block {
             name: "FRAME".into(),
             base: Vec2::new(0.0, 0.0),
@@ -2983,22 +3533,28 @@ mod tests {
         doc.push(DObject::new(Geom::BlockRef(BlockRef {
             block: frame,
             insert: Vec2::new(0.0, 0.0),
-            scale: 1.0, scale_y: 1.0,
+            scale: 1.0,
+            scale_y: 1.0,
             rotation: 0.0,
             mirror_x: false,
             param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
-                attr_values: Vec::new(),
-            })));
+            attr_values: Vec::new(),
+        })));
         let back = round_trip(&doc);
 
-        assert_eq!(back.blocks.blocks.len(), 2, "CHAIR + FRAME must both round-trip");
+        assert_eq!(
+            back.blocks.blocks.len(),
+            2,
+            "CHAIR + FRAME must both round-trip"
+        );
         let frame2 = back.blocks.find("FRAME").expect("FRAME");
         let chair2 = back.blocks.find("CHAIR").expect("CHAIR");
         let inner = &back.blocks.blocks[frame2 as usize].dobjects;
         assert_eq!(inner.len(), 1, "FRAME's nested BlockRef must survive");
         match &inner[0].geom {
-            Geom::BlockRef(br) => assert_eq!(br.block, chair2,
-                "nested ref must resolve back to CHAIR"),
+            Geom::BlockRef(br) => {
+                assert_eq!(br.block, chair2, "nested ref must resolve back to CHAIR")
+            }
             other => panic!("expected nested BlockRef, got {other:?}"),
         }
     }
@@ -3013,26 +3569,40 @@ mod tests {
         let mut doc = Document::default();
         doc.push(DObject::new(Geom::Dimension(cad_kernel::Dim {
             kind: cad_kernel::DimKind::ArcLen {
-                center: Vec2::new(2.0, 1.0), radius: 4.0,
-                start_angle: 0.0, sweep: std::f64::consts::FRAC_PI_2,
+                center: Vec2::new(2.0, 1.0),
+                radius: 4.0,
+                start_angle: 0.0,
+                sweep: std::f64::consts::FRAC_PI_2,
                 leader_end: Vec2::new(8.0, 5.0),
             },
-            style: 0, text_override: None,
+            style: 0,
+            text_override: None,
         })));
         doc.push(DObject::new(Geom::Dimension(cad_kernel::Dim {
             kind: cad_kernel::DimKind::Ordinate {
-                datum: Vec2::new(0.0, 0.0), point: Vec2::new(7.0, 2.0),
-                leader_end: Vec2::new(9.0, 2.0), is_x: true,
+                datum: Vec2::new(0.0, 0.0),
+                point: Vec2::new(7.0, 2.0),
+                leader_end: Vec2::new(9.0, 2.0),
+                is_x: true,
             },
-            style: 0, text_override: None,
+            style: 0,
+            text_override: None,
         })));
         let back = round_trip(&doc);
-        let Geom::Dimension(a) = &back.dobjects[0].geom else { panic!("arc-len lost") };
-        let cad_kernel::DimKind::ArcLen { radius, sweep, .. } = a.kind else { panic!() };
+        let Geom::Dimension(a) = &back.dobjects[0].geom else {
+            panic!("arc-len lost")
+        };
+        let cad_kernel::DimKind::ArcLen { radius, sweep, .. } = a.kind else {
+            panic!()
+        };
         assert!((radius - 4.0).abs() < 1e-9);
         assert!((sweep - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
-        let Geom::Dimension(o) = &back.dobjects[1].geom else { panic!("ordinate lost") };
-        let cad_kernel::DimKind::Ordinate { is_x, .. } = o.kind else { panic!("kind mismatch") };
+        let Geom::Dimension(o) = &back.dobjects[1].geom else {
+            panic!("ordinate lost")
+        };
+        let cad_kernel::DimKind::Ordinate { is_x, .. } = o.kind else {
+            panic!("kind mismatch")
+        };
         assert!(is_x);
     }
 
@@ -3041,7 +3611,9 @@ mod tests {
         let mut doc = Document::default();
         let rgb = doc.truecolors.intern(0x12_34_56);
         let mut d = DObject::new(Geom::Line(cad_kernel::Line {
-            a: Vec2::new(0.0, 0.0), b: Vec2::new(5.0, 0.0) }));
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(5.0, 0.0),
+        }));
         d.style.color = Color::TrueColorRef(rgb);
         d.style.linetype_scale = 2.5;
         doc.push(d);
@@ -3051,8 +3623,11 @@ mod tests {
             panic!("truecolor lost: {:?}", b.style.color);
         };
         assert_eq!(back.truecolors.get(idx), Some(0x12_34_56));
-        assert!((b.style.linetype_scale - 2.5).abs() < 1e-5,
-            "ltscale survived: {}", b.style.linetype_scale);
+        assert!(
+            (b.style.linetype_scale - 2.5).abs() < 1e-5,
+            "ltscale survived: {}",
+            b.style.linetype_scale
+        );
     }
 
     #[test]
@@ -3064,7 +3639,9 @@ mod tests {
             Vec2::new(0.0, 2.0),
         ))));
         let back = round_trip(&doc);
-        let Geom::Ray(r) = &back.dobjects[0].geom else { panic!("ray lost") };
+        let Geom::Ray(r) = &back.dobjects[0].geom else {
+            panic!("ray lost")
+        };
         assert_eq!((r.base.x, r.base.y), (4.0, -1.0));
         assert!((r.dir - Vec2::new(0.0, 1.0)).len() < 1e-9, "dir normalized");
     }
@@ -3073,32 +3650,50 @@ mod tests {
     fn ac1015_openability_structure_smoke() {
         let (mut doc, bid) = doc_with_chair();
         doc.push(DObject::new(Geom::Line(Line {
-            a: Vec2::new(0.0, 0.0), b: Vec2::new(1.0, 1.0),
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(1.0, 1.0),
         })));
         doc.push(DObject::new(Geom::BlockRef(BlockRef {
-            block: bid, insert: Vec2::new(2.0, 2.0),
-            scale: 1.0, scale_y: 1.0, rotation: 0.0, mirror_x: false,
+            block: bid,
+            insert: Vec2::new(2.0, 2.0),
+            scale: 1.0,
+            scale_y: 1.0,
+            rotation: 0.0,
+            mirror_x: false,
             param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
-                attr_values: Vec::new(),
-            })));
+            attr_values: Vec::new(),
+        })));
         let dxf = write_dxf(&doc);
 
         for needle in [
-            "\n$HANDSEED\n", "\nAPPID\n", "\nACAD\n", "\nBLOCK_RECORD\n",
-            "\n*Model_Space\n", "\n*Paper_Space\n", "\nVPORT\n", "\n*Active\n",
-            "\nDIMSTYLE\n", "\nSTANDARD\n",
-            "\nAcDbEntity\n", "\nAcDbSymbolTableRecord\n",
-            "\nAcDbLine\n", "\nAcDbBlockReference\n",
+            "\n$HANDSEED\n",
+            "\nAPPID\n",
+            "\nACAD\n",
+            "\nBLOCK_RECORD\n",
+            "\n*Model_Space\n",
+            "\n*Paper_Space\n",
+            "\nVPORT\n",
+            "\n*Active\n",
+            "\nDIMSTYLE\n",
+            "\nSTANDARD\n",
+            "\nAcDbEntity\n",
+            "\nAcDbSymbolTableRecord\n",
+            "\nAcDbLine\n",
+            "\nAcDbBlockReference\n",
             // OBJECTS graph so LAYER 390 plot-style pointers resolve.
-            "\nOBJECTS\n", "\nACAD_PLOTSTYLENAME\n", "\nACDBPLACEHOLDER\n",
+            "\nOBJECTS\n",
+            "\nACAD_PLOTSTYLENAME\n",
+            "\nACDBPLACEHOLDER\n",
             "\n390\n",
         ] {
             assert!(dxf.contains(needle), "written DXF missing {needle:?}");
         }
         // AutoCAD requires the default layer "0"; the default doc has no such
         // layer, so the writer must synthesize it.
-        assert!(dxf.contains("AcDbLayerTableRecord\n2\n0\n"),
-            "LAYER table must contain the default layer \"0\"");
+        assert!(
+            dxf.contains("AcDbLayerTableRecord\n2\n0\n"),
+            "LAYER table must contain the default layer \"0\""
+        );
         // A hex handle (group code 5) is present somewhere.
         assert!(dxf.contains("\n5\n"), "no group-5 handle present");
         // Section order must be HEADER < TABLES < BLOCKS < ENTITIES.
@@ -3108,16 +3703,26 @@ mod tests {
             dxf.find("\nBLOCKS\n").unwrap(),
             dxf.find("\nENTITIES\n").unwrap(),
         );
-        assert!(hh < tt && tt < bb && bb < ee,
-            "section order must be HEADER < TABLES < BLOCKS < ENTITIES");
+        assert!(
+            hh < tt && tt < bb && bb < ee,
+            "section order must be HEADER < TABLES < BLOCKS < ENTITIES"
+        );
 
         // The enriched file still round-trips through our own reader.
         let back = read_dxf(&dxf).expect("re-read enriched DXF");
         assert_eq!(back.blocks.blocks.len(), 1, "CHAIR must survive");
-        assert!(back.dobjects.iter().any(|d| matches!(d.geom, Geom::BlockRef(_))),
-            "the INSERT must survive as a BlockRef");
-        assert!(back.dobjects.iter().any(|d| matches!(d.geom, Geom::Line(_))),
-            "the model-space LINE must survive");
+        assert!(
+            back.dobjects
+                .iter()
+                .any(|d| matches!(d.geom, Geom::BlockRef(_))),
+            "the INSERT must survive as a BlockRef"
+        );
+        assert!(
+            back.dobjects
+                .iter()
+                .any(|d| matches!(d.geom, Geom::Line(_))),
+            "the model-space LINE must survive"
+        );
     }
 
     // D2: SOLID HATCH is written (write-only — the reader has no HATCH arm yet,
@@ -3125,10 +3730,22 @@ mod tests {
     fn closed_rect_poly(x0: f64, y0: f64, x1: f64, y1: f64) -> Polyline {
         Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(x0, y0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(x1, y0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(x1, y1), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(x0, y1), bulge: 0.0 },
+                PolyVertex {
+                    pos: Vec2::new(x0, y0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(x1, y0),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(x1, y1),
+                    bulge: 0.0,
+                },
+                PolyVertex {
+                    pos: Vec2::new(x0, y1),
+                    bulge: 0.0,
+                },
             ],
             closed: true,
             widths: Vec::new(),
@@ -3153,7 +3770,10 @@ mod tests {
         // 4-corner rect → duplicate close dropped → 93 = 4 boundary vertices.
         assert!(dxf.contains("\n93\n4\n"), "boundary loop has 4 vertices");
         // A boundary vertex (4,3) is present.
-        assert!(dxf.contains("\n10\n4\n20\n3\n"), "boundary vertex (4,3) written");
+        assert!(
+            dxf.contains("\n10\n4\n20\n3\n"),
+            "boundary vertex (4,3) written"
+        );
     }
 
     #[test]
@@ -3162,7 +3782,10 @@ mod tests {
         let outer = DObject::new(Geom::Polyline(closed_rect_poly(0.0, 0.0, 10.0, 10.0)));
         let outer_h = outer.handle;
         doc.push(outer);
-        let hole = DObject::new(Geom::Circle(Circle { center: Vec2::new(5.0, 5.0), radius: 2.0 }));
+        let hole = DObject::new(Geom::Circle(Circle {
+            center: Vec2::new(5.0, 5.0),
+            radius: 2.0,
+        }));
         let hole_h = hole.handle;
         doc.push(hole);
         doc.push(DObject::new(Geom::Hatch(cad_kernel::Hatch {
@@ -3170,8 +3793,14 @@ mod tests {
             pattern: cad_kernel::HatchPattern::Solid,
         })));
         let dxf = write_dxf(&doc);
-        assert!(dxf.contains("\n91\n2\n"), "two boundary loops (outer + hole)");
-        assert!(dxf.contains("\n93\n64\n"), "circle hole loop has 64 vertices");
+        assert!(
+            dxf.contains("\n91\n2\n"),
+            "two boundary loops (outer + hole)"
+        );
+        assert!(
+            dxf.contains("\n93\n64\n"),
+            "circle hole loop has 64 vertices"
+        );
     }
 
     #[test]
@@ -3204,17 +3833,32 @@ mod tests {
 
         // Boundary polyline + hatch (the original boundary polyline is also
         // written as its own LWPOLYLINE entity, so the reader re-imports BOTH).
-        let hatch = back.dobjects.iter().find_map(|d| match &d.geom {
-            Geom::Hatch(h) => Some(h), _ => None })
+        let hatch = back
+            .dobjects
+            .iter()
+            .find_map(|d| match &d.geom {
+                Geom::Hatch(h) => Some(h),
+                _ => None,
+            })
             .expect("hatch must survive the round-trip");
-        assert_eq!(hatch.boundary_handles.len(), 1,
-            "one boundary loop re-linked by handle");
+        assert_eq!(
+            hatch.boundary_handles.len(),
+            1,
+            "one boundary loop re-linked by handle"
+        );
         let loops = cad_kernel::resolve_hatch_loops(hatch, &back);
         assert_eq!(loops.len(), 1, "boundary resolves to one loop");
-        assert_eq!(loops[0].len(), 5, "4-corner rect → 4 corners + duplicated close");
+        assert_eq!(
+            loops[0].len(),
+            5,
+            "4-corner rect → 4 corners + duplicated close"
+        );
         // The synthetic boundary dobject is a CLOSED polyline with the loop's
         // 4 vertices, and the hatch references its handle.
-        let bd = back.dobjects.iter().find(|d| d.handle == hatch.boundary_handles[0])
+        let bd = back
+            .dobjects
+            .iter()
+            .find(|d| d.handle == hatch.boundary_handles[0])
             .expect("synthetic boundary dobject present");
         match &bd.geom {
             Geom::Polyline(p) => {
@@ -3233,7 +3877,10 @@ mod tests {
         let outer = DObject::new(Geom::Polyline(closed_rect_poly(0.0, 0.0, 10.0, 10.0)));
         let outer_h = outer.handle;
         doc.push(outer);
-        let hole = DObject::new(Geom::Circle(Circle { center: Vec2::new(5.0, 5.0), radius: 2.0 }));
+        let hole = DObject::new(Geom::Circle(Circle {
+            center: Vec2::new(5.0, 5.0),
+            radius: 2.0,
+        }));
         let hole_h = hole.handle;
         doc.push(hole);
         doc.push(DObject::new(Geom::Hatch(cad_kernel::Hatch {
@@ -3242,8 +3889,13 @@ mod tests {
         })));
 
         let back = round_trip(&doc);
-        let hatch = back.dobjects.iter().find_map(|d| match &d.geom {
-            Geom::Hatch(h) => Some(h), _ => None })
+        let hatch = back
+            .dobjects
+            .iter()
+            .find_map(|d| match &d.geom {
+                Geom::Hatch(h) => Some(h),
+                _ => None,
+            })
             .expect("hatch must survive");
         let loops = cad_kernel::resolve_hatch_loops(hatch, &back);
         assert_eq!(loops.len(), 2, "outer + hole both re-linked");
@@ -3268,11 +3920,20 @@ mod tests {
 0\nENDSEC\n0\nEOF\n";
         let (doc, skipped) = read_dxf_with_stats(dxf).expect("parse");
         assert_eq!(skipped, 0);
-        let hatch = doc.dobjects.iter().find_map(|d| match &d.geom {
-            Geom::Hatch(h) => Some(h), _ => None })
+        let hatch = doc
+            .dobjects
+            .iter()
+            .find_map(|d| match &d.geom {
+                Geom::Hatch(h) => Some(h),
+                _ => None,
+            })
             .expect("hatch parsed");
         match &hatch.pattern {
-            cad_kernel::HatchPattern::Pattern { name, scale, angle_deg } => {
+            cad_kernel::HatchPattern::Pattern {
+                name,
+                scale,
+                angle_deg,
+            } => {
                 assert_eq!(name, "ANSI31");
                 assert!((scale - 2.0).abs() < 1e-9);
                 assert!((angle_deg - 30.0).abs() < 1e-9);
@@ -3280,13 +3941,18 @@ mod tests {
             _ => panic!("named pattern must not collapse to SOLID"),
         }
         assert_eq!(hatch.boundary_handles.len(), 1);
-        let bd = doc.dobjects.iter().find(|d| d.handle == hatch.boundary_handles[0])
+        let bd = doc
+            .dobjects
+            .iter()
+            .find(|d| d.handle == hatch.boundary_handles[0])
             .expect("boundary dobject");
         match &bd.geom {
             Geom::Polyline(p) => {
                 assert_eq!(p.vertices.len(), 4);
-                assert!((p.vertices[1].bulge - 1.0).abs() < 1e-9,
-                    "bulge must survive into the boundary polyline");
+                assert!(
+                    (p.vertices[1].bulge - 1.0).abs() < 1e-9,
+                    "bulge must survive into the boundary polyline"
+                );
                 assert_eq!(p.vertices[0].pos, Vec2::new(0.0, 0.0));
             }
             _ => panic!("boundary must be a polyline"),
@@ -3312,7 +3978,13 @@ mod tests {
     #[test]
     fn line_round_trip() {
         let mut doc = Document::default();
-        doc.push(Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 5.0) }.into());
+        doc.push(
+            Line {
+                a: Vec2::new(0.0, 0.0),
+                b: Vec2::new(10.0, 5.0),
+            }
+            .into(),
+        );
         let back = round_trip(&doc);
         assert_eq!(back.dobjects.len(), 1);
         match &back.dobjects[0].geom {
@@ -3328,37 +4000,60 @@ mod tests {
     #[test]
     fn circle_round_trip() {
         let mut doc = Document::default();
-        doc.push(Circle { center: Vec2::new(3.0, 4.0), radius: 7.0 }.into());
+        doc.push(
+            Circle {
+                center: Vec2::new(3.0, 4.0),
+                radius: 7.0,
+            }
+            .into(),
+        );
         let back = round_trip(&doc);
         if let Geom::Circle(c) = &back.dobjects[0].geom {
             assert!((c.center.x - 3.0).abs() < 1e-9);
             assert!((c.radius - 7.0).abs() < 1e-9);
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn arc_round_trip_preserves_sweep() {
         let mut doc = Document::default();
-        doc.push(Arc {
-            center: Vec2::ZERO, radius: 5.0,
-            start_angle: 0.5_f64,
-            sweep_angle: 1.2_f64,
-        }.into());
+        doc.push(
+            Arc {
+                center: Vec2::ZERO,
+                radius: 5.0,
+                start_angle: 0.5_f64,
+                sweep_angle: 1.2_f64,
+            }
+            .into(),
+        );
         let back = round_trip(&doc);
         if let Geom::Arc(a) = &back.dobjects[0].geom {
             assert!((a.start_angle - 0.5).abs() < 1e-6);
             assert!((a.sweep_angle - 1.2).abs() < 1e-6);
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn point_round_trip() {
         let mut doc = Document::default();
-        doc.push(Point { location: Vec2::new(1.0, 2.0), style: 0, size: 0.0 }.into());
+        doc.push(
+            Point {
+                location: Vec2::new(1.0, 2.0),
+                style: 0,
+                size: 0.0,
+            }
+            .into(),
+        );
         let back = round_trip(&doc);
         if let Geom::Point(p) = &back.dobjects[0].geom {
             assert!((p.location.x - 1.0).abs() < 1e-9);
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
@@ -3368,22 +4063,22 @@ mod tests {
         let mut doc = Document::default();
         doc.push(DObject::new(Geom::Text(cad_kernel::Text {
             position: Vec2::new(3.0, -1.5),
-            height:   0.42,
-            angle:    30.0_f64.to_radians(),
-            text:     "Hello DXF".into(),
-            h_align:  cad_kernel::TextHAlign::Right,
-            v_align:  cad_kernel::TextVAlign::Baseline,
-            style:    cad_kernel::TextStyleTable::STANDARD,
+            height: 0.42,
+            angle: 30.0_f64.to_radians(),
+            text: "Hello DXF".into(),
+            h_align: cad_kernel::TextHAlign::Right,
+            v_align: cad_kernel::TextVAlign::Baseline,
+            style: cad_kernel::TextStyleTable::STANDARD,
             // Exercise the per-entity spec round-trip (51/41 + AutoRASM XDATA).
-            oblique:       12.0_f64.to_radians(),
-            width_factor:  0.85,
-            bold:          true,
-            outline_only:  true,
+            oblique: 12.0_f64.to_radians(),
+            width_factor: 0.85,
+            bold: true,
+            outline_only: true,
             outline_width: 0.3,
-            underline:     true,
-            font_name:     "Arial".into(),
-            list_mode:     cad_kernel::TextListKind::None,
-            line_spacing:  1.5,
+            underline: true,
+            font_name: "Arial".into(),
+            list_mode: cad_kernel::TextListKind::None,
+            line_spacing: 1.5,
         })));
         let back = round_trip(&doc);
         assert_eq!(back.dobjects.len(), 1, "text was dropped on import");
@@ -3400,20 +4095,28 @@ mod tests {
             assert!(t.underline, "underline flag");
             assert!((t.outline_width - 0.3).abs() < 1e-9, "outline width");
             assert_eq!(t.font_name, "Arial");
-        } else { panic!("expected Text, got a different geom"); }
+        } else {
+            panic!("expected Text, got a different geom");
+        }
     }
 
     #[test]
     fn spline_rational_round_trip() {
         // WP1.8 / B3: degree-3 rational spline, 5 ctrl pts, one weight ≠ 1.
         let ctrl = vec![
-            Vec2::new(0.0, 0.0), Vec2::new(1.0, 2.0), Vec2::new(3.0, 3.0),
-            Vec2::new(5.0, 1.0), Vec2::new(6.0, -1.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1.0, 2.0),
+            Vec2::new(3.0, 3.0),
+            Vec2::new(5.0, 1.0),
+            Vec2::new(6.0, -1.0),
         ];
         let weights = vec![1.0, 1.0, 2.5, 1.0, 1.0];
         let mut doc = Document::default();
-        doc.push(DObject::new(Geom::Spline(
-            cad_kernel::Spline::new(3, ctrl.clone(), weights.clone()))));
+        doc.push(DObject::new(Geom::Spline(cad_kernel::Spline::new(
+            3,
+            ctrl.clone(),
+            weights.clone(),
+        ))));
         let back = round_trip(&doc);
         assert_eq!(back.dobjects.len(), 1, "spline was dropped on import");
         if let Geom::Spline(s) = &back.dobjects[0].geom {
@@ -3426,7 +4129,9 @@ mod tests {
             for (a, b) in s.weights.iter().zip(&weights) {
                 assert!((a - b).abs() < 1e-9, "weight {} != {}", a, b);
             }
-        } else { panic!("expected Spline"); }
+        } else {
+            panic!("expected Spline");
+        }
     }
 
     #[test]
@@ -3434,93 +4139,154 @@ mod tests {
         // Non-rational path: all weights 1.0 → writer omits 41 → reader rebuilds
         // via new_bspline. degree 3, 5 ctrl pts.
         let ctrl = vec![
-            Vec2::new(0.0, 0.0), Vec2::new(2.0, 4.0), Vec2::new(4.0, 0.0),
-            Vec2::new(6.0, 4.0), Vec2::new(8.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(2.0, 4.0),
+            Vec2::new(4.0, 0.0),
+            Vec2::new(6.0, 4.0),
+            Vec2::new(8.0, 0.0),
         ];
         let mut doc = Document::default();
-        doc.push(DObject::new(Geom::Spline(
-            cad_kernel::Spline::new_bspline(3, ctrl.clone()))));
+        doc.push(DObject::new(Geom::Spline(cad_kernel::Spline::new_bspline(
+            3,
+            ctrl.clone(),
+        ))));
         let back = round_trip(&doc);
         assert_eq!(back.dobjects.len(), 1, "b-spline was dropped on import");
         if let Geom::Spline(s) = &back.dobjects[0].geom {
             assert_eq!(s.degree, 3);
             assert_eq!(s.control_points.len(), ctrl.len());
-            assert!(s.weights.iter().all(|w| (w - 1.0).abs() < 1e-9),
-                "non-rational weights must all be 1.0");
-        } else { panic!("expected Spline"); }
+            assert!(
+                s.weights.iter().all(|w| (w - 1.0).abs() < 1e-9),
+                "non-rational weights must all be 1.0"
+            );
+        } else {
+            panic!("expected Spline");
+        }
     }
 
     #[test]
     fn polyline_widths_round_trip() {
         let mut doc = Document::default();
-        doc.push(Polyline {
-            vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
-            ],
-            closed: false,
-            widths: vec![(2.0, 2.0), (1.0, 3.0)],
-        }.into());
+        doc.push(
+            Polyline {
+                vertices: vec![
+                    PolyVertex {
+                        pos: Vec2::new(0.0, 0.0),
+                        bulge: 0.0,
+                    },
+                    PolyVertex {
+                        pos: Vec2::new(4.0, 0.0),
+                        bulge: 0.0,
+                    },
+                    PolyVertex {
+                        pos: Vec2::new(4.0, 4.0),
+                        bulge: 0.0,
+                    },
+                ],
+                closed: false,
+                widths: vec![(2.0, 2.0), (1.0, 3.0)],
+            }
+            .into(),
+        );
         let back = round_trip(&doc);
         if let Geom::Polyline(p) = &back.dobjects[0].geom {
             // 2 segments → 2 width pairs preserved via DXF 40/41.
             assert_eq!(p.widths.len(), 2);
             assert!((p.widths[0].0 - 2.0).abs() < 1e-9 && (p.widths[0].1 - 2.0).abs() < 1e-9);
             assert!((p.widths[1].0 - 1.0).abs() < 1e-9 && (p.widths[1].1 - 3.0).abs() < 1e-9);
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn polyline_round_trip_open() {
         let mut doc = Document::default();
-        doc.push(Polyline {
-            vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(5.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(5.0, 5.0), bulge: 0.0 },
-            ],
-            closed: false,
-            widths: Vec::new(),
-        }.into());
+        doc.push(
+            Polyline {
+                vertices: vec![
+                    PolyVertex {
+                        pos: Vec2::new(0.0, 0.0),
+                        bulge: 0.0,
+                    },
+                    PolyVertex {
+                        pos: Vec2::new(5.0, 0.0),
+                        bulge: 0.0,
+                    },
+                    PolyVertex {
+                        pos: Vec2::new(5.0, 5.0),
+                        bulge: 0.0,
+                    },
+                ],
+                closed: false,
+                widths: Vec::new(),
+            }
+            .into(),
+        );
         let back = round_trip(&doc);
         if let Geom::Polyline(p) = &back.dobjects[0].geom {
             assert_eq!(p.vertices.len(), 3);
             assert!(!p.closed);
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn polyline_round_trip_closed() {
         let mut doc = Document::default();
-        doc.push(Polyline {
-            vertices: vec![
-                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(5.0, 0.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(5.0, 5.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(0.0, 5.0), bulge: 0.0 },
-            ],
-            closed: true,
-            widths: Vec::new(),
-        }.into());
+        doc.push(
+            Polyline {
+                vertices: vec![
+                    PolyVertex {
+                        pos: Vec2::new(0.0, 0.0),
+                        bulge: 0.0,
+                    },
+                    PolyVertex {
+                        pos: Vec2::new(5.0, 0.0),
+                        bulge: 0.0,
+                    },
+                    PolyVertex {
+                        pos: Vec2::new(5.0, 5.0),
+                        bulge: 0.0,
+                    },
+                    PolyVertex {
+                        pos: Vec2::new(0.0, 5.0),
+                        bulge: 0.0,
+                    },
+                ],
+                closed: true,
+                widths: Vec::new(),
+            }
+            .into(),
+        );
         let back = round_trip(&doc);
         if let Geom::Polyline(p) = &back.dobjects[0].geom {
             assert_eq!(p.vertices.len(), 4);
             assert!(p.closed);
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn ellipse_round_trip() {
         let mut doc = Document::default();
-        doc.push(Ellipse {
-            center: Vec2::ZERO, major: Vec2::new(5.0, 0.0), ratio: 0.4,
-        }.into());
+        doc.push(
+            Ellipse {
+                center: Vec2::ZERO,
+                major: Vec2::new(5.0, 0.0),
+                ratio: 0.4,
+            }
+            .into(),
+        );
         let back = round_trip(&doc);
         if let Geom::Ellipse(e) = &back.dobjects[0].geom {
             assert!((e.semi_major() - 5.0).abs() < 1e-9);
             assert!((e.ratio - 0.4).abs() < 1e-9);
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
@@ -3529,18 +4295,26 @@ mod tests {
         let walls = doc.layers.add(Layer {
             name: "WALLS".into(),
             color: Color::Aci(1),
-            order:      0,
-            ..Layer::layer_zero()});
+            order: 0,
+            ..Layer::layer_zero()
+        });
         doc.layers.active = walls;
         // WP6.1: push is a pure append now — it no longer inherits the active
         // layer, so the dobject must be placed on WALLS explicitly (was relying
         // on the removed inheritance).
-        let mut circ: DObject = Circle { center: Vec2::ZERO, radius: 5.0 }.into();
+        let mut circ: DObject = Circle {
+            center: Vec2::ZERO,
+            radius: 5.0,
+        }
+        .into();
         circ.style.layer = walls;
         doc.push(circ);
         let back = round_trip(&doc);
         // Layer must round-trip
-        let id = back.layers.find("WALLS").expect("WALLS layer not preserved");
+        let id = back
+            .layers
+            .find("WALLS")
+            .expect("WALLS layer not preserved");
         assert!(matches!(back.layers.get(id).unwrap().color, Color::Aci(1)));
         // Dobject's style.layer must point at WALLS post-import
         assert_eq!(back.dobjects[0].style.layer, id);
@@ -3590,12 +4364,15 @@ mod tests {
             name: "NOPLOT".into(),
             color: Color::Aci(6),
             plottable: false,
-            order:      0,
-            ..Layer::layer_zero()});
+            order: 0,
+            ..Layer::layer_zero()
+        });
         let back = round_trip(&doc);
         let id = back.layers.find("NOPLOT").expect("NOPLOT layer preserved");
-        assert!(!back.layers.get(id).unwrap().plottable,
-            "plottable=false must survive a DXF round-trip");
+        assert!(
+            !back.layers.get(id).unwrap().plottable,
+            "plottable=false must survive a DXF round-trip"
+        );
         // Sanity: a normal layer stays plottable.
         let l0 = back.layers.get(0).unwrap();
         assert!(l0.plottable, "default plottable layer must stay plottable");
@@ -3618,14 +4395,20 @@ mod centermark_dxf_tests {
         let back = read_dxf(&text).expect("read back");
         // The CENTERMARK entity itself imports; the two fallback LINEs
         // also import as real lines — so we see the mark + 2 arms.
-        let marks = back.dobjects.iter()
+        let marks = back
+            .dobjects
+            .iter()
             .filter(|d| matches!(d.geom, Geom::CenterMark(_)))
             .count();
         assert_eq!(marks, 1, "CENTERMARK entity survives the round trip");
-        if let Some(d) = back.dobjects.iter()
+        if let Some(d) = back
+            .dobjects
+            .iter()
             .find(|d| matches!(d.geom, Geom::CenterMark(_)))
         {
-            let Geom::CenterMark(cm) = &d.geom else { unreachable!() };
+            let Geom::CenterMark(cm) = &d.geom else {
+                unreachable!()
+            };
             assert!((cm.center.x - 2.0).abs() < 1e-9);
             assert!((cm.center.y + 3.0).abs() < 1e-9);
             assert!((cm.size - 1.25).abs() < 1e-9);
@@ -3664,7 +4447,12 @@ mod dimension_entity_tests {
         assert_eq!(back.dobjects.len(), 1, "dimension must import");
         if let Geom::Dimension(d) = &back.dobjects[0].geom {
             match d.kind {
-                cad_kernel::DimKind::Linear { p1, p2, dimline_pos, ortho } => {
+                cad_kernel::DimKind::Linear {
+                    p1,
+                    p2,
+                    dimline_pos,
+                    ortho,
+                } => {
                     assert!((p1 - Vec2::new(0.0, 0.0)).len() < 1e-6);
                     assert!((p2 - Vec2::new(10.0, 0.0)).len() < 1e-6);
                     assert!((dimline_pos - Vec2::new(5.0, -5.0)).len() < 1e-6);
@@ -3673,7 +4461,9 @@ mod dimension_entity_tests {
                 _ => panic!("kind lost: {:?}", d.kind),
             }
             assert_eq!(d.text_override.as_deref(), Some("<> mm"));
-        } else { panic!("not a dimension"); }
+        } else {
+            panic!("not a dimension");
+        }
     }
 
     #[test]
@@ -3692,7 +4482,12 @@ mod dimension_entity_tests {
         let back = round_trip(&doc);
         if let Geom::Dimension(d) = &back.dobjects[0].geom {
             match d.kind {
-                cad_kernel::DimKind::Angular { vertex, p1, p2, arc_pos } => {
+                cad_kernel::DimKind::Angular {
+                    vertex,
+                    p1,
+                    p2,
+                    arc_pos,
+                } => {
                     assert!((vertex - Vec2::new(0.0, 0.0)).len() < 1e-6);
                     assert!((p1 - Vec2::new(10.0, 0.0)).len() < 1e-6);
                     assert!((p2 - Vec2::new(0.0, 10.0)).len() < 1e-6);
@@ -3701,37 +4496,55 @@ mod dimension_entity_tests {
                 _ => panic!("kind lost"),
             }
             assert!(d.text_override.is_none(), "<> means measured");
-        } else { panic!("not a dimension"); }
+        } else {
+            panic!("not a dimension");
+        }
     }
 
     #[test]
     fn radius_and_diameter_round_trip() {
         for (kind, typ) in [
-            (cad_kernel::DimKind::Radius {
-                center: Vec2::new(0.0, 0.0),
-                on_circle: Vec2::new(3.0, 0.0),
-                leader_end: Vec2::new(6.0, 4.0),
-            }, 4),
-            (cad_kernel::DimKind::Diameter {
-                center: Vec2::new(0.0, 0.0),
-                on_circle: Vec2::new(3.0, 0.0),
-                leader_end: Vec2::new(6.0, 4.0),
-            }, 3),
+            (
+                cad_kernel::DimKind::Radius {
+                    center: Vec2::new(0.0, 0.0),
+                    on_circle: Vec2::new(3.0, 0.0),
+                    leader_end: Vec2::new(6.0, 4.0),
+                },
+                4,
+            ),
+            (
+                cad_kernel::DimKind::Diameter {
+                    center: Vec2::new(0.0, 0.0),
+                    on_circle: Vec2::new(3.0, 0.0),
+                    leader_end: Vec2::new(6.0, 4.0),
+                },
+                3,
+            ),
         ] {
             let mut doc = Document::default();
             doc.push(DObject::new(Geom::Dimension(cad_kernel::Dim {
-                kind, style: 0, text_override: None,
+                kind,
+                style: 0,
+                text_override: None,
             })));
             let back = round_trip(&doc);
             if let Geom::Dimension(d) = &back.dobjects[0].geom {
                 match d.kind {
-                    cad_kernel::DimKind::Radius { center, on_circle, leader_end } => {
+                    cad_kernel::DimKind::Radius {
+                        center,
+                        on_circle,
+                        leader_end,
+                    } => {
                         assert_eq!(typ, 4);
                         assert!((center - Vec2::new(0.0, 0.0)).len() < 1e-6);
                         assert!((on_circle - Vec2::new(3.0, 0.0)).len() < 1e-6);
                         assert!((leader_end - Vec2::new(6.0, 4.0)).len() < 1e-6);
                     }
-                    cad_kernel::DimKind::Diameter { center, on_circle, leader_end } => {
+                    cad_kernel::DimKind::Diameter {
+                        center,
+                        on_circle,
+                        leader_end,
+                    } => {
                         assert_eq!(typ, 3);
                         assert!((center - Vec2::new(0.0, 0.0)).len() < 1e-6);
                         assert!((on_circle - Vec2::new(3.0, 0.0)).len() < 1e-6);
@@ -3739,7 +4552,9 @@ mod dimension_entity_tests {
                     }
                     _ => panic!("kind lost for type {typ}"),
                 }
-            } else { panic!("not a dimension"); }
+            } else {
+                panic!("not a dimension");
+            }
         }
     }
 
@@ -3782,7 +4597,9 @@ mod mtext_entity_tests {
         if let Geom::Text(t) = &back.dobjects[0].geom {
             assert_eq!(t.text, "plain \\C1;red\\C0; end", "codes preserved");
             assert_eq!((t.position.x, t.position.y), (2.0, 3.0));
-        } else { panic!("mtext lost"); }
+        } else {
+            panic!("mtext lost");
+        }
     }
 
     #[test]
@@ -3804,7 +4621,9 @@ mod mtext_entity_tests {
         let back = round_trip(&doc);
         if let Geom::Text(t) = &back.dobjects[0].geom {
             assert_eq!(t.text, "line one\nline two", "\\P back to newline");
-        } else { panic!("mtext lost"); }
+        } else {
+            panic!("mtext lost");
+        }
     }
 
     #[test]
@@ -3826,7 +4645,9 @@ mod mtext_entity_tests {
         let back = round_trip(&doc);
         if let Geom::Text(t) = &back.dobjects[0].geom {
             assert_eq!(t.text, "hello");
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 }
 
@@ -3845,7 +4666,10 @@ mod extra_blob_tests {
 
     fn blob_doc() -> Document {
         let mut d = Document::default();
-        d.set_extra_blob("simlux-config", br#"{"furniture_lib":[],"textures":[{"name":"x"}]}"#.to_vec());
+        d.set_extra_blob(
+            "simlux-config",
+            br#"{"furniture_lib":[],"textures":[{"name":"x"}]}"#.to_vec(),
+        );
         d
     }
 
@@ -3872,7 +4696,8 @@ mod extra_blob_tests {
         d.set_extra_blob("big", body.clone().into_bytes());
         let back = round_trip(&d);
         assert_eq!(
-            back.extra_blob("big").map(|b| String::from_utf8_lossy(b).into_owned()),
+            back.extra_blob("big")
+                .map(|b| String::from_utf8_lossy(b).into_owned()),
             Some(body),
             "the chunked payload must reassemble byte-for-byte",
         );
@@ -3886,7 +4711,10 @@ mod extra_blob_tests {
         d.set_extra_blob("simlux-results", b"results-json".to_vec());
         let back = round_trip(&d);
         assert_eq!(back.extra_blob("simlux-config"), Some(&b"cfg-json"[..]));
-        assert_eq!(back.extra_blob("simlux-results"), Some(&b"results-json"[..]));
+        assert_eq!(
+            back.extra_blob("simlux-results"),
+            Some(&b"results-json"[..])
+        );
     }
 
     /// A drawing with nothing embedded writes NO SIMLUX_DATA dictionary and reads

@@ -1,4 +1,4 @@
-﻿//! 3D Factory — the `cad_solid` 3D solid layer, wired into the real app.
+//! 3D Factory — the `cad_solid` 3D solid layer, wired into the real app.
 //!
 //! This is the sandbox's core (`cad_solid/examples/sandbox.rs`) brought inside `cad_app`,
 //! where all ~31.8k lines of 2D drafting + modify already work — so every plane can get the
@@ -17,7 +17,13 @@ use crate::light3d::V3;
 /// faces plus an isometric, exactly the set every 3D solid app puts in its corner cube.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StdView {
-    Top, Bottom, Front, Back, Left, Right, Iso,
+    Top,
+    Bottom,
+    Front,
+    Back,
+    Left,
+    Right,
+    Iso,
 }
 
 /// WHERE a newly added 3D object, furniture piece or architecture element lands.
@@ -45,8 +51,12 @@ pub enum PlaceMode {
 }
 
 impl PlaceMode {
-    pub const ALL: [PlaceMode; 4] =
-        [PlaceMode::Click, PlaceMode::Centre, PlaceMode::Origin, PlaceMode::Offset];
+    pub const ALL: [PlaceMode; 4] = [
+        PlaceMode::Click,
+        PlaceMode::Centre,
+        PlaceMode::Origin,
+        PlaceMode::Offset,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -236,7 +246,13 @@ impl RoomInst {
 
     /// The (unbuilt) defaults a room starts with; shared by every creation path
     /// so a plan room, a layer import and a built room agree on slab defaults.
-    fn fresh(id: u32, name: String, footprint: Vec<Vec2>, height: f32, f: &FactoryState) -> RoomInst {
+    fn fresh(
+        id: u32,
+        name: String,
+        footprint: Vec<Vec2>,
+        height: f32,
+        f: &FactoryState,
+    ) -> RoomInst {
         RoomInst {
             id,
             name,
@@ -324,7 +340,11 @@ impl RoomInst {
             cy += (p.y + q.y) * cross;
         }
         if a2.abs() < 1e-9 {
-            let s: Vec2 = self.footprint.iter().copied().fold(Vec2::ZERO, |a, b| a + b);
+            let s: Vec2 = self
+                .footprint
+                .iter()
+                .copied()
+                .fold(Vec2::ZERO, |a, b| a + b);
             return s / n as f32;
         }
         Vec2::new(cx / (3.0 * a2), cy / (3.0 * a2))
@@ -540,7 +560,15 @@ impl SunEnv {
     fn hash_into(&self, h: &mut impl std::hash::Hasher) {
         use std::hash::Hash;
         self.enabled.hash(h);
-        for x in [self.lat_deg, self.lon_deg, self.utc_offset, self.hour, self.north_offset_deg, self.intensity, self.turbidity] {
+        for x in [
+            self.lat_deg,
+            self.lon_deg,
+            self.utc_offset,
+            self.hour,
+            self.north_offset_deg,
+            self.intensity,
+            self.turbidity,
+        ] {
             x.to_bits().hash(h);
         }
         self.month.hash(h);
@@ -577,7 +605,11 @@ impl SunEnv {
             gi: self.gi,
             refract: self.refract,
             ssr: self.ssr,
-            backdrop: if enabled && self.sky_backdrop { crate::env::Backdrop::Sky } else { crate::env::Backdrop::Studio },
+            backdrop: if enabled && self.sky_backdrop {
+                crate::env::Backdrop::Sky
+            } else {
+                crate::env::Backdrop::Studio
+            },
             reflections: self.reflections,
             // Filled in by the caller that owns the loaded map — `SunEnv` describes the SUN, and an
             // HDRI belongs to the scene, not to a date and a latitude.
@@ -594,7 +626,14 @@ impl SunEnv {
     /// `(enabled, dir, sun_rgb, sky_rgb, ground_rgb)` ready for [`set_sun_light`].
     pub fn resolve(&self) -> (bool, Vec3, [f32; 3], [f32; 3], [f32; 3]) {
         let doy = crate::solar::day_of_year(self.month, self.day);
-        let p = crate::solar::sun_position(self.lat_deg, self.lon_deg, self.utc_offset, doy, self.hour, self.north_offset_deg);
+        let p = crate::solar::sun_position(
+            self.lat_deg,
+            self.lon_deg,
+            self.utc_offset,
+            doy,
+            self.hour,
+            self.north_offset_deg,
+        );
         // Daylight factor f = sin(altitude): 0 at the horizon, 1 with the sun overhead.
         let f = p.dir.z.max(0.0).clamp(0.0, 1.0);
         // Direct sun: amber + dim near the horizon, bright near-WHITE when high (a midday sun is not
@@ -619,9 +658,17 @@ impl SunEnv {
         // `intensity`, so the brightness slider lifts the shadow side too — previously only the direct
         // term scaled, so a façade in shade stayed dusk-dark at any slider value.
         let sky_i = self.intensity * (0.35 + 0.95 * f); // cool skylight from ABOVE (was ~2× dimmer)
-        let sky = [0.85 * sky_i + 0.04, 0.92 * sky_i + 0.05, 1.05 * sky_i + 0.07];
+        let sky = [
+            0.85 * sky_i + 0.04,
+            0.92 * sky_i + 0.05,
+            1.05 * sky_i + 0.07,
+        ];
         let gnd_i = self.intensity * (0.15 + 0.80 * f); // warm ground BOUNCE from below
-        let ground = [0.90 * gnd_i + 0.03, 0.85 * gnd_i + 0.03, 0.75 * gnd_i + 0.03];
+        let ground = [
+            0.90 * gnd_i + 0.03,
+            0.85 * gnd_i + 0.03,
+            0.75 * gnd_i + 0.03,
+        ];
         (self.enabled, p.dir, sun, sky, ground)
     }
 }
@@ -641,7 +688,12 @@ struct SunLightRaw {
 
 impl Default for SunLightRaw {
     fn default() -> Self {
-        Self { enabled: false, dir: Vec3::new(0.35, 0.25, 0.9).normalize(), sun: [1.0, 0.96, 0.88], sh: [[0.0; 3]; 9] }
+        Self {
+            enabled: false,
+            dir: Vec3::new(0.35, 0.25, 0.9).normalize(),
+            sun: [1.0, 0.96, 0.88],
+            sh: [[0.0; 3]; 9],
+        }
     }
 }
 
@@ -654,7 +706,14 @@ thread_local! {
 /// Push the resolved sun light (call before building any shaded buffers). `dir` points TO the sun,
 /// `sh` is the sky's irradiance projection from [`crate::env::Sky::sh9`].
 pub fn set_sun_light(enabled: bool, dir: Vec3, sun: [f32; 3], sh: [[f32; 3]; 9]) {
-    SUN.with(|c| c.set(SunLightRaw { enabled, dir: dir.normalize_or_zero(), sun, sh }));
+    SUN.with(|c| {
+        c.set(SunLightRaw {
+            enabled,
+            dir: dir.normalize_or_zero(),
+            sun,
+            sh,
+        })
+    });
 }
 
 fn sun_light() -> SunLightRaw {
@@ -730,11 +789,19 @@ impl Baked {
     /// (a per-channel share would tint the occluded parts).
     fn split(ambient: [f32; 3], direct: [f32; 3]) -> Self {
         let lum = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
-        let col = [ambient[0] + direct[0], ambient[1] + direct[1], ambient[2] + direct[2]];
+        let col = [
+            ambient[0] + direct[0],
+            ambient[1] + direct[1],
+            ambient[2] + direct[2],
+        ];
         let total = lum(col);
         Self {
             col,
-            amb: if total > 1e-6 { (lum(ambient) / total).clamp(0.0, 1.0) } else { 1.0 },
+            amb: if total > 1e-6 {
+                (lum(ambient) / total).clamp(0.0, 1.0)
+            } else {
+                1.0
+            },
             albedo: [0.0; 3],
             n: Vec3::ZERO,
             mode: SHADE_UI,
@@ -787,7 +854,11 @@ fn shade(base: [f32; 3], n: Vec3) -> Baked {
     let lit = n.dot(s.dir).max(0.0);
     tag(Baked::split(
         [base[0] * a[0], base[1] * a[1], base[2] * a[2]],
-        [base[0] * s.sun[0] * lit, base[1] * s.sun[1] * lit, base[2] * s.sun[2] * lit],
+        [
+            base[0] * s.sun[0] * lit,
+            base[1] * s.sun[1] * lit,
+            base[2] * s.sun[2] * lit,
+        ],
     ))
 }
 
@@ -812,8 +883,16 @@ fn shade_furniture(base: [f32; 3], n: Vec3) -> Baked {
     let lit = n.dot(s.dir).max(0.0);
     let extra = 0.05;
     tag(Baked::split(
-        [base[0] * (a[0] + extra), base[1] * (a[1] + extra), base[2] * (a[2] + extra)],
-        [base[0] * s.sun[0] * lit, base[1] * s.sun[1] * lit, base[2] * s.sun[2] * lit],
+        [
+            base[0] * (a[0] + extra),
+            base[1] * (a[1] + extra),
+            base[2] * (a[2] + extra),
+        ],
+        [
+            base[0] * s.sun[0] * lit,
+            base[1] * s.sun[1] * lit,
+            base[2] * s.sun[2] * lit,
+        ],
     ))
 }
 
@@ -827,7 +906,11 @@ fn shade_scalar(n: Vec3, furniture: bool) -> f32 {
     let s = sun_light();
     if !s.enabled {
         let dir = Vec3::new(0.35, 0.25, 0.9).normalize();
-        return if furniture { 0.6 + 0.4 * n.dot(dir).abs() } else { 0.35 + 0.65 * n.dot(dir).abs() };
+        return if furniture {
+            0.6 + 0.4 * n.dot(dir).abs()
+        } else {
+            0.35 + 0.65 * n.dot(dir).abs()
+        };
     }
     let lum = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
     let lit = n.dot(s.dir).max(0.0);
@@ -856,7 +939,13 @@ fn v(p: Vec3, b: Baked) -> V3 {
 /// sRGB** (those passes set `u_linearize = 1` and decode it in the shader) and carries no ambient
 /// share, because a selection tint is not something ambient occlusion has any business dimming.
 fn ui(c: [f32; 3]) -> Baked {
-    Baked { col: c, amb: 0.0, albedo: c, n: Vec3::ZERO, mode: SHADE_UI }
+    Baked {
+        col: c,
+        amb: 0.0,
+        albedo: c,
+        n: Vec3::ZERO,
+        mode: SHADE_UI,
+    }
 }
 
 /// Whether the triangle whose first vertex is `base` is see-through — any of its three
@@ -1102,7 +1191,8 @@ pub fn length_ui(
 ) -> egui::Response {
     let mut shown = u.from_metres(*v as f64);
     let r = ui.add(
-        egui::DragValue::new(&mut shown).update_while_editing(false)
+        egui::DragValue::new(&mut shown)
+            .update_while_editing(false)
             .speed(u.from_metres(speed_m))
             .range(u.from_metres(min_m)..=u.from_metres(max_m))
             .max_decimals(length_decimals(u))
@@ -1130,7 +1220,8 @@ pub fn length_ui_pre(
 ) -> egui::Response {
     let mut shown = u.from_metres(*v as f64);
     let r = ui.add(
-        egui::DragValue::new(&mut shown).update_while_editing(false)
+        egui::DragValue::new(&mut shown)
+            .update_while_editing(false)
             .speed(u.from_metres(speed_m))
             .range(u.from_metres(min_m)..=u.from_metres(max_m))
             .max_decimals(length_decimals(u))
@@ -1146,7 +1237,12 @@ pub fn length_ui_pre(
 
 /// Format a length held in metres for display in `u`, with its unit.
 pub fn length_str(u: &cad_kernel::Units, metres: f32) -> String {
-    format!("{:.*} {}", length_decimals(u), u.from_metres(metres as f64), u.label())
+    format!(
+        "{:.*} {}",
+        length_decimals(u),
+        u.from_metres(metres as f64),
+        u.label()
+    )
 }
 
 /// An opening lifted out of the model for 2D reshaping — everything the sketch session has to
@@ -1679,20 +1775,38 @@ pub fn primitive_dim_fields(
 ) -> bool {
     let f = |ui: &mut egui::Ui, label: &str, v: &mut f32, min: f32| -> bool {
         ui.horizontal(|ui| {
-            ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new(label).small().weak()));
+            ui.add_sized(
+                [64.0, 18.0],
+                egui::Label::new(egui::RichText::new(label).small().weak()),
+            );
             length_ui(ui, &units, v, 0.02, min as f64, 1e5, calc).changed()
         })
         .inner
     };
     // INTEGER fields (counts/segments): the expression must come out whole —
     // no silent rounding of a non-integral result.
-    fn u(ui: &mut egui::Ui, label: &str, v: &mut u32, min: u32, calc: &crate::calc::CalcStore) -> bool {
+    fn u(
+        ui: &mut egui::Ui,
+        label: &str,
+        v: &mut u32,
+        min: u32,
+        calc: &crate::calc::CalcStore,
+    ) -> bool {
         ui.horizontal(|ui| {
-            ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new(label).small().weak()));
-            ui.add(egui::DragValue::new(v).update_while_editing(false).speed(1.0).range(min..=512)
-                .custom_parser(move |s| {
-                    crate::calc::parse_drag_int(calc, s, min as i64, 512).map(|n| n as f64)
-                })).changed()
+            ui.add_sized(
+                [64.0, 18.0],
+                egui::Label::new(egui::RichText::new(label).small().weak()),
+            );
+            ui.add(
+                egui::DragValue::new(v)
+                    .update_while_editing(false)
+                    .speed(1.0)
+                    .range(min..=512)
+                    .custom_parser(move |s| {
+                        crate::calc::parse_drag_int(calc, s, min as i64, 512).map(|n| n as f64)
+                    }),
+            )
+            .changed()
         })
         .inner
     }
@@ -1708,36 +1822,66 @@ pub fn primitive_dim_fields(
             c |= f(ui, "height", h, 0.001);
             c |= u(ui, "sides", sides, 3, calc);
         }
-        Primitive::Sphere { r, segments, stacks } => {
+        Primitive::Sphere {
+            r,
+            segments,
+            stacks,
+        } => {
             c |= f(ui, "radius", r, 0.001);
             c |= u(ui, "segments", segments, 3, calc);
             c |= u(ui, "stacks", stacks, 2, calc);
         }
-        Primitive::Frustum { r_bottom, r_top, h, sides } => {
+        Primitive::Frustum {
+            r_bottom,
+            r_top,
+            h,
+            sides,
+        } => {
             c |= f(ui, "r bottom", r_bottom, 0.0);
             c |= f(ui, "r top", r_top, 0.0);
             c |= f(ui, "height", h, 0.001);
             c |= u(ui, "sides", sides, 3, calc);
         }
-        Primitive::Torus { major_r, minor_r, seg_major, seg_minor } => {
+        Primitive::Torus {
+            major_r,
+            minor_r,
+            seg_major,
+            seg_minor,
+        } => {
             c |= f(ui, "ring r", major_r, 0.001);
             c |= f(ui, "tube r", minor_r, 0.001);
             c |= u(ui, "seg ring", seg_major, 3, calc);
             c |= u(ui, "seg tube", seg_minor, 3, calc);
         }
-        Primitive::Capsule { r, h, segments, stacks } => {
+        Primitive::Capsule {
+            r,
+            h,
+            segments,
+            stacks,
+        } => {
             c |= f(ui, "radius", r, 0.001);
             c |= f(ui, "length", h, 0.001);
             c |= u(ui, "segments", segments, 3, calc);
             c |= u(ui, "stacks", stacks, 2, calc);
         }
-        Primitive::Tube { r_outer, r_inner, h, sides } => {
+        Primitive::Tube {
+            r_outer,
+            r_inner,
+            h,
+            sides,
+        } => {
             c |= f(ui, "r outer", r_outer, 0.001);
             c |= f(ui, "r inner", r_inner, 0.0);
             c |= f(ui, "height", h, 0.001);
             c |= u(ui, "sides", sides, 3, calc);
         }
-        Primitive::Ellipsoid { rx, ry, rz, segments, stacks } => {
+        Primitive::Ellipsoid {
+            rx,
+            ry,
+            rz,
+            segments,
+            stacks,
+        } => {
             c |= f(ui, "rx", rx, 0.001);
             c |= f(ui, "ry", ry, 0.001);
             c |= f(ui, "rz", rz, 0.001);
@@ -1746,10 +1890,18 @@ pub fn primitive_dim_fields(
         }
         Primitive::Extrusion { h, .. } => {
             c |= f(ui, "height", h, 0.001);
-            ui.label(egui::RichText::new("  outline shape is fixed").small().weak());
+            ui.label(
+                egui::RichText::new("  outline shape is fixed")
+                    .small()
+                    .weak(),
+            );
         }
         Primitive::Sweep { .. } => {
-            ui.label(egui::RichText::new("  swept along a path — section & path are fixed").small().weak());
+            ui.label(
+                egui::RichText::new("  swept along a path — section & path are fixed")
+                    .small()
+                    .weak(),
+            );
         }
     }
     c
@@ -1877,7 +2029,7 @@ pub struct RingView {
 /// Light pieces (and everything in GPU / CPU mode) always draw in full.
 const APX_FURNITURE_TRIS: usize = 5_000;
 
-const GIZMO_MIN_PX: f32 = 65.0;   // shortest on-screen arm length, so tiny objects stay grabbable
+const GIZMO_MIN_PX: f32 = 65.0; // shortest on-screen arm length, so tiny objects stay grabbable
 const GIZMO_AXIS_PICK: f32 = 8.0;
 const GIZMO_CUBE_PICK: f32 = 9.0;
 
@@ -1921,7 +2073,9 @@ pub fn world_to_screen(w: Vec3, rect: egui::Rect, mvp: &[f32; 16]) -> Option<egu
 
 /// Nearest candidate within `aperture` pixels of `cursor`.
 fn nearest_within(
-    items: Vec<(usize, egui::Pos2)>, cursor: egui::Pos2, aperture: f32,
+    items: Vec<(usize, egui::Pos2)>,
+    cursor: egui::Pos2,
+    aperture: f32,
 ) -> Option<usize> {
     items
         .into_iter()
@@ -1942,7 +2096,6 @@ pub enum RoomError {
     NoSuchRoom,
 }
 
-
 /// Identifies a flat SURFACE for per-face colouring: the body's feature id plus its world
 /// plane, quantised (normal ×50, offset ×100) so all coplanar triangles of one face share
 /// a key. Stable while the object doesn't move; a moved object is simply re-painted.
@@ -1951,7 +2104,9 @@ pub type SurfaceKey = (u32, i32, i32, i32, i32);
 /// Compute a triangle's [`SurfaceKey`] from its face id and its three world positions.
 pub fn surface_key(face_id: u32, a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> SurfaceKey {
     let av = Vec3::from(a);
-    let n = (Vec3::from(b) - av).cross(Vec3::from(c) - av).normalize_or_zero();
+    let n = (Vec3::from(b) - av)
+        .cross(Vec3::from(c) - av)
+        .normalize_or_zero();
     let d = n.dot(av);
     (
         face_id,
@@ -2083,7 +2238,11 @@ pub fn cct_to_linear_rgb(cct_k: u32) -> [f32; 3] {
     let g = -0.9689 * xx + 1.8758 * yy + 0.0415 * zz;
     let b = 0.0557 * xx - 0.2040 * yy + 1.0570 * zz;
     let m = r.max(g).max(b).max(1e-6);
-    [(r / m).max(0.0) as f32, (g / m).max(0.0) as f32, (b / m).max(0.0) as f32]
+    [
+        (r / m).max(0.0) as f32,
+        (g / m).max(0.0) as f32,
+        (b / m).max(0.0) as f32,
+    ]
 }
 
 /// One emitting point of a GENERATED LUMINAIRE, in the asset's own local frame.
@@ -2151,7 +2310,12 @@ pub const ALPHA_OPAQUE: f32 = 0.996;
 impl FurnitureAsset {
     /// Build an asset and cache its local AABB. All construction goes through here so the
     /// cached bounds can never be stale or forgotten.
-    pub fn new(name: String, positions: Vec<[f32; 3]>, normals: Vec<[f32; 3]>, color: [f32; 3]) -> Self {
+    pub fn new(
+        name: String,
+        positions: Vec<[f32; 3]>,
+        normals: Vec<[f32; 3]>,
+        color: [f32; 3],
+    ) -> Self {
         let mut mn = [f32::INFINITY; 3];
         let mut mx = [f32::NEG_INFINITY; 3];
         for p in &positions {
@@ -2164,7 +2328,24 @@ impl FurnitureAsset {
             mn = [0.0; 3];
             mx = [0.0; 3];
         }
-        Self { name, positions, normals, color, local_min: mn, local_max: mx, import_scale: 1.0, uvs: Vec::new(), alpha: Vec::new(), source_path: None, alpha_resolved: false, lod: std::cell::RefCell::new(None), groups: std::cell::RefCell::new(None), part_ids: Vec::new(), emitters: Vec::new(), cct_k: 0 }
+        Self {
+            name,
+            positions,
+            normals,
+            color,
+            local_min: mn,
+            local_max: mx,
+            import_scale: 1.0,
+            uvs: Vec::new(),
+            alpha: Vec::new(),
+            source_path: None,
+            alpha_resolved: false,
+            lod: std::cell::RefCell::new(None),
+            groups: std::cell::RefCell::new(None),
+            part_ids: Vec::new(),
+            emitters: Vec::new(),
+            cct_k: 0,
+        }
     }
 
     /// The per-triangle face/body grouping, built once and cached. Used for per-surface texturing.
@@ -2197,19 +2378,29 @@ impl FurnitureAsset {
         // and the wait disappears entirely.
         if ntri > COPLANAR_TRI_LIMIT {
             let g = std::sync::Arc::new(if has_parts {
-                FurnGroups { face: self.part_ids.clone(), body: self.part_ids.clone() }
+                FurnGroups {
+                    face: self.part_ids.clone(),
+                    body: self.part_ids.clone(),
+                }
             } else {
                 // No parts either (a raw OBJ soup): one group. Per-face painting degrades to
                 // whole-object painting, which is honest — better than a ten-second freeze for a
                 // grouping nobody can use.
-                FurnGroups { face: vec![0; ntri], body: vec![0; ntri] }
+                FurnGroups {
+                    face: vec![0; ntri],
+                    body: vec![0; ntri],
+                }
             });
             *self.groups.borrow_mut() = Some(g.clone());
             return g;
         }
 
         let (face_coplanar, welded_body) = cad_solid::surface_groups(&self.positions);
-        let body = if has_parts { self.part_ids.clone() } else { welded_body };
+        let body = if has_parts {
+            self.part_ids.clone()
+        } else {
+            welded_body
+        };
         let face = if has_parts {
             // Split every coplanar region at part boundaries so a face stays within one primitive.
             let mut remap = std::collections::HashMap::new();
@@ -2349,24 +2540,40 @@ pub fn cluster_decimate(pos: &[[f32; 3]], grid: u32) -> (Vec<[f32; 3]>, Vec<[f32
     }
     let (mut mn, mut mx) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
     for p in pos {
-        for k in 0..3 { mn[k] = mn[k].min(p[k]); mx[k] = mx[k].max(p[k]); }
+        for k in 0..3 {
+            mn[k] = mn[k].min(p[k]);
+            mx[k] = mx[k].max(p[k]);
+        }
     }
-    let ext = [(mx[0] - mn[0]).max(1e-6), (mx[1] - mn[1]).max(1e-6), (mx[2] - mn[2]).max(1e-6)];
+    let ext = [
+        (mx[0] - mn[0]).max(1e-6),
+        (mx[1] - mn[1]).max(1e-6),
+        (mx[2] - mn[2]).max(1e-6),
+    ];
     let gi = grid.clamp(2, 128) as usize;
     let gf = gi as f32;
     let idx = |p: &[f32; 3]| -> usize {
-        let c = |v: f32, mnk: f32, ek: f32| (((v - mnk) / ek * gf).floor() as i64).clamp(0, gi as i64 - 1) as usize;
+        let c = |v: f32, mnk: f32, ek: f32| {
+            (((v - mnk) / ek * gf).floor() as i64).clamp(0, gi as i64 - 1) as usize
+        };
         (c(p[0], mn[0], ext[0]) * gi + c(p[1], mn[1], ext[1])) * gi + c(p[2], mn[2], ext[2])
     };
     // Flat cell grid → running centroid (sum x,y,z,count). ~8 MB at grid=64 (transient).
     let mut acc = vec![[0.0f64; 4]; gi * gi * gi];
     for p in pos {
         let a = &mut acc[idx(p)];
-        a[0] += p[0] as f64; a[1] += p[1] as f64; a[2] += p[2] as f64; a[3] += 1.0;
+        a[0] += p[0] as f64;
+        a[1] += p[1] as f64;
+        a[2] += p[2] as f64;
+        a[3] += 1.0;
     }
     let centroid = |i: usize| -> [f32; 3] {
         let a = acc[i];
-        [(a[0] / a[3]) as f32, (a[1] / a[3]) as f32, (a[2] / a[3]) as f32]
+        [
+            (a[0] / a[3]) as f32,
+            (a[1] / a[3]) as f32,
+            (a[2] / a[3]) as f32,
+        ]
     };
     let mut out_p = Vec::new();
     let mut out_n = Vec::new();
@@ -2380,8 +2587,12 @@ pub fn cluster_decimate(pos: &[[f32; 3]], grid: u32) -> (Vec<[f32; 3]>, Vec<[f32
             .cross(Vec3::from(c) - Vec3::from(a))
             .normalize_or_zero();
         let n = [n.x, n.y, n.z];
-        out_p.push(a); out_p.push(b); out_p.push(c);
-        out_n.push(n); out_n.push(n); out_n.push(n);
+        out_p.push(a);
+        out_p.push(b);
+        out_p.push(c);
+        out_n.push(n);
+        out_n.push(n);
+        out_n.push(n);
     }
     (out_p, out_n)
 }
@@ -2434,7 +2645,11 @@ pub fn cluster_decimate_attr(
             positions: pos.to_vec(),
             normals: vec![[0.0, 0.0, 1.0]; pos.len()],
             uvs: if keep_uv { uvs.to_vec() } else { Vec::new() },
-            alpha: if keep_alpha { alpha.to_vec() } else { Vec::new() },
+            alpha: if keep_alpha {
+                alpha.to_vec()
+            } else {
+                Vec::new()
+            },
             face: Vec::new(),
         };
     }
@@ -2543,7 +2758,11 @@ pub fn cluster_decimate_attr(
         let n = (Vec3::from(pb) - Vec3::from(pa))
             .cross(Vec3::from(pc) - Vec3::from(pa))
             .normalize_or_zero();
-        let n = if n.length_squared() < 0.5 { [0.0, 0.0, 1.0] } else { n.to_array() };
+        let n = if n.length_squared() < 0.5 {
+            [0.0, 0.0, 1.0]
+        } else {
+            n.to_array()
+        };
         out.positions.extend_from_slice(&[pa, pb, pc]);
         out.normals.extend_from_slice(&[n, n, n]);
         // ABSENT IN, ABSENT OUT. Callers decide between real texture coordinates and box projection
@@ -2722,7 +2941,12 @@ impl ProcPattern {
             _ => ProcPattern::Wood,
         }
     }
-    pub const ALL: [ProcPattern; 4] = [ProcPattern::Wood, ProcPattern::Marble, ProcPattern::Noise, ProcPattern::Checker];
+    pub const ALL: [ProcPattern; 4] = [
+        ProcPattern::Wood,
+        ProcPattern::Marble,
+        ProcPattern::Noise,
+        ProcPattern::Checker,
+    ];
 }
 
 /// A procedural material definition: two colours, an anisotropic world-space scale (tiles/m across,
@@ -2770,7 +2994,18 @@ impl ProcDef {
     /// a flat colour. This lets the Materials Factory drive a plain base colour through the LIVE
     /// per-frame procedural uniforms (no GPU texture re-upload), so colour edits show instantly.
     pub fn solid(c: [f32; 3]) -> Self {
-        Self { pattern: ProcPattern::Noise, col_a: c, col_b: c, scale: [1.0, 1.0, 1.0], detail: 1.0, rough: 0.5, contrast: 1.0, ramp: [0.0, 1.0], surf_rough: [0.5, 0.5], bump: 0.0 }
+        Self {
+            pattern: ProcPattern::Noise,
+            col_a: c,
+            col_b: c,
+            scale: [1.0, 1.0, 1.0],
+            detail: 1.0,
+            rough: 0.5,
+            contrast: 1.0,
+            ramp: [0.0, 1.0],
+            surf_rough: [0.5, 0.5],
+            bump: 0.0,
+        }
     }
     /// Whether this is a solid colour (both ramp stops equal) — the inverse of [`Self::solid`], so the
     /// node editor can show it as an RGB node rather than a pattern.
@@ -2837,7 +3072,18 @@ pub struct MaterialPreset {
 
 impl MaterialPreset {
     const fn flat(category: &'static str, name: &'static str, def: ProcDef) -> Self {
-        Self { category, name, def, metallic: 0.0, roughness: 0.6, ior: 1.5, opacity: 1.0, transmission: 0.0, emission: [0.0; 3], emission_strength: 0.0 }
+        Self {
+            category,
+            name,
+            def,
+            metallic: 0.0,
+            roughness: 0.6,
+            ior: 1.5,
+            opacity: 1.0,
+            transmission: 0.0,
+            emission: [0.0; 3],
+            emission_strength: 0.0,
+        }
     }
 }
 
@@ -2865,47 +3111,291 @@ impl MaterialPreset {
 pub fn material_presets() -> Vec<MaterialPreset> {
     use ProcPattern::*;
     #[allow(clippy::too_many_arguments)]
-    let pat = |pattern, col_a, col_b, scale: [f32; 3], detail, rough, contrast, ramp, surf_rough, bump| ProcDef {
-        pattern, col_a, col_b, scale, detail, rough, contrast, ramp, surf_rough, bump,
+    let pat = |pattern,
+               col_a,
+               col_b,
+               scale: [f32; 3],
+               detail,
+               rough,
+               contrast,
+               ramp,
+               surf_rough,
+               bump| ProcDef {
+        pattern,
+        col_a,
+        col_b,
+        scale,
+        detail,
+        rough,
+        contrast,
+        ramp,
+        surf_rough,
+        bump,
     };
     let mut v: Vec<MaterialPreset> = Vec::new();
     let mut p = |m: MaterialPreset| v.push(m);
 
     // ---- Wood ---- (open-pored species: dark early-wood duller and lower than pale late-wood)
-    p(MaterialPreset { roughness: 0.6, ..MaterialPreset::flat("Wood", "Oak", ProcDef::oak()) });
-    p(MaterialPreset { roughness: 0.58, ..MaterialPreset::flat("Wood", "Walnut", pat(Wood, [0.14, 0.09, 0.05], [0.36, 0.23, 0.13], [42.0, 10.0, 2.0], 7.0, 0.62, 1.5, [0.38, 0.62], [0.68, 0.44], 0.30)) });
-    p(MaterialPreset { roughness: 0.62, ..MaterialPreset::flat("Wood", "Pine", pat(Wood, [0.52, 0.40, 0.25], [0.74, 0.62, 0.42], [36.0, 9.0, 2.0], 6.0, 0.6, 1.3, [0.4, 0.62], [0.70, 0.52], 0.22)) });
+    p(MaterialPreset {
+        roughness: 0.6,
+        ..MaterialPreset::flat("Wood", "Oak", ProcDef::oak())
+    });
+    p(MaterialPreset {
+        roughness: 0.58,
+        ..MaterialPreset::flat(
+            "Wood",
+            "Walnut",
+            pat(
+                Wood,
+                [0.14, 0.09, 0.05],
+                [0.36, 0.23, 0.13],
+                [42.0, 10.0, 2.0],
+                7.0,
+                0.62,
+                1.5,
+                [0.38, 0.62],
+                [0.68, 0.44],
+                0.30,
+            ),
+        )
+    });
+    p(MaterialPreset {
+        roughness: 0.62,
+        ..MaterialPreset::flat(
+            "Wood",
+            "Pine",
+            pat(
+                Wood,
+                [0.52, 0.40, 0.25],
+                [0.74, 0.62, 0.42],
+                [36.0, 9.0, 2.0],
+                6.0,
+                0.6,
+                1.3,
+                [0.4, 0.62],
+                [0.70, 0.52],
+                0.22,
+            ),
+        )
+    });
     // Varnish is a clear dielectric layer over the timber: the grain still shows, the FINISH does
     // not vary with it, and it is not remotely metallic (the old preset used metallic 0.22 to fake
     // a sheen, which tinted the specular with the wood's own colour — the classic wrong-metal look).
-    p(MaterialPreset { roughness: 0.14, ior: 1.52, ..MaterialPreset::flat("Wood", "Varnished oak", ProcDef { surf_rough: [0.14, 0.12], bump: 0.10, ..ProcDef::oak() }) });
-    p(MaterialPreset { roughness: 0.52, ..MaterialPreset::flat("Wood", "Wenge (dark)", pat(Wood, [0.06, 0.045, 0.035], [0.18, 0.13, 0.09], [48.0, 12.0, 2.2], 7.0, 0.6, 1.6, [0.38, 0.6], [0.62, 0.40], 0.40)) });
+    p(MaterialPreset {
+        roughness: 0.14,
+        ior: 1.52,
+        ..MaterialPreset::flat(
+            "Wood",
+            "Varnished oak",
+            ProcDef {
+                surf_rough: [0.14, 0.12],
+                bump: 0.10,
+                ..ProcDef::oak()
+            },
+        )
+    });
+    p(MaterialPreset {
+        roughness: 0.52,
+        ..MaterialPreset::flat(
+            "Wood",
+            "Wenge (dark)",
+            pat(
+                Wood,
+                [0.06, 0.045, 0.035],
+                [0.18, 0.13, 0.09],
+                [48.0, 12.0, 2.2],
+                7.0,
+                0.6,
+                1.6,
+                [0.38, 0.6],
+                [0.62, 0.40],
+                0.40,
+            ),
+        )
+    });
 
     // ---- Stone & masonry ----
     // Polished marble is glossy where the calcite is and slightly duller along the veins.
-    p(MaterialPreset { roughness: 0.13, ..MaterialPreset::flat("Stone", "White marble", pat(Marble, [0.88, 0.88, 0.86], [0.55, 0.56, 0.58], [3.0, 3.0, 3.0], 6.0, 0.55, 1.6, [0.35, 0.65], [0.10, 0.20], 0.05)) });
-    p(MaterialPreset { roughness: 0.14, ..MaterialPreset::flat("Stone", "Black marble", pat(Marble, [0.05, 0.05, 0.06], [0.30, 0.30, 0.32], [3.0, 3.0, 3.0], 6.0, 0.55, 1.7, [0.35, 0.65], [0.11, 0.22], 0.05)) });
+    p(MaterialPreset {
+        roughness: 0.13,
+        ..MaterialPreset::flat(
+            "Stone",
+            "White marble",
+            pat(
+                Marble,
+                [0.88, 0.88, 0.86],
+                [0.55, 0.56, 0.58],
+                [3.0, 3.0, 3.0],
+                6.0,
+                0.55,
+                1.6,
+                [0.35, 0.65],
+                [0.10, 0.20],
+                0.05,
+            ),
+        )
+    });
+    p(MaterialPreset {
+        roughness: 0.14,
+        ..MaterialPreset::flat(
+            "Stone",
+            "Black marble",
+            pat(
+                Marble,
+                [0.05, 0.05, 0.06],
+                [0.30, 0.30, 0.32],
+                [3.0, 3.0, 3.0],
+                6.0,
+                0.55,
+                1.7,
+                [0.35, 0.65],
+                [0.11, 0.22],
+                0.05,
+            ),
+        )
+    });
     // Concrete: ~0.35 reflectance, not 0.5. It is also genuinely rough at a millimetre scale.
-    p(MaterialPreset { roughness: 0.88, ..MaterialPreset::flat("Stone", "Concrete", pat(Noise, [0.40, 0.395, 0.385], [0.30, 0.30, 0.29], [8.0, 8.0, 8.0], 7.0, 0.6, 1.1, [0.3, 0.7], [0.94, 0.80], 0.45)) });
-    p(MaterialPreset { roughness: 0.45, ..MaterialPreset::flat("Stone", "Granite", pat(Noise, [0.32, 0.31, 0.30], [0.16, 0.155, 0.15], [60.0, 60.0, 60.0], 8.0, 0.7, 1.8, [0.35, 0.65], [0.30, 0.55], 0.25)) });
-    p(MaterialPreset { roughness: 0.9, ..MaterialPreset::flat("Stone", "Sandstone", pat(Noise, [0.68, 0.60, 0.47], [0.54, 0.47, 0.36], [14.0, 14.0, 14.0], 6.0, 0.55, 1.2, [0.3, 0.7], [0.95, 0.82], 0.55)) });
+    p(MaterialPreset {
+        roughness: 0.88,
+        ..MaterialPreset::flat(
+            "Stone",
+            "Concrete",
+            pat(
+                Noise,
+                [0.40, 0.395, 0.385],
+                [0.30, 0.30, 0.29],
+                [8.0, 8.0, 8.0],
+                7.0,
+                0.6,
+                1.1,
+                [0.3, 0.7],
+                [0.94, 0.80],
+                0.45,
+            ),
+        )
+    });
+    p(MaterialPreset {
+        roughness: 0.45,
+        ..MaterialPreset::flat(
+            "Stone",
+            "Granite",
+            pat(
+                Noise,
+                [0.32, 0.31, 0.30],
+                [0.16, 0.155, 0.15],
+                [60.0, 60.0, 60.0],
+                8.0,
+                0.7,
+                1.8,
+                [0.35, 0.65],
+                [0.30, 0.55],
+                0.25,
+            ),
+        )
+    });
+    p(MaterialPreset {
+        roughness: 0.9,
+        ..MaterialPreset::flat(
+            "Stone",
+            "Sandstone",
+            pat(
+                Noise,
+                [0.68, 0.60, 0.47],
+                [0.54, 0.47, 0.36],
+                [14.0, 14.0, 14.0],
+                6.0,
+                0.55,
+                1.2,
+                [0.3, 0.7],
+                [0.95, 0.82],
+                0.55,
+            ),
+        )
+    });
 
     // ---- Metal ---- (base colour = the measured F0 at normal incidence, sRGB-encoded)
-    p(MaterialPreset { metallic: 1.0, roughness: 0.04, ..MaterialPreset::flat("Metal", "Chrome", ProcDef::solid([0.95, 0.96, 0.97])) });
-    p(MaterialPreset { metallic: 1.0, roughness: 0.28, ..MaterialPreset::flat("Metal", "Stainless steel", ProcDef::solid([0.77, 0.78, 0.78])) });
+    p(MaterialPreset {
+        metallic: 1.0,
+        roughness: 0.04,
+        ..MaterialPreset::flat("Metal", "Chrome", ProcDef::solid([0.95, 0.96, 0.97]))
+    });
+    p(MaterialPreset {
+        metallic: 1.0,
+        roughness: 0.28,
+        ..MaterialPreset::flat(
+            "Metal",
+            "Stainless steel",
+            ProcDef::solid([0.77, 0.78, 0.78]),
+        )
+    });
     // Brushed metal: an anisotropic streak that varies the FINISH, not the colour — which is what
     // brushing physically is. Hence a near-flat colour ramp and a wide roughness range.
-    p(MaterialPreset { metallic: 1.0, roughness: 0.35, ..MaterialPreset::flat("Metal", "Brushed aluminium", pat(Wood, [0.89, 0.90, 0.91], [0.93, 0.94, 0.94], [220.0, 4.0, 2.0], 5.0, 0.55, 1.2, [0.3, 0.7], [0.46, 0.24], 0.05)) });
-    p(MaterialPreset { metallic: 1.0, roughness: 0.22, ..MaterialPreset::flat("Metal", "Copper", ProcDef::solid([0.95, 0.64, 0.54])) });
-    p(MaterialPreset { metallic: 1.0, roughness: 0.18, ..MaterialPreset::flat("Metal", "Gold", ProcDef::solid([1.00, 0.77, 0.34])) });
-    p(MaterialPreset { metallic: 1.0, roughness: 0.45, ..MaterialPreset::flat("Metal", "Black steel", ProcDef::solid([0.16, 0.16, 0.17])) });
-    p(MaterialPreset { metallic: 1.0, roughness: 0.12, ..MaterialPreset::flat("Metal", "Brass", ProcDef::solid([0.91, 0.79, 0.49])) });
+    p(MaterialPreset {
+        metallic: 1.0,
+        roughness: 0.35,
+        ..MaterialPreset::flat(
+            "Metal",
+            "Brushed aluminium",
+            pat(
+                Wood,
+                [0.89, 0.90, 0.91],
+                [0.93, 0.94, 0.94],
+                [220.0, 4.0, 2.0],
+                5.0,
+                0.55,
+                1.2,
+                [0.3, 0.7],
+                [0.46, 0.24],
+                0.05,
+            ),
+        )
+    });
+    p(MaterialPreset {
+        metallic: 1.0,
+        roughness: 0.22,
+        ..MaterialPreset::flat("Metal", "Copper", ProcDef::solid([0.95, 0.64, 0.54]))
+    });
+    p(MaterialPreset {
+        metallic: 1.0,
+        roughness: 0.18,
+        ..MaterialPreset::flat("Metal", "Gold", ProcDef::solid([1.00, 0.77, 0.34]))
+    });
+    p(MaterialPreset {
+        metallic: 1.0,
+        roughness: 0.45,
+        ..MaterialPreset::flat("Metal", "Black steel", ProcDef::solid([0.16, 0.16, 0.17]))
+    });
+    p(MaterialPreset {
+        metallic: 1.0,
+        roughness: 0.12,
+        ..MaterialPreset::flat("Metal", "Brass", ProcDef::solid([0.91, 0.79, 0.49]))
+    });
 
     // ---- Glass ---- (IOR 1.52 = soda-lime, which every architectural pane is)
-    p(MaterialPreset { roughness: 0.02, ior: 1.52, opacity: 0.06, ..MaterialPreset::flat("Glass", "Clear glass", ProcDef::solid([0.93, 0.96, 0.95])) });
-    p(MaterialPreset { roughness: 0.45, ior: 1.52, opacity: 0.42, ..MaterialPreset::flat("Glass", "Frosted glass", ProcDef::solid([0.92, 0.94, 0.94])) });
-    p(MaterialPreset { roughness: 0.05, ior: 1.52, opacity: 0.22, ..MaterialPreset::flat("Glass", "Bronze glass", ProcDef::solid([0.45, 0.34, 0.24])) });
-    p(MaterialPreset { roughness: 0.04, ior: 1.52, opacity: 0.16, ..MaterialPreset::flat("Glass", "Blue glass", ProcDef::solid([0.6, 0.75, 0.85])) });
+    p(MaterialPreset {
+        roughness: 0.02,
+        ior: 1.52,
+        opacity: 0.06,
+        ..MaterialPreset::flat("Glass", "Clear glass", ProcDef::solid([0.93, 0.96, 0.95]))
+    });
+    p(MaterialPreset {
+        roughness: 0.45,
+        ior: 1.52,
+        opacity: 0.42,
+        ..MaterialPreset::flat("Glass", "Frosted glass", ProcDef::solid([0.92, 0.94, 0.94]))
+    });
+    p(MaterialPreset {
+        roughness: 0.05,
+        ior: 1.52,
+        opacity: 0.22,
+        ..MaterialPreset::flat("Glass", "Bronze glass", ProcDef::solid([0.45, 0.34, 0.24]))
+    });
+    p(MaterialPreset {
+        roughness: 0.04,
+        ior: 1.52,
+        opacity: 0.16,
+        ..MaterialPreset::flat("Glass", "Blue glass", ProcDef::solid([0.6, 0.75, 0.85]))
+    });
 
     // ---- Water ---- a MEDIUM, which is what separates these from the Glass presets above.
     //
@@ -2920,37 +3410,183 @@ pub fn material_presets() -> Vec<MaterialPreset> {
     //
     // IOR 1.333 is water at 20 °C. Roughness is the ONLY difference between the three: still water
     // is a mirror, and roughening it is what turns the reflection into a suggestion of one.
-    p(MaterialPreset { roughness: 0.02, ior: 1.333, opacity: 0.55, transmission: 0.45,
-        ..MaterialPreset::flat("Water", "Water (still)", ProcDef::solid([0.055, 0.30, 0.34])) });
-    p(MaterialPreset { roughness: 0.12, ior: 1.333, opacity: 0.60, transmission: 0.40,
-        ..MaterialPreset::flat("Water", "Water (rippled)", ProcDef::solid([0.055, 0.30, 0.34])) });
+    p(MaterialPreset {
+        roughness: 0.02,
+        ior: 1.333,
+        opacity: 0.55,
+        transmission: 0.45,
+        ..MaterialPreset::flat(
+            "Water",
+            "Water (still)",
+            ProcDef::solid([0.055, 0.30, 0.34]),
+        )
+    });
+    p(MaterialPreset {
+        roughness: 0.12,
+        ior: 1.333,
+        opacity: 0.60,
+        transmission: 0.40,
+        ..MaterialPreset::flat(
+            "Water",
+            "Water (rippled)",
+            ProcDef::solid([0.055, 0.30, 0.34]),
+        )
+    });
     // Deeper, greener and far less see-through — a lake or a canal rather than a swimming pool.
-    p(MaterialPreset { roughness: 0.06, ior: 1.333, opacity: 0.82, transmission: 0.18,
-        ..MaterialPreset::flat("Water", "Water (deep)", ProcDef::solid([0.018, 0.085, 0.075])) });
+    p(MaterialPreset {
+        roughness: 0.06,
+        ior: 1.333,
+        opacity: 0.82,
+        transmission: 0.18,
+        ..MaterialPreset::flat(
+            "Water",
+            "Water (deep)",
+            ProcDef::solid([0.018, 0.085, 0.075]),
+        )
+    });
 
     // ---- Paint & plaster ---- (architectural white measures ~0.78, not ~0.9)
-    p(MaterialPreset { roughness: 0.75, ..MaterialPreset::flat("Paint", "Matte white", ProcDef::solid([0.80, 0.79, 0.78])) });
+    p(MaterialPreset {
+        roughness: 0.75,
+        ..MaterialPreset::flat("Paint", "Matte white", ProcDef::solid([0.80, 0.79, 0.78]))
+    });
     // Satin is a dielectric clearcoat. Metallic 0.12 (the old value) makes the highlight take the
     // paint's colour, which is what a metal does and a painted wall does not.
-    p(MaterialPreset { roughness: 0.22, ior: 1.5, ..MaterialPreset::flat("Paint", "Satin white", ProcDef::solid([0.80, 0.79, 0.78])) });
-    p(MaterialPreset { roughness: 0.55, ..MaterialPreset::flat("Paint", "Anthracite", ProcDef::solid([0.09, 0.095, 0.10])) });
-    p(MaterialPreset { roughness: 0.82, ..MaterialPreset::flat("Paint", "Warm plaster", pat(Noise, [0.79, 0.75, 0.68], [0.72, 0.68, 0.61], [10.0, 10.0, 10.0], 5.0, 0.5, 1.0, [0.3, 0.7], [0.88, 0.76], 0.30)) });
+    p(MaterialPreset {
+        roughness: 0.22,
+        ior: 1.5,
+        ..MaterialPreset::flat("Paint", "Satin white", ProcDef::solid([0.80, 0.79, 0.78]))
+    });
+    p(MaterialPreset {
+        roughness: 0.55,
+        ..MaterialPreset::flat("Paint", "Anthracite", ProcDef::solid([0.09, 0.095, 0.10]))
+    });
+    p(MaterialPreset {
+        roughness: 0.82,
+        ..MaterialPreset::flat(
+            "Paint",
+            "Warm plaster",
+            pat(
+                Noise,
+                [0.79, 0.75, 0.68],
+                [0.72, 0.68, 0.61],
+                [10.0, 10.0, 10.0],
+                5.0,
+                0.5,
+                1.0,
+                [0.3, 0.7],
+                [0.88, 0.76],
+                0.30,
+            ),
+        )
+    });
     // Car paint IS a metallic-flake basecoat under a clearcoat, so this one keeps its metallic.
-    p(MaterialPreset { metallic: 0.7, roughness: 0.12, ..MaterialPreset::flat("Paint", "Car paint red", ProcDef::solid([0.58, 0.05, 0.08])) });
+    p(MaterialPreset {
+        metallic: 0.7,
+        roughness: 0.12,
+        ..MaterialPreset::flat("Paint", "Car paint red", ProcDef::solid([0.58, 0.05, 0.08]))
+    });
 
     // ---- Fabric ---- (fully rough, with weave-scale relief)
-    p(MaterialPreset { roughness: 0.95, ..MaterialPreset::flat("Fabric", "Grey fabric", pat(Noise, [0.44, 0.44, 0.46], [0.36, 0.36, 0.38], [90.0, 90.0, 90.0], 6.0, 0.6, 1.1, [0.3, 0.7], [1.0, 0.88], 0.6)) });
-    p(MaterialPreset { roughness: 0.98, ..MaterialPreset::flat("Fabric", "Beige carpet", pat(Noise, [0.56, 0.50, 0.41], [0.45, 0.40, 0.32], [70.0, 70.0, 70.0], 7.0, 0.6, 1.1, [0.3, 0.7], [1.0, 0.92], 0.9)) });
+    p(MaterialPreset {
+        roughness: 0.95,
+        ..MaterialPreset::flat(
+            "Fabric",
+            "Grey fabric",
+            pat(
+                Noise,
+                [0.44, 0.44, 0.46],
+                [0.36, 0.36, 0.38],
+                [90.0, 90.0, 90.0],
+                6.0,
+                0.6,
+                1.1,
+                [0.3, 0.7],
+                [1.0, 0.88],
+                0.6,
+            ),
+        )
+    });
+    p(MaterialPreset {
+        roughness: 0.98,
+        ..MaterialPreset::flat(
+            "Fabric",
+            "Beige carpet",
+            pat(
+                Noise,
+                [0.56, 0.50, 0.41],
+                [0.45, 0.40, 0.32],
+                [70.0, 70.0, 70.0],
+                7.0,
+                0.6,
+                1.1,
+                [0.3, 0.7],
+                [1.0, 0.92],
+                0.9,
+            ),
+        )
+    });
 
     // ---- Floor ----
     // Tiles: glossy face, matte grout — the roughness range does the grout, no second map needed.
-    p(MaterialPreset { roughness: 0.16, ..MaterialPreset::flat("Floor", "Checker tiles", pat(Checker, [0.78, 0.78, 0.77], [0.10, 0.10, 0.11], [2.0, 2.0, 2.0], 1.0, 0.5, 1.0, [0.0, 1.0], [0.14, 0.20], 0.06)) });
-    p(MaterialPreset { roughness: 0.24, ..MaterialPreset::flat("Floor", "Terrazzo", pat(Noise, [0.74, 0.72, 0.69], [0.40, 0.39, 0.37], [90.0, 90.0, 90.0], 8.0, 0.75, 2.2, [0.42, 0.58], [0.20, 0.30], 0.10)) });
+    p(MaterialPreset {
+        roughness: 0.16,
+        ..MaterialPreset::flat(
+            "Floor",
+            "Checker tiles",
+            pat(
+                Checker,
+                [0.78, 0.78, 0.77],
+                [0.10, 0.10, 0.11],
+                [2.0, 2.0, 2.0],
+                1.0,
+                0.5,
+                1.0,
+                [0.0, 1.0],
+                [0.14, 0.20],
+                0.06,
+            ),
+        )
+    });
+    p(MaterialPreset {
+        roughness: 0.24,
+        ..MaterialPreset::flat(
+            "Floor",
+            "Terrazzo",
+            pat(
+                Noise,
+                [0.74, 0.72, 0.69],
+                [0.40, 0.39, 0.37],
+                [90.0, 90.0, 90.0],
+                8.0,
+                0.75,
+                2.2,
+                [0.42, 0.58],
+                [0.20, 0.30],
+                0.10,
+            ),
+        )
+    });
 
     // ---- Emission ---- (strength in the same scene-referred units the sun uses)
-    p(MaterialPreset { roughness: 0.4, emission: [1.0, 0.85, 0.6], emission_strength: 5.0, ..MaterialPreset::flat("Emission", "LED warm", ProcDef::solid([1.0, 0.88, 0.7])) });
-    p(MaterialPreset { roughness: 0.4, emission: [0.85, 0.9, 1.0], emission_strength: 5.0, ..MaterialPreset::flat("Emission", "LED cool", ProcDef::solid([0.88, 0.92, 1.0])) });
-    p(MaterialPreset { roughness: 0.4, emission: [1.0, 0.08, 0.08], emission_strength: 8.0, ..MaterialPreset::flat("Emission", "Neon red", ProcDef::solid([1.0, 0.25, 0.25])) });
+    p(MaterialPreset {
+        roughness: 0.4,
+        emission: [1.0, 0.85, 0.6],
+        emission_strength: 5.0,
+        ..MaterialPreset::flat("Emission", "LED warm", ProcDef::solid([1.0, 0.88, 0.7]))
+    });
+    p(MaterialPreset {
+        roughness: 0.4,
+        emission: [0.85, 0.9, 1.0],
+        emission_strength: 5.0,
+        ..MaterialPreset::flat("Emission", "LED cool", ProcDef::solid([0.88, 0.92, 1.0]))
+    });
+    p(MaterialPreset {
+        roughness: 0.4,
+        emission: [1.0, 0.08, 0.08],
+        emission_strength: 8.0,
+        ..MaterialPreset::flat("Emission", "Neon red", ProcDef::solid([1.0, 0.25, 0.25]))
+    });
 
     v
 }
@@ -3086,14 +3722,48 @@ impl TextureAsset {
         } else {
             [0.8, 0.8, 0.82]
         };
-        Self { name, w, h, rgba, avg, scale: 1.0, offset: [0.0, 0.0], rot_deg: 0.0, opacity: 1.0, reflect: 1.0, png_cache: std::cell::RefCell::new(None), proc: None, normal_map: None, rough_map: None, metal_map: None, ao_map: None, triplanar: false, tiles_per_m: 1.0, roughness: 0.5, transmission: 0.0, metallic: 0.0, ior: 1.5, emission: [0.0, 0.0, 0.0], emission_strength: 0.0, clearcoat: 0.0, clearcoat_rough: 0.1, sheen: 0.0, sheen_tint: [1.0; 3] }
+        Self {
+            name,
+            w,
+            h,
+            rgba,
+            avg,
+            scale: 1.0,
+            offset: [0.0, 0.0],
+            rot_deg: 0.0,
+            opacity: 1.0,
+            reflect: 1.0,
+            png_cache: std::cell::RefCell::new(None),
+            proc: None,
+            normal_map: None,
+            rough_map: None,
+            metal_map: None,
+            ao_map: None,
+            triplanar: false,
+            tiles_per_m: 1.0,
+            roughness: 0.5,
+            transmission: 0.0,
+            metallic: 0.0,
+            ior: 1.5,
+            emission: [0.0, 0.0, 0.0],
+            emission_strength: 0.0,
+            clearcoat: 0.0,
+            clearcoat_rough: 0.1,
+            sheen: 0.0,
+            sheen_tint: [1.0; 3],
+        }
     }
 
     /// Build a PROCEDURAL texture from a [`ProcDef`]. Carries a 1×1 fallback swatch (the ramp
     /// midpoint) so non-shader paths (avg tint, thumbnails, old renderers) still show a colour.
     pub fn procedural(name: String, def: ProcDef) -> Self {
         let c = def.avg_color();
-        let px = [(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8, 255];
+        let px = [
+            (c[0] * 255.0) as u8,
+            (c[1] * 255.0) as u8,
+            (c[2] * 255.0) as u8,
+            255,
+        ];
         Self {
             name,
             w: 1,
@@ -3213,21 +3883,32 @@ pub fn encode_f32_blob(floats: &[f32]) -> String {
 /// Decode a blob written by [`encode_f32_blob`] back into `f32`s (empty on any error).
 pub fn decode_f32_blob(s: &str) -> Vec<f32> {
     use base64::Engine;
-    let Ok(comp) = base64::engine::general_purpose::STANDARD.decode(s.as_bytes()) else { return Vec::new() };
-    let Some(bytes) = inflate_raw_deflate(&comp, None) else { return Vec::new() };
-    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    let Ok(comp) = base64::engine::general_purpose::STANDARD.decode(s.as_bytes()) else {
+        return Vec::new();
+    };
+    let Some(bytes) = inflate_raw_deflate(&comp, None) else {
+        return Vec::new();
+    };
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 /// Flatten `[f32; 3]` vertices to a contiguous `f32` list (a plain memcpy, fast even for millions).
 fn flat3(v: &[[f32; 3]]) -> Vec<f32> {
     let mut o = Vec::with_capacity(v.len() * 3);
-    for p in v { o.extend_from_slice(p); }
+    for p in v {
+        o.extend_from_slice(p);
+    }
     o
 }
 /// Flatten `[f32; 2]` UVs to a contiguous `f32` list.
 fn flat2(v: &[[f32; 2]]) -> Vec<f32> {
     let mut o = Vec::with_capacity(v.len() * 2);
-    for p in v { o.extend_from_slice(p); }
+    for p in v {
+        o.extend_from_slice(p);
+    }
     o
 }
 
@@ -3320,20 +4001,33 @@ fn decode_furniture_geom_native(bytes: &[u8]) -> Vec<(Vec<f32>, Vec<f32>, Vec<f3
         *i += 4;
         Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
     };
-    let Some(count) = take4(bytes, &mut i) else { return Vec::new() };
+    let Some(count) = take4(bytes, &mut i) else {
+        return Vec::new();
+    };
     let count = (count as usize).min(1_000_000);
     // Pass 1 (serial, cheap): find each asset's four field slices.
     let mut fields: Vec<[GeomField; 4]> = Vec::with_capacity(count);
     for _ in 0..count {
-        let mut f: [GeomField; 4] =
-            std::array::from_fn(|_| GeomField { n: 0, comp: &[] });
+        let mut f: [GeomField; 4] = std::array::from_fn(|_| GeomField { n: 0, comp: &[] });
         let mut ok = true;
         for slot in f.iter_mut() {
-            let Some(n) = take4(bytes, &mut i) else { ok = false; break };
-            let Some(clen) = take4(bytes, &mut i) else { ok = false; break };
-            let Some(comp) = bytes.get(i..i + clen as usize) else { ok = false; break };
+            let Some(n) = take4(bytes, &mut i) else {
+                ok = false;
+                break;
+            };
+            let Some(clen) = take4(bytes, &mut i) else {
+                ok = false;
+                break;
+            };
+            let Some(comp) = bytes.get(i..i + clen as usize) else {
+                ok = false;
+                break;
+            };
             i += clen as usize;
-            *slot = GeomField { n: n as usize, comp };
+            *slot = GeomField {
+                n: n as usize,
+                comp,
+            };
         }
         if !ok {
             break;
@@ -3355,30 +4049,30 @@ fn decode_furniture_geom_native(bytes: &[u8]) -> Vec<(Vec<f32>, Vec<f32>, Vec<f3
             let end = ((w + 1) * per).min(fields.len());
             let chunk = &fields[start..end];
             handles.push(sc.spawn(move || {
-                    let mut out = Vec::with_capacity(chunk.len());
-                    for asset in chunk {
-                        let mut parts: [(Vec<f32>, bool); 4] = Default::default();
-                        let mut asset_ok = true;
-                        for (slot, field) in parts.iter_mut().zip(asset.iter()) {
-                            if let Some(raw) = inflate_field(field) {
-                                *slot = (raw, true);
-                            } else {
-                                asset_ok = false;
-                                break;
-                            }
-                        }
-                        out.push(if asset_ok {
-                            Some((
-                                std::mem::take(&mut parts[0].0),
-                                std::mem::take(&mut parts[1].0),
-                                std::mem::take(&mut parts[2].0),
-                                std::mem::take(&mut parts[3].0),
-                            ))
+                let mut out = Vec::with_capacity(chunk.len());
+                for asset in chunk {
+                    let mut parts: [(Vec<f32>, bool); 4] = Default::default();
+                    let mut asset_ok = true;
+                    for (slot, field) in parts.iter_mut().zip(asset.iter()) {
+                        if let Some(raw) = inflate_field(field) {
+                            *slot = (raw, true);
                         } else {
-                            None
-                        });
+                            asset_ok = false;
+                            break;
+                        }
                     }
-                    (start, out)
+                    out.push(if asset_ok {
+                        Some((
+                            std::mem::take(&mut parts[0].0),
+                            std::mem::take(&mut parts[1].0),
+                            std::mem::take(&mut parts[2].0),
+                            std::mem::take(&mut parts[3].0),
+                        ))
+                    } else {
+                        None
+                    });
+                }
+                (start, out)
             }));
         }
         for h in handles {
@@ -3492,7 +4186,14 @@ fn decode_pairs_in_parallel(
     std::thread::scope(|sc| {
         let handles: Vec<_> = chunks
             .into_iter()
-            .map(|chunk| sc.spawn(move || chunk.into_iter().map(|(r, p)| decode(r, p)).collect::<Vec<_>>()))
+            .map(|chunk| {
+                sc.spawn(move || {
+                    chunk
+                        .into_iter()
+                        .map(|(r, p)| decode(r, p))
+                        .collect::<Vec<_>>()
+                })
+            })
             .collect();
         let mut out = Vec::with_capacity(handles.len().saturating_mul(8));
         for h in handles {
@@ -3518,7 +4219,10 @@ pub fn encode_texture_png_b64(w: u32, h: u32, rgba: &[u8]) -> String {
     use image::ImageEncoder;
     let mut png = Vec::new();
     let enc = image::codecs::png::PngEncoder::new(&mut png);
-    if enc.write_image(rgba, w, h, image::ExtendedColorType::Rgba8).is_err() {
+    if enc
+        .write_image(rgba, w, h, image::ExtendedColorType::Rgba8)
+        .is_err()
+    {
         return String::new();
     }
     base64::engine::general_purpose::STANDARD.encode(&png)
@@ -3532,9 +4236,8 @@ pub fn encode_texture_png_b64(w: u32, h: u32, rgba: &[u8]) -> String {
 /// exactly like the inline decode it replaces.
 pub fn decode_texture_list(recs: &[crate::simlux_io::TextureRec]) -> Vec<TextureAsset> {
     fn decode_one(r: &crate::simlux_io::TextureRec) -> TextureAsset {
-        decode_texture_rec(r).unwrap_or_else(|| {
-            TextureAsset::new(r.name.clone(), 1, 1, vec![200, 200, 200, 255])
-        })
+        decode_texture_rec(r)
+            .unwrap_or_else(|| TextureAsset::new(r.name.clone(), 1, 1, vec![200, 200, 200, 255]))
     }
     let n = recs.len();
     if n <= 1 {
@@ -3562,19 +4265,29 @@ pub fn decode_texture_list(recs: &[crate::simlux_io::TextureRec]) -> Vec<Texture
 /// Decode a persisted [`crate::simlux_io::TextureRec`] back into a [`TextureAsset`].
 pub fn decode_texture_rec(r: &crate::simlux_io::TextureRec) -> Option<TextureAsset> {
     use base64::Engine;
-    let png = base64::engine::general_purpose::STANDARD.decode(r.png_b64.as_bytes()).ok()?;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(r.png_b64.as_bytes())
+        .ok()?;
     let img = image::load_from_memory(&png).ok()?.to_rgba8();
     let (w, h) = (img.width(), img.height());
     let mut a = TextureAsset::new(r.name.clone(), w, h, img.into_raw());
     a.scale = if r.scale > 0.0 { r.scale } else { 1.0 };
     a.offset = r.offset;
     a.rot_deg = r.rot_deg;
-    a.opacity = if r.opacity > 0.0 { r.opacity.clamp(0.01, 1.0) } else { 1.0 };
+    a.opacity = if r.opacity > 0.0 {
+        r.opacity.clamp(0.01, 1.0)
+    } else {
+        1.0
+    };
     // A stored 0 is an OLD sidecar's "matte", written when 0 was the default and nothing but a
     // metal ever got anything else. Read it as physical, or every project saved before this would
     // reload with its reflections switched off. The UI can no longer author 0 (it floors at 0.01),
     // so 0 unambiguously means "from before", not "the user asked for none".
-    a.reflect = if r.reflect <= 0.0 { 1.0 } else { r.reflect.clamp(0.01, 1.0) };
+    a.reflect = if r.reflect <= 0.0 {
+        1.0
+    } else {
+        r.reflect.clamp(0.01, 1.0)
+    };
     // The sidecar ALREADY holds this texture's PNG — reuse it as the cache so a re-save of a
     // loaded project doesn't re-encode every image (that was the save-time lag spike).
     *a.png_cache.borrow_mut() = Some(r.png_b64.clone());
@@ -3597,9 +4310,17 @@ pub fn decode_texture_rec(r: &crate::simlux_io::TextureRec) -> Option<TextureAss
     }
     a.normal_map = r.normal_map;
     a.rough_map = r.rough_map;
-    a.roughness = if r.roughness > 0.0 { r.roughness.clamp(0.0, 1.0) } else { 0.5 };
+    a.roughness = if r.roughness > 0.0 {
+        r.roughness.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
     a.metallic = r.metallic.clamp(0.0, 1.0);
-    a.ior = if r.ior > 0.0 { r.ior.clamp(1.0, 4.0) } else { 1.5 };
+    a.ior = if r.ior > 0.0 {
+        r.ior.clamp(1.0, 4.0)
+    } else {
+        1.5
+    };
     a.emission = r.emission;
     a.emission_strength = r.emission_strength.max(0.0);
     a.transmission = r.transmission.clamp(0.0, 1.0);
@@ -3638,10 +4359,16 @@ pub enum ApertureKind {
 
 impl ApertureKind {
     pub fn idx(self) -> usize {
-        match self { ApertureKind::Door => 0, ApertureKind::Window => 1 }
+        match self {
+            ApertureKind::Door => 0,
+            ApertureKind::Window => 1,
+        }
     }
     pub fn label(self) -> &'static str {
-        match self { ApertureKind::Door => "Door", ApertureKind::Window => "Window" }
+        match self {
+            ApertureKind::Door => "Door",
+            ApertureKind::Window => "Window",
+        }
     }
     /// The bundled mesh's name WITHIN `assets/` — a stable identifier, not a place to open.
     pub fn asset_path(self) -> &'static str {
@@ -3732,7 +4459,10 @@ impl Default for Draw3dDialog {
 
 impl Draw3dDialog {
     pub fn new(kind: Draw3dKind) -> Self {
-        Self { kind, ..Default::default() }
+        Self {
+            kind,
+            ..Default::default()
+        }
     }
 
     /// Load the controllers FROM an existing primitive — the inverse of `build()` — so
@@ -3753,44 +4483,98 @@ impl Draw3dDialog {
             Primitive::Sweep { .. } => {}
             Primitive::Box { w, d, h } => {
                 self.kind = Draw3dKind::Box;
-                self.w = w; self.d = d; self.h = h;
+                self.w = w;
+                self.d = d;
+                self.h = h;
             }
-            Primitive::Sphere { r, segments, stacks } => {
+            Primitive::Sphere {
+                r,
+                segments,
+                stacks,
+            } => {
                 self.kind = Draw3dKind::Sphere;
-                self.r = r; self.segments = segments; self.stacks = stacks;
+                self.r = r;
+                self.segments = segments;
+                self.stacks = stacks;
             }
             Primitive::Cylinder { r, h, sides } => {
                 self.kind = Draw3dKind::Cylinder;
-                self.r = r; self.h = h; self.segments = sides;
+                self.r = r;
+                self.h = h;
+                self.segments = sides;
             }
-            Primitive::Frustum { r_bottom, r_top, h, sides } => {
-                self.r = r_bottom; self.r_top = r_top; self.h = h;
-                self.sides = sides; self.segments = sides;
+            Primitive::Frustum {
+                r_bottom,
+                r_top,
+                h,
+                sides,
+            } => {
+                self.r = r_bottom;
+                self.r_top = r_top;
+                self.h = h;
+                self.sides = sides;
+                self.segments = sides;
                 self.kind = if r_top <= 1e-6 {
-                    if sides == 4 { Draw3dKind::Pyramid } else { Draw3dKind::Cone }
+                    if sides == 4 {
+                        Draw3dKind::Pyramid
+                    } else {
+                        Draw3dKind::Cone
+                    }
                 } else if (r_top - r_bottom).abs() <= 1e-6 {
                     Draw3dKind::Prism
                 } else {
                     Draw3dKind::Cone // a true frustum edits via the cone controllers (bottom/top/height)
                 };
             }
-            Primitive::Torus { major_r, minor_r, seg_major, seg_minor } => {
+            Primitive::Torus {
+                major_r,
+                minor_r,
+                seg_major,
+                seg_minor,
+            } => {
                 self.kind = Draw3dKind::Torus;
-                self.major_r = major_r; self.minor_r = minor_r;
-                self.seg_major = seg_major; self.seg_minor = seg_minor;
+                self.major_r = major_r;
+                self.minor_r = minor_r;
+                self.seg_major = seg_major;
+                self.seg_minor = seg_minor;
             }
-            Primitive::Capsule { r, h, segments, stacks } => {
+            Primitive::Capsule {
+                r,
+                h,
+                segments,
+                stacks,
+            } => {
                 self.kind = Draw3dKind::Capsule;
-                self.r = r; self.h = h; self.segments = segments; self.stacks = stacks;
+                self.r = r;
+                self.h = h;
+                self.segments = segments;
+                self.stacks = stacks;
             }
-            Primitive::Tube { r_outer, r_inner, h, sides } => {
+            Primitive::Tube {
+                r_outer,
+                r_inner,
+                h,
+                sides,
+            } => {
                 self.kind = Draw3dKind::Tube;
-                self.r = r_outer; self.r_inner = r_inner; self.h = h; self.segments = sides;
+                self.r = r_outer;
+                self.r_inner = r_inner;
+                self.h = h;
+                self.segments = sides;
             }
-            Primitive::Ellipsoid { rx, ry, rz, segments, stacks } => {
+            Primitive::Ellipsoid {
+                rx,
+                ry,
+                rz,
+                segments,
+                stacks,
+            } => {
                 self.kind = Draw3dKind::Ellipsoid;
-                self.rx = rx; self.ry = ry; self.rz = rz;
-                self.segments = segments; self.stacks = stacks;
+                self.rx = rx;
+                self.ry = ry;
+                self.rz = rz;
+                self.segments = segments;
+                self.stacks = stacks;
             }
         }
     }
@@ -3803,13 +4587,21 @@ impl Draw3dDialog {
     /// but one primitive is why there is no duplicated meshing code.
     pub fn build(&self) -> Primitive {
         match self.kind {
-            Draw3dKind::Box => Primitive::Box { w: self.w, d: self.d, h: self.h },
-            Draw3dKind::Sphere => {
-                Primitive::Sphere { r: self.r, segments: self.segments, stacks: self.stacks }
-            }
-            Draw3dKind::Cylinder => {
-                Primitive::Cylinder { r: self.r, h: self.h, sides: self.segments }
-            }
+            Draw3dKind::Box => Primitive::Box {
+                w: self.w,
+                d: self.d,
+                h: self.h,
+            },
+            Draw3dKind::Sphere => Primitive::Sphere {
+                r: self.r,
+                segments: self.segments,
+                stacks: self.stacks,
+            },
+            Draw3dKind::Cylinder => Primitive::Cylinder {
+                r: self.r,
+                h: self.h,
+                sides: self.segments,
+            },
             Draw3dKind::Cone => Primitive::Frustum {
                 r_bottom: self.r,
                 r_top: self.r_top,
@@ -3866,7 +4658,9 @@ impl Draw3dDialog {
             Draw3dKind::Torus if self.minor_r >= self.major_r => {
                 Some("minor radius must be smaller than major (else it self-intersects)")
             }
-            Draw3dKind::Cone if self.r_top >= self.r => Some("top radius must be < bottom (0 = cone)"),
+            Draw3dKind::Cone if self.r_top >= self.r => {
+                Some("top radius must be < bottom (0 = cone)")
+            }
             _ => None,
         }
     }
@@ -3877,7 +4671,10 @@ impl Default for FactoryState {
         Self {
             open: false,
             // Millimetres — what building drawings are dimensioned in. Storage stays metres.
-            units: cad_kernel::Units::from_metres_per_unit(cad_kernel::Units::MM, cad_kernel::UnitSource::User),
+            units: cad_kernel::Units::from_metres_per_unit(
+                cad_kernel::Units::MM,
+                cad_kernel::UnitSource::User,
+            ),
             model: Model::default(),
             cached: SolidMesh::default(),
             dirty: false,
@@ -3927,7 +4724,10 @@ impl Default for FactoryState {
             keep_sketch: false,
             // One storey at z = 0 — with a single level everything behaves exactly as it
             // did before storeys existed.
-            storeys: vec![Storey { name: "Ground".into(), height: 3.0 }],
+            storeys: vec![Storey {
+                name: "Ground".into(),
+                height: 3.0,
+            }],
             active_storey: 0,
             wall_drag: None,
             gizmo_drag: None,
@@ -4009,9 +4809,18 @@ pub(crate) fn tests_box(mn: Vec3, mx: Vec3) -> Vec<[f32; 3]> {
         ]
     };
     const FACES: [[usize; 3]; 12] = [
-        [0, 2, 3], [0, 3, 1], [4, 5, 7], [4, 7, 6],
-        [0, 1, 5], [0, 5, 4], [2, 6, 7], [2, 7, 3],
-        [0, 4, 6], [0, 6, 2], [1, 3, 7], [1, 7, 5],
+        [0, 2, 3],
+        [0, 3, 1],
+        [4, 5, 7],
+        [4, 7, 6],
+        [0, 1, 5],
+        [0, 5, 4],
+        [2, 6, 7],
+        [2, 7, 3],
+        [0, 4, 6],
+        [0, 6, 2],
+        [1, 3, 7],
+        [1, 7, 5],
     ];
     FACES.iter().flat_map(|f| f.iter().map(|&i| v(i))).collect()
 }
@@ -4051,9 +4860,15 @@ fn tri_cut_at_z(t: &[Vec3; 3], z: f32) -> Option<[glam::Vec2; 2]> {
 
 impl FactoryState {
     pub fn add_box(&mut self) {
-        let p = Primitive::Box { w: self.box_w, d: self.box_d, h: self.box_h };
+        let p = Primitive::Box {
+            w: self.box_w,
+            d: self.box_d,
+            h: self.box_h,
+        };
         let placement = self.placement_for(&p);
-        let id = self.model.push(BoolOp::Union, Plane::default(), placement, p);
+        let id = self
+            .model
+            .push(BoolOp::Union, Plane::default(), placement, p);
         self.selection = vec![id];
         self.arm_placement(AwaitingPlace::Feature(id));
         self.dirty = true;
@@ -4144,8 +4959,14 @@ impl FactoryState {
     /// Append a storey on top of the building and make it active.
     pub fn add_storey_on_top(&mut self) -> usize {
         let n = self.storeys.len();
-        let h = self.storeys.last().map_or(self.building_height, |s| s.height);
-        self.storeys.push(Storey { name: format!("Level {n}"), height: h.max(MIN_STOREY_H) });
+        let h = self
+            .storeys
+            .last()
+            .map_or(self.building_height, |s| s.height);
+        self.storeys.push(Storey {
+            name: format!("Level {n}"),
+            height: h.max(MIN_STOREY_H),
+        });
         self.active_storey = self.storeys.len() - 1;
         self.active_storey
     }
@@ -4185,7 +5006,9 @@ impl FactoryState {
         for w in src_walls {
             let mut segs = Vec::new();
             for win in w.footprint.windows(2) {
-                if let Some(id) = self.push_wall_box(win[0], win[1], w.thickness, w.height, new_base) {
+                if let Some(id) =
+                    self.push_wall_box(win[0], win[1], w.thickness, w.height, new_base)
+                {
                     segs.push(id);
                 }
             }
@@ -4276,7 +5099,11 @@ impl FactoryState {
         let size = [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]];
         let longest = size[0].max(size[1]).max(size[2]).max(1e-4);
         // Scale toward ~1.5 m only for wildly off sizes (cm/mm exports, or giant units).
-        let k = if longest > 20.0 || longest < 0.05 { 1.5 / longest } else { 1.0 };
+        let k = if longest > 20.0 || longest < 0.05 {
+            1.5 / longest
+        } else {
+            1.0
+        };
         Some(([(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, mn[2]], k))
     }
 
@@ -4426,8 +5253,12 @@ impl FactoryState {
         }
         if let Some(id) = self.selected_single() {
             if let Some(f) = self.model.features.iter().find(|f| f.id == id) {
-                let (op, plane, placement, primitive) =
-                    (f.op, f.plane.clone(), f.placement.clone(), f.primitive.clone());
+                let (op, plane, placement, primitive) = (
+                    f.op,
+                    f.plane.clone(),
+                    f.placement.clone(),
+                    f.primitive.clone(),
+                );
                 let (surface_colors, surface_textures) = self.capture_surface_paint(id);
                 self.clip = Some(FactoryClip::Feature {
                     op,
@@ -4461,13 +5292,17 @@ impl FactoryState {
         let mut texs: std::collections::HashMap<SurfaceKey, ([f32; 3], f32, usize)> =
             std::collections::HashMap::new();
         for (i, tri) in self.cached.positions.chunks_exact(3).enumerate() {
-            let Some(fid) = self.cached.face_ids.get(i).copied() else { continue };
+            let Some(fid) = self.cached.face_ids.get(i).copied() else {
+                continue;
+            };
             if fid != id {
                 continue;
             }
             let key = surface_key(fid, tri[0], tri[1], tri[2]);
             let av = Vec3::from(tri[0]);
-            let n = (Vec3::from(tri[1]) - av).cross(Vec3::from(tri[2]) - av).normalize_or_zero();
+            let n = (Vec3::from(tri[1]) - av)
+                .cross(Vec3::from(tri[2]) - av)
+                .normalize_or_zero();
             let d = n.dot(av);
             if let Some(&c) = self.surface_color.get(&key) {
                 cols.entry(key).or_insert(([n.x, n.y, n.z], d, c));
@@ -4492,8 +5327,14 @@ impl FactoryState {
                 Some(false)
             }
             FactoryClip::Feature {
-                op, plane, mut placement, primitive, color, texture,
-                surface_colors, surface_textures,
+                op,
+                plane,
+                mut placement,
+                primitive,
+                color,
+                texture,
+                surface_colors,
+                surface_textures,
             } => {
                 placement.u += OFF;
                 placement.v += OFF;
@@ -4502,8 +5343,12 @@ impl FactoryState {
                 let (ua, va) = plane.axes();
                 let delta = ua * OFF + va * OFF;
                 let id = self.model.push(op, plane, placement, primitive);
-                if let Some(c) = color { self.feature_color.insert(id, c); }
-                if let Some(t) = texture { self.feature_texture.insert(id, t); }
+                if let Some(c) = color {
+                    self.feature_color.insert(id, c);
+                }
+                if let Some(t) = texture {
+                    self.feature_texture.insert(id, t);
+                }
                 let rekey = |n: [f32; 3], d: f32| -> SurfaceKey {
                     let nv = Vec3::from(n);
                     let nd = d + nv.dot(delta);
@@ -4515,8 +5360,12 @@ impl FactoryState {
                         (nd * 100.0).round() as i32,
                     )
                 };
-                for (n, d, c) in surface_colors { self.surface_color.insert(rekey(n, d), c); }
-                for (n, d, t) in surface_textures { self.surface_texture.insert(rekey(n, d), t); }
+                for (n, d, c) in surface_colors {
+                    self.surface_color.insert(rekey(n, d), c);
+                }
+                for (n, d, t) in surface_textures {
+                    self.surface_texture.insert(rekey(n, d), t);
+                }
                 self.sel_furniture.clear();
                 self.selection = vec![id];
                 self.dirty = true;
@@ -4690,12 +5539,17 @@ impl FactoryState {
 
     /// Ray-pick the front-most furniture instance under the cursor.
     pub fn pick_furniture(
-        &self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16],
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
     ) -> Option<usize> {
         let (orig, dir) = Self::ray(cursor, rect, mvp);
         let mut best: Option<(f32, usize)> = None;
         for (i, inst) in self.furniture.iter().enumerate() {
-            let Some(asset) = self.furniture_lib.get(inst.asset) else { continue };
+            let Some(asset) = self.furniture_lib.get(inst.asset) else {
+                continue;
+            };
             // CHEAP REJECT: skip furniture whose world AABB the ray misses. Without this a
             // pick ray-tested EVERY triangle of EVERY piece — a 2M-triangle mesh cost ~6M
             // vertex transforms per click (the select/drag lag spike). The AABB is O(8).
@@ -4706,8 +5560,15 @@ impl FactoryState {
             }
             // Pick against the DISPLAY geometry — the decimated proxy for heavy pieces — so a
             // click on a 2M-triangle import doesn't ray-test millions of triangles per click.
-            let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
-            let positions: &[[f32; 3]] = match &lod { Some(a) => &a.positions, None => &asset.positions };
+            let lod = if asset.needs_lod() {
+                Some(asset.lod_geom())
+            } else {
+                None
+            };
+            let positions: &[[f32; 3]] = match &lod {
+                Some(a) => &a.positions,
+                None => &asset.positions,
+            };
             let mut ft: Option<f32> = None;
             for tri in positions.chunks_exact(3) {
                 let a = self.furniture_point(inst, tri[0]);
@@ -4734,33 +5595,51 @@ impl FactoryState {
     /// other furniture happens to be the global-nearest along that ray — the single-nearest
     /// `pick_furniture` could not express that, which made aperture selection inconsistent.
     pub fn pick_furniture_ex(
-        &self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16],
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
     ) -> (Option<(usize, f32)>, Option<(usize, f32)>) {
         let (orig, dir) = Self::ray(cursor, rect, mvp);
         let mut best: Option<(f32, usize)> = None;
         let mut best_ap: Option<(f32, usize)> = None;
         for (i, inst) in self.furniture.iter().enumerate() {
-            let Some(asset) = self.furniture_lib.get(inst.asset) else { continue };
+            let Some(asset) = self.furniture_lib.get(inst.asset) else {
+                continue;
+            };
             match self.furniture_aabb(i) {
                 Some((mn, mx)) if cad_solid::ray_aabb(orig, dir, mn, mx).is_some() => {}
                 _ => continue,
             }
-            let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
-            let positions: &[[f32; 3]] = match &lod { Some(a) => &a.positions, None => &asset.positions };
+            let lod = if asset.needs_lod() {
+                Some(asset.lod_geom())
+            } else {
+                None
+            };
+            let positions: &[[f32; 3]] = match &lod {
+                Some(a) => &a.positions,
+                None => &asset.positions,
+            };
             let mut ft: Option<f32> = None;
             for tri in positions.chunks_exact(3) {
                 let a = self.furniture_point(inst, tri[0]);
                 let b = self.furniture_point(inst, tri[1]);
                 let c = self.furniture_point(inst, tri[2]);
                 if let Some(t) = cad_solid::ray_triangle(orig, dir, a, b, c) {
-                    if ft.map_or(true, |x| t < x) { ft = Some(t); }
+                    if ft.map_or(true, |x| t < x) {
+                        ft = Some(t);
+                    }
                 }
             }
             if let Some(t) = ft {
-                if best.map_or(true, |(bt, _)| t < bt) { best = Some((t, i)); }
+                if best.map_or(true, |(bt, _)| t < bt) {
+                    best = Some((t, i));
+                }
                 // Recognise apertures broadly (fit OR a door/window asset), not just `fit`, so a
                 // free-standing/imported window flush in a wall still gets selection priority.
-                if self.is_aperture(i) && best_ap.map_or(true, |(bt, _)| t < bt) { best_ap = Some((t, i)); }
+                if self.is_aperture(i) && best_ap.map_or(true, |(bt, _)| t < bt) {
+                    best_ap = Some((t, i));
+                }
             }
         }
         (best.map(|(t, i)| (i, t)), best_ap.map(|(t, i)| (i, t)))
@@ -4769,7 +5648,10 @@ impl FactoryState {
     /// Nearest Union feature under the cursor WITH its ray distance — the depth-aware counterpart
     /// of [`Self::pick_feature`] (which returns only the id).
     pub fn pick_feature_t(
-        &self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16],
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
     ) -> Option<(u32, f32)> {
         let (orig, dir) = Self::ray(cursor, rect, mvp);
         let mut best: Option<(f32, f32, u32)> = None; // (t, aabb volume, id)
@@ -4785,7 +5667,9 @@ impl FactoryState {
             for c in tris.chunks_exact(3) {
                 let (a, b, cc) = (Vec3::from(c[0]), Vec3::from(c[1]), Vec3::from(c[2]));
                 if let Some(t) = cad_solid::ray_triangle(orig, dir, a, b, cc) {
-                    if ft.map_or(true, |x| t < x) { ft = Some(t); }
+                    if ft.map_or(true, |x| t < x) {
+                        ft = Some(t);
+                    }
                 }
             }
             if let Some(t) = ft {
@@ -4796,7 +5680,9 @@ impl FactoryState {
                     None => true,
                     Some((bt, bv, _)) => t < bt - 1e-3 || (t < bt + 1e-3 && vol < bv),
                 };
-                if better { best = Some((t, vol, f.id)); }
+                if better {
+                    best = Some((t, vol, f.id));
+                }
             }
         }
         best.map(|(t, _, id)| (id, t))
@@ -4818,7 +5704,12 @@ impl FactoryState {
     /// Is furniture instance `fi` in front of feature `id` along the pick ray? Used to
     /// break a tie when a click hits both. Exact depth compare (tolerance 0).
     pub fn furniture_nearer_than_feature(
-        &self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16], fi: usize, id: u32,
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+        fi: usize,
+        id: u32,
     ) -> bool {
         self.furniture_beats_feature(cursor, rect, mvp, fi, id, 0.0)
     }
@@ -4829,35 +5720,57 @@ impl FactoryState {
     /// at nearly the same depth as the aperture's face and would otherwise steal every click. The
     /// caller passes a generous `tol` (≈ wall thickness) for apertures and a tiny one otherwise.
     pub fn furniture_beats_feature(
-        &self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16], fi: usize, id: u32, tol: f32,
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+        fi: usize,
+        id: u32,
+        tol: f32,
     ) -> bool {
         let (orig, dir) = Self::ray(cursor, rect, mvp);
         let fur_t = self.furniture.get(fi).and_then(|inst| {
             let asset = self.furniture_lib.get(inst.asset)?;
-            let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
-            let positions: &[[f32; 3]] = match &lod { Some(a) => &a.positions, None => &asset.positions };
+            let lod = if asset.needs_lod() {
+                Some(asset.lod_geom())
+            } else {
+                None
+            };
+            let positions: &[[f32; 3]] = match &lod {
+                Some(a) => &a.positions,
+                None => &asset.positions,
+            };
             let mut best: Option<f32> = None;
             for tri in positions.chunks_exact(3) {
                 let a = self.furniture_point(inst, tri[0]);
                 let b = self.furniture_point(inst, tri[1]);
                 let c = self.furniture_point(inst, tri[2]);
                 if let Some(t) = cad_solid::ray_triangle(orig, dir, a, b, c) {
-                    if best.map_or(true, |x| t < x) { best = Some(t); }
+                    if best.map_or(true, |x| t < x) {
+                        best = Some(t);
+                    }
                 }
             }
             best
         });
-        let feat_t = self.model.features.iter().find(|f| f.id == id).and_then(|f| {
-            let tris = self.model.feature_world_positions(f);
-            let mut best: Option<f32> = None;
-            for c in tris.chunks_exact(3) {
-                let (a, b, cc) = (Vec3::from(c[0]), Vec3::from(c[1]), Vec3::from(c[2]));
-                if let Some(t) = cad_solid::ray_triangle(orig, dir, a, b, cc) {
-                    if best.map_or(true, |x| t < x) { best = Some(t); }
+        let feat_t = self
+            .model
+            .features
+            .iter()
+            .find(|f| f.id == id)
+            .and_then(|f| {
+                let tris = self.model.feature_world_positions(f);
+                let mut best: Option<f32> = None;
+                for c in tris.chunks_exact(3) {
+                    let (a, b, cc) = (Vec3::from(c[0]), Vec3::from(c[1]), Vec3::from(c[2]));
+                    if let Some(t) = cad_solid::ray_triangle(orig, dir, a, b, cc) {
+                        if best.map_or(true, |x| t < x) {
+                            best = Some(t);
+                        }
+                    }
                 }
-            }
-            best
-        });
+                best
+            });
         match (fur_t, feat_t) {
             (Some(a), Some(b)) => a <= b + tol,
             (Some(_), None) => true,
@@ -4875,7 +5788,9 @@ impl FactoryState {
     /// Without (2)/(3), an imported/free-standing window sitting flush in a wall was invisible to
     /// the aperture priority and the wall stole the click (confirmed via the pick diagnostic).
     pub fn is_aperture(&self, i: usize) -> bool {
-        let Some(inst) = self.furniture.get(i) else { return false };
+        let Some(inst) = self.furniture.get(i) else {
+            return false;
+        };
         if inst.fit.is_some() {
             return true;
         }
@@ -4980,8 +5895,10 @@ impl FactoryState {
         if ids.len() < 2 {
             return;
         }
-        let existing: Vec<u32> =
-            ids.iter().filter_map(|id| self.feature_group.get(id).copied()).collect();
+        let existing: Vec<u32> = ids
+            .iter()
+            .filter_map(|id| self.feature_group.get(id).copied())
+            .collect();
         let gid = existing.first().copied().unwrap_or_else(|| {
             let g = self.next_group_id;
             self.next_group_id += 1;
@@ -5038,7 +5955,10 @@ impl FactoryState {
     /// The group id of the current selection, if every selected feature shares ONE group (so the UI
     /// can show "Explode" instead of "Group").
     pub fn selection_group(&self) -> Option<u32> {
-        let mut it = self.selection.iter().map(|id| self.feature_group.get(id).copied());
+        let mut it = self
+            .selection
+            .iter()
+            .map(|id| self.feature_group.get(id).copied());
         let first = it.next()??;
         it.all(|g| g == Some(first)).then_some(first)
     }
@@ -5132,7 +6052,9 @@ impl FactoryState {
             if inst.fit.is_none() {
                 continue; // ordinary furniture is not part of the building's fabric
             }
-            let Some(tris) = crate::light::furniture_box_tris(self, i) else { continue };
+            let Some(tris) = crate::light::furniture_box_tris(self, i) else {
+                continue;
+            };
             out.extend(tris.iter().filter_map(|t| tri_cut_at_z(t, z)));
         }
         out
@@ -5164,7 +6086,11 @@ impl FactoryState {
     /// the surprise; the delete and move paths handle both, so nothing downstream is confused by
     /// it. Returns `(features, furniture)` counts.
     pub fn select_in_marquee(
-        &mut self, band: egui::Rect, viewport: egui::Rect, mvp: &[f32; 16], additive: bool,
+        &mut self,
+        band: egui::Rect,
+        viewport: egui::Rect,
+        mvp: &[f32; 16],
+        additive: bool,
     ) -> (usize, usize) {
         let mut hits = Vec::new();
         for f in &self.model.features {
@@ -5290,8 +6216,10 @@ impl FactoryState {
             *m = keep.into_iter().collect();
         };
         remap(&mut self.surface_texture);
-        let (mut keep, mut move_): (Vec<_>, Vec<_>) =
-            self.surface_color.drain().partition(|(k, _)| !moved.contains(&k.0));
+        let (mut keep, mut move_): (Vec<_>, Vec<_>) = self
+            .surface_color
+            .drain()
+            .partition(|(k, _)| !moved.contains(&k.0));
         for (k, v) in move_.drain(..) {
             keep.push((shift(&k), v));
         }
@@ -5371,7 +6299,10 @@ impl FactoryState {
     /// click?" and then edit or create that face's material. One implementation, so the window and
     /// the brush can never disagree about which face was meant.
     pub fn pick_surface_key(
-        &self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16],
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
     ) -> Option<SurfaceKey> {
         let (orig, dir) = Self::ray(cursor, rect, mvp);
         let mut best: Option<(f32, SurfaceKey)> = None;
@@ -5388,7 +6319,11 @@ impl FactoryState {
     }
 
     pub fn paint_surface(
-        &mut self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16], color: [f32; 3],
+        &mut self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+        color: [f32; 3],
     ) -> bool {
         if let Some(key) = self.pick_surface_key(cursor, rect, mvp) {
             self.surface_color.insert(key, color);
@@ -5401,7 +6336,11 @@ impl FactoryState {
     /// [`Self::paint_surface`] but writes `surface_texture`; clears any per-surface colour on
     /// that face so the image shows. Returns true if a surface was hit.
     pub fn paint_surface_texture(
-        &mut self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16], tex_idx: usize,
+        &mut self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+        tex_idx: usize,
     ) -> bool {
         if tex_idx >= self.textures.len() {
             return false;
@@ -5432,7 +6371,12 @@ impl FactoryState {
     /// space). Returns `None` if the object isn't under the cursor, or the asset is heavy
     /// (LOD)/translucent (per-surface unsupported there). See [`FurnGroups`].
     pub fn furniture_face_at(
-        &self, i: usize, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16], whole_piece: bool,
+        &self,
+        i: usize,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+        whole_piece: bool,
     ) -> Option<Vec<u32>> {
         let asset_idx = self.furniture.get(i)?.asset;
         let model = self.furniture_model_matrix(i)?;
@@ -5447,7 +6391,11 @@ impl FactoryState {
         // the source face id per triangle, so a hit on it names the same face group a hit on the
         // full mesh would, at a fraction of the ray tests. It also picks what is actually ON
         // SCREEN, which is the more defensible answer for a click.
-        let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
+        let lod = if asset.needs_lod() {
+            Some(asset.lod_geom())
+        } else {
+            None
+        };
         // World ray → the instance's LOCAL space (positions are stored local).
         let (ow, dw) = Self::ray(cursor, rect, mvp);
         let inv = glam::Mat4::from_cols_array(&model).inverse();
@@ -5506,14 +6454,17 @@ impl FactoryState {
         }
         self.add_texture(
             format!("colour #{:02x}{:02x}{:02x}", rgba[0], rgba[1], rgba[2]),
-            1, 1, rgba.to_vec(),
+            1,
+            1,
+            rgba.to_vec(),
         )
     }
 
     /// True when this furniture asset carries per-primitive part ids (a generated object). Used by
     /// diagnostics + to decide whether "piece"/"face" split cleanly.
     pub fn furniture_has_parts(&self, i: usize) -> bool {
-        self.furniture.get(i)
+        self.furniture
+            .get(i)
             .and_then(|inst| self.furniture_lib.get(inst.asset))
             .map_or(false, |a| a.part_ids.len() == a.positions.len() / 3)
     }
@@ -5521,13 +6472,20 @@ impl FactoryState {
     /// How many triangles of instance `i` currently carry a PER-FACE texture (for diagnostics —
     /// confirms an apply hit only the intended face, not the whole object).
     pub fn furniture_textured_tri_count(&self, i: usize) -> usize {
-        let Some(inst) = self.furniture.get(i) else { return 0 };
+        let Some(inst) = self.furniture.get(i) else {
+            return 0;
+        };
         if inst.surface_texture.is_empty() {
             return 0;
         }
-        let Some(asset) = self.furniture_lib.get(inst.asset) else { return 0 };
+        let Some(asset) = self.furniture_lib.get(inst.asset) else {
+            return 0;
+        };
         let g = asset.group_geom();
-        g.face.iter().filter(|fg| inst.surface_texture.contains_key(fg)).count()
+        g.face
+            .iter()
+            .filter(|fg| inst.surface_texture.contains_key(fg))
+            .count()
     }
 
     /// Record `tex_idx` against `face_groups` of furniture instance `i` (per-surface texturing).
@@ -5561,7 +6519,9 @@ impl FactoryState {
     /// face/piece "wears" (the first painted group's texture; `None` if none are painted).
     pub fn face_material(&self, i: usize, face_groups: &[u32]) -> Option<usize> {
         let inst = self.furniture.get(i)?;
-        face_groups.iter().find_map(|fg| inst.surface_texture.get(fg).copied())
+        face_groups
+            .iter()
+            .find_map(|fg| inst.surface_texture.get(fg).copied())
     }
 
     /// Is texture `ti` referenced ANYWHERE other than exactly `face_groups` of instance `i`? Drives
@@ -5586,8 +6546,15 @@ impl FactoryState {
     /// Deep-copy texture `ti` into a new asset (own pixels + fresh PNG cache), keeping its
     /// tiling/opacity/reflection, and return the new index. Used to give a piece its OWN material.
     pub fn clone_texture(&mut self, ti: usize) -> usize {
-        let Some(src) = self.textures.get(ti) else { return ti };
-        let mut t = TextureAsset::new(format!("{} (copy)", src.name), src.w, src.h, src.rgba.clone());
+        let Some(src) = self.textures.get(ti) else {
+            return ti;
+        };
+        let mut t = TextureAsset::new(
+            format!("{} (copy)", src.name),
+            src.w,
+            src.h,
+            src.rgba.clone(),
+        );
         t.scale = src.scale;
         t.offset = src.offset;
         t.rot_deg = src.rot_deg;
@@ -5609,7 +6576,11 @@ impl FactoryState {
         } else if let Some(t) = self.furniture.get(i).and_then(|f| f.texture) {
             t
         } else {
-            let col = self.furniture.get(i).map(|f| f.color).unwrap_or([0.8, 0.8, 0.82]);
+            let col = self
+                .furniture
+                .get(i)
+                .map(|f| f.color)
+                .unwrap_or([0.8, 0.8, 0.82]);
             self.ensure_solid_color_texture(col)
         };
         let ti = if self.texture_used_outside(seed, i, face_groups) {
@@ -5638,7 +6609,9 @@ impl FactoryState {
         if self.surface_texture.values().any(|&t| t == ti) {
             return true;
         }
-        self.feature_texture.iter().any(|(&id, &t)| t == ti && !want.contains(&id))
+        self.feature_texture
+            .iter()
+            .any(|(&id, &t)| t == ti && !want.contains(&id))
     }
 
     /// Give the selected CSG feature(s) a material EXCLUSIVE to them, so tuning its opacity /
@@ -5647,7 +6620,10 @@ impl FactoryState {
     /// it; binds it to every selected feature. Recomputes ONCE if a previously-untextured feature
     /// was newly textured (its triangles must move to the textured pass). Returns the index to write.
     pub fn private_feature_material(&mut self, ids: &[u32]) -> usize {
-        let seed = if let Some(t) = ids.iter().find_map(|id| self.feature_texture.get(id).copied()) {
+        let seed = if let Some(t) = ids
+            .iter()
+            .find_map(|id| self.feature_texture.get(id).copied())
+        {
             t
         } else {
             let col = ids
@@ -5746,9 +6722,13 @@ impl FactoryState {
     /// Cutting one piece never touches its neighbours: a derived asset belongs to one instance, so
     /// three doors placed from the same library entry stay independent.
     pub fn rebuild_cut_asset(&mut self, fi: usize) -> Result<(), cad_solid::meshcut::CutError> {
-        let Some(inst) = self.furniture.get(fi) else { return Ok(()) };
+        let Some(inst) = self.furniture.get(fi) else {
+            return Ok(());
+        };
         let src = inst.source_asset();
-        let Some(base) = self.furniture_lib.get(src) else { return Ok(()) };
+        let Some(base) = self.furniture_lib.get(src) else {
+            return Ok(());
+        };
         let cuts = inst.cuts.clone();
 
         // Nothing enabled → go back to the original outright, and drop the derived copy.
@@ -5798,7 +6778,9 @@ impl FactoryState {
         }
 
         // Reuse the derived slot when there is one, so repeated edits do not grow the library.
-        let existing = self.furniture[fi].base_asset.map(|_| self.furniture[fi].asset);
+        let existing = self.furniture[fi]
+            .base_asset
+            .map(|_| self.furniture[fi].asset);
         let derived = match existing {
             Some(d) if d != src && d < self.furniture_lib.len() => {
                 self.furniture_lib[d] = asset;
@@ -5836,9 +6818,15 @@ impl FactoryState {
 
     /// Overwrite an existing library asset's geometry in place, keeping its index valid.
     fn replace_furniture_asset(
-        &mut self, idx: usize, name: String, mesh: crate::mesh_io::ObjMesh, import_scale: f32,
+        &mut self,
+        idx: usize,
+        name: String,
+        mesh: crate::mesh_io::ObjMesh,
+        import_scale: f32,
     ) {
-        let Some(a) = self.furniture_lib.get_mut(idx) else { return };
+        let Some(a) = self.furniture_lib.get_mut(idx) else {
+            return;
+        };
         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
         for p in &mesh.positions {
             for i in 0..3 {
@@ -5879,16 +6867,28 @@ impl FactoryState {
     ///   the pose, so it is built once and then only transformed and projected. Orbiting the
     ///   camera and dragging the object both stay free.
     pub fn furniture_face_highlight_segments(
-        &self, rect: egui::Rect, mvp: &[f32; 16],
+        &self,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
     ) -> Vec<[egui::Pos2; 2]> {
         let mut out = Vec::new();
-        let Some((fi, groups)) = self.furn_face_sel.as_ref() else { return out };
-        let Some(inst) = self.furniture.get(*fi) else { return out };
-        let Some(asset) = self.furniture_lib.get(inst.asset) else { return out };
+        let Some((fi, groups)) = self.furn_face_sel.as_ref() else {
+            return out;
+        };
+        let Some(inst) = self.furniture.get(*fi) else {
+            return out;
+        };
+        let Some(asset) = self.furniture_lib.get(inst.asset) else {
+            return out;
+        };
         // TRACED ON WHATEVER IS ON SCREEN. This returned nothing at all for a LOD'd asset, which
         // cost nothing while `needs_lod` refused every textured import and would have silently
         // removed the selection outline from all of them once it stopped.
-        let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
+        let lod = if asset.needs_lod() {
+            Some(asset.lod_geom())
+        } else {
+            None
+        };
         let fg = asset.group_geom();
         let (src_pos, src_face): (&[[f32; 3]], &[u32]) = match &lod {
             Some(a) => (&a.positions, &a.face),
@@ -5902,8 +6902,9 @@ impl FactoryState {
                 c.inst != *fi || c.asset != inst.asset || c.tris != tris || c.groups != *groups
             });
             if stale {
-                *self.face_outline.borrow_mut() =
-                    Some(Self::build_face_outline(src_pos, src_face, *fi, inst.asset, groups));
+                *self.face_outline.borrow_mut() = Some(Self::build_face_outline(
+                    src_pos, src_face, *fi, inst.asset, groups,
+                ));
             }
         }
         let cache = self.face_outline.borrow();
@@ -5927,7 +6928,10 @@ impl FactoryState {
     /// rather than quietly drawing a partial highlight, because a highlight that stops halfway
     /// round a face reads as a hole in the face.
     pub fn face_highlight_truncated(&self) -> bool {
-        self.face_outline.borrow().as_ref().is_some_and(|c| c.truncated)
+        self.face_outline
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.truncated)
     }
 
     /// The boundary of the selected face-groups, in the asset's local space.
@@ -5940,7 +6944,11 @@ impl FactoryState {
     /// proxy when that is what is on screen. An outline built from the full mesh would float a
     /// little off the proxy the user is actually looking at.
     fn build_face_outline(
-        positions: &[[f32; 3]], face: &[u32], inst: usize, asset_idx: usize, groups: &[u32],
+        positions: &[[f32; 3]],
+        face: &[u32],
+        inst: usize,
+        asset_idx: usize,
+        groups: &[u32],
     ) -> FaceOutline {
         use std::collections::hash_map::Entry;
         let want: std::collections::HashSet<u32> = groups.iter().copied().collect();
@@ -6018,7 +7026,11 @@ impl FactoryState {
     /// axis 0 = pitch (about plane u), 1 = roll (about plane v), 2 = spin (about the
     /// normal). Drives both the numeric fields and the rotation-ring gizmo.
     pub fn set_feature_rotation(&mut self, id: u32, axis: usize, deg: f32) {
-        let Some(before) = self.model.get(id).map(|f| f.plane.world_matrix(&f.placement)) else {
+        let Some(before) = self
+            .model
+            .get(id)
+            .map(|f| f.plane.world_matrix(&f.placement))
+        else {
             return;
         };
         let mut after = before;
@@ -6040,7 +7052,11 @@ impl FactoryState {
     /// A feature's current rotation `[pitch, roll, spin]` in degrees, for the panel/gizmo.
     pub fn feature_rotation(&self, id: u32) -> Option<[f32; 3]> {
         let f = self.model.features.iter().find(|f| f.id == id)?;
-        Some([f.placement.pitch_deg, f.placement.roll_deg, f.placement.spin_deg])
+        Some([
+            f.placement.pitch_deg,
+            f.placement.roll_deg,
+            f.placement.spin_deg,
+        ])
     }
 
     /// The primitive of the single selected feature, for the properties panel.
@@ -6069,7 +7085,11 @@ impl FactoryState {
         let len = (half * 1.4).max(min_world);
         let mk = |h: GizmoHandle, d: Vec3| {
             let tip_w = c + d * len;
-            world_to_screen(tip_w, rect, mvp).map(|tip_s| GizmoArm { handle: h, dir: d, tip_s })
+            world_to_screen(tip_w, rect, mvp).map(|tip_s| GizmoArm {
+                handle: h,
+                dir: d,
+                tip_s,
+            })
         };
         Some(GizmoView {
             center_w: c,
@@ -6086,7 +7106,9 @@ impl FactoryState {
     /// Approximate pixels-per-world at a point — the max screen speed over the three axes,
     /// so it stays non-zero even when one axis points at the camera.
     fn px_per_world(&self, c: Vec3, rect: egui::Rect, mvp: &[f32; 16]) -> f32 {
-        let Some(cs) = world_to_screen(c, rect, mvp) else { return 0.0 };
+        let Some(cs) = world_to_screen(c, rect, mvp) else {
+            return 0.0;
+        };
         let probe = 0.5;
         let mut best = 0.0f32;
         for d in [Vec3::X, Vec3::Y, Vec3::Z] {
@@ -6100,7 +7122,10 @@ impl FactoryState {
     /// Which gizmo handle is under the cursor. The centre cube wins over the axes (it sits
     /// where all three arms meet), so a click there is always the free-move, never an axis.
     pub fn pick_gizmo(
-        &self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16],
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
     ) -> Option<GizmoHandle> {
         let v = self.gizmo_view(rect, mvp)?;
         if v.center_s.distance(cursor) <= GIZMO_CUBE_PICK {
@@ -6160,13 +7185,28 @@ impl FactoryState {
                     pts.push(s);
                 }
             }
-            rings.push(Ring { handle: handles[i], axis: axes[i], pts });
+            rings.push(Ring {
+                handle: handles[i],
+                axis: axes[i],
+                pts,
+            });
         }
-        Some(RingView { center, center_s, radius, rings, is_furniture })
+        Some(RingView {
+            center,
+            center_s,
+            radius,
+            rings,
+            is_furniture,
+        })
     }
 
     /// Which rotation ring is under the cursor (nearest ring polyline within tolerance).
-    pub fn pick_ring(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<GizmoHandle> {
+    pub fn pick_ring(
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+    ) -> Option<GizmoHandle> {
         let rv = self.rotation_rings(rect, mvp)?;
         let mut best: Option<(f32, GizmoHandle)> = None;
         for ring in &rv.rings {
@@ -6183,26 +7223,51 @@ impl FactoryState {
 
     /// The unit vector from the ring centre to where the cursor ray meets the ring's plane
     /// (axis-component removed). `None` if the ray is parallel to the plane or hits the centre.
-    fn ray_to_ring_vec(&self, cursor: egui::Pos2, center: Vec3, axis: Vec3, rect: egui::Rect, mvp: &[f32; 16]) -> Option<Vec3> {
+    fn ray_to_ring_vec(
+        &self,
+        cursor: egui::Pos2,
+        center: Vec3,
+        axis: Vec3,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+    ) -> Option<Vec3> {
         let (orig, dir) = Self::ray(cursor, rect, mvp);
         let denom = dir.dot(axis);
-        if denom.abs() < 1e-5 { return None; }
+        if denom.abs() < 1e-5 {
+            return None;
+        }
         let t = (center - orig).dot(axis) / denom;
-        if t <= 0.0 { return None; }
+        if t <= 0.0 {
+            return None;
+        }
         let p = orig + dir * t;
         let r = (p - center) - axis * (p - center).dot(axis);
         let len = r.length();
-        if len < 1e-5 { return None; }
+        if len < 1e-5 {
+            return None;
+        }
         Some(r / len)
     }
 
     /// Begin a rotation-ring drag on `handle`. Captures the grab reference + start rotation so
     /// the gesture is one undo step. Returns false if the grab can't be established.
-    pub fn rot_begin(&mut self, handle: GizmoHandle, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> bool {
-        let Some((center, axes, is_furniture)) = self.rot_target() else { return false };
-        let Some(ai) = handle.ring_axis() else { return false };
+    pub fn rot_begin(
+        &mut self,
+        handle: GizmoHandle,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+    ) -> bool {
+        let Some((center, axes, is_furniture)) = self.rot_target() else {
+            return false;
+        };
+        let Some(ai) = handle.ring_axis() else {
+            return false;
+        };
         let axis = axes[ai];
-        let Some(r0) = self.ray_to_ring_vec(cursor, center, axis, rect, mvp) else { return false };
+        let Some(r0) = self.ray_to_ring_vec(cursor, center, axis, rect, mvp) else {
+            return false;
+        };
         let start_furn: Vec<(usize, [f32; 3], [f32; 3])> = if is_furniture {
             self.sel_furniture
                 .iter()
@@ -6214,11 +7279,19 @@ impl FactoryState {
         let start_rot = if is_furniture {
             start_furn.first().map(|&(_, _, r)| r).unwrap_or([0.0; 3])
         } else {
-            self.selected_single().and_then(|id| self.feature_rotation(id)).unwrap_or([0.0; 3])
+            self.selected_single()
+                .and_then(|id| self.feature_rotation(id))
+                .unwrap_or([0.0; 3])
         };
         self.rot_drag = Some(RotDrag {
-            handle, axis, center, r0, start_rot,
-            feat_axis: ai, is_furniture, start_furn,
+            handle,
+            axis,
+            center,
+            r0,
+            start_rot,
+            feat_axis: ai,
+            is_furniture,
+            start_furn,
         });
         true
     }
@@ -6227,14 +7300,20 @@ impl FactoryState {
     /// world-axis quaternion (kept as Euler for the numeric fields); a feature adds the swept
     /// angle to the ring's plane-local placement angle.
     pub fn rot_update(&mut self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) {
-        let Some(d) = self.rot_drag.clone() else { return };
-        let Some(r1) = self.ray_to_ring_vec(cursor, d.center, d.axis, rect, mvp) else { return };
+        let Some(d) = self.rot_drag.clone() else {
+            return;
+        };
+        let Some(r1) = self.ray_to_ring_vec(cursor, d.center, d.axis, rect, mvp) else {
+            return;
+        };
         // Signed angle r0→r1 about the axis (radians).
         let angle = d.r0.cross(r1).dot(d.axis).atan2(d.r0.dot(r1));
         if d.is_furniture {
             let spin = glam::Quat::from_axis_angle(d.axis, angle);
             for &(fi, start_pos, start_rot) in &d.start_furn {
-                let Some(inst) = self.furniture.get_mut(fi) else { continue };
+                let Some(inst) = self.furniture.get_mut(fi) else {
+                    continue;
+                };
                 // ORBIT about the selection centre as well as spinning in place. With one piece
                 // selected the centre IS the piece and this term vanishes; with several, turning
                 // the group has to move them round each other or it is not a group rotation at
@@ -6244,7 +7323,9 @@ impl FactoryState {
                 inst.pos = [moved.x, moved.y, moved.z];
                 let q_start = glam::Quat::from_euler(
                     glam::EulerRot::XYZ,
-                    start_rot[0].to_radians(), start_rot[1].to_radians(), start_rot[2].to_radians(),
+                    start_rot[0].to_radians(),
+                    start_rot[1].to_radians(),
+                    start_rot[2].to_radians(),
                 );
                 let (x, y, z) = (spin * q_start).to_euler(glam::EulerRot::XYZ);
                 inst.rot = [x.to_degrees(), y.to_degrees(), z.to_degrees()];
@@ -6294,9 +7375,14 @@ impl FactoryState {
     /// Vertices behind the camera are omitted, so nothing is drawn or picked where the
     /// user cannot see it.
     pub fn wall_vertex_handles(
-        &self, wi: usize, rect: egui::Rect, mvp: &[f32; 16],
+        &self,
+        wi: usize,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
     ) -> Vec<(usize, egui::Pos2)> {
-        let Some(w) = self.walls.get(wi) else { return Vec::new() };
+        let Some(w) = self.walls.get(wi) else {
+            return Vec::new();
+        };
         (0..w.footprint.len())
             .filter_map(|vi| {
                 let world = self.wall_vertex_world(wi, vi)?;
@@ -6308,9 +7394,14 @@ impl FactoryState {
     /// Screen positions of each EDGE's midpoint, as `(segment index, position)` — the
     /// click target for inserting a vertex.
     pub fn wall_edge_handles(
-        &self, wi: usize, rect: egui::Rect, mvp: &[f32; 16],
+        &self,
+        wi: usize,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
     ) -> Vec<(usize, egui::Pos2)> {
-        let Some(w) = self.walls.get(wi) else { return Vec::new() };
+        let Some(w) = self.walls.get(wi) else {
+            return Vec::new();
+        };
         (0..w.footprint.len().saturating_sub(1))
             .filter_map(|si| {
                 let a = self.wall_vertex_world(wi, si)?;
@@ -6323,16 +7414,28 @@ impl FactoryState {
     /// Vertex handle under the cursor, if any. Nearest wins, so overlapping handles
     /// resolve predictably.
     pub fn pick_wall_vertex(
-        &self, wi: usize, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16],
+        &self,
+        wi: usize,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
     ) -> Option<usize> {
-        nearest_within(self.wall_vertex_handles(wi, rect, mvp), cursor, HANDLE_PICK_R)
+        nearest_within(
+            self.wall_vertex_handles(wi, rect, mvp),
+            cursor,
+            HANDLE_PICK_R,
+        )
     }
 
     /// Edge midpoint under the cursor. A TIGHTER aperture than a vertex, because a
     /// midpoint sits between two vertex handles — the vertex must win a close call, or
     /// dragging a corner would insert a point instead.
     pub fn pick_wall_edge(
-        &self, wi: usize, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16],
+        &self,
+        wi: usize,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
     ) -> Option<usize> {
         if self.pick_wall_vertex(wi, cursor, rect, mvp).is_some() {
             return None;
@@ -6368,9 +7471,23 @@ impl FactoryState {
         let (profile, centre, w, d) = self.model.add_profile(footprint).ok()?;
         // An extrusion rises +Z from its placement, so lift so the TOP face lands on
         // `top_z` — a floor's top is what you stand on, a ceiling's underside what you see.
-        let placement = Placement { u: centre.x, v: centre.y, lift: top_z - t, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 };
-        let p = Primitive::Extrusion { profile, h: t, w, d };
-        let id = self.model.push(BoolOp::Union, Plane::default(), placement, p);
+        let placement = Placement {
+            u: centre.x,
+            v: centre.y,
+            lift: top_z - t,
+            spin_deg: 0.0,
+            pitch_deg: 0.0,
+            roll_deg: 0.0,
+        };
+        let p = Primitive::Extrusion {
+            profile,
+            h: t,
+            w,
+            d,
+        };
+        let id = self
+            .model
+            .push(BoolOp::Union, Plane::default(), placement, p);
         self.dirty = true;
         Some(id)
     }
@@ -6384,18 +7501,29 @@ impl FactoryState {
     ///
     /// Returns the new feature id, or the reason the outline was refused.
     pub fn add_building_outline(
-        &mut self, footprint: &[Vec2], height: f32,
+        &mut self,
+        footprint: &[Vec2],
+        height: f32,
     ) -> Result<u32, cad_solid::ProfileError> {
         let (profile, centre, w, d) = self.model.add_profile(footprint)?;
         let placement = Placement {
-            u: centre.x, v: centre.y, lift: self.active_base_z(), spin_deg: 0.0,
-            pitch_deg: 0.0, roll_deg: 0.0,
+            u: centre.x,
+            v: centre.y,
+            lift: self.active_base_z(),
+            spin_deg: 0.0,
+            pitch_deg: 0.0,
+            roll_deg: 0.0,
         };
         let id = self.model.push(
             BoolOp::Union,
             Plane::default(),
             placement,
-            Primitive::Extrusion { profile, h: height.max(0.01), w, d },
+            Primitive::Extrusion {
+                profile,
+                h: height.max(0.01),
+                w,
+                d,
+            },
         );
         self.selection = vec![id];
         self.dirty = true;
@@ -6427,7 +7555,11 @@ impl FactoryState {
     /// takes only one of them is exactly "when i move a building its floor and ceiling stay in
     /// place". The enclosing solid is identified here and nowhere else, so this is the only place
     /// that can say which one it was.
-    fn carve_interior_from_building(&mut self, footprint: &[Vec2], base: f32) -> Option<(u32, u32)> {
+    fn carve_interior_from_building(
+        &mut self,
+        footprint: &[Vec2],
+        base: f32,
+    ) -> Option<(u32, u32)> {
         // Find the enclosing building and its feature index + top height.
         let mut target: Option<(usize, f32)> = None;
         for (i, f) in self.model.features.iter().enumerate() {
@@ -6439,24 +7571,39 @@ impl FactoryState {
                 continue; // a thin slab is a floor/ceiling, not a building mass
             }
             if let Some(outline) = self.feature_world_outline(f) {
-                if outline.len() >= 3 && footprint.iter().all(|p| point_in_poly(&outline, p.x, p.y)) {
+                if outline.len() >= 3 && footprint.iter().all(|p| point_in_poly(&outline, p.x, p.y))
+                {
                     target = Some((i, mx.z)); // last (top-most in list) enclosing solid wins
                 }
             }
         }
-        let Some((idx, top)) = target else { return None };
+        let Some((idx, top)) = target else {
+            return None;
+        };
         let building_id = self.model.features[idx].id;
         // Build the void, then move it to sit right after the building it cuts.
         let Ok((profile, centre, w, d)) = self.model.add_profile(footprint) else {
             return None;
         };
         let void_h = (top - base).max(0.1) + 0.02; // punch fully through the building
-        let placement = Placement { u: centre.x, v: centre.y, lift: base, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 };
+        let placement = Placement {
+            u: centre.x,
+            v: centre.y,
+            lift: base,
+            spin_deg: 0.0,
+            pitch_deg: 0.0,
+            roll_deg: 0.0,
+        };
         self.model.push(
             BoolOp::Difference,
             Plane::default(),
             placement,
-            Primitive::Extrusion { profile, h: void_h, w, d },
+            Primitive::Extrusion {
+                profile,
+                h: void_h,
+                w,
+                d,
+            },
         );
         // `push` appended at the end; bind it to the building and move it in behind, so the
         // difference cuts the BUILDING body and nothing else — and goes on cutting that same
@@ -6469,7 +7616,10 @@ impl FactoryState {
             // the void never get inserted in the shipped binary. `idx` was read out of `features`
             // a few lines up, so the host really is present and the assert is a guard, not a path.
             let placed = self.model.insert_after(building_id, void);
-            debug_assert!(placed, "the building was read from the feature list a moment ago");
+            debug_assert!(
+                placed,
+                "the building was read from the feature list a moment ago"
+            );
         }
         self.dirty = true;
         void_id.map(|v| (v, building_id))
@@ -6489,7 +7639,11 @@ impl FactoryState {
     /// typed a different number. [`RoomInst::fresh`] still seeds the room
     /// record's defaults; every field is then overwritten from `p` so the
     /// record and the geometry can never disagree.
-    pub fn add_room_spec(&mut self, footprint: &[Vec2], p: RoomBuildSpec) -> Result<u32, RoomError> {
+    pub fn add_room_spec(
+        &mut self,
+        footprint: &[Vec2],
+        p: RoomBuildSpec,
+    ) -> Result<u32, RoomError> {
         // CONSTRUCTIVE room — built from an outline as a complete enclosed space, with NO
         // pre-existing building required:
         //
@@ -6519,9 +7673,9 @@ impl FactoryState {
         // Distinct default colours (≈ real reflectances) so floor / walls / ceiling are
         // TELLABLE APART from any angle — including straight down, where hiding the light
         // ceiling to reveal the dark floor is now an obvious change.
-        const FLOOR_COL: [f32; 3] = [0.34, 0.31, 0.28];   // dark, ~0.2
-        const WALL_COL: [f32; 3] = [0.62, 0.62, 0.64];    // mid, ~0.5
-        const CEIL_COL: [f32; 3] = [0.90, 0.90, 0.93];    // light, ~0.7
+        const FLOOR_COL: [f32; 3] = [0.34, 0.31, 0.28]; // dark, ~0.2
+        const WALL_COL: [f32; 3] = [0.62, 0.62, 0.64]; // mid, ~0.5
+        const CEIL_COL: [f32; 3] = [0.90, 0.90, 0.93]; // light, ~0.7
 
         // FLOOR slab: top face at base + floor_t, so the walls stand on it.
         let floor_id = match self.add_slab(footprint, floor_t, base + floor_t) {
@@ -6573,7 +7727,7 @@ impl FactoryState {
         self.next_room_id += 1;
         let mut room = RoomInst::fresh(rid, format!("Room {rid}"), footprint.to_vec(), h, self);
         room.origin = RoomOrigin::Built;
-        room.base_z = base;              // fresh() seeded the ACTIVE storey; the spec overrides
+        room.base_z = base; // fresh() seeded the ACTIVE storey; the spec overrides
         room.floor_t = floor_t;
         room.ceiling_t = p.ceiling_t.max(0.02);
         room.wall_t = wall_t;
@@ -6617,7 +7771,11 @@ impl FactoryState {
         // evidence is a picture that looks wrong — which is exactly how it was reported. Stated
         // here so the answer is in the status line and the history, not only in a menu that has
         // since been closed.
-        let ct = if p.open_top { 0.0 } else { p.ceiling_t.max(0.02) };
+        let ct = if p.open_top {
+            0.0
+        } else {
+            p.ceiling_t.max(0.02)
+        };
         let overall = floor_t + h + ct;
         self.status = format!(
             "Room: {} clear, {} overall ({} floor + {} clear{}).{}",
@@ -6625,7 +7783,11 @@ impl FactoryState {
             length_str(&self.units, overall),
             length_str(&self.units, floor_t),
             length_str(&self.units, h),
-            if ct > 0.0 { format!(" + {} ceiling", length_str(&self.units, ct)) } else { String::new() },
+            if ct > 0.0 {
+                format!(" + {} ceiling", length_str(&self.units, ct))
+            } else {
+                String::new()
+            },
             if overall > self.effective_building_height() + 1e-4 {
                 format!(
                     "  ⚠ {} taller than the {} building — the room stands proud of the top. \
@@ -6651,7 +7813,11 @@ impl FactoryState {
             let n = name.trim();
             // An empty name would leave a room unlabelled on the plan and unfindable in the
             // openings list, so it falls back to something addressable rather than to nothing.
-            self.rooms[i].name = if n.is_empty() { format!("Room {id}") } else { n.to_string() };
+            self.rooms[i].name = if n.is_empty() {
+                format!("Room {id}")
+            } else {
+                n.to_string()
+            };
         }
     }
 
@@ -6674,7 +7840,15 @@ impl FactoryState {
         self.rooms[i].height = h;
         let (walls, ceiling, carve, base_z, floor_t, ct, wall_t) = {
             let r = &self.rooms[i];
-            (r.walls.clone(), r.ceiling, r.carve, r.base_z, r.floor_t, r.ceiling_t, r.wall_t)
+            (
+                r.walls.clone(),
+                r.ceiling,
+                r.carve,
+                r.base_z,
+                r.floor_t,
+                r.ceiling_t,
+                r.wall_t,
+            )
         };
         for fid in walls {
             if let Some(f) = self.model.get_mut(fid) {
@@ -6687,14 +7861,25 @@ impl FactoryState {
         // raising the room means cutting further up through that building.
         if let Some(cid) = carve {
             if let Some(f) = self.model.get_mut(cid) {
-                if let Primitive::Extrusion { profile, w, d, h: was } = f.primitive {
+                if let Primitive::Extrusion {
+                    profile,
+                    w,
+                    d,
+                    h: was,
+                } = f.primitive
+                {
                     // GROW ONLY. The void was cut to punch clear THROUGH the building, which is
                     // what turns the building into a wall ring rather than a cap sitting over the
                     // room. Re-sizing it to the room's own height would put that cap back — a test
                     // caught exactly that. So it only ever reaches further, when the room outgrows
                     // the void it was given.
                     let need = floor_t + h + ct + 0.02;
-                    f.primitive = Primitive::Extrusion { profile, h: was.max(need), w, d };
+                    f.primitive = Primitive::Extrusion {
+                        profile,
+                        h: was.max(need),
+                        w,
+                        d,
+                    };
                 }
             }
         }
@@ -6747,12 +7932,26 @@ impl FactoryState {
         let Some(i) = self.room_index(id) else { return };
         let (floor, walls, ceiling, carve, base_z, floor_t, h, ct) = {
             let r = &self.rooms[i];
-            (r.floor, r.walls.clone(), r.ceiling, r.carve, r.base_z, r.floor_t, r.height, r.ceiling_t)
+            (
+                r.floor,
+                r.walls.clone(),
+                r.ceiling,
+                r.carve,
+                r.base_z,
+                r.floor_t,
+                r.height,
+                r.ceiling_t,
+            )
         };
         if let Some(fid) = floor {
             if let Some(f) = self.model.get_mut(fid) {
                 if let Primitive::Extrusion { profile, w, d, .. } = f.primitive {
-                    f.primitive = Primitive::Extrusion { profile, h: floor_t, w, d };
+                    f.primitive = Primitive::Extrusion {
+                        profile,
+                        h: floor_t,
+                        w,
+                        d,
+                    };
                     f.placement.lift = base_z; // top lands at base + floor_t
                 }
             }
@@ -6766,7 +7965,12 @@ impl FactoryState {
         if let Some(cid) = ceiling {
             if let Some(f) = self.model.get_mut(cid) {
                 if let Primitive::Extrusion { profile, w, d, .. } = f.primitive {
-                    f.primitive = Primitive::Extrusion { profile, h: ct, w, d };
+                    f.primitive = Primitive::Extrusion {
+                        profile,
+                        h: ct,
+                        w,
+                        d,
+                    };
                     f.placement.lift = wall_base + h;
                 }
             }
@@ -6774,8 +7978,12 @@ impl FactoryState {
         if let Some(cid) = carve {
             if let Some(f) = self.model.get_mut(cid) {
                 if let Primitive::Extrusion { profile, w, d, .. } = f.primitive {
-                    f.primitive =
-                        Primitive::Extrusion { profile, h: (floor_t + h + ct + 0.02).max(0.1), w, d };
+                    f.primitive = Primitive::Extrusion {
+                        profile,
+                        h: (floor_t + h + ct + 0.02).max(0.1),
+                        w,
+                        d,
+                    };
                     f.placement.lift = base_z;
                 }
             }
@@ -6790,7 +7998,11 @@ impl FactoryState {
     /// is left of it after the two slabs. Never below a usable room, so a building too short for
     /// one says so through the warning rather than by silently proposing a crawlspace.
     pub fn suggested_room_height(&self) -> f32 {
-        let ct = if self.room_open_top { 0.0 } else { self.ceiling_thickness.max(0.02) };
+        let ct = if self.room_open_top {
+            0.0
+        } else {
+            self.ceiling_thickness.max(0.02)
+        };
         (self.effective_building_height() - self.room_floor.max(0.02) - ct).max(2.1)
     }
 
@@ -6810,8 +8022,11 @@ impl FactoryState {
         // itself: its wall boxes are Union solids well over the slab threshold, so a room with no
         // building around it reported its own wall top as the height it had to fit inside — and
         // then warned that it did not. A test caught exactly that.
-        let owned: std::collections::HashSet<u32> =
-            self.rooms.iter().flat_map(|r| self.room_features(r.id)).collect();
+        let owned: std::collections::HashSet<u32> = self
+            .rooms
+            .iter()
+            .flat_map(|r| self.room_features(r.id))
+            .collect();
         let mut top: Option<f32> = None;
         for f in &self.model.features {
             if f.op != BoolOp::Union || owned.contains(&f.id) {
@@ -6864,13 +8079,25 @@ impl FactoryState {
                 }
             }
         }
-        let rooms: Vec<(Option<u32>, f32)> = self.rooms.iter().map(|r| (r.carve, r.base_z)).collect();
+        let rooms: Vec<(Option<u32>, f32)> =
+            self.rooms.iter().map(|r| (r.carve, r.base_z)).collect();
         for (carve, base_z) in rooms {
             if let Some(cid) = carve {
                 if let Some(f) = self.model.get_mut(cid) {
-                    if let Primitive::Extrusion { profile, w, d, h: was } = f.primitive {
+                    if let Primitive::Extrusion {
+                        profile,
+                        w,
+                        d,
+                        h: was,
+                    } = f.primitive
+                    {
                         let need = (h - base_z).max(0.1) + 0.02;
-                        f.primitive = Primitive::Extrusion { profile, h: was.max(need), w, d };
+                        f.primitive = Primitive::Extrusion {
+                            profile,
+                            h: was.max(need),
+                            w,
+                            d,
+                        };
                     }
                 }
             }
@@ -6887,9 +8114,16 @@ impl FactoryState {
 
     /// Every feature a room owns — what a delete has to take, and what selecting it should cover.
     pub fn room_features(&self, id: u32) -> Vec<u32> {
-        let Some(i) = self.room_index(id) else { return Vec::new() };
+        let Some(i) = self.room_index(id) else {
+            return Vec::new();
+        };
         let r = &self.rooms[i];
-        r.floor.iter().chain(r.ceiling.iter()).copied().chain(r.walls.iter().copied()).collect()
+        r.floor
+            .iter()
+            .chain(r.ceiling.iter())
+            .copied()
+            .chain(r.walls.iter().copied())
+            .collect()
     }
 
     /// The room whose outline contains `p` — how an opening finds the room it is in.
@@ -6951,8 +8185,13 @@ impl FactoryState {
         } else {
             name.trim().to_string()
         };
-        let mut r =
-            RoomInst::fresh(rid, name, footprint_m.to_vec(), self.room_height.max(0.05), self);
+        let mut r = RoomInst::fresh(
+            rid,
+            name,
+            footprint_m.to_vec(),
+            self.room_height.max(0.05),
+            self,
+        );
         r.origin = RoomOrigin::PlanDesignated;
         self.rooms.push(r);
         self.dirty = true;
@@ -7007,12 +8246,19 @@ impl FactoryState {
             .map(|d| d.handle)
             .collect();
         self.rooms.retain(|r| {
-            !(r.origin == RoomOrigin::ImportedLayer && r.layer_name.as_deref() == Some(layer_name.as_str()))
+            !(r.origin == RoomOrigin::ImportedLayer
+                && r.layer_name.as_deref() == Some(layer_name.as_str()))
         });
         let footprint = Self::closed_ring_on_layer(doc, layer_id);
         let rid = self.next_room_id;
         self.next_room_id += 1;
-        let mut r = RoomInst::fresh(rid, layer_name.clone(), footprint, self.room_height.max(0.05), self);
+        let mut r = RoomInst::fresh(
+            rid,
+            layer_name.clone(),
+            footprint,
+            self.room_height.max(0.05),
+            self,
+        );
         r.origin = RoomOrigin::ImportedLayer;
         r.layer_name = Some(layer_name);
         r.handles = handles;
@@ -7062,9 +8308,7 @@ impl FactoryState {
                 continue;
             }
             let ring = match &d.geom {
-                cad_kernel::Geom::Polyline(p)
-                    if p.closed && p.vertices.len() >= 3 =>
-                {
+                cad_kernel::Geom::Polyline(p) if p.closed && p.vertices.len() >= 3 => {
                     let mut pts: Vec<Vec2> = p
                         .vertices
                         .iter()
@@ -7094,7 +8338,9 @@ impl FactoryState {
     /// wall, and a wall is shared between two rooms, so this attributes it by where the piece
     /// actually sits — the smaller room wins, via [`Self::room_at`].
     pub fn openings_in_room(&self, id: u32) -> Vec<usize> {
-        let Some(i) = self.room_index(id) else { return Vec::new() };
+        let Some(i) = self.room_index(id) else {
+            return Vec::new();
+        };
         let r = &self.rooms[i];
         (0..self.furniture.len())
             .filter(|&k| self.is_aperture(k))
@@ -7183,7 +8429,11 @@ impl FactoryState {
             .map(|a| FurnitureGeomRaw {
                 pos: flat3(&a.positions),
                 nrm: flat3(&a.normals),
-                uv: if a.uvs.is_empty() { Vec::new() } else { flat2(&a.uvs) },
+                uv: if a.uvs.is_empty() {
+                    Vec::new()
+                } else {
+                    flat2(&a.uvs)
+                },
                 alpha: a.alpha.clone(),
             })
             .collect()
@@ -7209,7 +8459,10 @@ impl FactoryState {
             storeys: self
                 .storeys
                 .iter()
-                .map(|s| crate::simlux_io::StoreyRec { name: s.name.clone(), height: s.height })
+                .map(|s| crate::simlux_io::StoreyRec {
+                    name: s.name.clone(),
+                    height: s.height,
+                })
                 .collect(),
             active_storey: self.active_storey,
             ceilings: self.ceilings.iter().copied().collect(),
@@ -7224,17 +8477,41 @@ impl FactoryState {
                     uvs: Vec::new(),
                     // When `encode_geom` is false the blobs are left EMPTY and a save worker fills
                     // them from `furniture_geom_flat()` — keeping the deflate off the UI thread.
-                    pos_b64: if encode_geom { encode_f32_blob(&flat3(&a.positions)) } else { String::new() },
-                    nrm_b64: if encode_geom { encode_f32_blob(&flat3(&a.normals)) } else { String::new() },
-                    uv_b64: if encode_geom && !a.uvs.is_empty() { encode_f32_blob(&flat2(&a.uvs)) } else { String::new() },
-                    alpha_b64: if encode_geom && !a.alpha.is_empty() { encode_f32_blob(&a.alpha) } else { String::new() },
+                    pos_b64: if encode_geom {
+                        encode_f32_blob(&flat3(&a.positions))
+                    } else {
+                        String::new()
+                    },
+                    nrm_b64: if encode_geom {
+                        encode_f32_blob(&flat3(&a.normals))
+                    } else {
+                        String::new()
+                    },
+                    uv_b64: if encode_geom && !a.uvs.is_empty() {
+                        encode_f32_blob(&flat2(&a.uvs))
+                    } else {
+                        String::new()
+                    },
+                    alpha_b64: if encode_geom && !a.alpha.is_empty() {
+                        encode_f32_blob(&a.alpha)
+                    } else {
+                        String::new()
+                    },
                     source_path: a.source_path.clone().unwrap_or_default(),
                     alpha_resolved: a.alpha_resolved,
                     part_ids: a.part_ids.clone(),
                     emitters: a
                         .emitters
                         .iter()
-                        .map(|e| [e.pos[0] as f64, e.pos[1] as f64, e.pos[2] as f64, e.lumens, e.watts])
+                        .map(|e| {
+                            [
+                                e.pos[0] as f64,
+                                e.pos[1] as f64,
+                                e.pos[2] as f64,
+                                e.lumens,
+                                e.watts,
+                            ]
+                        })
                         .collect(),
                     cct_k: a.cct_k,
                 })
@@ -7252,7 +8529,11 @@ impl FactoryState {
                     texture: f.texture,
                     fit: f.fit,
                     surface_texture: f.surface_texture.iter().map(|(&g, &t)| (g, t)).collect(),
-                    cuts: f.cuts.iter().map(crate::simlux_io::MeshCutRec::of).collect(),
+                    cuts: f
+                        .cuts
+                        .iter()
+                        .map(crate::simlux_io::MeshCutRec::of)
+                        .collect(),
                     base_asset: f.base_asset,
                 })
                 .collect(),
@@ -7389,7 +8670,11 @@ impl FactoryState {
         uvs: Vec<[f32; 2]>,
         alpha: Vec<f32>,
     ) -> FurnitureAsset {
-        let color = if a.color == [0.0, 0.0, 0.0] { [0.82, 0.82, 0.84] } else { a.color };
+        let color = if a.color == [0.0, 0.0, 0.0] {
+            [0.82, 0.82, 0.84]
+        } else {
+            a.color
+        };
         let mut fa = FurnitureAsset::new(a.name, positions, normals, color);
         fa.uvs = uvs;
         fa.alpha = alpha;
@@ -7401,7 +8686,11 @@ impl FactoryState {
         fa.emitters = a
             .emitters
             .iter()
-            .map(|e| FurnEmitter { pos: [e[0] as f32, e[1] as f32, e[2] as f32], lumens: e[3], watts: e[4] })
+            .map(|e| FurnEmitter {
+                pos: [e[0] as f32, e[1] as f32, e[2] as f32],
+                lumens: e[3],
+                watts: e[4],
+            })
             .collect();
         fa.cct_k = a.cct_k;
         // BUILD THE DISPLAY PROXY HERE, ON THE WORKER, not on the first frame that draws.
@@ -7426,18 +8715,44 @@ impl FactoryState {
     /// Decode a persisted furniture library whose geometry came as base64 JSON
     /// blobs (the sidecar and the DXF XRECORD payload, both text formats).
     /// Assets are independent, so the decode runs ACROSS CORES.
-    pub fn decode_furniture_lib(recs: Vec<crate::simlux_io::FurnitureAssetRec>) -> Vec<FurnitureAsset> {
+    pub fn decode_furniture_lib(
+        recs: Vec<crate::simlux_io::FurnitureAssetRec>,
+    ) -> Vec<FurnitureAsset> {
         // One record → one asset (its b64 geometry, legacy arrays as fallback).
         fn decode_one(mut a: crate::simlux_io::FurnitureAssetRec) -> FurnitureAsset {
-            let un3 = |v: Vec<f32>| v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect::<Vec<[f32; 3]>>();
-            let un2 = |v: Vec<f32>| v.chunks_exact(2).map(|c| [c[0], c[1]]).collect::<Vec<[f32; 2]>>();
+            let un3 = |v: Vec<f32>| {
+                v.chunks_exact(3)
+                    .map(|c| [c[0], c[1], c[2]])
+                    .collect::<Vec<[f32; 3]>>()
+            };
+            let un2 = |v: Vec<f32>| {
+                v.chunks_exact(2)
+                    .map(|c| [c[0], c[1]])
+                    .collect::<Vec<[f32; 2]>>()
+            };
             // Prefer the compact blobs; fall back to legacy JSON arrays for old sidecars.
             // (mem::take, never a plain move: the record is handed to the shared
             // builder WHOLE, and a partially-moved struct cannot be passed on.)
-            let positions = if !a.pos_b64.is_empty() { un3(decode_f32_blob(&a.pos_b64)) } else { std::mem::take(&mut a.positions) };
-            let normals = if !a.nrm_b64.is_empty() { un3(decode_f32_blob(&a.nrm_b64)) } else { std::mem::take(&mut a.normals) };
-            let uvs = if !a.uv_b64.is_empty() { un2(decode_f32_blob(&a.uv_b64)) } else { std::mem::take(&mut a.uvs) };
-            let alpha = if !a.alpha_b64.is_empty() { decode_f32_blob(&a.alpha_b64) } else { Vec::new() };
+            let positions = if !a.pos_b64.is_empty() {
+                un3(decode_f32_blob(&a.pos_b64))
+            } else {
+                std::mem::take(&mut a.positions)
+            };
+            let normals = if !a.nrm_b64.is_empty() {
+                un3(decode_f32_blob(&a.nrm_b64))
+            } else {
+                std::mem::take(&mut a.normals)
+            };
+            let uvs = if !a.uv_b64.is_empty() {
+                un2(decode_f32_blob(&a.uv_b64))
+            } else {
+                std::mem::take(&mut a.uvs)
+            };
+            let alpha = if !a.alpha_b64.is_empty() {
+                decode_f32_blob(&a.alpha_b64)
+            } else {
+                Vec::new()
+            };
             FactoryState::furniture_asset_from_parts(a, positions, normals, uvs, alpha)
         }
         decode_recs_in_parallel(recs, decode_one)
@@ -7453,16 +8768,20 @@ impl FactoryState {
         native: &[u8],
     ) -> Vec<FurnitureAsset> {
         let parts = decode_furniture_geom_native(native);
-        decode_pairs_in_parallel(
-            recs,
-            parts,
-            |a, parts| {
-                let un3 = |v: Vec<f32>| v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect::<Vec<[f32; 3]>>();
-                let un2 = |v: Vec<f32>| v.chunks_exact(2).map(|c| [c[0], c[1]]).collect::<Vec<[f32; 2]>>();
-                let (p, n, u, al) = parts;
-                FactoryState::furniture_asset_from_parts(a, un3(p), un3(n), un2(u), al)
-            },
-        )
+        decode_pairs_in_parallel(recs, parts, |a, parts| {
+            let un3 = |v: Vec<f32>| {
+                v.chunks_exact(3)
+                    .map(|c| [c[0], c[1], c[2]])
+                    .collect::<Vec<[f32; 3]>>()
+            };
+            let un2 = |v: Vec<f32>| {
+                v.chunks_exact(2)
+                    .map(|c| [c[0], c[1]])
+                    .collect::<Vec<[f32; 2]>>()
+            };
+            let (p, n, u, al) = parts;
+            FactoryState::furniture_asset_from_parts(a, un3(p), un3(n), un2(u), al)
+        })
     }
 
     /// Install a persisted model whose furniture library was ALREADY decoded (see
@@ -7474,8 +8793,7 @@ impl FactoryState {
         furniture_lib: Vec<FurnitureAsset>,
         textures: Option<Vec<TextureAsset>>,
     ) -> usize {
-        let have: std::collections::HashSet<u32> =
-            d.model.features.iter().map(|f| f.id).collect();
+        let have: std::collections::HashSet<u32> = d.model.features.iter().map(|f| f.id).collect();
         let mut dropped = 0usize;
         let mut walls = Vec::with_capacity(d.walls.len());
         for w in d.walls {
@@ -7519,10 +8837,16 @@ impl FactoryState {
             .storeys
             .into_iter()
             .filter(|s| s.height >= MIN_STOREY_H)
-            .map(|s| Storey { name: s.name, height: s.height })
+            .map(|s| Storey {
+                name: s.name,
+                height: s.height,
+            })
             .collect();
         self.storeys = if levels.is_empty() {
-            vec![Storey { name: "Ground".into(), height: self.building_height.max(MIN_STOREY_H) }]
+            vec![Storey {
+                name: "Ground".into(),
+                height: self.building_height.max(MIN_STOREY_H),
+            }]
         } else {
             levels
         };
@@ -7530,7 +8854,11 @@ impl FactoryState {
         // Ceilings that still exist in the restored model.
         let have: std::collections::HashSet<u32> =
             self.model.features.iter().map(|f| f.id).collect();
-        self.ceilings = d.ceilings.into_iter().filter(|id| have.contains(id)).collect();
+        self.ceilings = d
+            .ceilings
+            .into_iter()
+            .filter(|id| have.contains(id))
+            .collect();
         // Furniture library was already decoded (off-thread on the live load path).
         self.furniture_lib = furniture_lib;
         // Textures first — furniture/feature assignments index into this list.
@@ -7596,7 +8924,10 @@ impl FactoryState {
         // was authored with; a sidecar written before this existed says nothing, and the default
         // stands rather than the geometry being reinterpreted.
         if d.working_unit_m > 0.0 {
-            self.units = cad_kernel::Units::from_metres_per_unit(d.working_unit_m, cad_kernel::UnitSource::User);
+            self.units = cad_kernel::Units::from_metres_per_unit(
+                d.working_unit_m,
+                cad_kernel::UnitSource::User,
+            );
         }
         // Placement preference. Absent from a file written before it existed, and then the default
         // stands — the same rule as the working unit above.
@@ -7684,7 +9015,9 @@ impl FactoryState {
     /// DRAW3D: commit the dialog's primitive into the model (at the origin).
     pub fn add_primitive(&mut self, p: Primitive) {
         let placement = self.placement_for(&p);
-        let id = self.model.push(BoolOp::Union, Plane::default(), placement, p);
+        let id = self
+            .model
+            .push(BoolOp::Union, Plane::default(), placement, p);
         self.selection = vec![id];
         self.arm_placement(AwaitingPlace::Feature(id));
         self.dirty = true;
@@ -7702,8 +9035,12 @@ impl FactoryState {
         // The click gives x,y; the ACTIVE storey gives z. Clicking the ground plane while
         // level 2 is active must build on level 2, not under it.
         let placement = Placement {
-            u: uv.x + ox, v: uv.y + oy, lift: self.active_base_z(), spin_deg: 0.0,
-            pitch_deg: 0.0, roll_deg: 0.0,
+            u: uv.x + ox,
+            v: uv.y + oy,
+            lift: self.active_base_z(),
+            spin_deg: 0.0,
+            pitch_deg: 0.0,
+            roll_deg: 0.0,
         };
         let id = self.model.push(BoolOp::Union, plane, placement, p);
         self.selection = vec![id];
@@ -7711,9 +9048,15 @@ impl FactoryState {
     }
 
     pub fn add_cylinder(&mut self) {
-        let p = Primitive::Cylinder { r: self.cyl_r, h: self.cyl_h, sides: self.cyl_sides.max(3) };
+        let p = Primitive::Cylinder {
+            r: self.cyl_r,
+            h: self.cyl_h,
+            sides: self.cyl_sides.max(3),
+        };
         let placement = self.placement_for(&p);
-        let id = self.model.push(BoolOp::Union, Plane::default(), placement, p);
+        let id = self
+            .model
+            .push(BoolOp::Union, Plane::default(), placement, p);
         self.selection = vec![id];
         self.arm_placement(AwaitingPlace::Feature(id));
         self.dirty = true;
@@ -7729,7 +9072,12 @@ impl FactoryState {
     /// wall's coords ARE the ground uv); the Box keeps `thickness` and rises to `height`.
     /// Pure Box + Placement (see `Plane::world_matrix`), so no `cad_solid` change is needed.
     fn push_wall_box(
-        &mut self, a: Vec2, b: Vec2, thickness: f32, height: f32, base_z: f32,
+        &mut self,
+        a: Vec2,
+        b: Vec2,
+        thickness: f32,
+        height: f32,
+        base_z: f32,
     ) -> Option<u32> {
         let d = b - a;
         let len = d.length();
@@ -7737,12 +9085,23 @@ impl FactoryState {
             return None; // ignore degenerate input
         }
         let mid = (a + b) * 0.5;
-        let p = Primitive::Box { w: len, d: thickness, h: height };
-        let placement = Placement {
-            u: mid.x, v: mid.y, lift: base_z, spin_deg: d.y.atan2(d.x).to_degrees(),
-            pitch_deg: 0.0, roll_deg: 0.0,
+        let p = Primitive::Box {
+            w: len,
+            d: thickness,
+            h: height,
         };
-        Some(self.model.push(BoolOp::Union, Plane::default(), placement, p))
+        let placement = Placement {
+            u: mid.x,
+            v: mid.y,
+            lift: base_z,
+            spin_deg: d.y.atan2(d.x).to_degrees(),
+            pitch_deg: 0.0,
+            roll_deg: 0.0,
+        };
+        Some(
+            self.model
+                .push(BoolOp::Union, Plane::default(), placement, p),
+        )
     }
 
     /// Promote a **footprint** (≥ 2 ground-plane points) to a live wall: one Box per edge,
@@ -7766,7 +9125,12 @@ impl FactoryState {
             return None;
         }
         self.walls.push(WallInst {
-            footprint, segments, thickness, height, rake_deg: 0.0, base_z,
+            footprint,
+            segments,
+            thickness,
+            height,
+            rake_deg: 0.0,
+            base_z,
         });
         self.dirty = true;
         Some(self.walls.len() - 1)
@@ -7779,7 +9143,9 @@ impl FactoryState {
 
     /// Index of the live-wall record OWNING `feature_id` (any of its segments), if any.
     pub fn wall_index(&self, feature_id: u32) -> Option<usize> {
-        self.walls.iter().position(|w| w.segments.contains(&feature_id))
+        self.walls
+            .iter()
+            .position(|w| w.segments.contains(&feature_id))
     }
 
     /// Rebuild every segment Box of wall `wi` from its current footprint + params. The old
@@ -7881,7 +9247,9 @@ impl FactoryState {
             // in would open nothing and the wall would come back solid. The binding has to be
             // carried across the rebuild exactly as the position is.
             for (k, ids) in hosted_by.iter().enumerate() {
-                let Some(&seg) = segments.get(k) else { continue };
+                let Some(&seg) = segments.get(k) else {
+                    continue;
+                };
                 for &c in ids {
                     self.model.set_target(c, Some(seg));
                 }
@@ -7966,11 +9334,15 @@ impl FactoryState {
     /// Returns the CLOSEST qualifying segment. At a corner two segments both contain the point,
     /// and the one the opening is actually cut into is the one it is squarely inside.
     fn segment_containing(
-        spans: &[(Vec2, Vec2)], p: Vec3, thickness: f32, height: f32, base_z: f32,
+        spans: &[(Vec2, Vec2)],
+        p: Vec3,
+        thickness: f32,
+        height: f32,
+        base_z: f32,
     ) -> Option<usize> {
         const TOL: f32 = 1e-3; // a millimetre, in a model measured in metres
-        // Height first: a wall directly above this one, on the next storey, lines up perfectly in
-        // plan. Only the z band tells the two apart.
+                               // Height first: a wall directly above this one, on the next storey, lines up perfectly in
+                               // plan. Only the z band tells the two apart.
         if p.z < base_z - TOL || p.z > base_z + height + TOL {
             return None;
         }
@@ -8138,7 +9510,11 @@ impl FactoryState {
             // Extrusion cuts (the real openings) dedup by profile+placement; any other
             // Difference is listed on its own.
             if let cad_solid::Primitive::Extrusion { profile, .. } = f.primitive {
-                let key = (profile, (f.placement.u * 1000.0) as i32, (f.placement.v * 1000.0) as i32);
+                let key = (
+                    profile,
+                    (f.placement.u * 1000.0) as i32,
+                    (f.placement.v * 1000.0) as i32,
+                );
                 if seen.contains(&key) {
                     continue;
                 }
@@ -8153,8 +9529,12 @@ impl FactoryState {
     /// placement) — the sibling cuts in the shell, the room, etc. Moving or deleting them
     /// together keeps the opening coherent.
     pub fn cutout_siblings(&self, id: u32) -> Vec<u32> {
-        let Some(f) = self.model.features.iter().find(|g| g.id == id) else { return vec![id] };
-        let cad_solid::Primitive::Extrusion { profile, .. } = f.primitive else { return vec![id] };
+        let Some(f) = self.model.features.iter().find(|g| g.id == id) else {
+            return vec![id];
+        };
+        let cad_solid::Primitive::Extrusion { profile, .. } = f.primitive else {
+            return vec![id];
+        };
         let (pu, pv) = (f.placement.u, f.placement.v);
         self.model.features.iter()
             .filter(|g| g.op == cad_solid::BoolOp::Difference)
@@ -8244,7 +9624,10 @@ impl FactoryState {
             m.iter()
                 .map(|(&(fid, nx, ny, nz, d), v)| {
                     let d_world = d as f32 / 100.0;
-                    ((fid, nx, ny, nz, (d_world * k * 100.0).round() as i32), v.clone())
+                    (
+                        (fid, nx, ny, nz, (d_world * k * 100.0).round() as i32),
+                        v.clone(),
+                    )
                 })
                 .collect()
         }
@@ -8325,10 +9708,7 @@ impl FactoryState {
                     [(-hw, -hd), (hw, -hd), (hw, hd), (-hw, hd)]
                         .iter()
                         .map(|(x, y)| {
-                            Vec2::new(
-                                f.placement.u + x * c - y * s,
-                                f.placement.v + x * s + y * c,
-                            )
+                            Vec2::new(f.placement.u + x * c - y * s, f.placement.v + x * s + y * c)
                         })
                         .collect(),
                 )
@@ -8371,18 +9751,30 @@ impl FactoryState {
                 // Facetted around the vertical axis: the n-gon IS the footprint, exactly. A
                 // 4-sided Frustum is a pyramid, and drawing it as a circle would be a lie.
                 Primitive::Cylinder { r, sides, .. } => return ring(sides, r, r, spin),
-                Primitive::Tube { r_outer, sides, .. } => return ring(sides, r_outer, r_outer, spin),
-                Primitive::Frustum { r_bottom, r_top, sides, .. } => {
+                Primitive::Tube { r_outer, sides, .. } => {
+                    return ring(sides, r_outer, r_outer, spin)
+                }
+                Primitive::Frustum {
+                    r_bottom,
+                    r_top,
+                    sides,
+                    ..
+                } => {
                     // The wider of the two ends is what the shape covers.
                     let r = r_bottom.max(r_top);
                     return ring(sides, r, r, spin);
                 }
                 Primitive::Sphere { r, segments, .. } => return ring(segments, r, r, spin),
                 Primitive::Capsule { r, segments, .. } => return ring(segments, r, r, spin),
-                Primitive::Torus { major_r, minor_r, seg_major, .. } => {
-                    return ring(seg_major, major_r + minor_r, major_r + minor_r, spin)
-                }
-                Primitive::Ellipsoid { rx, ry, segments, .. } => {
+                Primitive::Torus {
+                    major_r,
+                    minor_r,
+                    seg_major,
+                    ..
+                } => return ring(seg_major, major_r + minor_r, major_r + minor_r, spin),
+                Primitive::Ellipsoid {
+                    rx, ry, segments, ..
+                } => {
                     // Only axis-aligned radii are meaningful here; a spun ellipse needs the corner
                     // rotation, so hand a spun one to the AABB below rather than draw it wrong.
                     if spin.abs() < 1e-3 {
@@ -8442,7 +9834,11 @@ impl FactoryState {
         };
         let kind = f.primitive.kind_label();
         // An Extrusion is what a building outline is, and "Extrusion 1" is not what anyone calls it.
-        let kind = if kind == "Extrusion" { "Building" } else { kind };
+        let kind = if kind == "Extrusion" {
+            "Building"
+        } else {
+            kind
+        };
         let n = self
             .model
             .features
@@ -8554,8 +9950,12 @@ impl FactoryState {
             any = true;
         }
         for (i, inst) in self.furniture.iter().enumerate() {
-            let Some(asset) = self.furniture_lib.get(inst.asset) else { continue };
-            let Some(model) = self.furniture_model_matrix(i) else { continue };
+            let Some(asset) = self.furniture_lib.get(inst.asset) else {
+                continue;
+            };
+            let Some(model) = self.furniture_model_matrix(i) else {
+                continue;
+            };
             let m = glam::Mat4::from_cols_array(&model);
             let (lo, hi) = (asset.local_min, asset.local_max);
             for cx in [lo[0], hi[0]] {
@@ -8656,8 +10056,13 @@ impl FactoryState {
             sheen_tint: [f32; 3],
         }
         const BARE: Extras = Extras {
-            metallic: 0.0, ior: 1.5, emission: [0.0; 3],
-            clearcoat: 0.0, clearcoat_rough: 0.1, sheen: 0.0, sheen_tint: [1.0; 3],
+            metallic: 0.0,
+            ior: 1.5,
+            emission: [0.0; 3],
+            clearcoat: 0.0,
+            clearcoat_rough: 0.1,
+            sheen: 0.0,
+            sheen_tint: [1.0; 3],
         };
         let extras = |ti: Option<usize>| -> Extras {
             if clay {
@@ -8686,11 +10091,20 @@ impl FactoryState {
         for (i, tri) in self.cached.positions.chunks_exact(3).enumerate() {
             let id = self.cached.face_ids.get(i).copied().unwrap_or(0);
             let sk = surface_key(id, tri[0], tri[1], tri[2]);
-            let tex = self.surface_texture.get(&sk).or_else(|| self.feature_texture.get(&id)).copied();
+            let tex = self
+                .surface_texture
+                .get(&sk)
+                .or_else(|| self.feature_texture.get(&id))
+                .copied();
             let (rgb, rough, op) = if let Some(ti) = tex {
                 self.export_tex_rep(ti)
             } else {
-                let col = self.surface_color.get(&sk).or_else(|| self.feature_color.get(&id)).copied().unwrap_or(DEF);
+                let col = self
+                    .surface_color
+                    .get(&sk)
+                    .or_else(|| self.feature_color.get(&id))
+                    .copied()
+                    .unwrap_or(DEF);
                 (col, 0.5, 1.0)
             };
             let rgb = if clay { CLAY_GREY } else { rgb };
@@ -8707,7 +10121,11 @@ impl FactoryState {
                 clearcoat_rough: x.clearcoat_rough,
                 sheen: x.sheen,
                 sheen_tint: x.sheen_tint,
-                material: if clay { None } else { tex.and_then(|t| u16::try_from(t).ok()) },
+                material: if clay {
+                    None
+                } else {
+                    tex.and_then(|t| u16::try_from(t).ok())
+                },
                 // CSG faces carry no UV layer — the viewport projects their textures from world
                 // space, and the tracer is told to do the same rather than invent a mapping.
                 uv: [[0.0; 2]; 3],
@@ -8717,15 +10135,21 @@ impl FactoryState {
 
         // ── Furniture (local mesh → world via the model matrix). ──
         for (i, inst) in self.furniture.iter().enumerate() {
-            let Some(asset) = self.furniture_lib.get(inst.asset) else { continue };
-            let Some(model) = self.furniture_model_matrix(i) else { continue };
+            let Some(asset) = self.furniture_lib.get(inst.asset) else {
+                continue;
+            };
+            let Some(model) = self.furniture_model_matrix(i) else {
+                continue;
+            };
             let m = glam::Mat4::from_cols_array(&model);
             let groups = asset.group_geom();
             let ntri = asset.positions.len() / 3;
             for t in 0..ntri {
                 let fg = groups.face.get(t).copied().unwrap_or(0);
                 let eff = inst.surface_texture.get(&fg).copied().or(inst.texture);
-                let (rgb, rough, op) = eff.map(|ti| self.export_tex_rep(ti)).unwrap_or((inst.color, 0.5, 1.0));
+                let (rgb, rough, op) = eff
+                    .map(|ti| self.export_tex_rep(ti))
+                    .unwrap_or((inst.color, 0.5, 1.0));
                 let rgb = if clay { CLAY_GREY } else { rgb };
                 let x = extras(eff);
                 // Imported glass (per-vertex alpha, e.g. the villa panes) has no texture — carry the
@@ -8751,11 +10175,22 @@ impl FactoryState {
                     }
                 }
                 out.push(crate::radiance_export::ExportTri {
-                    verts: vs, rgb, roughness: rough, opacity: op,
-                    metallic: x.metallic, ior: x.ior, emission: x.emission,
-                    clearcoat: x.clearcoat, clearcoat_rough: x.clearcoat_rough,
-                    sheen: x.sheen, sheen_tint: x.sheen_tint,
-                    material: if clay { None } else { eff.and_then(|t| u16::try_from(t).ok()) },
+                    verts: vs,
+                    rgb,
+                    roughness: rough,
+                    opacity: op,
+                    metallic: x.metallic,
+                    ior: x.ior,
+                    emission: x.emission,
+                    clearcoat: x.clearcoat,
+                    clearcoat_rough: x.clearcoat_rough,
+                    sheen: x.sheen,
+                    sheen_tint: x.sheen_tint,
+                    material: if clay {
+                        None
+                    } else {
+                        eff.and_then(|t| u16::try_from(t).ok())
+                    },
                     uv,
                     has_uv,
                 });
@@ -8798,7 +10233,11 @@ impl FactoryState {
     /// do (it only knows the CSG bounds).
     pub fn fit_all(&mut self) {
         if let Some((mn, mx)) = self.render_bounds() {
-            self.cam_target = [(mn.x + mx.x) * 0.5, (mn.y + mx.y) * 0.5, (mn.z + mx.z) * 0.5];
+            self.cam_target = [
+                (mn.x + mx.x) * 0.5,
+                (mn.y + mx.y) * 0.5,
+                (mn.z + mx.z) * 0.5,
+            ];
             let span = (mx.x - mn.x).max(mx.y - mn.y).max(mx.z - mn.z);
             self.cam_dist = (span * 1.6).clamp(1.0, self.max_cam_dist());
         } else {
@@ -8818,7 +10257,11 @@ impl FactoryState {
         let fwd = Vec3::new(cp * cy, cp * sy, sp);
         let right = {
             let x = fwd.cross(Vec3::Z);
-            if x.length() < 1e-4 { Vec3::X } else { x.normalize() }
+            if x.length() < 1e-4 {
+                Vec3::X
+            } else {
+                x.normalize()
+            }
         };
         let up = right.cross(fwd).normalize();
         let k = self.cam_dist * 0.0018;
@@ -8836,13 +10279,13 @@ impl FactoryState {
     pub fn set_view(&mut self, v: StdView) {
         use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
         let (yaw, pitch) = match v {
-            StdView::Top    => (-FRAC_PI_2,  FRAC_PI_2),
+            StdView::Top => (-FRAC_PI_2, FRAC_PI_2),
             StdView::Bottom => (-FRAC_PI_2, -FRAC_PI_2),
-            StdView::Front  => (-FRAC_PI_2,  0.0),
-            StdView::Back   => ( FRAC_PI_2,  0.0),
-            StdView::Right  => ( 0.0,        0.0),
-            StdView::Left   => ( PI,         0.0),
-            StdView::Iso    => (-FRAC_PI_4,  0.6155), // 35.26° — the classic SE isometric
+            StdView::Front => (-FRAC_PI_2, 0.0),
+            StdView::Back => (FRAC_PI_2, 0.0),
+            StdView::Right => (0.0, 0.0),
+            StdView::Left => (PI, 0.0),
+            StdView::Iso => (-FRAC_PI_4, 0.6155), // 35.26° — the classic SE isometric
         };
         self.cam_yaw = yaw;
         self.cam_pitch = pitch;
@@ -8871,7 +10314,10 @@ impl FactoryState {
         // it on trust swings the camera through the wall and leaves you inside the building looking
         // at the back of the face you picked.
         let eye = Vec3::from(crate::light3d::cam_eye(
-            self.cam_yaw, self.cam_pitch, self.cam_dist, self.cam_target,
+            self.cam_yaw,
+            self.cam_pitch,
+            self.cam_dist,
+            self.cam_target,
         ));
         if n.dot(eye - at) < 0.0 {
             n = -n;
@@ -8902,8 +10348,12 @@ impl FactoryState {
     /// Snapshot the camera so `zoom previous` can restore it.
     pub fn zoom_save_prev(&mut self) {
         self.cam_prev = Some([
-            self.cam_yaw, self.cam_pitch, self.cam_dist,
-            self.cam_target[0], self.cam_target[1], self.cam_target[2],
+            self.cam_yaw,
+            self.cam_pitch,
+            self.cam_dist,
+            self.cam_target[0],
+            self.cam_target[1],
+            self.cam_target[2],
         ]);
     }
 
@@ -8948,8 +10398,11 @@ impl FactoryState {
         format!(
             "dist={:.2} target=({:.1},{:.1},{:.1}) yaw={:.0}° pitch={:.0}°",
             self.cam_dist,
-            self.cam_target[0], self.cam_target[1], self.cam_target[2],
-            self.cam_yaw.to_degrees(), self.cam_pitch.to_degrees(),
+            self.cam_target[0],
+            self.cam_target[1],
+            self.cam_target[2],
+            self.cam_yaw.to_degrees(),
+            self.cam_pitch.to_degrees(),
         )
     }
 
@@ -8986,27 +10439,43 @@ impl FactoryState {
             return Vec::new(); // once the base is picked the GHOST is the feedback
         }
         let c = [0.0, 0.75, 0.95];
-        self.sel_mesh.positions.iter().map(|p| v(Vec3::from(*p), ui(c))).collect()
+        self.sel_mesh
+            .positions
+            .iter()
+            .map(|p| v(Vec3::from(*p), ui(c)))
+            .collect()
     }
 
     /// GHOST — the selected solids under the op's LIVE transform, at the constrained
     /// cursor (spec §0.6: "while moving it shows the path").
     fn ghost_verts(&self, c: [f32; 3], xf: impl Fn(Vec3) -> Vec3) -> Vec<V3> {
-        self.sel_mesh.positions.iter().map(|p| v(xf(Vec3::from(*p)), ui(c))).collect()
+        self.sel_mesh
+            .positions
+            .iter()
+            .map(|p| v(xf(Vec3::from(*p)), ui(c)))
+            .collect()
     }
 
     /// The live ghost for the running op. Colours per §0.6: Move accent(255,200,100) ·
     /// Copy green(150,230,170) · Rotate/Scale white · Mirror violet(200,160,255).
     pub fn modify_ghost(&self, cursor_world: Vec3, card: bool) -> Vec<V3> {
         use cad_solid::modify::{rot_about, scale_about, ModifyOp};
-        let Some(md) = &self.modify else { return Vec::new() };
+        let Some(md) = &self.modify else {
+            return Vec::new();
+        };
         let plane = Plane::default();
-        let Some(base) = md.anchor_world(&plane) else { return Vec::new() };
+        let Some(base) = md.anchor_world(&plane) else {
+            return Vec::new();
+        };
         match md.op {
             ModifyOp::Move | ModifyOp::Copy => {
                 let d = cursor_world - base;
                 let d = if card { card_lock_world(d) } else { d };
-                let c = if md.op == ModifyOp::Move { [1.0, 0.78, 0.39] } else { [0.59, 0.90, 0.67] };
+                let c = if md.op == ModifyOp::Move {
+                    [1.0, 0.78, 0.39]
+                } else {
+                    [0.59, 0.90, 0.67]
+                };
                 self.ghost_verts(c, |p| p + d)
             }
             ModifyOp::Rotate => {
@@ -9020,7 +10489,9 @@ impl FactoryState {
             ModifyOp::Mirror => {
                 let line = (cursor_world - base).normalize_or_zero();
                 let n = Vec3::Z.cross(line).normalize_or_zero();
-                if n.length_squared() < 1e-9 { return Vec::new(); }
+                if n.length_squared() < 1e-9 {
+                    return Vec::new();
+                }
                 self.ghost_verts([0.78, 0.63, 1.0], |p| p - n * (2.0 * (p - base).dot(n)))
             }
         }
@@ -9068,7 +10539,9 @@ impl FactoryState {
             // batch. A per-surface texture wins over a whole-feature one.
             if let Some(id) = fid {
                 let skey = surface_key(id, tri[0], tri[1], tri[2]);
-                if self.surface_texture.contains_key(&skey) || self.feature_texture.contains_key(&id) {
+                if self.surface_texture.contains_key(&skey)
+                    || self.feature_texture.contains_key(&id)
+                {
                     continue;
                 }
             }
@@ -9082,7 +10555,12 @@ impl FactoryState {
             // Stable tie-break so faces coincident with another body's stop flickering.
             let nudge = fid.map_or(0.0, depth_tiebreak);
             for (k, p) in tri.iter().enumerate() {
-                let n = self.cached.normals.get(i * 3 + k).copied().unwrap_or(default_n);
+                let n = self
+                    .cached
+                    .normals
+                    .get(i * 3 + k)
+                    .copied()
+                    .unwrap_or(default_n);
                 let p = Vec3::from(*p) + Vec3::from(n) * nudge;
                 out.push(v(p, shade(base, Vec3::from(n))));
             }
@@ -9108,9 +10586,9 @@ impl FactoryState {
     /// once for the WHOLE model so neighbouring bodies stay aligned rather than breaking the
     /// pattern at every seam. Shared with the shader's triplanar path so the two cannot drift.
     pub fn uv_rebase_origin(&self) -> [f32; 3] {
-        self.cached
-            .bounds()
-            .map_or([0.0; 3], |(mn, _)| [mn[0].round(), mn[1].round(), mn[2].round()])
+        self.cached.bounds().map_or([0.0; 3], |(mn, _)| {
+            [mn[0].round(), mn[1].round(), mn[2].round()]
+        })
     }
 
     pub fn feature_textured_meshes(&self) -> Vec<(usize, Vec<crate::light3d::TexVtx>)> {
@@ -9131,7 +10609,9 @@ impl FactoryState {
         // neighbouring bodies stay aligned instead of breaking the pattern at every seam.
         let uv_org = self.uv_rebase_origin();
         for (i, tri) in self.cached.positions.chunks_exact(3).enumerate() {
-            let Some(id) = self.cached.face_ids.get(i).copied() else { continue };
+            let Some(id) = self.cached.face_ids.get(i).copied() else {
+                continue;
+            };
             // Per-surface texture wins over the whole-feature one.
             let tex_idx = self
                 .surface_texture
@@ -9154,7 +10634,13 @@ impl FactoryState {
             // triangles at once, and nudging only one of them would split it along the seam.
             let nudge = depth_tiebreak(id);
             for (k, p) in tri.iter().enumerate() {
-                let n = Vec3::from(self.cached.normals.get(i * 3 + k).copied().unwrap_or([0.0, 0.0, 1.0]));
+                let n = Vec3::from(
+                    self.cached
+                        .normals
+                        .get(i * 3 + k)
+                        .copied()
+                        .unwrap_or([0.0, 0.0, 1.0]),
+                );
                 let np = Vec3::from(*p) + n * nudge;
                 let p = &[np.x, np.y, np.z];
                 // UV from the REBASED position — see `uv_org`. The vertex itself keeps its
@@ -9171,10 +10657,15 @@ impl FactoryState {
                 let s = shade_scalar(n, false); // sun-aware; matches `shade`
                 let uv = tex.map_uv(uc, vc);
                 g.push(crate::light3d::TexVtx {
-                    x: p[0], y: p[1], z: p[2],
+                    x: p[0],
+                    y: p[1],
+                    z: p[2],
                     // Carry the texture's opacity so a see-through feature routes to the blended
                     // pass (opacity 1 = opaque, unchanged). Frag alpha = image.a · this.
-                    u: uv[0], v: uv[1], s, a: tex.opacity,
+                    u: uv[0],
+                    v: uv[1],
+                    s,
+                    a: tex.opacity,
                 });
             }
         }
@@ -9205,15 +10696,25 @@ impl FactoryState {
     pub fn furniture_verts(&self, apx: bool, skip: Option<usize>) -> Vec<V3> {
         let mut out = Vec::new();
         for (idx, inst) in self.furniture.iter().enumerate() {
-            if Some(idx) == skip { continue; }
-            let Some(asset) = self.furniture_lib.get(inst.asset) else { continue };
+            if Some(idx) == skip {
+                continue;
+            }
+            let Some(asset) = self.furniture_lib.get(inst.asset) else {
+                continue;
+            };
             let s = inst.scale_vec();
             let rm = inst.rot_mat();
             let pos = Vec3::from(inst.pos);
             // APX proxy for a heavy mesh — a box (12 tris) spanning its cached local bounds.
             if apx && asset.positions.len() / 3 > APX_FURNITURE_TRIS {
                 Self::push_furniture_box(
-                    &mut out, asset.local_min, asset.local_max, s, rm, pos, inst.color,
+                    &mut out,
+                    asset.local_min,
+                    asset.local_max,
+                    s,
+                    rm,
+                    pos,
+                    inst.color,
                 );
                 continue;
             }
@@ -9234,8 +10735,12 @@ impl FactoryState {
     /// [`Self::furniture_model_matrix`]) so moving/rotating a heavy piece keeps its FULL form
     /// with no per-frame CPU vertex transform. Built once per drag and reused.
     pub fn furniture_local_mesh(&self, i: usize) -> Vec<V3> {
-        let Some(inst) = self.furniture.get(i) else { return Vec::new() };
-        let Some(asset) = self.furniture_lib.get(inst.asset) else { return Vec::new() };
+        let Some(inst) = self.furniture.get(i) else {
+            return Vec::new();
+        };
+        let Some(asset) = self.furniture_lib.get(inst.asset) else {
+            return Vec::new();
+        };
         // Heavy pieces render from a decimated proxy (built once) so 8 imports don't crawl.
         //
         // THE PROXY PEELS ITS GLASS TOO, now that it carries alpha. This branch used to emit every
@@ -9307,7 +10812,11 @@ impl FactoryState {
         // FROM THE SAME MESH THE SOLID PASS DRAWS. `furniture_local_mesh` peels this piece's glass
         // OUT of the proxy, so if the panes came back from the full mesh the frame would be the
         // proxy's and the glass the original's — two different meshes in one object.
-        let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
+        let lod = if asset.needs_lod() {
+            Some(asset.lod_geom())
+        } else {
+            None
+        };
         let (src_pos, src_nrm, src_alpha): (&[[f32; 3]], &[[f32; 3]], &[f32]) = match &lod {
             Some(a) => (&a.positions, &a.normals, &a.alpha),
             None => (&asset.positions, &asset.normals, &asset.alpha),
@@ -9326,8 +10835,12 @@ impl FactoryState {
                 let n = src_nrm.get(k).copied().unwrap_or([0.0, 0.0, 1.0]);
                 let c = shade_furniture(inst.color, Vec3::from(n));
                 out.push(crate::light3d::V3A {
-                    x: p[0], y: p[1], z: p[2],
-                    r: c.col[0], g: c.col[1], b: c.col[2],
+                    x: p[0],
+                    y: p[1],
+                    z: p[2],
+                    r: c.col[0],
+                    g: c.col[1],
+                    b: c.col[2],
                     a: src_alpha.get(k).copied().unwrap_or(1.0),
                 });
             }
@@ -9358,7 +10871,9 @@ impl FactoryState {
         // share a GPU buffer.
         let mut h = std::collections::hash_map::DefaultHasher::new();
         inst.asset.hash(&mut h);
-        for x in inst.color { x.to_bits().hash(&mut h); }
+        for x in inst.color {
+            x.to_bits().hash(&mut h);
+        }
         0xA1A1_A1A1u32.hash(&mut h);
         Some(h.finish())
     }
@@ -9394,16 +10909,16 @@ impl FactoryState {
         // because `needs_lod` guaranteed a proxied asset had no UVs (the comment here said so
         // outright). With the proxy carrying UVs, mixing the two would texture a mesh with another
         // mesh's coordinates, so `src_uv` follows `src_pos`.
-        let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
-        let (src_pos, src_nrm, src_uv, src_alpha): (
-            &[[f32; 3]],
-            &[[f32; 3]],
-            &[[f32; 2]],
-            &[f32],
-        ) = match &lod {
-            Some(a) => (&a.positions, &a.normals, &a.uvs, &a.alpha),
-            None => (&asset.positions, &asset.normals, &asset.uvs, &asset.alpha),
+        let lod = if asset.needs_lod() {
+            Some(asset.lod_geom())
+        } else {
+            None
         };
+        let (src_pos, src_nrm, src_uv, src_alpha): (&[[f32; 3]], &[[f32; 3]], &[[f32; 2]], &[f32]) =
+            match &lod {
+                Some(a) => (&a.positions, &a.normals, &a.uvs, &a.alpha),
+                None => (&asset.positions, &asset.normals, &asset.uvs, &asset.alpha),
+            };
         // Real UVs (from a glTF import) map the texture as the artist intended; otherwise box
         // projection normalised to the local bbox.
         let has_uv = src_uv.len() == src_pos.len();
@@ -9428,7 +10943,12 @@ impl FactoryState {
             out.push(crate::light3d::TexVtx {
                 // From `src_alpha`, for the same reason as `src_uv`: the proxy's vertex k is not
                 // the full mesh's vertex k.
-                x: p[0], y: p[1], z: p[2], u: uv[0], v: uv[1], s,
+                x: p[0],
+                y: p[1],
+                z: p[2],
+                u: uv[0],
+                v: uv[1],
+                s,
                 a: src_alpha.get(k).copied().unwrap_or(1.0) * tex.opacity,
             });
         }
@@ -9448,7 +10968,10 @@ impl FactoryState {
     /// by asset+texture+tiling. For a fully-opaque textured asset this is the whole mesh (fast
     /// path); a mixed piece keeps only its solid faces here, glass going to
     /// [`Self::furniture_textured_translucent_mesh`]. `None` if it has no texture or no opaque tris.
-    pub fn furniture_textured_mesh(&self, i: usize) -> Option<(usize, u64, Vec<crate::light3d::TexVtx>)> {
+    pub fn furniture_textured_mesh(
+        &self,
+        i: usize,
+    ) -> Option<(usize, u64, Vec<crate::light3d::TexVtx>)> {
         let (tex_idx, key, all) = self.textured_vtx(i)?;
         // See-through if the mesh has glass OR the texture's opacity < 1 (baked into vertex `a`).
         if !all.iter().any(|v| v.a < ALPHA_OPAQUE) {
@@ -9457,7 +10980,9 @@ impl FactoryState {
         let mut out = Vec::with_capacity(all.len());
         for t in 0..all.len() / 3 {
             let b = t * 3;
-            let tr = all[b].a < ALPHA_OPAQUE || all[b + 1].a < ALPHA_OPAQUE || all[b + 2].a < ALPHA_OPAQUE;
+            let tr = all[b].a < ALPHA_OPAQUE
+                || all[b + 1].a < ALPHA_OPAQUE
+                || all[b + 2].a < ALPHA_OPAQUE;
             if !tr {
                 out.extend_from_slice(&all[b..b + 3]);
             }
@@ -9468,12 +10993,17 @@ impl FactoryState {
     /// The TRANSLUCENT textured triangles of instance `i` (textured glass), with per-vertex
     /// opacity, for the blended textured pass. Keyed distinctly from the opaque mesh so the two
     /// never share a GPU buffer. `None` when the asset is fully opaque or carries no texture.
-    pub fn furniture_textured_translucent_mesh(&self, i: usize) -> Option<(usize, u64, Vec<crate::light3d::TexVtx>)> {
+    pub fn furniture_textured_translucent_mesh(
+        &self,
+        i: usize,
+    ) -> Option<(usize, u64, Vec<crate::light3d::TexVtx>)> {
         let (tex_idx, key, all) = self.textured_vtx(i)?;
         let mut out = Vec::new();
         for t in 0..all.len() / 3 {
             let b = t * 3;
-            let tr = all[b].a < ALPHA_OPAQUE || all[b + 1].a < ALPHA_OPAQUE || all[b + 2].a < ALPHA_OPAQUE;
+            let tr = all[b].a < ALPHA_OPAQUE
+                || all[b + 1].a < ALPHA_OPAQUE
+                || all[b + 2].a < ALPHA_OPAQUE;
             if tr {
                 out.extend_from_slice(&all[b..b + 3]);
             }
@@ -9512,7 +11042,9 @@ impl FactoryState {
         let mut sig = std::collections::hash_map::DefaultHasher::new();
         inst.asset.hash(&mut sig);
         inst.texture.hash(&mut sig);
-        for c in inst.color { c.to_bits().hash(&mut sig); }
+        for c in inst.color {
+            c.to_bits().hash(&mut sig);
+        }
         let mut sig_entries: Vec<(u32, usize)> =
             inst.surface_texture.iter().map(|(&g, &t)| (g, t)).collect();
         sig_entries.sort_unstable();
@@ -9548,11 +11080,19 @@ impl FactoryState {
 
         let groups = asset.group_geom();
         let (mn, mx) = (asset.local_min, asset.local_max);
-        let ext = [(mx[0] - mn[0]).max(1e-4), (mx[1] - mn[1]).max(1e-4), (mx[2] - mn[2]).max(1e-4)];
+        let ext = [
+            (mx[0] - mn[0]).max(1e-4),
+            (mx[1] - mn[1]).max(1e-4),
+            (mx[2] - mn[2]).max(1e-4),
+        ];
         // Positions, normals, UVs, alpha AND the per-triangle face id all from ONE source. The
         // proxy's face ids are the source's, which is what makes the same texture assignment land
         // on the same surfaces at a fraction of the triangles.
-        let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
+        let lod = if asset.needs_lod() {
+            Some(asset.lod_geom())
+        } else {
+            None
+        };
         let (src_pos, src_nrm, src_uv, src_alpha, src_face): (
             &[[f32; 3]],
             &[[f32; 3]],
@@ -9561,7 +11101,13 @@ impl FactoryState {
             &[u32],
         ) = match &lod {
             Some(a) => (&a.positions, &a.normals, &a.uvs, &a.alpha, &a.face),
-            None => (&asset.positions, &asset.normals, &asset.uvs, &asset.alpha, &groups.face),
+            None => (
+                &asset.positions,
+                &asset.normals,
+                &asset.uvs,
+                &asset.alpha,
+                &groups.face,
+            ),
         };
         let has_uv = src_uv.len() == src_pos.len();
         let ntri = src_pos.len() / 3;
@@ -9570,7 +11116,8 @@ impl FactoryState {
         // buffer key so a paint (which changes this) rebuilds only that instance's GPU meshes.
         let mut ah = std::collections::hash_map::DefaultHasher::new();
         inst.texture.hash(&mut ah);
-        let mut entries: Vec<(u32, usize)> = inst.surface_texture.iter().map(|(&g, &t)| (g, t)).collect();
+        let mut entries: Vec<(u32, usize)> =
+            inst.surface_texture.iter().map(|(&g, &t)| (g, t)).collect();
         entries.sort_unstable();
         entries.hash(&mut ah);
         let assign_hash = ah.finish();
@@ -9623,7 +11170,15 @@ impl FactoryState {
                         let uv = tex.map_uv(uc, vc);
                         // Surface transparency multiplies the mesh's own per-vertex opacity.
                         let a = src_alpha.get(k).copied().unwrap_or(1.0) * tex.opacity;
-                        buf.push(crate::light3d::TexVtx { x: p[0], y: p[1], z: p[2], u: uv[0], v: uv[1], s, a });
+                        buf.push(crate::light3d::TexVtx {
+                            x: p[0],
+                            y: p[1],
+                            z: p[2],
+                            u: uv[0],
+                            v: uv[1],
+                            s,
+                            a,
+                        });
                     }
                 }
                 None => {
@@ -9652,7 +11207,8 @@ impl FactoryState {
             0xFACEu32.hash(&mut h);
             // A see-through surface (its texture opacity < 1, or any glass vertex) goes to the
             // blended pass; everything else stays in the fast opaque pass.
-            let see_through = tex.opacity < ALPHA_OPAQUE || verts.iter().any(|v| v.a < ALPHA_OPAQUE);
+            let see_through =
+                tex.opacity < ALPHA_OPAQUE || verts.iter().any(|v| v.a < ALPHA_OPAQUE);
             if see_through {
                 translucent.push((ti, h.finish() ^ 0x5151_5151_5151_5151, verts));
             } else {
@@ -9671,8 +11227,14 @@ impl FactoryState {
             0xF1A7u32.hash(&mut h);
             Some((h.finish(), flat))
         };
-        let arc = std::sync::Arc::new(FacetedFurniture { opaque, translucent, flat });
-        self.faceted_cache.borrow_mut().insert(i, (sig, arc.clone()));
+        let arc = std::sync::Arc::new(FacetedFurniture {
+            opaque,
+            translucent,
+            flat,
+        });
+        self.faceted_cache
+            .borrow_mut()
+            .insert(i, (sig, arc.clone()));
         Some(arc)
     }
 
@@ -9683,7 +11245,9 @@ impl FactoryState {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         if let Some(inst) = self.furniture.get(i) {
             inst.asset.hash(&mut h);
-            for x in inst.color { x.to_bits().hash(&mut h); }
+            for x in inst.color {
+                x.to_bits().hash(&mut h);
+            }
         }
         self.sun.hash_into(&mut h); // sun change → re-shade furniture
         self.clay_mode.hash(&mut h); // clay toggle → re-bake
@@ -9707,14 +11271,26 @@ impl FactoryState {
     /// bounding-box proxy so even a 90k-tri piece stays smooth while you move/rotate it.
     #[allow(dead_code)]
     pub fn furniture_ghost_verts(&self, i: usize) -> Vec<V3> {
-        let Some(inst) = self.furniture.get(i) else { return Vec::new() };
-        let Some(asset) = self.furniture_lib.get(inst.asset) else { return Vec::new() };
+        let Some(inst) = self.furniture.get(i) else {
+            return Vec::new();
+        };
+        let Some(asset) = self.furniture_lib.get(inst.asset) else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         let s = inst.scale_vec();
         let rm = inst.rot_mat();
         let pos = Vec3::from(inst.pos);
         if asset.positions.len() / 3 > APX_FURNITURE_TRIS {
-            Self::push_furniture_box(&mut out, asset.local_min, asset.local_max, s, rm, pos, inst.color);
+            Self::push_furniture_box(
+                &mut out,
+                asset.local_min,
+                asset.local_max,
+                s,
+                rm,
+                pos,
+                inst.color,
+            );
         } else {
             for (k, p) in asset.positions.iter().enumerate() {
                 let lp = Vec3::new(p[0] * s.x, p[1] * s.y, p[2] * s.z);
@@ -9731,8 +11307,13 @@ impl FactoryState {
     /// by `scale`/`rot`/`pos` and tinted like the instance. This is the APX proxy for a heavy
     /// furniture mesh — 12 triangles instead of ~90 000.
     fn push_furniture_box(
-        out: &mut Vec<V3>, lmn: [f32; 3], lmx: [f32; 3],
-        s: Vec3, rm: glam::Mat3, pos: Vec3, color: [f32; 3],
+        out: &mut Vec<V3>,
+        lmn: [f32; 3],
+        lmx: [f32; 3],
+        s: Vec3,
+        rm: glam::Mat3,
+        pos: Vec3,
+        color: [f32; 3],
     ) {
         let corner = |xi: usize, yi: usize, zi: usize| -> Vec3 {
             let lx = if xi == 0 { lmn[0] } else { lmx[0] };
@@ -9778,7 +11359,11 @@ impl FactoryState {
             .iter()
             .filter_map(|inst| self.furniture_lib.get(inst.asset))
             .map(|a| {
-                if a.needs_lod() { a.lod_geom().tri_count() } else { a.positions.len() / 3 }
+                if a.needs_lod() {
+                    a.lod_geom().tri_count()
+                } else {
+                    a.positions.len() / 3
+                }
             })
             .max()
             .unwrap_or(0)
@@ -9802,13 +11387,15 @@ impl FactoryState {
         // sun's ENABLED state matters, because it selects the studio response.
         self.sun.enabled.hash(&mut h);
         self.clay_mode.hash(&mut h); // clay toggle → re-bake grey/coloured
-        // Colour maps: combine per-entry hashes order-independently (XOR/add) so a recolour
-        // of an existing key changes the signature even though the map length is unchanged.
+                                     // Colour maps: combine per-entry hashes order-independently (XOR/add) so a recolour
+                                     // of an existing key changes the signature even though the map length is unchanged.
         let mut fc: u64 = 0;
         for (k, c) in &self.feature_color {
             let mut e = std::collections::hash_map::DefaultHasher::new();
             k.hash(&mut e);
-            for x in c { x.to_bits().hash(&mut e); }
+            for x in c {
+                x.to_bits().hash(&mut e);
+            }
             fc = fc.wrapping_add(e.finish());
         }
         fc.hash(&mut h);
@@ -9816,7 +11403,9 @@ impl FactoryState {
         for (k, c) in &self.surface_color {
             let mut e = std::collections::hash_map::DefaultHasher::new();
             k.hash(&mut e);
-            for x in c { x.to_bits().hash(&mut e); }
+            for x in c {
+                x.to_bits().hash(&mut e);
+            }
             sc = sc.wrapping_add(e.finish());
         }
         sc.hash(&mut h);
@@ -9933,13 +11522,35 @@ impl FactoryState {
             let (x, y) = (cx + t, cy + t);
             let is_major = |v: f32| (v / major - (v / major).round()).abs() < 1.0e-4;
 
-            let cxl = if x.abs() < step * 0.5 { AXIS_Y } // the line x = 0 runs along +Y
-            else if is_major(x) { MAJOR } else { MINOR };
-            let cyl = if y.abs() < step * 0.5 { AXIS_X }
-            else if is_major(y) { MAJOR } else { MINOR };
+            let cxl = if x.abs() < step * 0.5 {
+                AXIS_Y
+            }
+            // the line x = 0 runs along +Y
+            else if is_major(x) {
+                MAJOR
+            } else {
+                MINOR
+            };
+            let cyl = if y.abs() < step * 0.5 {
+                AXIS_X
+            } else if is_major(y) {
+                MAJOR
+            } else {
+                MINOR
+            };
 
-            seg(&mut out, Vec3::new(x, cy - half, 0.0), Vec3::new(x, cy + half, 0.0), cxl);
-            seg(&mut out, Vec3::new(cx - half, y, 0.0), Vec3::new(cx + half, y, 0.0), cyl);
+            seg(
+                &mut out,
+                Vec3::new(x, cy - half, 0.0),
+                Vec3::new(x, cy + half, 0.0),
+                cxl,
+            );
+            seg(
+                &mut out,
+                Vec3::new(cx - half, y, 0.0),
+                Vec3::new(cx + half, y, 0.0),
+                cyl,
+            );
         }
         out
     }
@@ -9974,13 +11585,24 @@ impl FactoryState {
         const GROUND_Z: f32 = -0.02;
         const GROUND: [f32; 3] = [0.33, 0.31, 0.26]; // dry earth — under the rooms, not in them
         let v = |x: f32, y: f32| V3 {
-            x, y, z: GROUND_Z,
-            r: GROUND[0], g: GROUND[1], b: GROUND[2],
-            nx: 0.0, ny: 0.0, nz: 1.0,
+            x,
+            y,
+            z: GROUND_Z,
+            r: GROUND[0],
+            g: GROUND[1],
+            b: GROUND[2],
+            nx: 0.0,
+            ny: 0.0,
+            nz: 1.0,
             mode: SHADE_SCENE,
         };
         // Two triangles, wound CCW from above so the +Z normal is outward.
-        let (a, b, cc, d) = (v(cx - h, cy - h), v(cx + h, cy - h), v(cx + h, cy + h), v(cx - h, cy + h));
+        let (a, b, cc, d) = (
+            v(cx - h, cy - h),
+            v(cx + h, cy - h),
+            v(cx + h, cy + h),
+            v(cx - h, cy + h),
+        );
         vec![a, b, cc, a, cc, d]
     }
 
@@ -10011,9 +11633,7 @@ impl FactoryState {
         const GREEN: [f32; 3] = [0.30, 0.90, 0.35]; // +Y
         const BLUE: [f32; 3] = [0.35, 0.55, 1.00]; // +Z
         let o = Vec3::ZERO;
-        for (dir, c) in
-            [(Vec3::X, RED), (Vec3::Y, GREEN), (Vec3::Z, BLUE)]
-        {
+        for (dir, c) in [(Vec3::X, RED), (Vec3::Y, GREEN), (Vec3::Z, BLUE)] {
             let tip = dir * len;
             seg(&mut out, o, tip, c);
             // An ARROWHEAD, so +X and −X are not the same line. Two barbs in the plane the axis is
@@ -10085,7 +11705,10 @@ impl FactoryState {
     /// draws everything instead, which is merely slow.
     pub fn ground_view_bounds(rect: egui::Rect, mvp: &[f32; 16], z: f32) -> Option<(Vec2, Vec2)> {
         let corners = [
-            rect.left_top(), rect.right_top(), rect.left_bottom(), rect.right_bottom(),
+            rect.left_top(),
+            rect.right_top(),
+            rect.left_bottom(),
+            rect.right_bottom(),
         ];
         let (mut mn, mut mx) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
         for c in corners {
@@ -10107,7 +11730,12 @@ impl FactoryState {
 
     /// Ray-pick the front-most FEATURE (solid) under `cursor`, by world AABB.
     /// This is what the LEFT button does in the 3D view — selection, never camera.
-    pub fn pick_feature(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<u32> {
+    pub fn pick_feature(
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+    ) -> Option<u32> {
         let (orig, dir) = Self::ray(cursor, rect, mvp);
         // Ray-test the actual TRIANGLES of each visible body, not its bounding box — a big
         // building's AABB encloses a ceiling sitting on it, so an AABB pick could never
@@ -10154,7 +11782,12 @@ impl FactoryState {
 
     /// Ray-pick the front-most solid FACE under `cursor` and return a sketch [`Frame`]
     /// sitting on it — the basis for sketch-on-face. `None` if the ray misses.
-    pub fn pick_face(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<Frame> {
+    pub fn pick_face(
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+    ) -> Option<Frame> {
         let (orig, dir) = Self::ray(cursor, rect, mvp);
         let mut best: Option<(f32, Vec3, Vec3)> = None;
         let mut consider = |t: f32, a: Vec3, b: Vec3, c: Vec3| {
@@ -10174,7 +11807,9 @@ impl FactoryState {
         // sketch-on-face is how a cut is aimed, none of those could be cut either. They are all
         // furniture instances, so testing them here opens the feature to all three at once.
         for (i, inst) in self.furniture.iter().enumerate() {
-            let Some(asset) = self.furniture_lib.get(inst.asset) else { continue };
+            let Some(asset) = self.furniture_lib.get(inst.asset) else {
+                continue;
+            };
             match self.furniture_aabb(i) {
                 Some((mn, mx)) if cad_solid::ray_aabb(orig, dir, mn, mx).is_some() => {}
                 _ => continue,
@@ -10204,7 +11839,9 @@ impl FactoryState {
         let (o, n) = (frame.origin, frame.normal());
         let mut best: Option<(f32, usize)> = None;
         for (i, inst) in self.furniture.iter().enumerate() {
-            let Some(asset) = self.furniture_lib.get(inst.asset) else { continue };
+            let Some(asset) = self.furniture_lib.get(inst.asset) else {
+                continue;
+            };
             match self.furniture_aabb(i) {
                 // 5 mm of slack: the origin came OFF this surface, it is not a guess.
                 Some((mn, mx))
@@ -10254,13 +11891,19 @@ impl FactoryState {
         through: bool,
         depth: f32,
     ) -> Result<usize, cad_solid::meshcut::CutError> {
-        let Some(local) = self.frame_to_local(fi, world) else { return Ok(0) };
+        let Some(local) = self.frame_to_local(fi, world) else {
+            return Ok(0);
+        };
         // Scale: the instance may be scaled, so a metre drawn on screen is not a metre in the
         // asset's own units. Measure it off the transform rather than assuming 1.
         let k = {
             let m = Mat4::from_cols_array(&self.furniture_model_matrix(fi).unwrap_or_default());
             let s = m.transform_vector3(local.u).length();
-            if s > 1e-6 { 1.0 / s } else { 1.0 }
+            if s > 1e-6 {
+                1.0 / s
+            } else {
+                1.0
+            }
         };
         let before = self.furniture[fi].cuts.len();
         for pts in loops {
@@ -10296,7 +11939,12 @@ impl FactoryState {
 
     /// Unproject `cursor` onto the active construction plane (XY at z=0) — the 3D
     /// analog of the 2D canvas's screen→world. `None` if the ray is parallel to it.
-    pub fn cursor_on_plane(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<Vec3> {
+    pub fn cursor_on_plane(
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+    ) -> Option<Vec3> {
         let (orig, dir) = Self::ray(cursor, rect, mvp);
         let n = Vec3::Z;
         let denom = dir.dot(n);
@@ -10404,7 +12052,11 @@ impl FactoryState {
         // Quantise a world position so the two triangles sharing an edge hash together.
         let q = |p: [f32; 3]| -> (i64, i64, i64) {
             const S: f32 = 1.0e4;
-            ((p[0] * S).round() as i64, (p[1] * S).round() as i64, (p[2] * S).round() as i64)
+            (
+                (p[0] * S).round() as i64,
+                (p[1] * S).round() as i64,
+                (p[2] * S).round() as i64,
+            )
         };
         // undirected edge key → (endpoint a, endpoint b, adjacent triangle normals)
         let mut map: HashMap<((i64, i64, i64), (i64, i64, i64)), ([f32; 3], [f32; 3], Vec<Vec3>)> =
@@ -10422,9 +12074,10 @@ impl FactoryState {
         let mut out = Vec::new();
         for (_, (a, b, normals)) in map {
             let is_feature = normals.len() == 1
-                || normals.iter().enumerate().any(|(i, na)| {
-                    normals[i + 1..].iter().any(|nb| na.dot(*nb) < cos_thresh)
-                });
+                || normals
+                    .iter()
+                    .enumerate()
+                    .any(|(i, na)| normals[i + 1..].iter().any(|nb| na.dot(*nb) < cos_thresh));
             if is_feature && keep(Vec3::from(a), Vec3::from(b)) {
                 out.push([frame.to_uv(Vec3::from(a)), frame.to_uv(Vec3::from(b))]);
             }
@@ -10447,7 +12100,11 @@ impl FactoryState {
     /// then the same edges by construction, and cannot disagree about which face is open.
     pub fn picked_face_lines(&self) -> Vec<V3> {
         let mut out = Vec::new();
-        let Some(sk) = self.session.as_ref().and_then(|s| self.model.sketch_by_id(s.plane)) else {
+        let Some(sk) = self
+            .session
+            .as_ref()
+            .and_then(|s| self.model.sketch_by_id(s.plane))
+        else {
             return out;
         };
         // Yellow, and brighter than anything else in the overlay — this answers "did I pick the
@@ -10484,7 +12141,11 @@ impl FactoryState {
                 // ByLayer, which is what almost everything is. Stepped back in value, not in hue.
                 let c = dobject_srgb(d, &sk.doc, doc).map(|x| x * FINISHED_DIM);
                 // By the SKETCH's own unit — `from_uv` lifts (u,v) into world METRES.
-                for poly in cad_solid::geom_display_outlines_scaled(&d.geom, &sk.doc, sk.doc.units.metres_per_unit) {
+                for poly in cad_solid::geom_display_outlines_scaled(
+                    &d.geom,
+                    &sk.doc,
+                    sk.doc.units.metres_per_unit,
+                ) {
                     for w in poly.windows(2) {
                         seg(
                             &mut out,
@@ -10536,8 +12197,12 @@ impl FactoryState {
 
     pub fn live_sketch_lines(&self, doc: &cad_kernel::Document) -> Vec<V3> {
         let mut out = Vec::new();
-        let Some(session) = self.session.as_ref() else { return out };
-        let Some(sk) = self.model.sketch_by_id(session.plane) else { return out };
+        let Some(session) = self.session.as_ref() else {
+            return out;
+        };
+        let Some(sk) = self.model.sketch_by_id(session.plane) else {
+            return out;
+        };
         for d in &doc.dobjects {
             // THE LIVE SKETCH RESOLVES AGAINST ITSELF, at full strength — this is the plane being
             // drawn on. While a session is open `doc` IS the sketch: it carries the clone of the
@@ -10545,7 +12210,9 @@ impl FactoryState {
             // it is the freshest there is and the one `factory_exit_sketch` copies back out.
             let c = dobject_srgb(d, doc, doc);
             // By the live sketch document's own unit — `from_uv` lifts into world METRES.
-            for poly in cad_solid::geom_display_outlines_scaled(&d.geom, doc, doc.units.metres_per_unit) {
+            for poly in
+                cad_solid::geom_display_outlines_scaled(&d.geom, doc, doc.units.metres_per_unit)
+            {
                 for w in poly.windows(2) {
                     seg(
                         &mut out,
@@ -10574,7 +12241,14 @@ mod pick_tests {
 
     fn view(st: &FactoryState, rect: egui::Rect) -> [f32; 16] {
         let aspect = rect.width() / rect.height();
-        crate::light3d::mvp(st.cam_yaw, st.cam_pitch, st.cam_dist, st.cam_target, aspect, st.ortho)
+        crate::light3d::mvp(
+            st.cam_yaw,
+            st.cam_pitch,
+            st.cam_dist,
+            st.cam_target,
+            aspect,
+            st.ortho,
+        )
     }
 
     /// The user reports "3D dobject not selecting". Picking is pure math (screen →
@@ -10590,7 +12264,10 @@ mod pick_tests {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let mvp = view(&st, rect);
         let hit = st.pick_feature(rect.center(), rect, &mvp);
-        assert!(hit.is_some(), "a ray through the centre must hit the centred solid");
+        assert!(
+            hit.is_some(),
+            "a ray through the centre must hit the centred solid"
+        );
         assert_eq!(hit.unwrap(), st.model.features[0].id);
     }
 
@@ -10603,7 +12280,12 @@ mod pick_tests {
         st.add_box();
         st.recompute();
         let edges = st.frame_reference_edges(&FactoryState::ground_frame());
-        assert_eq!(edges.len(), 12, "a box projects to its 12 feature edges, got {}", edges.len());
+        assert_eq!(
+            edges.len(),
+            12,
+            "a box projects to its 12 feature edges, got {}",
+            edges.len()
+        );
     }
 
     /// …and a ray into empty space must MISS (else everything is always selected).
@@ -10616,7 +12298,10 @@ mod pick_tests {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let mvp = view(&st, rect);
         let corner = egui::pos2(rect.left() + 2.0, rect.top() + 2.0);
-        assert!(st.pick_feature(corner, rect, &mvp).is_none(), "corner ray must miss");
+        assert!(
+            st.pick_feature(corner, rect, &mvp).is_none(),
+            "corner ray must miss"
+        );
     }
 
     /// Face-pick (the right-click → "Draw on this face" path) must land ON the solid.
@@ -10629,7 +12314,10 @@ mod pick_tests {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let mvp = view(&st, rect);
         let f = st.pick_face(rect.center(), rect, &mvp);
-        assert!(f.is_some(), "centre ray must hit a face of the centred solid");
+        assert!(
+            f.is_some(),
+            "centre ray must hit a face of the centred solid"
+        );
     }
 }
 
@@ -10639,8 +12327,12 @@ mod outline_tests {
 
     fn ell() -> Vec<Vec2> {
         vec![
-            Vec2::new(0.0, 0.0), Vec2::new(6.0, 0.0), Vec2::new(6.0, 3.0),
-            Vec2::new(3.0, 3.0), Vec2::new(3.0, 6.0), Vec2::new(0.0, 6.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(6.0, 0.0),
+            Vec2::new(6.0, 3.0),
+            Vec2::new(3.0, 3.0),
+            Vec2::new(3.0, 6.0),
+            Vec2::new(0.0, 6.0),
         ]
     }
 
@@ -10649,14 +12341,21 @@ mod outline_tests {
     #[test]
     fn an_l_shaped_building_is_exact_not_a_bounding_box() {
         let mut st = FactoryState::default();
-        st.add_building_outline(&ell(), 4.0).expect("an L is a valid outline");
+        st.add_building_outline(&ell(), 4.0)
+            .expect("an L is a valid outline");
         st.recompute();
         let (mn, mx) = st.cached.bounds().expect("the building must have geometry");
-        assert!((mx[2] - mn[2] - 4.0).abs() < 1e-3, "it rises to the given height");
+        assert!(
+            (mx[2] - mn[2] - 4.0).abs() < 1e-3,
+            "it rises to the given height"
+        );
         // A bounding-box approximation would fill the whole 6×6 square. The L's area is
         // 27 of that 36, so an exact extrusion has strictly less volume.
         let tris = st.cached.tri_count();
-        assert!(tris > 12, "an L has more faces than a box ({tris} triangles)");
+        assert!(
+            tris > 12,
+            "an L has more faces than a box ({tris} triangles)"
+        );
     }
 
     /// A building is built on the ACTIVE storey, like every other new solid.
@@ -10676,15 +12375,23 @@ mod outline_tests {
     fn a_crossed_outline_is_refused_with_its_reason() {
         let mut st = FactoryState::default();
         let bowtie = vec![
-            Vec2::new(0.0, 0.0), Vec2::new(4.0, 4.0),
-            Vec2::new(4.0, 0.0), Vec2::new(0.0, 4.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(4.0, 4.0),
+            Vec2::new(4.0, 0.0),
+            Vec2::new(0.0, 4.0),
         ];
         assert_eq!(
             st.add_building_outline(&bowtie, 3.0),
             Err(cad_solid::ProfileError::SelfIntersecting)
         );
-        assert!(st.model.features.is_empty(), "nothing may be built from a bad outline");
-        assert!(st.model.profiles.is_empty(), "and no profile may be left behind");
+        assert!(
+            st.model.features.is_empty(),
+            "nothing may be built from a bad outline"
+        );
+        assert!(
+            st.model.profiles.is_empty(),
+            "and no profile may be left behind"
+        );
     }
 
     /// A building survives save/reopen — the profile table rides in the same `Model` the
@@ -10698,9 +12405,16 @@ mod outline_tests {
 
         let mut re = FactoryState::default();
         re.apply_persist(back);
-        assert_eq!(re.model.profiles.len(), 1, "the outline itself must survive");
+        assert_eq!(
+            re.model.profiles.len(),
+            1,
+            "the outline itself must survive"
+        );
         re.recompute();
-        assert!(re.cached.tri_count() > 0, "and still build geometry after reload");
+        assert!(
+            re.cached.tri_count() > 0,
+            "and still build geometry after reload"
+        );
     }
 }
 
@@ -10760,8 +12474,14 @@ mod furniture_and_color_tests {
         assert_eq!(st.furniture_lib.len(), 1);
         st.place_furniture(idx, Vec3::new(2.0, 3.0, 0.0));
         assert_eq!(st.furniture.len(), 1);
-        assert!(!st.furniture_verts(false, None).is_empty(), "placed furniture must produce geometry");
-        assert!((st.furniture[0].pos[0] - 2.0).abs() < 1e-4, "placed at the given point");
+        assert!(
+            !st.furniture_verts(false, None).is_empty(),
+            "placed furniture must produce geometry"
+        );
+        assert!(
+            (st.furniture[0].pos[0] - 2.0).abs() < 1e-4,
+            "placed at the given point"
+        );
     }
 
     /// The opaque CSG buffer is CACHED: repeated calls with no change hand back the SAME Arc.
@@ -10776,22 +12496,34 @@ mod furniture_and_color_tests {
 
         let a = st.opaque_verts();
         let b = st.opaque_verts();
-        assert!(std::sync::Arc::ptr_eq(&a, &b), "unchanged scene reuses the cached buffer");
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &b),
+            "unchanged scene reuses the cached buffer"
+        );
 
         // Placing / moving furniture must NOT touch the opaque buffer (it's GPU-instanced).
         let idx = st.add_furniture_asset("chair".into(), tetra());
         st.place_furniture(idx, Vec3::new(2.0, 3.0, 0.0));
         let c = st.opaque_verts();
-        assert!(std::sync::Arc::ptr_eq(&a, &c), "furniture is not in the opaque buffer");
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &c),
+            "furniture is not in the opaque buffer"
+        );
         st.furniture[0].pos[0] += 5.0;
         let d = st.opaque_verts();
-        assert!(std::sync::Arc::ptr_eq(&a, &d), "moving furniture does not rebuild the opaque buffer");
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &d),
+            "moving furniture does not rebuild the opaque buffer"
+        );
 
         // A real geometry change (recompute) DOES invalidate it.
         st.add_box();
         st.recompute();
         let e = st.opaque_verts();
-        assert!(!std::sync::Arc::ptr_eq(&a, &e), "a geometry change invalidates the cache");
+        assert!(
+            !std::sync::Arc::ptr_eq(&a, &e),
+            "a geometry change invalidates the cache"
+        );
     }
 
     /// APX render mode replaces a HEAVY furniture mesh with a 12-triangle box proxy, while
@@ -10803,7 +12535,9 @@ mod furniture_and_color_tests {
         let heavy = st.add_furniture_asset(
             "couch".into(),
             crate::mesh_io::ObjMesh {
-                positions: (0..18_000).map(|i| [(i % 7) as f32, (i % 5) as f32, (i % 3) as f32]).collect(),
+                positions: (0..18_000)
+                    .map(|i| [(i % 7) as f32, (i % 5) as f32, (i % 3) as f32])
+                    .collect(),
                 normals: vec![[0.0, 0.0, 1.0]; 18_000],
                 color: None,
                 alpha: Vec::new(),
@@ -10814,7 +12548,10 @@ mod furniture_and_color_tests {
         let full = st.furniture_verts(false, None).len();
         let proxy = st.furniture_verts(true, None).len();
         assert_eq!(full, 18_000, "GPU/CPU draws the full mesh");
-        assert_eq!(proxy, 36, "APX draws a 12-triangle box (36 verts) for the heavy piece");
+        assert_eq!(
+            proxy, 36,
+            "APX draws a 12-triangle box (36 verts) for the heavy piece"
+        );
         assert!(proxy < full, "APX is lighter");
 
         // A LIGHT piece (4 tris) is drawn in full even in APX — no proxy.
@@ -10848,7 +12585,11 @@ mod furniture_and_color_tests {
             },
         );
         st.place_furniture(heavy, Vec3::ZERO);
-        assert_eq!(st.heaviest_furniture_tris(), 300, "reports the heaviest, not the total");
+        assert_eq!(
+            st.heaviest_furniture_tris(),
+            300,
+            "reports the heaviest, not the total"
+        );
 
         let line = format_event_oneline(&DbgEvent::FactoryPerf {
             phase: "buffer-rebuilt".into(),
@@ -10861,8 +12602,14 @@ mod furniture_and_color_tests {
             cache_rebuilt: true,
         });
         assert!(line.contains("FACTORY PERF"), "labelled: {line}");
-        assert!(line.contains("tris=94247") && line.contains("heaviest=94247"), "load shown: {line}");
-        assert!(line.contains("⚠ SLOW"), "a 20 ms build is flagged slow: {line}");
+        assert!(
+            line.contains("tris=94247") && line.contains("heaviest=94247"),
+            "load shown: {line}"
+        );
+        assert!(
+            line.contains("⚠ SLOW"),
+            "a 20 ms build is flagged slow: {line}"
+        );
     }
 
     /// `furniture_aabb` transforms the CACHED 8 local-box corners (O(8)) instead of sweeping
@@ -10874,7 +12621,12 @@ mod furniture_and_color_tests {
         let mut st = FactoryState::default();
         // A skewed tetra so a rotation actually changes the bounds.
         let mesh = crate::mesh_io::ObjMesh {
-            positions: vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 1.0]],
+            positions: vec![
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [0.0, 3.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
             normals: vec![[0.0, 0.0, 1.0]; 4],
             color: None,
             alpha: Vec::new(),
@@ -10895,8 +12647,14 @@ mod furniture_and_color_tests {
             bmx = bmx.max(w);
         }
         // The 8-corner box must CONTAIN the true vertex bounds (a valid enclosing AABB).
-        assert!(mn.x <= bmn.x + 1e-3 && mn.y <= bmn.y + 1e-3 && mn.z <= bmn.z + 1e-3, "encloses min");
-        assert!(mx.x >= bmx.x - 1e-3 && mx.y >= bmx.y - 1e-3 && mx.z >= bmx.z - 1e-3, "encloses max");
+        assert!(
+            mn.x <= bmn.x + 1e-3 && mn.y <= bmn.y + 1e-3 && mn.z <= bmn.z + 1e-3,
+            "encloses min"
+        );
+        assert!(
+            mx.x >= bmx.x - 1e-3 && mx.y >= bmx.y - 1e-3 && mx.z >= bmx.z - 1e-3,
+            "encloses max"
+        );
 
         // With no rotation the corner box is EXACT.
         st.furniture[0].rot = [0.0, 0.0, 0.0];
@@ -10908,7 +12666,10 @@ mod furniture_and_color_tests {
             emn = emn.min(w);
             emx = emx.max(w);
         }
-        assert!((mn2 - emn).length() < 1e-3 && (mx2 - emx).length() < 1e-3, "exact without rotation");
+        assert!(
+            (mn2 - emn).length() < 1e-3 && (mx2 - emx).length() < 1e-3,
+            "exact without rotation"
+        );
     }
 
     /// The drag-time GPU model matrix must reproduce the CPU pose EXACTLY, so the dragged
@@ -10916,12 +12677,20 @@ mod furniture_and_color_tests {
     #[test]
     fn furniture_model_matrix_matches_cpu_pose() {
         let mut st = FactoryState::default();
-        let idx = st.add_furniture_asset("wedge".into(), crate::mesh_io::ObjMesh {
-            positions: vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 1.0]],
-            normals: vec![[0.0, 0.0, 1.0]; 4],
-            color: None,
-            alpha: Vec::new(),
-        });
+        let idx = st.add_furniture_asset(
+            "wedge".into(),
+            crate::mesh_io::ObjMesh {
+                positions: vec![
+                    [0.0, 0.0, 0.0],
+                    [2.0, 0.0, 0.0],
+                    [0.0, 3.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                normals: vec![[0.0, 0.0, 1.0]; 4],
+                color: None,
+                alpha: Vec::new(),
+            },
+        );
         st.place_furniture(idx, Vec3::new(2.0, 3.0, 1.0));
         st.furniture[0].scale = 1.7;
         st.furniture[0].rot = [20.0, 35.0, 50.0];
@@ -10929,10 +12698,12 @@ mod furniture_and_color_tests {
         let m = glam::Mat4::from_cols_array(&st.furniture_model_matrix(0).unwrap());
         let asset = &st.furniture_lib[idx];
         for p in &asset.positions {
-            let via_matrix = m.transform_point3(Vec3::from(*p));   // GPU path
+            let via_matrix = m.transform_point3(Vec3::from(*p)); // GPU path
             let via_point = st.furniture_point(&st.furniture[0], *p); // cached CPU path
-            assert!((via_matrix - via_point).length() < 1e-4,
-                "model matrix must match furniture_point (no jump on drag-end)");
+            assert!(
+                (via_matrix - via_point).length() < 1e-4,
+                "model matrix must match furniture_point (no jump on drag-end)"
+            );
         }
     }
 
@@ -10944,12 +12715,23 @@ mod furniture_and_color_tests {
         // No model yet → origin.
         assert_eq!(st.default_place_at(), Vec3::ZERO);
         // Build a box far from the origin (like a DXF-coordinate import) and re-check.
-        let p = Primitive::Box { w: 4.0, d: 4.0, h: 3.0 };
-        let placement = Placement { u: 3620.0, v: 958.0, ..Placement::default() };
+        let p = Primitive::Box {
+            w: 4.0,
+            d: 4.0,
+            h: 3.0,
+        };
+        let placement = Placement {
+            u: 3620.0,
+            v: 958.0,
+            ..Placement::default()
+        };
         st.model.push(BoolOp::Union, Plane::default(), placement, p);
         st.recompute();
         let at = st.default_place_at();
-        assert!(at.x > 3000.0 && at.y > 900.0, "lands where the building is, not at (0,0)");
+        assert!(
+            at.x > 3000.0 && at.y > 900.0,
+            "lands where the building is, not at (0,0)"
+        );
     }
 
     /// The library persists across save/reload, and instances keep their asset/pose.
@@ -10963,9 +12745,16 @@ mod furniture_and_color_tests {
 
         let mut re = FactoryState::default();
         re.apply_persist(back);
-        assert_eq!(re.furniture_lib.len(), 1, "the imported mesh is stored in the project");
+        assert_eq!(
+            re.furniture_lib.len(),
+            1,
+            "the imported mesh is stored in the project"
+        );
         assert_eq!(re.furniture.len(), 1);
-        assert!(!re.furniture_verts(false, None).is_empty(), "and still renders after reload");
+        assert!(
+            !re.furniture_verts(false, None).is_empty(),
+            "and still renders after reload"
+        );
     }
 
     /// Furniture is selectable, and selecting it clears the feature selection (they are
@@ -10973,12 +12762,15 @@ mod furniture_and_color_tests {
     #[test]
     fn furniture_selection_is_exclusive_with_features() {
         let mut st = FactoryState::default();
-        st.add_box();                          // selects the feature
+        st.add_box(); // selects the feature
         assert!(!st.selection.is_empty());
         let idx = st.add_furniture_asset("x".into(), tetra());
-        st.place_furniture(idx, Vec3::ZERO);   // selects the furniture
+        st.place_furniture(idx, Vec3::ZERO); // selects the furniture
         assert_eq!(st.sel_furniture, vec![0]);
-        assert!(st.selection.is_empty(), "selecting furniture clears the feature selection");
+        assert!(
+            st.selection.is_empty(),
+            "selecting furniture clears the feature selection"
+        );
     }
 
     /// Furniture rotates about all three axes: yaw 90°/Z sends local +X→+Y; pitch 90°/X
@@ -10990,7 +12782,10 @@ mod furniture_and_color_tests {
         st.place_furniture(idx, Vec3::ZERO);
         st.furniture[0].rot = [0.0, 0.0, 90.0];
         let p = st.furniture_point(&st.furniture[0], [1.0, 0.0, 0.0]);
-        assert!(p.x.abs() < 1e-4 && (p.y - 1.0).abs() < 1e-4, "yaw 90° sends +X→+Y, got {p:?}");
+        assert!(
+            p.x.abs() < 1e-4 && (p.y - 1.0).abs() < 1e-4,
+            "yaw 90° sends +X→+Y, got {p:?}"
+        );
         st.furniture[0].rot = [90.0, 0.0, 0.0];
         let q = st.furniture_point(&st.furniture[0], [0.0, 1.0, 0.0]);
         assert!((q.z - 1.0).abs() < 1e-4, "pitch 90° sends +Y→+Z, got {q:?}");
@@ -11008,8 +12803,10 @@ mod furniture_and_color_tests {
         let mut re = FactoryState::default();
         re.apply_persist(back);
         let r = re.furniture[0].rot;
-        assert!((r[0] - 12.0).abs() < 1e-3 && (r[1] - 34.0).abs() < 1e-3 && (r[2] - 56.0).abs() < 1e-3,
-            "3-axis rot round-trips, got {r:?}");
+        assert!(
+            (r[0] - 12.0).abs() < 1e-3 && (r[1] - 34.0).abs() < 1e-3 && (r[2] - 56.0).abs() < 1e-3,
+            "3-axis rot round-trips, got {r:?}"
+        );
     }
 
     /// A feature's local rotation is settable, reads back, and the model still meshes.
@@ -11022,7 +12819,10 @@ mod furniture_and_color_tests {
         st.set_feature_rotation(id, 0, 30.0); // pitch (about u)
         assert_eq!(st.feature_rotation(id), Some([30.0, 0.0, 45.0]));
         st.recompute();
-        assert!(!st.cached.positions.is_empty(), "rotated feature still produces a mesh");
+        assert!(
+            !st.cached.positions.is_empty(),
+            "rotated feature still produces a mesh"
+        );
     }
 
     /// The gizmo drives furniture: move_selection shifts the selected instance's position,
@@ -11071,17 +12871,35 @@ mod furniture_and_color_tests {
     fn cutaway_hides_geometry_above_the_plane() {
         let mut st = FactoryState::default();
         // A 2×2×4 box spanning z = 0..4.
-        st.model.push(cad_solid::BoolOp::Union, cad_solid::Plane::default(),
-            cad_solid::Placement::default(), Primitive::Box { w: 2.0, d: 2.0, h: 4.0 });
+        st.model.push(
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::default(),
+            cad_solid::Placement::default(),
+            Primitive::Box {
+                w: 2.0,
+                d: 2.0,
+                h: 4.0,
+            },
+        );
         st.recompute();
         let full = st.scene_verts().len();
         let mesh_tris = st.cached.tri_count();
 
         st.cutaway = true;
         st.cutaway_z = 2.0;
-        assert!(st.scene_verts().len() < full, "the top cap above the plane is dropped");
-        assert!(!st.scene_verts().is_empty(), "the walls crossing the plane remain");
-        assert_eq!(st.cached.tri_count(), mesh_tris, "cutaway is view-only, mesh unchanged");
+        assert!(
+            st.scene_verts().len() < full,
+            "the top cap above the plane is dropped"
+        );
+        assert!(
+            !st.scene_verts().is_empty(),
+            "the walls crossing the plane remain"
+        );
+        assert_eq!(
+            st.cached.tri_count(),
+            mesh_tris,
+            "cutaway is view-only, mesh unchanged"
+        );
     }
 
     /// A HIDDEN ceiling must not be pickable — otherwise you select the invisible ceiling
@@ -11089,45 +12907,83 @@ mod furniture_and_color_tests {
     #[test]
     fn a_hidden_ceiling_is_not_pickable() {
         let mut st = FactoryState::default();
-        st.add_building_outline(&[
-            Vec2::new(0.0, 0.0), Vec2::new(6.0, 0.0), Vec2::new(6.0, 6.0), Vec2::new(0.0, 6.0),
-        ], 3.0).unwrap();
+        st.add_building_outline(
+            &[
+                Vec2::new(0.0, 0.0),
+                Vec2::new(6.0, 0.0),
+                Vec2::new(6.0, 6.0),
+                Vec2::new(0.0, 6.0),
+            ],
+            3.0,
+        )
+        .unwrap();
         st.add_room(&[
-            Vec2::new(1.0, 1.0), Vec2::new(5.0, 1.0), Vec2::new(5.0, 5.0), Vec2::new(1.0, 5.0),
-        ]).unwrap();
+            Vec2::new(1.0, 1.0),
+            Vec2::new(5.0, 1.0),
+            Vec2::new(5.0, 5.0),
+            Vec2::new(1.0, 5.0),
+        ])
+        .unwrap();
         let cid = *st.ceilings.iter().next().expect("a ceiling was made");
         st.recompute();
 
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         st.set_view(StdView::Top);
         st.fit();
-        let mvp = crate::light3d::mvp(st.cam_yaw, st.cam_pitch, st.cam_dist, st.cam_target, 800.0/600.0, st.ortho);
+        let mvp = crate::light3d::mvp(
+            st.cam_yaw,
+            st.cam_pitch,
+            st.cam_dist,
+            st.cam_target,
+            800.0 / 600.0,
+            st.ortho,
+        );
 
         // Straight down the middle from the top: without hiding, the ceiling can be hit.
         st.hide_ceilings = true;
         st.recompute();
         let hit = st.pick_feature(rect.center(), rect, &mvp);
-        assert_ne!(hit, Some(cid), "a hidden ceiling must never be the pick result");
+        assert_ne!(
+            hit,
+            Some(cid),
+            "a hidden ceiling must never be the pick result"
+        );
     }
 
     /// Painting a surface stores a per-surface colour that scene_verts uses.
     #[test]
     fn painting_a_surface_colours_only_that_face() {
         let mut st = FactoryState::default();
-        st.add_box();                       // 2×2×1 box, feature id 1
+        st.add_box(); // 2×2×1 box, feature id 1
         st.recompute();
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         st.set_view(StdView::Top);
         st.fit();
-        let mvp = crate::light3d::mvp(st.cam_yaw, st.cam_pitch, st.cam_dist, st.cam_target, 800.0/600.0, st.ortho);
+        let mvp = crate::light3d::mvp(
+            st.cam_yaw,
+            st.cam_pitch,
+            st.cam_dist,
+            st.cam_target,
+            800.0 / 600.0,
+            st.ortho,
+        );
 
         // From the top, the ray hits the top face — paint it red.
-        assert!(st.paint_surface(rect.center(), rect, &mvp, [1.0, 0.0, 0.0]), "the top face must be hit");
+        assert!(
+            st.paint_surface(rect.center(), rect, &mvp, [1.0, 0.0, 0.0]),
+            "the top face must be hit"
+        );
         assert_eq!(st.surface_color.len(), 1, "one surface painted");
         // Some triangles now render red; not all (only the painted face).
         let verts = st.scene_verts();
-        assert!(verts.iter().any(|v| v.r > 0.8 && v.g < 0.3), "the painted face is red");
-        assert!(verts.iter().any(|v| !(v.r > 0.8 && v.g < 0.3)), "other faces are not");
+        assert!(
+            verts.iter().any(|v| v.r > 0.8 && v.g < 0.3),
+            "the painted face is red"
+        );
+        assert!(
+            verts.iter().any(|v| !(v.r > 0.8 && v.g < 0.3)),
+            "other faces are not"
+        );
     }
 
     /// A colour assigned to a feature tints that body's triangles (and only tints — it
@@ -11135,13 +12991,17 @@ mod furniture_and_color_tests {
     #[test]
     fn feature_colour_tints_only_that_body() {
         let mut st = FactoryState::default();
-        st.add_box();                    // feature id 1
+        st.add_box(); // feature id 1
         st.recompute();
         let plain = st.scene_verts();
         let id = st.selected_single().unwrap();
         st.feature_color.insert(id, [1.0, 0.0, 0.0]);
         let tinted = st.scene_verts();
-        assert_eq!(plain.len(), tinted.len(), "colour must not change triangle count");
+        assert_eq!(
+            plain.len(),
+            tinted.len(),
+            "colour must not change triangle count"
+        );
         assert!(
             tinted.iter().any(|v| v.r > v.g && v.r > v.b),
             "the coloured body must render reddish"
@@ -11154,7 +13014,10 @@ mod furniture_and_color_tests {
         let mut st = FactoryState::default();
         st.add_box();
         st.recompute();
-        assert!(st.scene_verts().iter().all(|v| v.r > 0.0 || v.g > 0.0 || v.b > 0.0));
+        assert!(st
+            .scene_verts()
+            .iter()
+            .all(|v| v.r > 0.0 || v.g > 0.0 || v.b > 0.0));
     }
 }
 
@@ -11167,13 +13030,17 @@ mod gizmo_and_props_tests {
     }
     fn view(st: &FactoryState) -> [f32; 16] {
         crate::light3d::mvp(
-            st.cam_yaw, st.cam_pitch, st.cam_dist, st.cam_target,
-            rect().width() / rect().height(), st.ortho,
+            st.cam_yaw,
+            st.cam_pitch,
+            st.cam_dist,
+            st.cam_target,
+            rect().width() / rect().height(),
+            st.ortho,
         )
     }
     fn one_box() -> FactoryState {
         let mut st = FactoryState::default();
-        st.add_box();          // id 1, selected
+        st.add_box(); // id 1, selected
         st.recompute();
         st.fit();
         st
@@ -11210,9 +13077,21 @@ mod gizmo_and_props_tests {
     fn setting_one_position_axis_leaves_the_others() {
         let mut st = one_box();
         let id = st.selected_single().unwrap();
-        let o0 = st.model.features.iter().find(|f| f.id == id).unwrap().world_origin();
-        st.set_feature_origin_axis(id, 2, 5.0);   // Z
-        let o1 = st.model.features.iter().find(|f| f.id == id).unwrap().world_origin();
+        let o0 = st
+            .model
+            .features
+            .iter()
+            .find(|f| f.id == id)
+            .unwrap()
+            .world_origin();
+        st.set_feature_origin_axis(id, 2, 5.0); // Z
+        let o1 = st
+            .model
+            .features
+            .iter()
+            .find(|f| f.id == id)
+            .unwrap()
+            .world_origin();
         assert!((o1.z - 5.0).abs() < 1e-4);
         assert!((o1.x - o0.x).abs() < 1e-4 && (o1.y - o0.y).abs() < 1e-4);
     }
@@ -11222,7 +13101,9 @@ mod gizmo_and_props_tests {
     fn setting_a_dimension_replaces_the_primitive() {
         let mut st = one_box();
         let (id, prim, _) = st.selected_primitive().unwrap();
-        let Primitive::Box { w, d, .. } = prim else { panic!("default add_box is a Box") };
+        let Primitive::Box { w, d, .. } = prim else {
+            panic!("default add_box is a Box")
+        };
         st.set_feature_primitive(id, Primitive::Box { w, d, h: 9.0 });
         let (_, after, _) = st.selected_primitive().unwrap();
         match after {
@@ -11237,8 +13118,13 @@ mod gizmo_and_props_tests {
     fn the_center_cube_picks_the_free_handle() {
         let st = one_box();
         let mvp = view(&st);
-        let v = st.gizmo_view(rect(), &mvp).expect("a selected object has a gizmo");
-        assert_eq!(st.pick_gizmo(v.center_s, rect(), &mvp), Some(GizmoHandle::Free));
+        let v = st
+            .gizmo_view(rect(), &mvp)
+            .expect("a selected object has a gizmo");
+        assert_eq!(
+            st.pick_gizmo(v.center_s, rect(), &mvp),
+            Some(GizmoHandle::Free)
+        );
     }
 
     /// Clicking partway along an arm picks that axis, not Free.
@@ -11254,7 +13140,8 @@ mod gizmo_and_props_tests {
                 st.pick_gizmo(p, rect(), &mvp),
                 Some(arm.handle),
                 "a click along the {:?} arm must pick {:?}",
-                arm.handle, arm.handle
+                arm.handle,
+                arm.handle
             );
         }
     }
@@ -11268,7 +13155,11 @@ mod gizmo_and_props_tests {
             cad_solid::BoolOp::Union,
             cad_solid::Plane::default(),
             cad_solid::Placement::default(),
-            Primitive::Box { w: 0.02, d: 0.02, h: 0.02 },
+            Primitive::Box {
+                w: 0.02,
+                d: 0.02,
+                h: 0.02,
+            },
         );
         st.selection = vec![id];
         st.recompute();
@@ -11288,12 +13179,40 @@ mod gizmo_and_props_tests {
     fn marquee_selects_features_inside_the_band() {
         let mut st = FactoryState::default();
         // Two boxes, far apart in X.
-        let a = st.model.push(cad_solid::BoolOp::Union, cad_solid::Plane::default(),
-            cad_solid::Placement { u: -3.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
-            Primitive::Box { w: 0.5, d: 0.5, h: 0.5 });
-        let b = st.model.push(cad_solid::BoolOp::Union, cad_solid::Plane::default(),
-            cad_solid::Placement { u: 3.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
-            Primitive::Box { w: 0.5, d: 0.5, h: 0.5 });
+        let a = st.model.push(
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::default(),
+            cad_solid::Placement {
+                u: -3.0,
+                v: 0.0,
+                lift: 0.0,
+                spin_deg: 0.0,
+                pitch_deg: 0.0,
+                roll_deg: 0.0,
+            },
+            Primitive::Box {
+                w: 0.5,
+                d: 0.5,
+                h: 0.5,
+            },
+        );
+        let b = st.model.push(
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::default(),
+            cad_solid::Placement {
+                u: 3.0,
+                v: 0.0,
+                lift: 0.0,
+                spin_deg: 0.0,
+                pitch_deg: 0.0,
+                roll_deg: 0.0,
+            },
+            Primitive::Box {
+                w: 0.5,
+                d: 0.5,
+                h: 0.5,
+            },
+        );
         st.selection.clear();
         st.recompute();
         st.fit();
@@ -11301,10 +13220,15 @@ mod gizmo_and_props_tests {
 
         // A band around box A's screen centre only.
         let sa = crate::factory::world_to_screen(
-            { let f = st.model.features.iter().find(|f| f.id == a).unwrap();
-              let (mn, mx) = f.world_aabb(); (mn + mx) * 0.5 },
-            rect(), &mvp,
-        ).unwrap();
+            {
+                let f = st.model.features.iter().find(|f| f.id == a).unwrap();
+                let (mn, mx) = f.world_aabb();
+                (mn + mx) * 0.5
+            },
+            rect(),
+            &mvp,
+        )
+        .unwrap();
         let band = egui::Rect::from_center_size(sa, egui::vec2(30.0, 30.0));
         st.select_in_marquee(band, rect(), &mvp, false);
         assert!(st.selection.contains(&a), "A is inside the band");
@@ -11347,8 +13271,16 @@ mod gizmo_and_props_tests {
         st.toggle_furniture(1);
         assert_eq!(st.sel_furniture, vec![0, 1], "both are selected");
         st.toggle_furniture(1);
-        assert_eq!(st.sel_furniture, vec![0], "…and the second one came back out");
-        assert_eq!(st.sel_furn_primary(), Some(0), "the primary is unchanged throughout");
+        assert_eq!(
+            st.sel_furniture,
+            vec![0],
+            "…and the second one came back out"
+        );
+        assert_eq!(
+            st.sel_furn_primary(),
+            Some(0),
+            "the primary is unchanged throughout"
+        );
     }
 
     /// Deleting several pieces must delete the ones that were selected.
@@ -11367,7 +13299,11 @@ mod gizmo_and_props_tests {
         assert_eq!(st.erase_selected_furniture(), 2);
         assert_eq!(st.furniture.len(), 2);
         let xs: Vec<f32> = st.furniture.iter().map(|f| f.pos[0]).collect();
-        assert_eq!(xs, vec![1.0, 3.0], "the pieces at x=0 and x=2 went, not their neighbours");
+        assert_eq!(
+            xs,
+            vec![1.0, 3.0],
+            "the pieces at x=0 and x=2 went, not their neighbours"
+        );
         assert!(st.sel_furniture.is_empty(), "nothing is left selected");
     }
 
@@ -11397,9 +13333,15 @@ mod gizmo_and_props_tests {
         st.sel_furniture = vec![0, 1];
         st.selection.clear();
         let (mn, mx) = st.selection_aabb().expect("a multi-selection has bounds");
-        assert!(mn.x <= 0.01 && mx.x >= 9.99, "bounds {mn:?}..{mx:?} miss a piece");
+        assert!(
+            mn.x <= 0.01 && mx.x >= 9.99,
+            "bounds {mn:?}..{mx:?} miss a piece"
+        );
         let c = st.selection_center().unwrap();
-        assert!((c.x - 5.0).abs() < 0.5, "the centre sits between them, not on one");
+        assert!(
+            (c.x - 5.0).abs() < 0.5,
+            "the centre sits between them, not on one"
+        );
     }
 
     /// An editor that writes one set of numbers must refuse a multi-selection outright.
@@ -11413,10 +13355,22 @@ mod gizmo_and_props_tests {
         st.place_furniture(idx, Vec3::ZERO);
         st.place_furniture(idx, Vec3::new(2.0, 0.0, 0.0));
         st.select_furniture(1);
-        assert_eq!(st.sel_furn_one(), Some(1), "one selected — the editor opens");
+        assert_eq!(
+            st.sel_furn_one(),
+            Some(1),
+            "one selected — the editor opens"
+        );
         st.toggle_furniture(0);
-        assert_eq!(st.sel_furn_one(), None, "two selected — the editor stands down");
-        assert_eq!(st.sel_furn_primary(), Some(1), "…but the primary is still known");
+        assert_eq!(
+            st.sel_furn_one(),
+            None,
+            "two selected — the editor stands down"
+        );
+        assert_eq!(
+            st.sel_furn_primary(),
+            Some(1),
+            "…but the primary is still known"
+        );
     }
 
     /// Empty selection: no gizmo, nothing to pick.
@@ -11498,8 +13452,12 @@ mod handle_tests {
 
     fn view(st: &FactoryState) -> [f32; 16] {
         crate::light3d::mvp(
-            st.cam_yaw, st.cam_pitch, st.cam_dist, st.cam_target,
-            rect().width() / rect().height(), st.ortho,
+            st.cam_yaw,
+            st.cam_pitch,
+            st.cam_dist,
+            st.cam_target,
+            rect().width() / rect().height(),
+            st.ortho,
         )
     }
 
@@ -11507,7 +13465,11 @@ mod handle_tests {
         let mut st = FactoryState::default();
         let wi = st
             .add_wall(
-                vec![Vec2::new(-2.0, 0.0), Vec2::new(2.0, 0.0), Vec2::new(2.0, 3.0)],
+                vec![
+                    Vec2::new(-2.0, 0.0),
+                    Vec2::new(2.0, 0.0),
+                    Vec2::new(2.0, 3.0),
+                ],
                 0.2,
                 2.5,
             )
@@ -11582,19 +13544,26 @@ mod handle_tests {
     #[test]
     fn reselecting_keeps_the_handles_alive_across_a_shape_edit() {
         let (mut st, wi) = wall_app();
-        st.add_box();                 // now the wall is no longer the highest id
+        st.add_box(); // now the wall is no longer the highest id
         st.select_wall(wi);
         let before = st.selection.clone();
 
         st.wall_move_vertex(wi, 1, Vec2::new(3.0, 1.0));
-        assert_ne!(st.walls[wi].segments, before, "the rebuild really did mint new ids");
+        assert_ne!(
+            st.walls[wi].segments, before,
+            "the rebuild really did mint new ids"
+        );
         assert!(
             st.selected_wall().is_none(),
             "the stale selection no longer resolves — the test is meaningful"
         );
 
         st.select_wall(wi);
-        assert_eq!(st.selected_wall(), Some(wi), "handles must survive the edit");
+        assert_eq!(
+            st.selected_wall(),
+            Some(wi),
+            "handles must survive the edit"
+        );
         assert_ne!(st.selection, before, "and they track the NEW ids");
     }
 
@@ -11604,7 +13573,9 @@ mod handle_tests {
         let mut st = FactoryState::default();
         st.add_storey_on_top();
         let base = st.active_base_z();
-        let wi = st.add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(3.0, 0.0)], 0.2, 2.5).unwrap();
+        let wi = st
+            .add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(3.0, 0.0)], 0.2, 2.5)
+            .unwrap();
         assert_eq!(st.wall_vertex_world(wi, 0).unwrap().z, base);
     }
 }
@@ -11615,7 +13586,10 @@ mod slab_tests {
 
     fn square(s: f32) -> Vec<Vec2> {
         vec![
-            Vec2::new(0.0, 0.0), Vec2::new(s, 0.0), Vec2::new(s, s), Vec2::new(0.0, s),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(s, 0.0),
+            Vec2::new(s, s),
+            Vec2::new(0.0, s),
             Vec2::new(0.0, 0.0),
         ]
     }
@@ -11686,8 +13660,14 @@ mod slab_tests {
         st.hide_ceilings = true;
         let center_hidden = ceiling_z_at(&st, 0.0, 0.0);
         eprintln!("REPRO: centre top shown = {center_shown:.3}, hidden = {center_hidden:.3}");
-        assert!(ceil_tris > 0, "the ceiling must contribute triangles that hide can drop");
-        assert!(center_shown > 2.5, "the ceiling covers the centre before hiding");
+        assert!(
+            ceil_tris > 0,
+            "the ceiling must contribute triangles that hide can drop"
+        );
+        assert!(
+            center_shown > 2.5,
+            "the ceiling covers the centre before hiding"
+        );
         assert!(
             center_hidden < 1.0,
             "the ceiling over the interior must open (hidden centre z {center_hidden:.2})"
@@ -11717,16 +13697,26 @@ mod slab_tests {
         let verts = st.scene_verts();
         let center_hidden = ceiling_z_at(&st, 0.0, 0.0);
         eprintln!("REPRO2: centre top shown = {center_shown:.3}, hidden = {center_hidden:.3}");
-        assert!(center_shown > 2.5, "the ceiling covers the centre before hiding");
+        assert!(
+            center_shown > 2.5,
+            "the ceiling covers the centre before hiding"
+        );
         assert!(
             center_hidden < 1.0,
             "the interior must open by geometry alone (hidden centre z {center_hidden:.2})"
         );
         // The floor is still there to look at (dark floor triangles near z≈0.2 survive).
         let floor_min = verts.iter().map(|v| v.z).fold(f32::MAX, f32::min);
-        assert!(floor_min < 0.3, "the floor slab must remain visible, got min z {floor_min:.2}");
+        assert!(
+            floor_min < 0.3,
+            "the floor slab must remain visible, got min z {floor_min:.2}"
+        );
         // And the WALLS are NOT removed — plenty of geometry remains.
-        assert!(verts.len() > 200, "walls + floor must survive, got {}", verts.len());
+        assert!(
+            verts.len() > 200,
+            "walls + floor must survive, got {}",
+            verts.len()
+        );
     }
 
     /// DIAGNOSTIC: what does a pure circle room actually contain? Compares against the
@@ -11784,14 +13774,26 @@ mod slab_tests {
         );
         // THE FIX: the roof over the room INTERIOR opens (you see in) …
         assert!(center_before > 2.5, "roof caps the interior to begin with");
-        assert!(center_after < 1.0, "hiding opens the interior — no roof over the centre");
+        assert!(
+            center_after < 1.0,
+            "hiding opens the interior — no roof over the centre"
+        );
         // … the roof over the WALL RING stays (the wall is capped, not opened) …
         assert!(wall_before > 2.5, "the wall ring is capped to begin with");
-        assert!(wall_after > 2.5, "the wall ring MUST keep its cap after hiding");
+        assert!(
+            wall_after > 2.5,
+            "the wall ring MUST keep its cap after hiding"
+        );
         // … a border of roof remains, and the building's WALLS stay solid.
-        assert!(border_after > 0, "a roof cap must remain over the wall ring");
+        assert!(
+            border_after > 0,
+            "a roof cap must remain over the wall ring"
+        );
         assert!(walls_before > 0, "the building has walls to begin with");
-        assert_eq!(walls_after, walls_before, "the building walls must stay solid");
+        assert_eq!(
+            walls_after, walls_before,
+            "the building walls must stay solid"
+        );
     }
 
     /// A plain solid building with NO room under it must NOT be touched by "Hide ceilings" —
@@ -11822,26 +13824,33 @@ mod slab_tests {
             let (mn, mx) = f.world_aabb();
             let is_wall = (mx.z - mn.z) > 1.0; // walls span the room height
             if is_wall {
-                assert!(!st.ceiling_caps.contains(&f.id), "a wall must not be a ceiling cap");
+                assert!(
+                    !st.ceiling_caps.contains(&f.id),
+                    "a wall must not be a ceiling cap"
+                );
             }
         }
         st.hide_ceilings = true;
         // Vertical wall faces (normal ~horizontal) must survive hiding.
-        let has_vertical = st
-            .scene_verts()
-            .chunks_exact(3)
-            .any(|t| {
-                let z = (t[0].z + t[1].z + t[2].z) / 3.0;
-                z > 0.5 && z < 2.5 // mid-wall height band
-            });
-        assert!(has_vertical, "wall geometry at mid height must remain after hiding");
+        let has_vertical = st.scene_verts().chunks_exact(3).any(|t| {
+            let z = (t[0].z + t[1].z + t[2].z) / 3.0;
+            z > 0.5 && z < 2.5 // mid-wall height band
+        });
+        assert!(
+            has_vertical,
+            "wall geometry at mid height must remain after hiding"
+        );
     }
 
     /// An L-shape — the case a Box genuinely cannot represent.
     fn ell() -> Vec<Vec2> {
         vec![
-            Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), Vec2::new(4.0, 2.0),
-            Vec2::new(2.0, 2.0), Vec2::new(2.0, 4.0), Vec2::new(0.0, 4.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(4.0, 0.0),
+            Vec2::new(4.0, 2.0),
+            Vec2::new(2.0, 2.0),
+            Vec2::new(2.0, 4.0),
+            Vec2::new(0.0, 4.0),
             Vec2::new(0.0, 0.0),
         ]
     }
@@ -11860,7 +13869,10 @@ mod slab_tests {
         );
         // The extruded L has more triangles than a 6-face box would.
         st.recompute();
-        assert!(st.cached.tri_count() > 12, "the L outline must be preserved in the mesh");
+        assert!(
+            st.cached.tri_count() > 12,
+            "the L outline must be preserved in the mesh"
+        );
     }
 
     /// A room is a VOID carved from the building — a Difference feature, not a solid.
@@ -11868,14 +13880,23 @@ mod slab_tests {
     fn a_room_is_built_constructively_with_walls() {
         let mut st = FactoryState::default();
         // No building needed — a room builds itself.
-        let id = st.add_room(&square(4.0)).expect("a room builds from an outline");
+        let id = st
+            .add_room(&square(4.0))
+            .expect("a room builds from an outline");
         // The returned id is the floor slab, an extrusion.
         let f = st.model.features.iter().find(|f| f.id == id).unwrap();
         assert_eq!(f.op, cad_solid::BoolOp::Union);
         // Walls were added as their own boxes (one per edge of the square = 4).
-        let wall_boxes = st.model.features.iter()
-            .filter(|x| matches!(x.primitive, Primitive::Box { .. })).count();
-        assert!(wall_boxes >= 4, "a square room has at least 4 wall boxes, got {wall_boxes}");
+        let wall_boxes = st
+            .model
+            .features
+            .iter()
+            .filter(|x| matches!(x.primitive, Primitive::Box { .. }))
+            .count();
+        assert!(
+            wall_boxes >= 4,
+            "a square room has at least 4 wall boxes, got {wall_boxes}"
+        );
         st.recompute();
         assert!(st.cached.tri_count() > 0, "the room renders");
     }
@@ -11888,9 +13909,9 @@ mod slab_tests {
         st.add_room(&square(4.0)).unwrap();
         st.recompute();
         let shown = st.scene_verts().len();
-        st.hide_ceilings = true;         // NO recompute
+        st.hide_ceilings = true; // NO recompute
         let hidden = st.scene_verts().len();
-        st.hide_ceilings = false;        // NO recompute
+        st.hide_ceilings = false; // NO recompute
         let shown_again = st.scene_verts().len();
         assert!(hidden < shown, "hiding drops triangles at render time");
         assert_eq!(shown, shown_again, "unhiding restores them");
@@ -11907,7 +13928,10 @@ mod slab_tests {
         let center_shown = ceiling_z_at(&st, 2.0, 2.0);
         st.hide_ceilings = true;
         let center_hidden = ceiling_z_at(&st, 2.0, 2.0);
-        assert!(center_shown > 2.5, "the ceiling covers the centre before hiding");
+        assert!(
+            center_shown > 2.5,
+            "the ceiling covers the centre before hiding"
+        );
         assert!(
             center_hidden < 1.0,
             "hiding must open the interior over the centre (hidden centre z {center_hidden:.2})"
@@ -11920,19 +13944,28 @@ mod slab_tests {
     fn a_default_room_is_full_height() {
         let mut st = FactoryState::default();
         // Defaults: floor 0.2, height 2.7, ceiling 0.15 → top ≈ 3.05 m.
-        assert!((st.room_height - 2.7).abs() < 1e-4, "default room height is 2.7");
+        assert!(
+            (st.room_height - 2.7).abs() < 1e-4,
+            "default room height is 2.7"
+        );
         st.add_room(&square(4.0)).unwrap();
         st.recompute();
         let (mn, mx) = st.cached.bounds().expect("the room has geometry");
         let tall = mx[2] - mn[2];
-        assert!(tall > 2.5, "a default room must be ~3 m tall, got {tall:.2} m");
+        assert!(
+            tall > 2.5,
+            "a default room must be ~3 m tall, got {tall:.2} m"
+        );
     }
 
     /// A room needs NO pre-existing building — it constructs its own floor, walls, ceiling.
     #[test]
     fn a_room_builds_standalone() {
         let mut st = FactoryState::default();
-        assert!(st.add_room(&square(4.0)).is_ok(), "a room must build with no building");
+        assert!(
+            st.add_room(&square(4.0)).is_ok(),
+            "a room must build with no building"
+        );
         assert!(!st.model.features.is_empty());
         assert_eq!(st.ceilings.len(), 1, "and it has a ceiling");
     }
@@ -11942,7 +13975,7 @@ mod slab_tests {
     fn a_room_has_a_separate_floor_and_ceiling_by_default() {
         let mut st = FactoryState::default();
         st.room_floor = 0.25;
-        st.room_height = 2.5;   // floor→ceiling clear height
+        st.room_height = 2.5; // floor→ceiling clear height
         st.ceiling_thickness = 0.15;
         st.add_room(&square(4.0)).unwrap();
         // The ceiling sits above the floor + walls: base(0) + floor(0.25) + height(2.5).
@@ -11950,7 +13983,10 @@ mod slab_tests {
         let cid = *st.ceilings.iter().next().unwrap();
         let c = st.model.features.iter().find(|f| f.id == cid).unwrap();
         // add_slab lifts by (top_z - thickness): top at 0.25+2.5+0.15 = 2.9, lift = 2.75.
-        assert!((c.placement.lift - 2.75).abs() < 1e-3, "ceiling underside at floor + height");
+        assert!(
+            (c.placement.lift - 2.75).abs() < 1e-3,
+            "ceiling underside at floor + height"
+        );
     }
 
     /// The open-to-sky toggle makes NO ceiling slab.
@@ -11975,8 +14011,15 @@ mod slab_tests {
         let shown = st.scene_verts().len();
         st.hide_ceilings = true;
         // No recompute needed — hiding is a render-time filter.
-        assert!(st.scene_verts().len() < shown, "hiding removes it from the render");
-        assert_eq!(st.cached.tri_count(), st.model.eval().tri_count(), "the mesh itself is unchanged");
+        assert!(
+            st.scene_verts().len() < shown,
+            "hiding removes it from the render"
+        );
+        assert_eq!(
+            st.cached.tri_count(),
+            st.model.eval().tri_count(),
+            "the mesh itself is unchanged"
+        );
     }
 
     /// Hiding ceilings drops ONLY the ceiling slabs from the render — the model keeps them
@@ -11991,8 +14034,15 @@ mod slab_tests {
         let features = st.model.features.len();
 
         st.hide_ceilings = true;
-        assert!(st.scene_verts().len() < shown, "the ceiling slab is not drawn");
-        assert_eq!(st.model.features.len(), features, "but no feature is deleted");
+        assert!(
+            st.scene_verts().len() < shown,
+            "the ceiling slab is not drawn"
+        );
+        assert_eq!(
+            st.model.features.len(),
+            features,
+            "but no feature is deleted"
+        );
         assert_eq!(st.ceilings.len(), 1, "the ceiling is still tracked");
     }
 
@@ -12003,14 +14053,17 @@ mod slab_tests {
         let mut st = FactoryState::default();
         st.room_floor = 0.2;
         st.room_height = 2.5;
-        st.add_storey_on_top();     // storey 1 active
+        st.add_storey_on_top(); // storey 1 active
         let base = st.active_base_z();
         assert!(base > 0.0, "we are on an upper storey");
         st.add_room(&square(4.0)).unwrap();
         // The ceiling sits a storey up (base + floor + height, above the ground storey).
         let cid = *st.ceilings.iter().next().unwrap();
         let c = st.model.features.iter().find(|f| f.id == cid).unwrap();
-        assert!(c.placement.lift > base, "the room is built on the upper storey");
+        assert!(
+            c.placement.lift > base,
+            "the room is built on the upper storey"
+        );
     }
 
     /// A rectangle still slabs fine — the general path must not regress the simple case.
@@ -12050,7 +14103,9 @@ mod slab_tests {
     fn a_zero_area_outline_makes_no_slab() {
         let mut st = FactoryState::default();
         let flat = vec![
-            Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), Vec2::new(2.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(4.0, 0.0),
+            Vec2::new(2.0, 0.0),
             Vec2::new(0.0, 0.0),
         ];
         assert!(st.add_slab(&flat, 0.2, 0.0).is_none());
@@ -12105,9 +14160,18 @@ mod storey_tests {
     fn bases_are_the_running_sum_of_the_heights_below() {
         let mut st = FactoryState::default();
         st.storeys = vec![
-            Storey { name: "G".into(), height: 3.0 },
-            Storey { name: "1".into(), height: 2.5 },
-            Storey { name: "2".into(), height: 4.0 },
+            Storey {
+                name: "G".into(),
+                height: 3.0,
+            },
+            Storey {
+                name: "1".into(),
+                height: 2.5,
+            },
+            Storey {
+                name: "2".into(),
+                height: 4.0,
+            },
         ];
         assert_eq!(st.storey_base_z(0), 0.0);
         assert_eq!(st.storey_base_z(1), 3.0);
@@ -12119,14 +14183,17 @@ mod storey_tests {
     #[test]
     fn new_geometry_lands_on_the_active_storey() {
         let mut st = FactoryState::default();
-        st.add_storey_on_top();                    // level 1, active
+        st.add_storey_on_top(); // level 1, active
         let base = st.active_base_z();
         assert!(base > 0.0, "the second level cannot start at the ground");
 
         st.add_wall(fp(), 0.2, 2.5).expect("wall must promote");
         assert_eq!(st.walls[0].base_z, base);
         let z = st.model.features.last().unwrap().world_origin().z;
-        assert!((z - base).abs() < 1e-3, "the solid must stand on the active level");
+        assert!(
+            (z - base).abs() < 1e-3,
+            "the solid must stand on the active level"
+        );
     }
 
     /// Membership is derived from the z band, so it survives a `rederive_wall` that mints
@@ -12139,10 +14206,13 @@ mod storey_tests {
         let before = st.features_on_storey(1);
         assert!(!before.is_empty());
 
-        st.wall_insert_vertex(wi, 0, Vec2::new(2.0, 0.0));   // rebuilds with fresh ids
+        st.wall_insert_vertex(wi, 0, Vec2::new(2.0, 0.0)); // rebuilds with fresh ids
         let after = st.features_on_storey(1);
         assert!(!after.is_empty(), "the wall must still belong to level 1");
-        assert_ne!(before, after, "ids really did change — the test is meaningful");
+        assert_ne!(
+            before, after,
+            "ids really did change — the test is meaningful"
+        );
     }
 
     /// Thickness is editable after the fact, like height — and IN PLACE, so feature ids
@@ -12156,14 +14226,20 @@ mod storey_tests {
 
         st.set_wall_thickness(fid, 0.45);
         assert_eq!(st.walls[wi].thickness, 0.45);
-        assert_eq!(st.walls[wi].segments, ids, "an in-place edit must not renumber");
+        assert_eq!(
+            st.walls[wi].segments, ids,
+            "an in-place edit must not renumber"
+        );
         // The Box's depth IS the wall thickness.
         let f = st.model.features.iter().find(|f| f.id == fid).unwrap();
         match f.primitive {
             cad_solid::Primitive::Box { d, .. } => assert_eq!(d, 0.45),
             other => panic!("a wall segment must stay a Box, got {other:?}"),
         }
-        assert_eq!(st.walls[wi].height, 2.5, "changing thickness must not touch height");
+        assert_eq!(
+            st.walls[wi].height, 2.5,
+            "changing thickness must not touch height"
+        );
     }
 
     /// Promoted geometry with no thickness of its own takes the FACTORY setting — the one
@@ -12188,7 +14264,14 @@ mod storey_tests {
         st.wall_move_vertex(wi, 1, Vec2::new(6.0, 0.0));
         assert_eq!(st.walls[wi].base_z, base);
         for id in &st.walls[wi].segments {
-            let z = st.model.features.iter().find(|f| f.id == *id).unwrap().world_origin().z;
+            let z = st
+                .model
+                .features
+                .iter()
+                .find(|f| f.id == *id)
+                .unwrap()
+                .world_origin()
+                .z;
             assert!((z - base).abs() < 1e-3, "the wall fell off its storey");
         }
     }
@@ -12204,30 +14287,54 @@ mod storey_tests {
         let wall_height = st.walls[upper].height;
 
         st.set_storey_height(0, st.storeys[0].height + 1.0);
-        assert_eq!(st.walls[upper].base_z, upper_base + 1.0, "the upper level must rise");
-        assert_eq!(st.walls[upper].height, wall_height, "its walls must not stretch");
-        assert_eq!(st.storey_base_z(1), st.storeys[0].height, "stack stays contiguous");
+        assert_eq!(
+            st.walls[upper].base_z,
+            upper_base + 1.0,
+            "the upper level must rise"
+        );
+        assert_eq!(
+            st.walls[upper].height, wall_height,
+            "its walls must not stretch"
+        );
+        assert_eq!(
+            st.storey_base_z(1),
+            st.storeys[0].height,
+            "stack stays contiguous"
+        );
     }
 
     /// "Duplicate floor up" copies the active level's geometry onto a new level above,
     /// stacked by the storey height — the visible "add a floor" the user expected.
     #[test]
     fn duplicate_storey_up_stacks_a_copy() {
-        let sq = |s: f32| vec![
-            Vec2::new(0.0, 0.0), Vec2::new(s, 0.0), Vec2::new(s, s), Vec2::new(0.0, s),
-            Vec2::new(0.0, 0.0),
-        ];
+        let sq = |s: f32| {
+            vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(s, 0.0),
+                Vec2::new(s, s),
+                Vec2::new(0.0, s),
+                Vec2::new(0.0, 0.0),
+            ]
+        };
         let mut st = FactoryState::default();
-        st.add_building_outline(&sq(6.0), 3.0).unwrap();  // a ground-floor building
+        st.add_building_outline(&sq(6.0), 3.0).unwrap(); // a ground-floor building
         let before = st.model.features.len();
-        let dst = st.duplicate_storey_up().expect("there is geometry to duplicate");
+        let dst = st
+            .duplicate_storey_up()
+            .expect("there is geometry to duplicate");
         assert_eq!(st.storeys.len(), 2, "a new level was added");
         assert_eq!(st.active_storey, dst, "the copy's level becomes active");
-        assert!(st.model.features.len() > before, "the building was copied, not moved");
+        assert!(
+            st.model.features.len() > before,
+            "the building was copied, not moved"
+        );
         let base = st.storey_base_z(dst);
         assert!(base > 0.0);
         assert!(
-            st.model.features.iter().any(|f| (f.world_origin().z - base).abs() < 0.5),
+            st.model
+                .features
+                .iter()
+                .any(|f| (f.world_origin().z - base).abs() < 0.5),
             "the copy stands on the new level"
         );
     }
@@ -12244,15 +14351,21 @@ mod storey_tests {
     #[test]
     fn deleting_a_storey_removes_its_geometry_and_closes_the_gap() {
         let mut st = FactoryState::default();
-        st.add_wall(fp(), 0.2, 2.5);            // ground
+        st.add_wall(fp(), 0.2, 2.5); // ground
         st.add_storey_on_top();
-        st.add_wall(fp(), 0.2, 2.5);            // level 1
+        st.add_wall(fp(), 0.2, 2.5); // level 1
         assert_eq!(st.walls.len(), 2);
 
-        assert!(st.delete_storey(0), "deleting the ground level must succeed");
+        assert!(
+            st.delete_storey(0),
+            "deleting the ground level must succeed"
+        );
         assert_eq!(st.storeys.len(), 1);
         assert_eq!(st.walls.len(), 1, "the ground wall went with its storey");
-        assert_eq!(st.walls[0].base_z, 0.0, "the surviving level dropped to the ground");
+        assert_eq!(
+            st.walls[0].base_z, 0.0,
+            "the surviving level dropped to the ground"
+        );
     }
 
     /// A building must always have a level — otherwise `active_storey` indexes nothing.
@@ -12277,7 +14390,10 @@ mod storey_tests {
         re.apply_persist(back);
         assert_eq!(re.storeys.len(), 2);
         assert_eq!(re.active_storey, 1);
-        assert_eq!(re.walls[0].base_z, st.walls[0].base_z, "the wall kept its level");
+        assert_eq!(
+            re.walls[0].base_z, st.walls[0].base_z,
+            "the wall kept its level"
+        );
 
         // A sidecar written before storeys existed.
         let mut old = FactoryState::default();
@@ -12299,8 +14415,13 @@ mod persist_tests {
         let mut st = FactoryState::default();
         st.wall_height = 3.4;
         st.building_height = 6.5;
-        let fp = vec![Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), Vec2::new(4.0, 3.0)];
-        st.add_wall(fp.clone(), 0.25, 3.4).expect("wall must promote");
+        let fp = vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(4.0, 0.0),
+            Vec2::new(4.0, 3.0),
+        ];
+        st.add_wall(fp.clone(), 0.25, 3.4)
+            .expect("wall must promote");
         st.add_box();
         let features_before = st.model.features.len();
 
@@ -12312,12 +14433,19 @@ mod persist_tests {
         assert_eq!(re.apply_persist(back), 0, "nothing should be dropped");
         assert_eq!(re.model.features.len(), features_before);
         assert_eq!(re.walls.len(), 1);
-        assert_eq!(re.walls[0].footprint.len(), fp.len(), "footprint must survive intact");
+        assert_eq!(
+            re.walls[0].footprint.len(),
+            fp.len(),
+            "footprint must survive intact"
+        );
         assert_eq!(re.walls[0].footprint[1], Vec2::new(4.0, 0.0));
         assert_eq!(re.walls[0].thickness, 0.25);
         assert_eq!(re.wall_height, 3.4);
         assert_eq!(re.building_height, 6.5);
-        assert!(re.dirty, "a restored model must re-evaluate before it can be drawn");
+        assert!(
+            re.dirty,
+            "a restored model must re-evaluate before it can be drawn"
+        );
     }
 
     /// A wall whose segments name features the model does not have is unusable — the
@@ -12328,12 +14456,19 @@ mod persist_tests {
         let mut st = FactoryState::default();
         st.add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(2.0, 0.0)], 0.2, 2.5);
         let mut doc = st.to_persist();
-        doc.walls[0].segments = vec![9999];       // no such feature
+        doc.walls[0].segments = vec![9999]; // no such feature
 
         let mut re = FactoryState::default();
-        assert_eq!(re.apply_persist(doc), 1, "the bad wall must be counted as dropped");
+        assert_eq!(
+            re.apply_persist(doc),
+            1,
+            "the bad wall must be counted as dropped"
+        );
         assert!(re.walls.is_empty());
-        assert!(!re.model.features.is_empty(), "the solids themselves still load");
+        assert!(
+            !re.model.features.is_empty(),
+            "the solids themselves still load"
+        );
     }
 
     /// An older sidecar has no heights (serde fills 0.0). Adopting that would give a
@@ -12370,9 +14505,12 @@ mod building_tests {
     #[test]
     fn building_height_is_state_not_dialog() {
         let mut st = FactoryState::default();
-        assert!(st.building_height > 0.0, "a building must have a usable default height");
+        assert!(
+            st.building_height > 0.0,
+            "a building must have a usable default height"
+        );
         st.building_height = 4.25;
-        st.add_box();   // an unrelated modelling op must not disturb it
+        st.add_box(); // an unrelated modelling op must not disturb it
         assert_eq!(st.building_height, 4.25);
     }
 }
@@ -12387,7 +14525,10 @@ mod persist_perf_tests {
         let v: Vec<f32> = (0..300).map(|i| (i as f32) * 0.12345 - 7.0).collect();
         let dec = decode_f32_blob(&encode_f32_blob(&v));
         assert_eq!(dec.len(), v.len());
-        assert!(v.iter().zip(&dec).all(|(a, b)| (a - b).abs() < 1e-6), "exact f32 round-trip");
+        assert!(
+            v.iter().zip(&dec).all(|(a, b)| (a - b).abs() < 1e-6),
+            "exact f32 round-trip"
+        );
     }
 
     /// A furniture mesh survives a sidecar round-trip through the compact blobs.
@@ -12408,16 +14549,25 @@ mod persist_perf_tests {
 
         let doc = st.to_persist();
         // The heavy JSON arrays must be empty — geometry rides in the blob.
-        assert!(doc.furniture_lib[idx].positions.is_empty(), "no JSON float arrays written");
+        assert!(
+            doc.furniture_lib[idx].positions.is_empty(),
+            "no JSON float arrays written"
+        );
         assert!(!doc.furniture_lib[idx].pos_b64.is_empty(), "blob written");
 
         let mut st2 = FactoryState::default();
         st2.apply_persist(doc);
         let after = st2.furniture_lib[idx].positions.clone();
         assert_eq!(before.len(), after.len(), "vertex count preserved");
-        assert!(before.iter().zip(&after).all(|(a, b)|
-            (a[0]-b[0]).abs()<1e-4 && (a[1]-b[1]).abs()<1e-4 && (a[2]-b[2]).abs()<1e-4),
-            "positions round-trip");
+        assert!(
+            before
+                .iter()
+                .zip(&after)
+                .all(|(a, b)| (a[0] - b[0]).abs() < 1e-4
+                    && (a[1] - b[1]).abs() < 1e-4
+                    && (a[2] - b[2]).abs() < 1e-4),
+            "positions round-trip"
+        );
     }
 
     /// A mixed opaque+glass asset splits correctly and its per-vertex opacity survives a
@@ -12427,8 +14577,12 @@ mod persist_perf_tests {
         // Two triangles: tri 0 opaque (frame), tri 1 glass (alpha 0.2).
         let mesh = crate::mesh_io::ObjMesh {
             positions: vec![
-                [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [1.0, 0.0, 1.0],
+                [0.0, 1.0, 1.0],
             ],
             normals: vec![[0.0, 0.0, 1.0]; 6],
             color: None,
@@ -12437,21 +14591,41 @@ mod persist_perf_tests {
         let mut st = FactoryState::default();
         let idx = st.add_furniture_asset("window".into(), mesh);
         st.place_furniture(idx, Vec3::new(0.0, 0.0, 0.0));
-        assert!(st.furniture_lib[idx].is_translucent(), "asset flagged translucent");
+        assert!(
+            st.furniture_lib[idx].is_translucent(),
+            "asset flagged translucent"
+        );
 
         // Solid pass gets ONLY the opaque triangle; the blended pass gets ONLY the glass one.
-        assert_eq!(st.furniture_local_mesh(0).len(), 3, "one opaque tri in the solid pass");
+        assert_eq!(
+            st.furniture_local_mesh(0).len(),
+            3,
+            "one opaque tri in the solid pass"
+        );
         let (_key, glass) = st.furniture_translucent_mesh(0).expect("glass split out");
         assert_eq!(glass.len(), 3, "one glass tri in the transparent pass");
-        assert!(glass.iter().all(|v| (v.a - 0.2).abs() < 1e-6), "glass carries its opacity");
+        assert!(
+            glass.iter().all(|v| (v.a - 0.2).abs() < 1e-6),
+            "glass carries its opacity"
+        );
 
         // Round-trip through the compact sidecar blob.
         let doc = st.to_persist();
-        assert!(!doc.furniture_lib[idx].alpha_b64.is_empty(), "alpha blob written");
+        assert!(
+            !doc.furniture_lib[idx].alpha_b64.is_empty(),
+            "alpha blob written"
+        );
         let mut st2 = FactoryState::default();
         st2.apply_persist(doc);
-        assert!(st2.furniture_lib[idx].is_translucent(), "still translucent after reload");
-        assert_eq!(st2.furniture_lib[idx].alpha.len(), 6, "per-vertex opacity preserved");
+        assert!(
+            st2.furniture_lib[idx].is_translucent(),
+            "still translucent after reload"
+        );
+        assert_eq!(
+            st2.furniture_lib[idx].alpha.len(),
+            6,
+            "per-vertex opacity preserved"
+        );
     }
 
     /// REGRESSION: a TRANSLUCENT asset (glass panes — e.g. the villa after the FBX opacity import)
@@ -12463,8 +14637,12 @@ mod persist_perf_tests {
         // click at the rect centre fires a +Z ray through (0,0) — square in the quad.
         let mesh = crate::mesh_io::ObjMesh {
             positions: vec![
-                [-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.5, 0.5, 0.0],
-                [-0.5, -0.5, 0.0], [0.5, 0.5, 0.0], [-0.5, 0.5, 0.0],
+                [-0.5, -0.5, 0.0],
+                [0.5, -0.5, 0.0],
+                [0.5, 0.5, 0.0],
+                [-0.5, -0.5, 0.0],
+                [0.5, 0.5, 0.0],
+                [-0.5, 0.5, 0.0],
             ],
             normals: vec![[0.0, 0.0, 1.0]; 6],
             color: None,
@@ -12503,15 +14681,25 @@ mod persist_perf_tests {
         // Main thread: config with EMPTY furniture blobs + the raw flattened geometry.
         let mut doc = st.to_persist_lite();
         let geom = st.furniture_geom_flat();
-        assert!(doc.furniture_lib[idx].pos_b64.is_empty(), "lite leaves blobs empty");
-        assert_eq!(geom.len(), doc.furniture_lib.len(), "one raw geom per asset");
+        assert!(
+            doc.furniture_lib[idx].pos_b64.is_empty(),
+            "lite leaves blobs empty"
+        );
+        assert_eq!(
+            geom.len(),
+            doc.furniture_lib.len(),
+            "one raw geom per asset"
+        );
 
         // Worker: compress the raw geometry into the blobs (what save_file_worker does).
         for (rec, g) in doc.furniture_lib.iter_mut().zip(geom.iter()) {
             rec.pos_b64 = encode_f32_blob(&g.pos);
             rec.nrm_b64 = encode_f32_blob(&g.nrm);
         }
-        assert!(!doc.furniture_lib[idx].pos_b64.is_empty(), "worker filled the blob");
+        assert!(
+            !doc.furniture_lib[idx].pos_b64.is_empty(),
+            "worker filled the blob"
+        );
 
         // Load worker: decode furniture off-thread; main thread installs the prebuilt lib.
         let lib = FactoryState::decode_furniture_lib(std::mem::take(&mut doc.furniture_lib));
@@ -12519,9 +14707,15 @@ mod persist_perf_tests {
         st2.apply_persist_prebuilt(doc, lib, None);
         let after = st2.furniture_lib[idx].positions.clone();
         assert_eq!(before.len(), after.len(), "vertex count preserved");
-        assert!(before.iter().zip(&after).all(|(a, b)|
-            (a[0]-b[0]).abs()<1e-4 && (a[1]-b[1]).abs()<1e-4 && (a[2]-b[2]).abs()<1e-4),
-            "positions round-trip through the deferred worker path");
+        assert!(
+            before
+                .iter()
+                .zip(&after)
+                .all(|(a, b)| (a[0] - b[0]).abs() < 1e-4
+                    && (a[1] - b[1]).abs() < 1e-4
+                    && (a[2] - b[2]).abs() < 1e-4),
+            "positions round-trip through the deferred worker path"
+        );
     }
 }
 
@@ -12534,23 +14728,53 @@ mod aperture_tests {
     /// side < 20 it applies no auto-scale, so the local box is [-w/2,w/2]×[-d/2,d/2]×[0,h].
     fn box_asset(st: &mut FactoryState, w: f32, d: f32, h: f32) -> usize {
         let positions = vec![
-            [-w/2.0, -d/2.0, 0.0], [w/2.0, -d/2.0, 0.0], [w/2.0, d/2.0, 0.0],
-            [-w/2.0, d/2.0, h],    [w/2.0, d/2.0, h],    [-w/2.0, -d/2.0, h],
+            [-w / 2.0, -d / 2.0, 0.0],
+            [w / 2.0, -d / 2.0, 0.0],
+            [w / 2.0, d / 2.0, 0.0],
+            [-w / 2.0, d / 2.0, h],
+            [w / 2.0, d / 2.0, h],
+            [-w / 2.0, -d / 2.0, h],
         ];
         let normals = vec![[0.0, 0.0, 1.0]; positions.len()];
-        st.add_furniture_asset("box".into(), crate::mesh_io::ObjMesh { positions, normals, color: None, alpha: Vec::new() })
+        st.add_furniture_asset(
+            "box".into(),
+            crate::mesh_io::ObjMesh {
+                positions,
+                normals,
+                color: None,
+                alpha: Vec::new(),
+            },
+        )
     }
 
     /// scale_vec resolves uniform vs non-uniform correctly, and `scale` multiplies on top.
     #[test]
     fn scale_vec_resolves_uniform_and_fit() {
-        let mut inst = FurnitureInst { asset: 0, pos: [0.0;3], scale: 2.0, fit: None, rot: [0.0;3], color: [0.8;3], texture: None, surface_texture: std::collections::HashMap::new(), ..Default::default() };
+        let mut inst = FurnitureInst {
+            asset: 0,
+            pos: [0.0; 3],
+            scale: 2.0,
+            fit: None,
+            rot: [0.0; 3],
+            color: [0.8; 3],
+            texture: None,
+            surface_texture: std::collections::HashMap::new(),
+            ..Default::default()
+        };
         assert_eq!(inst.scale_vec(), Vec3::splat(2.0), "uniform");
         inst.scale = 1.0;
         inst.fit = Some([1.2, 3.0, 1.05]);
-        assert_eq!(inst.scale_vec(), Vec3::new(1.2, 3.0, 1.05), "fit used verbatim at scale 1");
+        assert_eq!(
+            inst.scale_vec(),
+            Vec3::new(1.2, 3.0, 1.05),
+            "fit used verbatim at scale 1"
+        );
         inst.scale = 2.0;
-        assert_eq!(inst.scale_vec(), Vec3::new(2.4, 6.0, 2.1), "scale multiplies fit");
+        assert_eq!(
+            inst.scale_vec(),
+            Vec3::new(2.4, 6.0, 2.1),
+            "scale multiplies fit"
+        );
     }
 
     /// place_aperture fills the opening exactly: the placed instance's world AABB matches the
@@ -12565,10 +14789,17 @@ mod aperture_tests {
         let (mn, mx) = st.furniture_aabb(i).unwrap();
         let sz = mx - mn;
         assert!((sz.x - w).abs() < 1e-3, "width along X: {} vs {w}", sz.x);
-        assert!((sz.y - depth).abs() < 1e-3, "depth along Y: {} vs {depth}", sz.y);
+        assert!(
+            (sz.y - depth).abs() < 1e-3,
+            "depth along Y: {} vs {depth}",
+            sz.y
+        );
         assert!((sz.z - h).abs() < 1e-3, "height along Z: {} vs {h}", sz.z);
         let c = (mn + mx) * 0.5;
-        assert!((c - center).length() < 1e-3, "centred on the opening: {c:?} vs {center:?}");
+        assert!(
+            (c - center).length() < 1e-3,
+            "centred on the opening: {c:?} vs {center:?}"
+        );
     }
 
     /// An aperture (placed with `fit`) is flagged `is_aperture`; ordinary uniform-scale furniture
@@ -12577,11 +14808,16 @@ mod aperture_tests {
     fn is_aperture_flags_only_fitted_pieces() {
         let mut st = FactoryState::default();
         let a = box_asset(&mut st, 1.0, 0.1, 2.0);
-        let ap = st.place_aperture(a, Vec3::new(1.0, 0.0, 1.0), Vec3::X, 1.0, 2.0, 0.2).unwrap();
+        let ap = st
+            .place_aperture(a, Vec3::new(1.0, 0.0, 1.0), Vec3::X, 1.0, 2.0, 0.2)
+            .unwrap();
         assert!(st.is_aperture(ap), "a fitted door/window is an aperture");
         st.place_furniture(a, Vec3::new(5.0, 5.0, 0.0));
         let plain = st.furniture.len() - 1;
-        assert!(!st.is_aperture(plain), "uniform-scale furniture is not an aperture");
+        assert!(
+            !st.is_aperture(plain),
+            "uniform-scale furniture is not an aperture"
+        );
     }
 
     /// A bundled door/window IMPORTED free-standing (so it has no `fit`) is still recognised as an
@@ -12592,13 +14828,23 @@ mod aperture_tests {
         let win = {
             let positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 2.0]];
             let normals = vec![[0.0, 1.0, 0.0]; 3];
-            st.add_furniture_asset("Window".into(),
-                crate::mesh_io::ObjMesh { positions, normals, color: None, alpha: Vec::new() })
+            st.add_furniture_asset(
+                "Window".into(),
+                crate::mesh_io::ObjMesh {
+                    positions,
+                    normals,
+                    color: None,
+                    alpha: Vec::new(),
+                },
+            )
         };
         st.place_furniture(win, Vec3::new(0.0, 0.0, 0.0)); // free-standing → no fit
         let i = st.furniture.len() - 1;
         assert!(st.furniture[i].fit.is_none(), "placed without a fit");
-        assert!(st.is_aperture(i), "a Window-named asset is an aperture even without fit");
+        assert!(
+            st.is_aperture(i),
+            "a Window-named asset is an aperture even without fit"
+        );
     }
 
     /// The aperture selection tolerance scales with the wall thickness it fills, so a door in a
@@ -12607,11 +14853,21 @@ mod aperture_tests {
     fn aperture_pick_tol_scales_with_thickness() {
         let mut st = FactoryState::default();
         let a = box_asset(&mut st, 1.0, 0.1, 2.0);
-        let thin = st.place_aperture(a, Vec3::new(0.0, 0.0, 1.0), Vec3::X, 1.0, 2.0, 0.1).unwrap();
-        let thick = st.place_aperture(a, Vec3::new(5.0, 0.0, 1.0), Vec3::X, 1.0, 2.0, 1.0).unwrap();
+        let thin = st
+            .place_aperture(a, Vec3::new(0.0, 0.0, 1.0), Vec3::X, 1.0, 2.0, 0.1)
+            .unwrap();
+        let thick = st
+            .place_aperture(a, Vec3::new(5.0, 0.0, 1.0), Vec3::X, 1.0, 2.0, 1.0)
+            .unwrap();
         let (t_thin, t_thick) = (st.aperture_pick_tol(thin), st.aperture_pick_tol(thick));
-        assert!(t_thick > t_thin, "thicker wall → larger tolerance: {t_thin} vs {t_thick}");
-        assert!((0.2..=3.0).contains(&t_thin), "clamped to a usable range: {t_thin}");
+        assert!(
+            t_thick > t_thin,
+            "thicker wall → larger tolerance: {t_thin} vs {t_thick}"
+        );
+        assert!(
+            (0.2..=3.0).contains(&t_thin),
+            "clamped to a usable range: {t_thin}"
+        );
     }
 
     /// A wall running along world-Y (opening horizontal axis = Y): width/height/depth still match,
@@ -12627,10 +14883,17 @@ mod aperture_tests {
         let sz = mx - mn;
         // u_h = +Y → width along Y, depth along X, height along Z.
         assert!((sz.y - w).abs() < 1e-3, "width along Y: {} vs {w}", sz.y);
-        assert!((sz.x - depth).abs() < 1e-3, "depth along X: {} vs {depth}", sz.x);
+        assert!(
+            (sz.x - depth).abs() < 1e-3,
+            "depth along X: {} vs {depth}",
+            sz.x
+        );
         assert!((sz.z - h).abs() < 1e-3, "height along Z: {} vs {h}", sz.z);
         let c = (mn + mx) * 0.5;
-        assert!((c - center).length() < 1e-3, "centred on the opening: {c:?}");
+        assert!(
+            (c - center).length() < 1e-3,
+            "centred on the opening: {c:?}"
+        );
     }
 
     /// The non-uniform `fit` survives a sidecar round-trip (so a placed door/window keeps its
@@ -12649,7 +14912,10 @@ mod aperture_tests {
         assert_eq!(st2.furniture.len(), 1, "instance restored");
         let fit_after = st2.furniture[0].fit.expect("fit restored");
         let fb = fit_before.unwrap();
-        assert!((0..3).all(|k| (fit_after[k] - fb[k]).abs() < 1e-5), "fit round-trips: {fit_after:?} vs {fb:?}");
+        assert!(
+            (0..3).all(|k| (fit_after[k] - fb[k]).abs() < 1e-5),
+            "fit round-trips: {fit_after:?} vs {fb:?}"
+        );
     }
 }
 
@@ -12662,18 +14928,34 @@ mod cutout_tests {
     fn cutout_list_and_delete() {
         let mut st = FactoryState::default();
         st.model.push(
-            cad_solid::BoolOp::Union, cad_solid::Plane::default(),
-            cad_solid::Placement::default(), Primitive::Box { w: 2.0, d: 2.0, h: 2.0 },
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::default(),
+            cad_solid::Placement::default(),
+            Primitive::Box {
+                w: 2.0,
+                d: 2.0,
+                h: 2.0,
+            },
         );
         st.recompute();
         let plain = st.scene_verts().len();
 
         st.model.push(
-            cad_solid::BoolOp::Difference, cad_solid::Plane::default(),
-            cad_solid::Placement::default(), Primitive::Box { w: 0.5, d: 0.5, h: 3.0 },
+            cad_solid::BoolOp::Difference,
+            cad_solid::Plane::default(),
+            cad_solid::Placement::default(),
+            Primitive::Box {
+                w: 0.5,
+                d: 0.5,
+                h: 3.0,
+            },
         );
         st.recompute();
-        assert_ne!(st.scene_verts().len(), plain, "the cut changed the geometry");
+        assert_ne!(
+            st.scene_verts().len(),
+            plain,
+            "the cut changed the geometry"
+        );
 
         let ids = st.cutout_ids();
         assert_eq!(ids.len(), 1, "one cutout listed");
@@ -12686,7 +14968,11 @@ mod cutout_tests {
         st.delete_cutout(id);
         st.recompute();
         assert!(st.cutout_ids().is_empty(), "cutout removed");
-        assert_eq!(st.scene_verts().len(), plain, "the opening filled back to the plain solid");
+        assert_eq!(
+            st.scene_verts().len(),
+            plain,
+            "the opening filled back to the plain solid"
+        );
     }
 }
 
@@ -12699,11 +14985,19 @@ mod decimation_tests {
     #[test]
     fn cluster_decimate_drops_slivers_keeps_shape() {
         let pos = vec![
-            [0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0], // spans distinct cells → kept
-            [0.0, 0.0, 0.0], [0.001, 0.0, 0.0], [0.0, 0.001, 0.0], // sub-cell sliver → dropped
+            [0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [0.0, 10.0, 0.0], // spans distinct cells → kept
+            [0.0, 0.0, 0.0],
+            [0.001, 0.0, 0.0],
+            [0.0, 0.001, 0.0], // sub-cell sliver → dropped
         ];
         let (dp, dn) = cluster_decimate(&pos, 8);
-        assert_eq!(dp.len() / 3, 1, "one real triangle survives, the sliver is dropped");
+        assert_eq!(
+            dp.len() / 3,
+            1,
+            "one real triangle survives, the sliver is dropped"
+        );
         assert_eq!(dp.len(), dn.len(), "a normal per vertex");
     }
 
@@ -12743,10 +15037,17 @@ mod clipboard_tests {
         let orig = st.furniture[0].pos;
 
         assert!(st.copy_selection(), "furniture copied");
-        assert_eq!(st.paste_clipboard(), Some(false), "furniture paste (not a feature)");
+        assert_eq!(
+            st.paste_clipboard(),
+            Some(false),
+            "furniture paste (not a feature)"
+        );
         assert_eq!(st.furniture.len(), 2, "one clone added");
         let copy = st.furniture[1].pos;
-        assert!((copy[0] - orig[0] - 0.3).abs() < 1e-4 && (copy[1] - orig[1] - 0.3).abs() < 1e-4, "offset by 0.3 m");
+        assert!(
+            (copy[0] - orig[0] - 0.3).abs() < 1e-4 && (copy[1] - orig[1] - 0.3).abs() < 1e-4,
+            "offset by 0.3 m"
+        );
         assert_eq!(st.sel_furniture, vec![1], "the copy is selected");
     }
 
@@ -12755,8 +15056,14 @@ mod clipboard_tests {
     fn copy_paste_feature_clones_with_colour() {
         let mut st = FactoryState::default();
         st.model.push(
-            BoolOp::Union, Plane::default(), Placement::default(),
-            Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+            BoolOp::Union,
+            Plane::default(),
+            Placement::default(),
+            Primitive::Box {
+                w: 1.0,
+                d: 1.0,
+                h: 1.0,
+            },
         );
         st.recompute();
         let id = st.model.features.last().unwrap().id;
@@ -12765,13 +15072,24 @@ mod clipboard_tests {
         let n = st.model.features.len();
 
         assert!(st.copy_selection(), "feature copied");
-        assert_eq!(st.paste_clipboard(), Some(true), "feature paste needs recompute");
+        assert_eq!(
+            st.paste_clipboard(),
+            Some(true),
+            "feature paste needs recompute"
+        );
         assert_eq!(st.model.features.len(), n + 1, "one feature added");
         let new_id = *st.selection.first().unwrap();
         assert_ne!(new_id, id, "the clone has a fresh id");
-        assert_eq!(st.feature_color.get(&new_id).copied(), Some([1.0, 0.0, 0.0]), "colour carried");
+        assert_eq!(
+            st.feature_color.get(&new_id).copied(),
+            Some([1.0, 0.0, 0.0]),
+            "colour carried"
+        );
         let f = st.model.features.iter().find(|f| f.id == new_id).unwrap();
-        assert!((f.placement.u - 0.3).abs() < 1e-4 && (f.placement.v - 0.3).abs() < 1e-4, "placement offset");
+        assert!(
+            (f.placement.u - 0.3).abs() < 1e-4 && (f.placement.v - 0.3).abs() < 1e-4,
+            "placement offset"
+        );
     }
 
     /// Pasting with an empty buffer is a no-op.
@@ -12786,23 +15104,37 @@ mod clipboard_tests {
     #[test]
     fn copy_paste_aperture_preserves_fit() {
         let mut st = FactoryState::default();
-        let a = st.add_furniture_asset("door".into(), crate::mesh_io::ObjMesh {
-            positions: vec![
-                [-0.5, -0.05, 0.0], [0.5, -0.05, 0.0], [0.5, 0.05, 0.0],
-                [-0.5, 0.05, 2.0],  [0.5, 0.05, 2.0],  [-0.5, -0.05, 2.0],
-            ],
-            normals: vec![[0.0, 0.0, 1.0]; 6],
-            color: Some([0.7, 0.7, 0.7]),
-            alpha: Vec::new(),
-        });
+        let a = st.add_furniture_asset(
+            "door".into(),
+            crate::mesh_io::ObjMesh {
+                positions: vec![
+                    [-0.5, -0.05, 0.0],
+                    [0.5, -0.05, 0.0],
+                    [0.5, 0.05, 0.0],
+                    [-0.5, 0.05, 2.0],
+                    [0.5, 0.05, 2.0],
+                    [-0.5, -0.05, 2.0],
+                ],
+                normals: vec![[0.0, 0.0, 1.0]; 6],
+                color: Some([0.7, 0.7, 0.7]),
+                alpha: Vec::new(),
+            },
+        );
         st.place_aperture(a, Vec3::new(5.0, 3.0, 1.0), Vec3::X, 1.2, 2.1, 0.3);
         let fit0 = st.furniture[0].fit;
         assert!(fit0.is_some(), "aperture carries a non-uniform fit");
         st.select_furniture(0);
         assert!(st.copy_selection(), "aperture furniture copied");
-        assert_eq!(st.paste_clipboard(), Some(false), "furniture paste (not a feature)");
+        assert_eq!(
+            st.paste_clipboard(),
+            Some(false),
+            "furniture paste (not a feature)"
+        );
         assert_eq!(st.furniture.len(), 2, "one clone added");
-        assert_eq!(st.furniture[1].fit, fit0, "the copy keeps the stretched fit");
+        assert_eq!(
+            st.furniture[1].fit, fit0,
+            "the copy keeps the stretched fit"
+        );
         assert_eq!(st.sel_furniture, vec![1], "the copy is selected");
     }
 
@@ -12811,13 +15143,27 @@ mod clipboard_tests {
     #[test]
     fn copy_paste_extruded_solid_clones() {
         let mut st = FactoryState::default();
-        let sq = [Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(1.0, 1.0), Vec2::new(0.0, 1.0)];
+        let sq = [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(0.0, 1.0),
+        ];
         let (profile, c, w, d) = st.model.add_profile(&sq).unwrap();
         let mut placement = Placement::default();
         placement.u = c.x;
         placement.v = c.y;
-        let id = st.model.push(BoolOp::Union, Plane::default(), placement,
-            Primitive::Extrusion { profile, h: 0.8, w, d });
+        let id = st.model.push(
+            BoolOp::Union,
+            Plane::default(),
+            placement,
+            Primitive::Extrusion {
+                profile,
+                h: 0.8,
+                w,
+                d,
+            },
+        );
         st.feature_color.insert(id, [0.6, 0.62, 0.70]);
         st.recompute();
         let n = st.model.features.len();
@@ -12825,12 +15171,20 @@ mod clipboard_tests {
         st.selection = vec![id];
 
         assert!(st.copy_selection(), "extruded solid copied");
-        assert_eq!(st.paste_clipboard(), Some(true), "feature paste needs recompute");
+        assert_eq!(
+            st.paste_clipboard(),
+            Some(true),
+            "feature paste needs recompute"
+        );
         st.recompute();
         assert_eq!(st.model.features.len(), n + 1, "one clone added");
         let new_id = *st.selection.first().unwrap();
         assert_ne!(new_id, id, "fresh id");
-        assert_eq!(st.feature_color.get(&new_id).copied(), Some([0.6, 0.62, 0.70]), "colour carried");
+        assert_eq!(
+            st.feature_color.get(&new_id).copied(),
+            Some([0.6, 0.62, 0.70]),
+            "colour carried"
+        );
         assert!(!st.scene_verts().is_empty(), "both solids render");
     }
 
@@ -12838,13 +15192,24 @@ mod clipboard_tests {
     #[test]
     fn paste_feature_without_paint_adds_no_surface_entries() {
         let mut st = FactoryState::default();
-        st.model.push(BoolOp::Union, Plane::default(), Placement::default(),
-            Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
+        st.model.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement::default(),
+            Primitive::Box {
+                w: 1.0,
+                d: 1.0,
+                h: 1.0,
+            },
+        );
         st.recompute();
         st.selection = vec![st.model.features[0].id];
         assert!(st.copy_selection());
         assert_eq!(st.paste_clipboard(), Some(true));
-        assert!(st.surface_color.is_empty() && st.surface_texture.is_empty(), "no stray per-face entries");
+        assert!(
+            st.surface_color.is_empty() && st.surface_texture.is_empty(),
+            "no stray per-face entries"
+        );
     }
 }
 
@@ -12861,17 +15226,26 @@ mod extrude_property_tests {
     struct Lcg(u64);
     impl Lcg {
         fn u32(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (self.0 >> 33) as u32
         }
-        fn f32(&mut self) -> f32 { self.u32() as f32 / u32::MAX as f32 }
-        fn range(&mut self, a: f32, b: f32) -> f32 { a + (b - a) * self.f32() }
+        fn f32(&mut self) -> f32 {
+            self.u32() as f32 / u32::MAX as f32
+        }
+        fn range(&mut self, a: f32, b: f32) -> f32 {
+            a + (b - a) * self.f32()
+        }
     }
 
     /// A simple (non-self-intersecting) polygon: random radii at ANGULARLY SORTED vertices around
     /// a centre — star-shaped, so it's always a valid closed outline `add_profile` accepts.
     fn simple_poly(rng: &mut Lcg, n: usize, cx: f32, cy: f32, r: f32) -> Vec<Vec2> {
-        let mut angs: Vec<f32> = (0..n).map(|_| rng.range(0.0, std::f32::consts::TAU)).collect();
+        let mut angs: Vec<f32> = (0..n)
+            .map(|_| rng.range(0.0, std::f32::consts::TAU))
+            .collect();
         angs.sort_by(|a, b| a.partial_cmp(b).unwrap());
         angs.into_iter()
             .map(|a| {
@@ -12893,9 +15267,13 @@ mod extrude_property_tests {
             let pts = simple_poly(&mut rng, n, cx, cy, r);
 
             let mut st = FactoryState::default();
-            let Ok((profile, centre, w, d)) = st.model.add_profile(&pts) else { continue };
+            let Ok((profile, centre, w, d)) = st.model.add_profile(&pts) else {
+                continue;
+            };
             st.model.push(
-                BoolOp::Union, Plane::default(), Placement::default(),
+                BoolOp::Union,
+                Plane::default(),
+                Placement::default(),
                 Primitive::Extrusion { profile, h, w, d },
             );
             st.recompute(); // MUST NOT panic on any random valid sketch
@@ -12907,18 +15285,33 @@ mod extrude_property_tests {
             let (mut zmn, mut zmx) = (f32::MAX, f32::MIN);
             let (mut xmn, mut xmx, mut ymn, mut ymx) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
             for p in pos {
-                assert!(p[0].is_finite() && p[1].is_finite() && p[2].is_finite(), "no NaN/Inf vertices");
-                zmn = zmn.min(p[2]); zmx = zmx.max(p[2]);
-                xmn = xmn.min(p[0]); xmx = xmx.max(p[0]);
-                ymn = ymn.min(p[1]); ymx = ymx.max(p[1]);
+                assert!(
+                    p[0].is_finite() && p[1].is_finite() && p[2].is_finite(),
+                    "no NaN/Inf vertices"
+                );
+                zmn = zmn.min(p[2]);
+                zmx = zmx.max(p[2]);
+                xmn = xmn.min(p[0]);
+                xmx = xmx.max(p[0]);
+                ymn = ymn.min(p[1]);
+                ymx = ymx.max(p[1]);
             }
-            assert!(zmx - zmn > 0.0 && zmx - zmn <= h + 1e-2, "solid height ≈ extrude depth");
+            assert!(
+                zmx - zmn > 0.0 && zmx - zmn <= h + 1e-2,
+                "solid height ≈ extrude depth"
+            );
             // The extruded footprint can't exceed the sketch's own bbox (+ a small margin).
-            assert!(xmx - xmn <= w + 1e-2 && ymx - ymn <= d + 1e-2, "footprint within the sketch");
+            assert!(
+                xmx - xmn <= w + 1e-2 && ymx - ymn <= d + 1e-2,
+                "footprint within the sketch"
+            );
             let _ = centre;
             extruded += 1;
         }
-        assert!(extruded > 500, "most random polygons extruded successfully ({extruded}/600)");
+        assert!(
+            extruded > 500,
+            "most random polygons extruded successfully ({extruded}/600)"
+        );
     }
 
     /// Degenerate / malformed sketches are REJECTED cleanly (a typed error), never a panic — the
@@ -12927,22 +15320,50 @@ mod extrude_property_tests {
     fn degenerate_sketches_are_rejected_without_panicking() {
         let mut st = FactoryState::default();
         // Fewer than 3 distinct points.
-        assert!(st.model.add_profile(&[Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0)]).is_err());
+        assert!(st
+            .model
+            .add_profile(&[Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0)])
+            .is_err());
         // All duplicates → collapses below 3.
         assert!(st.model.add_profile(&[Vec2::splat(2.0); 5]).is_err());
         // Collinear → zero area.
-        assert!(st.model
-            .add_profile(&[Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(2.0, 0.0)])
+        assert!(st
+            .model
+            .add_profile(&[
+                Vec2::new(0.0, 0.0),
+                Vec2::new(1.0, 0.0),
+                Vec2::new(2.0, 0.0)
+            ])
             .is_err());
         // Bow-tie (self-intersecting).
-        assert!(st.model
-            .add_profile(&[Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)])
+        assert!(st
+            .model
+            .add_profile(&[
+                Vec2::new(0.0, 0.0),
+                Vec2::new(1.0, 1.0),
+                Vec2::new(1.0, 0.0),
+                Vec2::new(0.0, 1.0)
+            ])
             .is_err());
         // A valid square extruded to ZERO height must not panic (may yield a flat/empty mesh).
-        let sq = [Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(1.0, 1.0), Vec2::new(0.0, 1.0)];
+        let sq = [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(0.0, 1.0),
+        ];
         if let Ok((profile, _c, w, d)) = st.model.add_profile(&sq) {
-            st.model.push(BoolOp::Union, Plane::default(), Placement::default(),
-                Primitive::Extrusion { profile, h: 0.0, w, d });
+            st.model.push(
+                BoolOp::Union,
+                Plane::default(),
+                Placement::default(),
+                Primitive::Extrusion {
+                    profile,
+                    h: 0.0,
+                    w,
+                    d,
+                },
+            );
             st.recompute(); // no panic
         }
     }
@@ -12954,8 +15375,14 @@ mod extrude_property_tests {
     fn per_face_paint_survives_copy_paste() {
         let mut st = FactoryState::default();
         st.model.push(
-            BoolOp::Union, Plane::default(), Placement::default(),
-            Primitive::Box { w: 2.0, d: 2.0, h: 2.0 },
+            BoolOp::Union,
+            Plane::default(),
+            Placement::default(),
+            Primitive::Box {
+                w: 2.0,
+                d: 2.0,
+                h: 2.0,
+            },
         );
         st.recompute();
         let id = st.model.features[0].id;
@@ -12979,11 +15406,19 @@ mod extrude_property_tests {
         // A face of the PASTED feature must resolve (via its real geometry) to the copied paint.
         let mut found = false;
         for (i, tri) in st.cached.positions.chunks_exact(3).enumerate() {
-            if st.cached.face_ids.get(i).copied() != Some(new_id) { continue; }
+            if st.cached.face_ids.get(i).copied() != Some(new_id) {
+                continue;
+            }
             let k = surface_key(new_id, tri[0], tri[1], tri[2]);
-            if st.surface_color.get(&k) == Some(&paint) { found = true; break; }
+            if st.surface_color.get(&k) == Some(&paint) {
+                found = true;
+                break;
+            }
         }
-        assert!(found, "per-face paint transferred to the matching face of the pasted feature");
+        assert!(
+            found,
+            "per-face paint transferred to the matching face of the pasted feature"
+        );
     }
 }
 
@@ -13034,7 +15469,10 @@ mod texture_tests {
             },
         );
         st.place_furniture(idx, Vec3::new(0.0, 0.0, 0.0));
-        assert!(st.furniture_textured_mesh(0).is_none(), "no texture yet → None");
+        assert!(
+            st.furniture_textured_mesh(0).is_none(),
+            "no texture yet → None"
+        );
 
         let ti = st.add_texture("img".into(), 2, 2, vec![255; 16]);
         st.furniture[0].texture = Some(ti);
@@ -13042,7 +15480,12 @@ mod texture_tests {
         assert_eq!(tex_idx, ti);
         assert_eq!(verts.len(), 3, "one vertex per position");
         for v in &verts {
-            assert!((0.0..=1.0).contains(&v.u) && (0.0..=1.0).contains(&v.v), "uv in [0,1]: {},{}", v.u, v.v);
+            assert!(
+                (0.0..=1.0).contains(&v.u) && (0.0..=1.0).contains(&v.v),
+                "uv in [0,1]: {},{}",
+                v.u,
+                v.v
+            );
             assert!(v.s > 0.0 && v.s <= 1.0, "shade in (0,1]: {}", v.s);
         }
         // Z-facing face → UV comes from XY: the (1,0,0) vertex maps to u=1, the (0,1,0) to v=1.
@@ -13053,13 +15496,24 @@ mod texture_tests {
     fn box_soup(o: [f32; 3]) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
         let vtx = |x: f32, y: f32, z: f32| [o[0] + x, o[1] + y, o[2] + z];
         let c = [
-            vtx(0.0, 0.0, 0.0), vtx(1.0, 0.0, 0.0), vtx(1.0, 1.0, 0.0), vtx(0.0, 1.0, 0.0),
-            vtx(0.0, 0.0, 1.0), vtx(1.0, 0.0, 1.0), vtx(1.0, 1.0, 1.0), vtx(0.0, 1.0, 1.0),
+            vtx(0.0, 0.0, 0.0),
+            vtx(1.0, 0.0, 0.0),
+            vtx(1.0, 1.0, 0.0),
+            vtx(0.0, 1.0, 0.0),
+            vtx(0.0, 0.0, 1.0),
+            vtx(1.0, 0.0, 1.0),
+            vtx(1.0, 1.0, 1.0),
+            vtx(0.0, 1.0, 1.0),
         ];
         let mut pos = Vec::new();
         let mut nrm = Vec::new();
         let mut quad = |a: usize, b: usize, cc: usize, d: usize| {
-            let (pa, pb, pcc, pd) = (Vec3::from(c[a]), Vec3::from(c[b]), Vec3::from(c[cc]), Vec3::from(c[d]));
+            let (pa, pb, pcc, pd) = (
+                Vec3::from(c[a]),
+                Vec3::from(c[b]),
+                Vec3::from(c[cc]),
+                Vec3::from(c[d]),
+            );
             let n = (pb - pa).cross(pcc - pa).normalize_or_zero().to_array();
             for p in [c[a], c[b], c[cc], c[a], c[cc], c[d]] {
                 pos.push(p);
@@ -13082,8 +15536,14 @@ mod texture_tests {
         let mut st = FactoryState::default();
         let mut add_box = || {
             st.model.push(
-                cad_solid::BoolOp::Union, cad_solid::Plane::default(), cad_solid::Placement::default(),
-                Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+                cad_solid::BoolOp::Union,
+                cad_solid::Plane::default(),
+                cad_solid::Placement::default(),
+                Primitive::Box {
+                    w: 1.0,
+                    d: 1.0,
+                    h: 1.0,
+                },
             )
         };
         let (a, b, c) = (add_box(), add_box(), add_box());
@@ -13123,7 +15583,12 @@ mod texture_tests {
         nrm.extend(n2);
         let idx = st.add_furniture_asset(
             "twobox".into(),
-            crate::mesh_io::ObjMesh { positions: pos, normals: nrm, color: None, alpha: Vec::new() },
+            crate::mesh_io::ObjMesh {
+                positions: pos,
+                normals: nrm,
+                color: None,
+                alpha: Vec::new(),
+            },
         );
         st.place_furniture(idx, Vec3::ZERO);
         let ti = st.add_texture("img".into(), 1, 1, vec![255; 4]);
@@ -13138,9 +15603,17 @@ mod texture_tests {
         let fac = st.furniture_faceted(0).expect("faceted split");
         assert_eq!(fac.opaque.len(), 1, "one texture used");
         assert_eq!(fac.opaque[0].0, ti);
-        assert_eq!(fac.opaque[0].2.len(), 6, "only that flat face's 2 tris are textured");
+        assert_eq!(
+            fac.opaque[0].2.len(),
+            6,
+            "only that flat face's 2 tris are textured"
+        );
         let flat = fac.flat.as_ref().expect("flat remainder");
-        assert_eq!(flat.1.len(), st.furniture_lib[idx].positions.len() - 6, "everything else stays flat");
+        assert_eq!(
+            flat.1.len(),
+            st.furniture_lib[idx].positions.len() - 6,
+            "everything else stays flat"
+        );
 
         // Now paint the WHOLE first body: all 6 faces (12 tris = 36 verts) of box 0 textured.
         st.furniture[0].surface_texture.clear();
@@ -13151,8 +15624,16 @@ mod texture_tests {
             }
         }
         let fac = st.furniture_faceted(0).expect("faceted split");
-        assert_eq!(fac.opaque[0].2.len(), 36, "the whole first box (12 tris) is textured");
-        assert_eq!(fac.flat.as_ref().expect("remainder").1.len(), 36, "the second box stays flat");
+        assert_eq!(
+            fac.opaque[0].2.len(),
+            36,
+            "the whole first box (12 tris) is textured"
+        );
+        assert_eq!(
+            fac.flat.as_ref().expect("remainder").1.len(),
+            36,
+            "the second box stays flat"
+        );
     }
 
     /// A GENERATED staircase carries per-primitive part ids, so "piece" grouping gives one tread
@@ -13160,13 +15641,22 @@ mod texture_tests {
     #[test]
     fn generated_stair_pieces_are_per_primitive_not_the_whole_run() {
         use cad_solid::architecture::{build_stairs, StairParams};
-        let sp = StairParams { total_height: 2.0, desired_riser_height: 0.2, ..Default::default() };
+        let sp = StairParams {
+            total_height: 2.0,
+            desired_riser_height: 0.2,
+            ..Default::default()
+        };
         let m = build_stairs(&sp).unwrap();
         let part_ids = m.face_ids.clone();
         let mut st = FactoryState::default();
         let idx = st.add_furniture_asset(
             "stair".into(),
-            crate::mesh_io::ObjMesh { positions: m.positions, normals: m.normals, color: None, alpha: Vec::new() },
+            crate::mesh_io::ObjMesh {
+                positions: m.positions,
+                normals: m.normals,
+                color: None,
+                alpha: Vec::new(),
+            },
         );
         // Mirror arch_build_and_place: tag the asset with its per-primitive part ids.
         assert_eq!(part_ids.len(), st.furniture_lib[idx].positions.len() / 3);
@@ -13175,11 +15665,17 @@ mod texture_tests {
         let g = st.furniture_lib[idx].group_geom();
         let ntri = st.furniture_lib[idx].positions.len() / 3;
         let bodies = g.body.iter().copied().max().unwrap() + 1;
-        assert!(bodies > 10, "many pieces (treads/risers/rails/balusters), got {bodies}");
+        assert!(
+            bodies > 10,
+            "many pieces (treads/risers/rails/balusters), got {bodies}"
+        );
         // No single piece is the whole object (the old welded-run bug).
         for b in 0..bodies {
             let cnt = g.body.iter().filter(|&&x| x == b).count();
-            assert!(cnt * 3 < ntri, "piece {b} is not the whole run ({cnt} of {ntri} tris)");
+            assert!(
+                cnt * 3 < ntri,
+                "piece {b} is not the whole run ({cnt} of {ntri} tris)"
+            );
         }
         // FACE groups must not span primitives: no face group covers a big chunk of the mesh
         // (the coplanar-sides-merge bug — a stair side is coplanar-connected across every tread).
@@ -13200,22 +15696,41 @@ mod texture_tests {
     #[test]
     fn generated_helical_ramp_deck_is_one_smooth_piece_plus_balustrade() {
         use cad_solid::architecture::{build_helical_ramp, HelicalRampParams};
-        let m = build_helical_ramp(&HelicalRampParams { segments_per_turn: 48, ..Default::default() }).unwrap();
+        let m = build_helical_ramp(&HelicalRampParams {
+            segments_per_turn: 48,
+            ..Default::default()
+        })
+        .unwrap();
         let part_ids = m.face_ids.clone();
         let mut st = FactoryState::default();
         let idx = st.add_furniture_asset(
             "ramp".into(),
-            crate::mesh_io::ObjMesh { positions: m.positions, normals: m.normals, color: None, alpha: Vec::new() },
+            crate::mesh_io::ObjMesh {
+                positions: m.positions,
+                normals: m.normals,
+                color: None,
+                alpha: Vec::new(),
+            },
         );
-        assert_eq!(part_ids.len(), st.furniture_lib[idx].positions.len() / 3, "one part id per triangle");
+        assert_eq!(
+            part_ids.len(),
+            st.furniture_lib[idx].positions.len() / 3,
+            "one part id per triangle"
+        );
         st.furniture_lib[idx].part_ids = part_ids;
         st.place_furniture(idx, Vec3::ZERO);
-        assert!(st.furniture_has_parts(0), "the placed ramp carries part ids");
+        assert!(
+            st.furniture_has_parts(0),
+            "the placed ramp carries part ids"
+        );
 
         let g = st.furniture_lib[idx].group_geom();
         // Many pieces overall — the deck is ONE, but each rail and post is its own piece.
         let bodies = g.body.iter().copied().max().unwrap() + 1;
-        assert!(bodies > 20, "rails + posts are many separate pieces, got {bodies}");
+        assert!(
+            bodies > 20,
+            "rails + posts are many separate pieces, got {bodies}"
+        );
     }
 
     /// Painting a face is AUTHORITATIVE: it drops any whole-object texture so the rest of the
@@ -13226,7 +15741,12 @@ mod texture_tests {
         let (pos, nrm) = box_soup([0.0, 0.0, 0.0]);
         let idx = st.add_furniture_asset(
             "box".into(),
-            crate::mesh_io::ObjMesh { positions: pos, normals: nrm, color: None, alpha: Vec::new() },
+            crate::mesh_io::ObjMesh {
+                positions: pos,
+                normals: nrm,
+                color: None,
+                alpha: Vec::new(),
+            },
         );
         st.place_furniture(idx, Vec3::ZERO);
         let ti = st.add_texture("img".into(), 1, 1, vec![255; 4]);
@@ -13238,13 +15758,23 @@ mod texture_tests {
         let fg0 = groups.face[0];
         st.apply_face_texture(0, &[fg0], ti);
 
-        assert_eq!(st.furniture[0].texture, None, "whole-object texture dropped");
-        assert_eq!(st.furniture[0].surface_texture.get(&fg0).copied(), Some(ti), "face textured");
+        assert_eq!(
+            st.furniture[0].texture, None,
+            "whole-object texture dropped"
+        );
+        assert_eq!(
+            st.furniture[0].surface_texture.get(&fg0).copied(),
+            Some(ti),
+            "face textured"
+        );
         // Only that one face is textured now; the rest are flat (no whole-object mask).
         let fac = st.furniture_faceted(0).expect("faceted");
         assert_eq!(fac.opaque.len(), 1);
         assert_eq!(fac.opaque[0].2.len(), 6, "just the clicked face");
-        assert!(fac.flat.is_some(), "the rest is flat, not whole-object textured");
+        assert!(
+            fac.flat.is_some(),
+            "the rest is flat, not whole-object textured"
+        );
     }
 
     /// Tuning a PIECE's opacity/reflection must not touch the rest of the object: the piece gets
@@ -13256,7 +15786,12 @@ mod texture_tests {
         let (pos, nrm) = box_soup([0.0, 0.0, 0.0]);
         let idx = st.add_furniture_asset(
             "box".into(),
-            crate::mesh_io::ObjMesh { positions: pos, normals: nrm, color: None, alpha: Vec::new() },
+            crate::mesh_io::ObjMesh {
+                positions: pos,
+                normals: nrm,
+                color: None,
+                alpha: Vec::new(),
+            },
         );
         st.place_furniture(idx, Vec3::ZERO);
         let ti = st.add_texture("img".into(), 1, 1, vec![255; 4]);
@@ -13267,13 +15802,27 @@ mod texture_tests {
 
         // Tuning a piece seeded from the whole-object texture must CLONE (ti is used outside).
         let piece_ti = st.private_piece_material(0, &[fg0]);
-        assert_ne!(piece_ti, ti, "the piece got its OWN copy, not the shared whole-object texture");
-        assert_eq!(st.furniture[0].surface_texture.get(&fg0).copied(), Some(piece_ti), "piece bound to its copy");
-        assert_eq!(st.furniture[0].texture, Some(ti), "the whole-object texture is left intact");
+        assert_ne!(
+            piece_ti, ti,
+            "the piece got its OWN copy, not the shared whole-object texture"
+        );
+        assert_eq!(
+            st.furniture[0].surface_texture.get(&fg0).copied(),
+            Some(piece_ti),
+            "piece bound to its copy"
+        );
+        assert_eq!(
+            st.furniture[0].texture,
+            Some(ti),
+            "the whole-object texture is left intact"
+        );
 
         // Changing the piece's opacity leaves the whole-object texture's opacity unchanged.
         st.textures[piece_ti].opacity = 0.3;
-        assert_eq!(st.textures[ti].opacity, 1.0, "whole-object opacity untouched");
+        assert_eq!(
+            st.textures[ti].opacity, 1.0,
+            "whole-object opacity untouched"
+        );
 
         // Idempotent: the piece already owns an exclusive material → no further clone.
         let n = st.textures.len();
@@ -13289,8 +15838,29 @@ mod texture_tests {
     fn private_feature_material_isolates_and_routes_transparency() {
         let mut st = FactoryState::default();
         // Two boxes → two features sharing one texture (as if the whole stair were textured at once).
-        let a = st.model.push(BoolOp::Union, Plane::default(), Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
-        let b = st.model.push(BoolOp::Union, Plane::default(), Placement { u: 3.0, ..Default::default() }, Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
+        let a = st.model.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement::default(),
+            Primitive::Box {
+                w: 1.0,
+                d: 1.0,
+                h: 1.0,
+            },
+        );
+        let b = st.model.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement {
+                u: 3.0,
+                ..Default::default()
+            },
+            Primitive::Box {
+                w: 1.0,
+                d: 1.0,
+                h: 1.0,
+            },
+        );
         st.recompute();
         let ti = st.add_texture("shared".into(), 1, 1, vec![200, 200, 210, 255]);
         st.feature_texture.insert(a, ti);
@@ -13300,17 +15870,42 @@ mod texture_tests {
         // Tuning solid `a` alone must clone (ti is shared with `b`) and rebind only `a`.
         let pa = st.private_feature_material(&[a]);
         assert_ne!(pa, ti, "solid A got its own copy");
-        assert_eq!(st.feature_texture.get(&a).copied(), Some(pa), "A rebound to its copy");
-        assert_eq!(st.feature_texture.get(&b).copied(), Some(ti), "B still on the shared texture");
+        assert_eq!(
+            st.feature_texture.get(&a).copied(),
+            Some(pa),
+            "A rebound to its copy"
+        );
+        assert_eq!(
+            st.feature_texture.get(&b).copied(),
+            Some(ti),
+            "B still on the shared texture"
+        );
 
         // Make A see-through; B stays opaque. The textured-feature verts split by opacity.
         st.textures[pa].opacity = 0.3;
-        assert_eq!(st.textures[ti].opacity, 1.0, "B's texture opacity untouched");
+        assert_eq!(
+            st.textures[ti].opacity, 1.0,
+            "B's texture opacity untouched"
+        );
         let groups = st.feature_textured_meshes();
-        let a_verts = groups.iter().find(|(t, _)| *t == pa).map(|(_, v)| v).expect("A group");
-        let b_verts = groups.iter().find(|(t, _)| *t == ti).map(|(_, v)| v).expect("B group");
-        assert!(a_verts.iter().all(|v| (v.a - 0.3).abs() < 1e-3), "A carries its opacity → blended pass");
-        assert!(b_verts.iter().all(|v| v.a >= ALPHA_OPAQUE), "B stays opaque");
+        let a_verts = groups
+            .iter()
+            .find(|(t, _)| *t == pa)
+            .map(|(_, v)| v)
+            .expect("A group");
+        let b_verts = groups
+            .iter()
+            .find(|(t, _)| *t == ti)
+            .map(|(_, v)| v)
+            .expect("B group");
+        assert!(
+            a_verts.iter().all(|v| (v.a - 0.3).abs() < 1e-3),
+            "A carries its opacity → blended pass"
+        );
+        assert!(
+            b_verts.iter().all(|v| v.a >= ALPHA_OPAQUE),
+            "B stays opaque"
+        );
     }
 
     /// A TEXTURED piece with glass splits between the opaque image pass and the blended textured
@@ -13323,8 +15918,12 @@ mod texture_tests {
             "win".into(),
             crate::mesh_io::ObjMesh {
                 positions: vec![
-                    [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], // frame (opaque)
-                    [0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0], // glass (0.25)
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0], // frame (opaque)
+                    [0.0, 0.0, 1.0],
+                    [1.0, 0.0, 1.0],
+                    [0.0, 1.0, 1.0], // glass (0.25)
                 ],
                 normals: vec![[0.0, 0.0, 1.0]; 6],
                 color: None,
@@ -13335,14 +15934,26 @@ mod texture_tests {
         let ti = st.add_texture("frame".into(), 2, 2, vec![255; 16]);
         st.furniture[0].texture = Some(ti);
 
-        let (_ti1, opaque_key, opaque) = st.furniture_textured_mesh(0).expect("opaque textured tris");
+        let (_ti1, opaque_key, opaque) =
+            st.furniture_textured_mesh(0).expect("opaque textured tris");
         assert_eq!(opaque.len(), 3, "only the frame triangle is opaque");
-        assert!(opaque.iter().all(|v| v.a >= ALPHA_OPAQUE), "opaque verts carry full opacity");
+        assert!(
+            opaque.iter().all(|v| v.a >= ALPHA_OPAQUE),
+            "opaque verts carry full opacity"
+        );
 
-        let (_ti2, glass_key, glass) = st.furniture_textured_translucent_mesh(0).expect("glass tris");
+        let (_ti2, glass_key, glass) = st
+            .furniture_textured_translucent_mesh(0)
+            .expect("glass tris");
         assert_eq!(glass.len(), 3, "only the glass triangle is translucent");
-        assert!(glass.iter().all(|v| (v.a - 0.25).abs() < 1e-6), "glass carries its opacity");
-        assert_ne!(opaque_key, glass_key, "opaque and glass use distinct GPU buffers");
+        assert!(
+            glass.iter().all(|v| (v.a - 0.25).abs() < 1e-6),
+            "glass carries its opacity"
+        );
+        assert_ne!(
+            opaque_key, glass_key,
+            "opaque and glass use distinct GPU buffers"
+        );
     }
 
     /// Texturing a FEATURE moves its triangles out of the flat batch and into the textured
@@ -13351,8 +15962,14 @@ mod texture_tests {
     fn feature_texture_moves_tris_to_the_textured_pass() {
         let mut st = FactoryState::default();
         st.model.push(
-            cad_solid::BoolOp::Union, cad_solid::Plane::default(),
-            cad_solid::Placement::default(), Primitive::Box { w: 2.0, d: 2.0, h: 2.0 },
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::default(),
+            cad_solid::Placement::default(),
+            Primitive::Box {
+                w: 2.0,
+                d: 2.0,
+                h: 2.0,
+            },
         );
         st.recompute();
         let id = st.model.features.last().unwrap().id;
@@ -13363,14 +15980,24 @@ mod texture_tests {
         st.feature_texture.insert(id, ti);
 
         let flat_after = st.scene_verts().len();
-        assert!(flat_after < flat_before, "textured feature leaves the flat batch");
+        assert!(
+            flat_after < flat_before,
+            "textured feature leaves the flat batch"
+        );
 
         let groups = st.feature_textured_meshes();
         assert_eq!(groups.len(), 1, "one texture group");
         let (gi, verts) = &groups[0];
         assert_eq!(*gi, ti);
-        assert_eq!(verts.len(), flat_before - flat_after, "moved tris == removed tris");
-        assert!(verts.iter().all(|v| v.s > 0.0 && v.s <= 1.0), "shade in (0,1]");
+        assert_eq!(
+            verts.len(),
+            flat_before - flat_after,
+            "moved tris == removed tris"
+        );
+        assert!(
+            verts.iter().all(|v| v.s > 0.0 && v.s <= 1.0),
+            "shade in (0,1]"
+        );
     }
 
     /// Textures + their assignments + tiling survive a sidecar round-trip (PNG/base64), and a
@@ -13379,15 +16006,20 @@ mod texture_tests {
     fn textures_persist_through_the_sidecar() {
         let mut st = FactoryState::default();
         st.model.push(
-            cad_solid::BoolOp::Union, cad_solid::Plane::default(),
-            cad_solid::Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::default(),
+            cad_solid::Placement::default(),
+            Primitive::Box {
+                w: 1.0,
+                d: 1.0,
+                h: 1.0,
+            },
         );
         st.recompute();
         let id = st.model.features.last().unwrap().id;
         // A distinct 2×2 RGBA image so a decode error would be caught.
         let px: Vec<u8> = vec![
-            255, 0, 0, 255,   0, 255, 0, 255,
-            0, 0, 255, 255,   255, 255, 0, 255,
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ];
         let ti = st.add_texture("img".into(), 2, 2, px.clone());
         st.textures[ti].scale = 3.5;
@@ -13400,8 +16032,15 @@ mod texture_tests {
         assert_eq!(st2.textures.len(), 1, "texture restored");
         assert_eq!(st2.textures[0].w, 2);
         assert_eq!(st2.textures[0].rgba, px, "pixels round-trip exactly");
-        assert!((st2.textures[0].scale - 3.5).abs() < 1e-4, "tiling restored");
-        assert_eq!(st2.feature_texture.get(&id).copied(), Some(0), "assignment restored");
+        assert!(
+            (st2.textures[0].scale - 3.5).abs() < 1e-4,
+            "tiling restored"
+        );
+        assert_eq!(
+            st2.feature_texture.get(&id).copied(),
+            Some(0),
+            "assignment restored"
+        );
     }
 
     /// A UNIFORM environment of radiance `l` as SH coefficients — only the `l = 0` band is
@@ -13421,18 +16060,39 @@ mod texture_tests {
     fn sun_light_drives_directional_shading() {
         use glam::Vec3;
         // Disabled → the fixed two-sided key light (front and back shade equally under |n·dir|).
-        set_sun_light(false, Vec3::new(0.0, 0.0, 1.0), [1.0, 1.0, 1.0], flat_sh(0.3));
+        set_sun_light(
+            false,
+            Vec3::new(0.0, 0.0, 1.0),
+            [1.0, 1.0, 1.0],
+            flat_sh(0.3),
+        );
         let up = shade([1.0, 1.0, 1.0], Vec3::Z);
         let down = shade([1.0, 1.0, 1.0], -Vec3::Z);
-        assert!((up.col[0] - down.col[0]).abs() < 1e-6, "studio light is two-sided");
+        assert!(
+            (up.col[0] - down.col[0]).abs() < 1e-6,
+            "studio light is two-sided"
+        );
 
         // Enabled, sun straight up → an up-facing surface is lit, a down-facing one gets only ambient.
-        set_sun_light(true, Vec3::new(0.0, 0.0, 1.0), [1.0, 0.95, 0.85], flat_sh(0.25));
+        set_sun_light(
+            true,
+            Vec3::new(0.0, 0.0, 1.0),
+            [1.0, 0.95, 0.85],
+            flat_sh(0.25),
+        );
         let lit = shade([1.0, 1.0, 1.0], Vec3::Z);
         let shadow = shade([1.0, 1.0, 1.0], -Vec3::Z);
-        assert!(lit.col[0] > shadow.col[0] + 0.3, "sun-facing brighter than shadow side: {lit:?} vs {shadow:?}");
+        assert!(
+            lit.col[0] > shadow.col[0] + 0.3,
+            "sun-facing brighter than shadow side: {lit:?} vs {shadow:?}"
+        );
         // Reset so other tests see the default.
-        set_sun_light(false, Vec3::new(0.35, 0.25, 0.9), [1.0, 0.96, 0.88], flat_sh(0.32));
+        set_sun_light(
+            false,
+            Vec3::new(0.35, 0.25, 0.9),
+            [1.0, 0.96, 0.88],
+            flat_sh(0.32),
+        );
     }
 
     /// The ambient SHARE is what ambient occlusion is allowed to darken, so it has to track where
@@ -13445,17 +16105,33 @@ mod texture_tests {
         set_sun_light(true, Vec3::Z, [2.0, 2.0, 2.0], flat_sh(0.3));
         let lit = shade([0.8; 3], Vec3::Z);
         let away = shade([0.8; 3], -Vec3::Z);
-        assert!(away.amb > 0.99, "a surface facing away from the sun is lit purely by the sky: {away:?}");
-        assert!(lit.amb < 0.2, "a surface facing a 2.0 sun against a 0.3 sky is mostly direct: {lit:?}");
+        assert!(
+            away.amb > 0.99,
+            "a surface facing away from the sun is lit purely by the sky: {away:?}"
+        );
+        assert!(
+            lit.amb < 0.2,
+            "a surface facing a 2.0 sun against a 0.3 sky is mostly direct: {lit:?}"
+        );
         // The split must be lossless: ambient + direct is the colour, whatever the share.
-        assert!(lit.col[0] > away.col[0], "the sunlit face is still the brighter one");
+        assert!(
+            lit.col[0] > away.col[0],
+            "the sunlit face is still the brighter one"
+        );
         // Studio mode: the fixed key is 0.35 fill + 0.65 directional, so a face square to it is
         // 0.35/1.0 ambient and one edge-on is all ambient.
         set_sun_light(false, Vec3::Z, [1.0; 3], flat_sh(0.0));
         let d = Vec3::new(0.35, 0.25, 0.9).normalize();
-        assert!((shade([0.8; 3], d).amb - 0.35).abs() < 0.02, "{:?}", shade([0.8; 3], d));
+        assert!(
+            (shade([0.8; 3], d).amb - 0.35).abs() < 0.02,
+            "{:?}",
+            shade([0.8; 3], d)
+        );
         let edge = d.cross(Vec3::Z).normalize();
-        assert!(shade([0.8; 3], edge).amb > 0.99, "edge-on to the key light is pure fill");
+        assert!(
+            shade([0.8; 3], edge).amb > 0.99,
+            "edge-on to the key light is pure fill"
+        );
     }
 
     /// Clay mode overrides the shaded base colour to neutral grey (same for any input colour),
@@ -13467,10 +16143,16 @@ mod texture_tests {
         set_clay(true);
         let red = shade([0.9, 0.1, 0.1], Vec3::Z);
         let blue = shade([0.1, 0.1, 0.9], Vec3::Z);
-        assert!((red.col[0] - blue.col[0]).abs() < 1e-6 && (red.col[2] - blue.col[2]).abs() < 1e-6, "clay greys any colour the same");
+        assert!(
+            (red.col[0] - blue.col[0]).abs() < 1e-6 && (red.col[2] - blue.col[2]).abs() < 1e-6,
+            "clay greys any colour the same"
+        );
         set_clay(false);
         let red2 = shade([0.9, 0.1, 0.1], Vec3::Z);
-        assert!(red2.col[0] > red2.col[2] + 0.2, "colour restored when clay off");
+        assert!(
+            red2.col[0] > red2.col[2] + 0.2,
+            "colour restored when clay off"
+        );
     }
 
     /// The baked colour must be **scene-referred linear** and must NOT be tone-mapped: Phase 1
@@ -13484,23 +16166,42 @@ mod texture_tests {
         let a = shade([1.0; 3], Vec3::Z).col[0];
         set_sun_light(true, Vec3::Z, [4.0; 3], flat_sh(0.0));
         let b = shade([1.0; 3], Vec3::Z).col[0];
-        assert!(b > 3.0, "4x the light must give ~4x the value, not a saturated one: {a} -> {b}");
+        assert!(
+            b > 3.0,
+            "4x the light must give ~4x the value, not a saturated one: {a} -> {b}"
+        );
         assert!((b / a - 4.0).abs() < 0.01, "and exactly 4x: {a} -> {b}");
         // Albedo is decoded from sRGB, so a 0.5 swatch contributes its LINEAR 0.214.
         set_sun_light(true, Vec3::Z, [1.0; 3], flat_sh(0.0));
         let half = shade([0.5; 3], Vec3::Z).col[0];
-        assert!((half - crate::color::srgb_to_linear(0.5)).abs() < 1e-4, "albedo must be decoded: {half}");
-        set_sun_light(false, Vec3::new(0.35, 0.25, 0.9), [1.0, 0.96, 0.88], flat_sh(0.32));
+        assert!(
+            (half - crate::color::srgb_to_linear(0.5)).abs() < 1e-4,
+            "albedo must be decoded: {half}"
+        );
+        set_sun_light(
+            false,
+            Vec3::new(0.35, 0.25, 0.9),
+            [1.0, 0.96, 0.88],
+            flat_sh(0.32),
+        );
     }
 
     /// [`SunEnv::resolve`] returns a normalized daytime sun direction and a dimmer light at night.
     #[test]
     fn sun_env_resolves_day_and_night() {
-        let noon = SunEnv { enabled: true, hour: 13.0, ..Default::default() };
+        let noon = SunEnv {
+            enabled: true,
+            hour: 13.0,
+            ..Default::default()
+        };
         let (en, dir, sun, _sky, _gnd) = noon.resolve();
         assert!(en && dir.z > 0.5, "midday sun is high");
         assert!((dir.length() - 1.0).abs() < 1e-3, "unit direction");
-        let night = SunEnv { enabled: true, hour: 1.0, ..Default::default() };
+        let night = SunEnv {
+            enabled: true,
+            hour: 1.0,
+            ..Default::default()
+        };
         let (_e, ndir, nsun, _s, _g) = night.resolve();
         assert!(ndir.z < 0.0, "sun below horizon at 1 am");
         assert!(nsun[0] < sun[0], "night direct light dimmer than noon");
@@ -13511,16 +16212,30 @@ mod texture_tests {
     #[test]
     fn material_presets_build_into_assets() {
         let presets = material_presets();
-        assert!(presets.len() >= 25, "a real library, not a stub: {}", presets.len());
+        assert!(
+            presets.len() >= 25,
+            "a real library, not a stub: {}",
+            presets.len()
+        );
         let mut seen = std::collections::HashSet::new();
         let mut st = FactoryState::default();
         for p in &presets {
-            assert!(seen.insert((p.category, p.name)), "duplicate preset {}/{}", p.category, p.name);
+            assert!(
+                seen.insert((p.category, p.name)),
+                "duplicate preset {}/{}",
+                p.category,
+                p.name
+            );
             let idx = st.add_preset_material(p);
             let t = &st.textures[idx];
             assert_eq!(t.name, p.name);
-            assert!((t.metallic - p.metallic).abs() < 1e-6 && (t.roughness - p.roughness).abs() < 1e-6);
-            assert!(t.proc.is_some(), "every preset is procedural/solid (live-uniform driven)");
+            assert!(
+                (t.metallic - p.metallic).abs() < 1e-6 && (t.roughness - p.roughness).abs() < 1e-6
+            );
+            assert!(
+                t.proc.is_some(),
+                "every preset is procedural/solid (live-uniform driven)"
+            );
         }
         // Spot checks: glass see-through, chrome metallic-glossy, LED emits.
         let glass = presets.iter().find(|p| p.name == "Clear glass").unwrap();
@@ -13544,8 +16259,15 @@ mod texture_tests {
         let doc = st.to_persist();
         let mut st2 = FactoryState::default();
         st2.apply_persist(doc);
-        assert_eq!(st2.textures[base].normal_map, Some(nrm), "normal map index restored");
-        assert!((st2.textures[base].roughness - 0.2).abs() < 1e-4, "roughness restored");
+        assert_eq!(
+            st2.textures[base].normal_map,
+            Some(nrm),
+            "normal map index restored"
+        );
+        assert!(
+            (st2.textures[base].roughness - 0.2).abs() < 1e-4,
+            "roughness restored"
+        );
     }
 
     /// A PROCEDURAL texture (wood grain) survives the sidecar round-trip — pattern + colours + grain
@@ -13579,7 +16301,12 @@ mod texture_tests {
         let (pos, nrm) = box_soup([0.0, 0.0, 0.0]);
         let idx = st.add_furniture_asset(
             "box".into(),
-            crate::mesh_io::ObjMesh { positions: pos, normals: nrm, color: None, alpha: Vec::new() },
+            crate::mesh_io::ObjMesh {
+                positions: pos,
+                normals: nrm,
+                color: None,
+                alpha: Vec::new(),
+            },
         );
         st.place_furniture(idx, Vec3::ZERO);
         let ti = st.add_texture("img".into(), 1, 1, vec![255; 4]);
@@ -13608,7 +16335,10 @@ mod texture_tests {
         st2.apply_persist(doc);
         let t = &st2.textures[0];
         assert!((t.scale - 2.0).abs() < 1e-4, "tiling restored");
-        assert!((t.offset[0] - 0.25).abs() < 1e-4 && (t.offset[1] + 0.5).abs() < 1e-4, "move restored");
+        assert!(
+            (t.offset[0] - 0.25).abs() < 1e-4 && (t.offset[1] + 0.5).abs() < 1e-4,
+            "move restored"
+        );
         assert!((t.rot_deg - 90.0).abs() < 1e-3, "rotation restored");
     }
 
@@ -13620,15 +16350,24 @@ mod texture_tests {
         assert_eq!(t.map_uv(0.3, 0.7), [0.3, 0.7], "identity at defaults");
         t.scale = 2.0;
         let uv = t.map_uv(1.0, 0.0);
-        assert!((uv[0] - 2.0).abs() < 1e-4 && uv[1].abs() < 1e-4, "tiling ×2: {uv:?}");
+        assert!(
+            (uv[0] - 2.0).abs() < 1e-4 && uv[1].abs() < 1e-4,
+            "tiling ×2: {uv:?}"
+        );
         t.scale = 1.0;
         t.offset = [0.1, 0.2];
         let uv = t.map_uv(0.3, 0.7);
-        assert!((uv[0] - 0.4).abs() < 1e-4 && (uv[1] - 0.9).abs() < 1e-4, "offset shifts: {uv:?}");
+        assert!(
+            (uv[0] - 0.4).abs() < 1e-4 && (uv[1] - 0.9).abs() < 1e-4,
+            "offset shifts: {uv:?}"
+        );
         t.offset = [0.0, 0.0];
         t.rot_deg = 90.0;
         let uv = t.map_uv(1.0, 0.5); // right-centre → top-centre under a 90° spin about (0.5,0.5)
-        assert!((uv[0] - 0.5).abs() < 1e-3 && (uv[1] - 1.0).abs() < 1e-3, "90° rotate: {uv:?}");
+        assert!(
+            (uv[0] - 0.5).abs() < 1e-3 && (uv[1] - 1.0).abs() < 1e-3,
+            "90° rotate: {uv:?}"
+        );
     }
 
     /// A per-SURFACE texture moves only that face's triangles out of the flat batch (the other
@@ -13637,8 +16376,14 @@ mod texture_tests {
     fn per_surface_texture_moves_only_that_face() {
         let mut st = FactoryState::default();
         st.model.push(
-            cad_solid::BoolOp::Union, cad_solid::Plane::default(),
-            cad_solid::Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::default(),
+            cad_solid::Placement::default(),
+            Primitive::Box {
+                w: 1.0,
+                d: 1.0,
+                h: 1.0,
+            },
         );
         st.recompute();
         let flat_before = st.scene_verts().len();
@@ -13652,19 +16397,30 @@ mod texture_tests {
         st.surface_texture.insert(key, ti);
 
         let flat_after = st.scene_verts().len();
-        assert!(flat_after < flat_before, "the painted face leaves the flat batch");
+        assert!(
+            flat_after < flat_before,
+            "the painted face leaves the flat batch"
+        );
         assert!(flat_after > 0, "the OTHER faces stay flat-shaded");
 
         let groups = st.feature_textured_meshes();
         assert_eq!(groups.len(), 1, "one texture group");
         assert_eq!(groups[0].0, ti);
-        assert_eq!(groups[0].1.len(), flat_before - flat_after, "moved tris == removed tris");
+        assert_eq!(
+            groups[0].1.len(),
+            flat_before - flat_after,
+            "moved tris == removed tris"
+        );
 
         // Round-trips through the sidecar.
         let doc = st.to_persist();
         let mut st2 = FactoryState::default();
         st2.apply_persist(doc);
-        assert_eq!(st2.surface_texture.get(&key).copied(), Some(0), "surface texture restored");
+        assert_eq!(
+            st2.surface_texture.get(&key).copied(),
+            Some(0),
+            "surface texture restored"
+        );
     }
 }
 
@@ -13682,23 +16438,72 @@ mod draw3d_edit_tests {
     #[test]
     fn load_from_then_build_round_trips() {
         let cases = [
-            Primitive::Box { w: 3.0, d: 4.0, h: 2.5 },
-            Primitive::Cylinder { r: 1.2, h: 5.0, sides: 20 },
-            Primitive::Sphere { r: 2.0, segments: 40, stacks: 18 },
-            Primitive::Frustum { r_bottom: 2.0, r_top: 0.0, h: 3.0, sides: 24 }, // cone
-            Primitive::Frustum { r_bottom: 1.5, r_top: 1.5, h: 2.0, sides: 6 },  // prism
-            Primitive::Frustum { r_bottom: 2.0, r_top: 0.0, h: 3.0, sides: 4 },  // pyramid
-            Primitive::Torus { major_r: 3.0, minor_r: 0.8, seg_major: 36, seg_minor: 18 },
-            Primitive::Capsule { r: 0.7, h: 2.0, segments: 24, stacks: 12 },
-            Primitive::Tube { r_outer: 2.0, r_inner: 1.0, h: 3.0, sides: 28 },
-            Primitive::Ellipsoid { rx: 1.0, ry: 2.0, rz: 0.5, segments: 32, stacks: 16 },
+            Primitive::Box {
+                w: 3.0,
+                d: 4.0,
+                h: 2.5,
+            },
+            Primitive::Cylinder {
+                r: 1.2,
+                h: 5.0,
+                sides: 20,
+            },
+            Primitive::Sphere {
+                r: 2.0,
+                segments: 40,
+                stacks: 18,
+            },
+            Primitive::Frustum {
+                r_bottom: 2.0,
+                r_top: 0.0,
+                h: 3.0,
+                sides: 24,
+            }, // cone
+            Primitive::Frustum {
+                r_bottom: 1.5,
+                r_top: 1.5,
+                h: 2.0,
+                sides: 6,
+            }, // prism
+            Primitive::Frustum {
+                r_bottom: 2.0,
+                r_top: 0.0,
+                h: 3.0,
+                sides: 4,
+            }, // pyramid
+            Primitive::Torus {
+                major_r: 3.0,
+                minor_r: 0.8,
+                seg_major: 36,
+                seg_minor: 18,
+            },
+            Primitive::Capsule {
+                r: 0.7,
+                h: 2.0,
+                segments: 24,
+                stacks: 12,
+            },
+            Primitive::Tube {
+                r_outer: 2.0,
+                r_inner: 1.0,
+                h: 3.0,
+                sides: 28,
+            },
+            Primitive::Ellipsoid {
+                rx: 1.0,
+                ry: 2.0,
+                rz: 0.5,
+                segments: 32,
+                stacks: 16,
+            },
         ];
         for p in cases {
             let mut dlg = Draw3dDialog::new(Draw3dKind::Box);
             dlg.load_from(&p);
             let rebuilt = dlg.build();
             assert_eq!(
-                format!("{rebuilt:?}"), format!("{p:?}"),
+                format!("{rebuilt:?}"),
+                format!("{p:?}"),
                 "load_from → build must reproduce the primitive"
             );
         }
@@ -13726,7 +16531,10 @@ mod wall_tests {
             }
             other => panic!("wall segment must be a Box, got {other:?}"),
         }
-        assert!((f.placement.u - 2.0).abs() < 1e-4, "placed at the midpoint u");
+        assert!(
+            (f.placement.u - 2.0).abs() < 1e-4,
+            "placed at the midpoint u"
+        );
         assert!(f.placement.v.abs() < 1e-4, "placed at the midpoint v");
         assert!(f.placement.spin_deg.abs() < 1e-4, "run along +X → spin 0°");
     }
@@ -13737,11 +16545,18 @@ mod wall_tests {
         let mut st = FactoryState::default();
         st.add_wall_segment(Vec2::new(0.0, 0.0), Vec2::new(0.0, 3.0), 0.2, 2.7); // +Y
         assert_eq!(st.model.features.len(), 1);
-        assert!((st.model.features[0].placement.spin_deg - 90.0).abs() < 1e-3, "+Y run → spin 90°");
+        assert!(
+            (st.model.features[0].placement.spin_deg - 90.0).abs() < 1e-3,
+            "+Y run → spin 90°"
+        );
 
         st.add_wall_segment(Vec2::new(1.0, 1.0), Vec2::new(1.0, 1.0), 0.2, 2.7); // zero length
         st.add_wall_segment(Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), 0.0, 2.7); // zero thickness
-        assert_eq!(st.model.features.len(), 1, "degenerate segments are ignored");
+        assert_eq!(
+            st.model.features.len(),
+            1,
+            "degenerate segments are ignored"
+        );
     }
 
     /// Walls stay ALIVE (owner, 2026-07-17): a promotion records a live wall whose height
@@ -13754,11 +16569,17 @@ mod wall_tests {
         let fid = st.walls[0].segments[0];
 
         st.set_wall_height(fid, 3.2);
-        assert!((st.walls[0].height - 3.2).abs() < 1e-4, "registry height updated");
+        assert!(
+            (st.walls[0].height - 3.2).abs() < 1e-4,
+            "registry height updated"
+        );
         match st.model.get_mut(fid).unwrap().primitive {
             Primitive::Box { w, d, h } => {
                 assert!((h - 3.2).abs() < 1e-4, "box height re-derived");
-                assert!((w - 4.0).abs() < 1e-4 && (d - 0.3).abs() < 1e-4, "length & thickness kept");
+                assert!(
+                    (w - 4.0).abs() < 1e-4 && (d - 0.3).abs() < 1e-4,
+                    "length & thickness kept"
+                );
             }
             _ => panic!("a wall is a Box"),
         }
@@ -13775,14 +16596,24 @@ mod wall_tests {
         let mut st = FactoryState::default();
         // An L-shaped footprint: (0,0)-(4,0)-(4,3) → 2 segments.
         let wi = st
-            .add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), Vec2::new(4.0, 3.0)], 0.3, 2.7)
+            .add_wall(
+                vec![
+                    Vec2::new(0.0, 0.0),
+                    Vec2::new(4.0, 0.0),
+                    Vec2::new(4.0, 3.0),
+                ],
+                0.3,
+                2.7,
+            )
             .expect("L footprint promotes");
         assert_eq!(st.walls[wi].footprint.len(), 3);
         assert_eq!(st.walls[wi].segments.len(), 2, "N points → N−1 segments");
         assert_eq!(st.model.features.len(), 2);
 
         // Add a corner mid first edge, at (2,0): 4 points / 3 segments.
-        let vi = st.wall_insert_vertex(wi, 0, Vec2::new(2.0, 0.0)).expect("split edge 0");
+        let vi = st
+            .wall_insert_vertex(wi, 0, Vec2::new(2.0, 0.0))
+            .expect("split edge 0");
         assert_eq!(vi, 1);
         assert_eq!(st.walls[wi].footprint.len(), 4);
         assert_eq!(st.walls[wi].segments.len(), 3, "add vertex → +1 segment");
@@ -13792,7 +16623,10 @@ mod wall_tests {
         for &fid in &st.walls[wi].segments {
             match st.model.get_mut(fid).expect("segment feature").primitive {
                 Primitive::Box { h, .. } => {
-                    assert!((h - 2.7).abs() < 1e-4, "segment rises full height → vertex on floor & ceiling")
+                    assert!(
+                        (h - 2.7).abs() < 1e-4,
+                        "segment rises full height → vertex on floor & ceiling"
+                    )
                 }
                 _ => panic!("a wall segment must be a Box"),
             }
@@ -13801,17 +16635,26 @@ mod wall_tests {
         // Drag the corner → the surface shifts; still 3 segments.
         st.wall_move_vertex(wi, 1, Vec2::new(2.0, 1.0));
         assert_eq!(st.walls[wi].segments.len(), 3);
-        assert!((st.walls[wi].footprint[1] - Vec2::new(2.0, 1.0)).length() < 1e-6, "vertex moved");
+        assert!(
+            (st.walls[wi].footprint[1] - Vec2::new(2.0, 1.0)).length() < 1e-6,
+            "vertex moved"
+        );
 
         // Delete the corner → back to 3 points / 2 segments.
         assert!(st.wall_delete_vertex(wi, 1), "delete a corner");
         assert_eq!(st.walls[wi].footprint.len(), 3);
         assert_eq!(st.walls[wi].segments.len(), 2);
         // Delete down to the 2-point minimum (one segment), then reject any further delete.
-        assert!(st.wall_delete_vertex(wi, 0), "delete down to a single segment");
+        assert!(
+            st.wall_delete_vertex(wi, 0),
+            "delete down to a single segment"
+        );
         assert_eq!(st.walls[wi].footprint.len(), 2);
         assert_eq!(st.walls[wi].segments.len(), 1);
-        assert!(!st.wall_delete_vertex(wi, 0), "a wall never drops below 2 points");
+        assert!(
+            !st.wall_delete_vertex(wi, 0),
+            "a wall never drops below 2 points"
+        );
     }
 }
 
@@ -13829,10 +16672,19 @@ mod zoom_tests {
         let vp = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let c = vp.center();
         // a centered box, half the viewport height (300 px) → target unchanged, dist halved
-        st.zoom_window(vp, egui::pos2(c.x - 100.0, c.y - 150.0), egui::pos2(c.x + 100.0, c.y + 150.0));
-        assert!((st.cam_target[0] - 5.0).abs() < 1e-3 && (st.cam_target[1] - 5.0).abs() < 1e-3,
-                "a centered box keeps the target");
-        assert!((st.cam_dist - 10.0).abs() < 1e-2, "a half-height box halves the distance");
+        st.zoom_window(
+            vp,
+            egui::pos2(c.x - 100.0, c.y - 150.0),
+            egui::pos2(c.x + 100.0, c.y + 150.0),
+        );
+        assert!(
+            (st.cam_target[0] - 5.0).abs() < 1e-3 && (st.cam_target[1] - 5.0).abs() < 1e-3,
+            "a centered box keeps the target"
+        );
+        assert!(
+            (st.cam_dist - 10.0).abs() < 1e-2,
+            "a half-height box halves the distance"
+        );
     }
 
     /// An off-centre box shifts the target toward it (here: box to the RIGHT of centre).
@@ -13843,7 +16695,11 @@ mod zoom_tests {
         let vp = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let c = vp.center();
         let before = st.cam_target;
-        st.zoom_window(vp, egui::pos2(c.x + 100.0, c.y - 50.0), egui::pos2(c.x + 300.0, c.y + 50.0));
+        st.zoom_window(
+            vp,
+            egui::pos2(c.x + 100.0, c.y - 50.0),
+            egui::pos2(c.x + 300.0, c.y + 50.0),
+        );
         let moved = (st.cam_target[0] - before[0]).abs()
             + (st.cam_target[1] - before[1]).abs()
             + (st.cam_target[2] - before[2]).abs();
@@ -13861,11 +16717,16 @@ mod zoom_tests {
         st.cam_target = [9.0, 9.0, 9.0];
         st.zoom_restore_previous();
         assert!((st.cam_dist - 20.0).abs() < 1e-4, "distance restored");
-        assert!((st.cam_target[0] - 1.0).abs() < 1e-4 && (st.cam_target[2] - 3.0).abs() < 1e-4,
-                "target restored");
+        assert!(
+            (st.cam_target[0] - 1.0).abs() < 1e-4 && (st.cam_target[2] - 3.0).abs() < 1e-4,
+            "target restored"
+        );
         // a second restore is a no-op (the snapshot was consumed)
         st.zoom_restore_previous();
-        assert!((st.cam_dist - 20.0).abs() < 1e-4, "second restore is harmless");
+        assert!(
+            (st.cam_dist - 20.0).abs() < 1e-4,
+            "second restore is harmless"
+        );
     }
 }
 
@@ -13920,7 +16781,12 @@ mod furniture_cuts {
         let r = 0.02;
         (
             Frame::from_point_normal(p, n),
-            vec![vec![Vec2::new(-r, -r), Vec2::new(r, -r), Vec2::new(r, r), Vec2::new(-r, r)]],
+            vec![vec![
+                Vec2::new(-r, -r),
+                Vec2::new(r, -r),
+                Vec2::new(r, r),
+                Vec2::new(-r, r),
+            ]],
         )
     }
 
@@ -13936,15 +16802,23 @@ mod furniture_cuts {
         let original: Vec<[f32; 3]> = st.furniture_lib[st.furniture[fi].asset].positions.clone();
         let (frame, loops) = slot(&st, fi);
 
-        let made = st.add_furniture_cut(fi, &frame, &loops, true, 0.0).expect("the door cuts");
+        let made = st
+            .add_furniture_cut(fi, &frame, &loops, true, 0.0)
+            .expect("the door cuts");
         assert_eq!(made, 1, "one loop, one cut");
         assert_eq!(st.furniture[fi].cuts.len(), 1);
-        assert!(st.furniture[fi].base_asset.is_some(), "the instance now points at a derived copy");
+        assert!(
+            st.furniture[fi].base_asset.is_some(),
+            "the instance now points at a derived copy"
+        );
         assert_ne!(tris(&st, fi), original.len() / 3, "the geometry changed");
 
         st.furniture[fi].cuts[0].enabled = false;
         st.rebuild_cut_asset(fi).unwrap();
-        assert_eq!(st.furniture[fi].base_asset, None, "back to the original asset itself");
+        assert_eq!(
+            st.furniture[fi].base_asset, None,
+            "back to the original asset itself"
+        );
         assert_eq!(
             st.furniture_lib[st.furniture[fi].asset].positions, original,
             "and to the original geometry, exactly"
@@ -13952,7 +16826,10 @@ mod furniture_cuts {
 
         st.furniture[fi].cuts[0].enabled = true;
         st.rebuild_cut_asset(fi).unwrap();
-        assert_ne!(st.furniture_lib[st.furniture[fi].asset].positions, original, "the cut is back");
+        assert_ne!(
+            st.furniture_lib[st.furniture[fi].asset].positions, original,
+            "the cut is back"
+        );
     }
 
     /// Cutting one piece must not touch another placed from the same library entry. Three doors,
@@ -14029,11 +16906,25 @@ mod furniture_cuts {
         let before = st.furniture_lib[a].positions.clone();
 
         let (frame, loops) = slot(&st, 0);
-        let err = st.add_furniture_cut(0, &frame, &loops, true, 0.0).unwrap_err();
-        assert!(matches!(err, cad_solid::meshcut::CutError::NotClosed { .. }), "{err}");
-        assert!(st.furniture[0].cuts.is_empty(), "the failed cut was not recorded");
-        assert_eq!(st.furniture[0].asset, a, "the piece still points at its own asset");
-        assert_eq!(st.furniture_lib[a].positions, before, "and is geometrically untouched");
+        let err = st
+            .add_furniture_cut(0, &frame, &loops, true, 0.0)
+            .unwrap_err();
+        assert!(
+            matches!(err, cad_solid::meshcut::CutError::NotClosed { .. }),
+            "{err}"
+        );
+        assert!(
+            st.furniture[0].cuts.is_empty(),
+            "the failed cut was not recorded"
+        );
+        assert_eq!(
+            st.furniture[0].asset, a,
+            "the piece still points at its own asset"
+        );
+        assert_eq!(
+            st.furniture_lib[a].positions, before,
+            "and is geometrically untouched"
+        );
     }
 
     /// Cuts are stored in the piece's OWN space, so moving and spinning it carries its holes along.
@@ -14064,7 +16955,11 @@ mod furniture_cuts {
         let (mut st, fi) = placed_door();
         st.recompute();
         let (frame, _) = slot(&st, fi);
-        assert_eq!(st.furniture_at_face(&frame), Some(fi), "the frame resolves to its piece");
+        assert_eq!(
+            st.furniture_at_face(&frame),
+            Some(fi),
+            "the frame resolves to its piece"
+        );
 
         // A frame floating in space belongs to nothing.
         let nowhere = Frame::from_point_normal(Vec3::new(9.0, 9.0, 9.0), Vec3::Z);
@@ -14082,17 +16977,35 @@ mod place_tests {
     fn box_corner_and_cylinder_centre() {
         let mut st = FactoryState::default();
         // Box 2×2×1, corner at (10, 20) → centre offset by half-extents (+1, +1).
-        st.place_primitive(Primitive::Box { w: 2.0, d: 2.0, h: 1.0 }, Vec3::new(10.0, 20.0, 0.0));
+        st.place_primitive(
+            Primitive::Box {
+                w: 2.0,
+                d: 2.0,
+                h: 1.0,
+            },
+            Vec3::new(10.0, 20.0, 0.0),
+        );
         assert_eq!(st.model.features.len(), 1);
         let pl = st.model.features[0].placement;
-        assert!((pl.u - 11.0).abs() < 1e-4 && (pl.v - 21.0).abs() < 1e-4,
-                "box's near corner sits at the click");
+        assert!(
+            (pl.u - 11.0).abs() < 1e-4 && (pl.v - 21.0).abs() < 1e-4,
+            "box's near corner sits at the click"
+        );
 
         // Cylinder centred at the click.
-        st.place_primitive(Primitive::Cylinder { r: 1.0, h: 2.0, sides: 24 }, Vec3::new(5.0, -5.0, 0.0));
+        st.place_primitive(
+            Primitive::Cylinder {
+                r: 1.0,
+                h: 2.0,
+                sides: 24,
+            },
+            Vec3::new(5.0, -5.0, 0.0),
+        );
         let pl2 = st.model.features[1].placement;
-        assert!((pl2.u - 5.0).abs() < 1e-4 && (pl2.v + 5.0).abs() < 1e-4,
-                "cylinder centre sits at the click");
+        assert!(
+            (pl2.u - 5.0).abs() < 1e-4 && (pl2.v + 5.0).abs() < 1e-4,
+            "cylinder centre sits at the click"
+        );
     }
 }
 
@@ -14124,7 +17037,12 @@ mod face_highlight {
                 }
             }
         }
-        crate::mesh_io::ObjMesh { positions, normals, color: None, alpha: Vec::new() }
+        crate::mesh_io::ObjMesh {
+            positions,
+            normals,
+            color: None,
+            alpha: Vec::new(),
+        }
     }
 
     fn one_selected_grid(n: usize) -> FactoryState {
@@ -14158,13 +17076,23 @@ mod face_highlight {
         // 40 × 40 quads = 3,200 triangles; the old code emitted 3 segments for every one of them.
         let st = one_selected_grid(40);
         let n = segs(&st).len();
-        assert_eq!(n, 160, "the perimeter of a 40×40 grid is 4 × 40 edges, got {n}");
-        assert!(n * 20 < 3_200 * 3, "…which is a fraction of the 9,600-segment wireframe");
+        assert_eq!(
+            n, 160,
+            "the perimeter of a 40×40 grid is 4 × 40 edges, got {n}"
+        );
+        assert!(
+            n * 20 < 3_200 * 3,
+            "…which is a fraction of the 9,600-segment wireframe"
+        );
 
         // Quadrupling the triangles must only DOUBLE the outline (perimeter, not area). This is
         // the property that makes a 2 M-triangle mesh affordable.
         let dense = one_selected_grid(80);
-        assert_eq!(segs(&dense).len(), 320, "6,400 more triangles cost 160 more segments");
+        assert_eq!(
+            segs(&dense).len(),
+            320,
+            "6,400 more triangles cost 160 more segments"
+        );
     }
 
     /// The cache must survive a camera move — that was the other half of the cost, since the
@@ -14174,18 +17102,28 @@ mod face_highlight {
         let st = one_selected_grid(40);
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let a = st.furniture_face_highlight_segments(rect, &Mat4::IDENTITY.to_cols_array());
-        let ptr = st.face_outline.borrow().as_ref().map(|c| c.edges.as_ptr() as usize);
+        let ptr = st
+            .face_outline
+            .borrow()
+            .as_ref()
+            .map(|c| c.edges.as_ptr() as usize);
 
         // A different view: same outline, different pixels, same allocation.
         let spun = Mat4::from_rotation_z(0.6) * Mat4::from_scale(Vec3::splat(0.8));
         let b = st.furniture_face_highlight_segments(rect, &spun.to_cols_array());
         assert_eq!(
             ptr,
-            st.face_outline.borrow().as_ref().map(|c| c.edges.as_ptr() as usize),
+            st.face_outline
+                .borrow()
+                .as_ref()
+                .map(|c| c.edges.as_ptr() as usize),
             "the cached edges were not rebuilt"
         );
         assert_eq!(a.len(), b.len(), "the same edges are projected");
-        assert!(a.iter().zip(&b).any(|(p, q)| p[0] != q[0]), "…to different places on screen");
+        assert!(
+            a.iter().zip(&b).any(|(p, q)| p[0] != q[0]),
+            "…to different places on screen"
+        );
     }
 
     /// Changing the selection MUST rebuild it — a cache that never invalidates is a bug that
@@ -14195,7 +17133,11 @@ mod face_highlight {
         let mut st = one_selected_grid(40);
         assert_eq!(segs(&st).len(), 160);
         st.furn_face_sel = Some((0, vec![999]));
-        assert_eq!(segs(&st).len(), 0, "a group that selects nothing outlines nothing");
+        assert_eq!(
+            segs(&st).len(),
+            0,
+            "a group that selects nothing outlines nothing"
+        );
         assert!(!st.face_highlight_truncated());
     }
 
@@ -14227,10 +17169,18 @@ mod shader_twin {
         st.sun.hour = 17.0;
         st.sun.north_offset_deg = 40.0;
         st.sun.intensity = 1.6;
-        assert_eq!(a, st.opaque_sig(), "a sun move must not invalidate the buffer");
+        assert_eq!(
+            a,
+            st.opaque_sig(),
+            "a sun move must not invalidate the buffer"
+        );
         // …but switching daylight OFF selects the studio response, which the shader branches on.
         st.sun.enabled = false;
-        assert_ne!(a, st.opaque_sig(), "toggling daylight must still invalidate");
+        assert_ne!(
+            a,
+            st.opaque_sig(),
+            "toggling daylight must still invalidate"
+        );
     }
 
     /// Whatever else changes, a vertex must carry the surface's OWN colour and its normal. If the
@@ -14242,9 +17192,19 @@ mod shader_twin {
         let n = Vec3::new(0.0, 0.0, 1.0);
         let red = [0.8, 0.1, 0.1];
         let vert = v(Vec3::ZERO, shade(red, n));
-        assert!((vert.r - red[0]).abs() < 1e-6, "the vertex carries the authored colour, got {}", vert.r);
+        assert!(
+            (vert.r - red[0]).abs() < 1e-6,
+            "the vertex carries the authored colour, got {}",
+            vert.r
+        );
         assert!((vert.g - red[1]).abs() < 1e-6 && (vert.b - red[2]).abs() < 1e-6);
-        assert!((vert.nz - 1.0).abs() < 1e-6, "and its normal, got ({},{},{})", vert.nx, vert.ny, vert.nz);
+        assert!(
+            (vert.nz - 1.0).abs() < 1e-6,
+            "and its normal, got ({},{},{})",
+            vert.nx,
+            vert.ny,
+            vert.nz
+        );
         assert_eq!(vert.mode, SHADE_SCENE);
         assert_eq!(v(Vec3::ZERO, shade_furniture(red, n)).mode, SHADE_FURNITURE);
         // A UI swatch is not a surface: zero normal, and the shader passes it through unlit.
@@ -14274,14 +17234,27 @@ mod shader_twin {
         let src = crate::light3d::scene_fs_for_test();
         // The studio constants are written into the shader; read them back rather than trust that
         // the two copies were typed the same.
-        for want in ["float fill = furniture ? 0.6 : 0.35;", "(furniture ? 0.4 : 0.65) * abs(dot(N, normalize(STUDIO_DIR)))"] {
+        for want in [
+            "float fill = furniture ? 0.6 : 0.35;",
+            "(furniture ? 0.4 : 0.65) * abs(dot(N, normalize(STUDIO_DIR)))",
+        ] {
             assert!(src.contains(want), "shader no longer contains `{want}`");
         }
-        assert!(src.contains("vec3(0.35, 0.25, 0.9)"), "STUDIO_DIR changed in the shader");
-        assert!(src.contains("float extra = furniture ? 0.05 : 0.0;"), "the furniture ambient floor changed");
+        assert!(
+            src.contains("vec3(0.35, 0.25, 0.9)"),
+            "STUDIO_DIR changed in the shader"
+        );
+        assert!(
+            src.contains("float extra = furniture ? 0.05 : 0.0;"),
+            "the furniture ambient floor changed"
+        );
 
         // The shader's own arithmetic, in Rust.
-        let shader = |albedo: [f32; 3], n: Vec3, furniture: bool, sun: Option<&SunLightRaw>| -> ([f32; 3], [f32; 3]) {
+        let shader = |albedo: [f32; 3],
+                      n: Vec3,
+                      furniture: bool,
+                      sun: Option<&SunLightRaw>|
+         -> ([f32; 3], [f32; 3]) {
             let a = crate::color::srgb_to_linear3(albedo);
             match sun {
                 Some(s) => {
@@ -14289,23 +17262,42 @@ mod shader_twin {
                     let sh = crate::env::sh_ambient(&s.sh, n);
                     let lit = n.dot(s.dir).max(0.0);
                     (
-                        [a[0] * (sh[0] + extra), a[1] * (sh[1] + extra), a[2] * (sh[2] + extra)],
-                        [a[0] * s.sun[0] * lit, a[1] * s.sun[1] * lit, a[2] * s.sun[2] * lit],
+                        [
+                            a[0] * (sh[0] + extra),
+                            a[1] * (sh[1] + extra),
+                            a[2] * (sh[2] + extra),
+                        ],
+                        [
+                            a[0] * s.sun[0] * lit,
+                            a[1] * s.sun[1] * lit,
+                            a[2] * s.sun[2] * lit,
+                        ],
                     )
                 }
                 None => {
                     let fill = if furniture { 0.6 } else { 0.35 };
                     let k = (if furniture { 0.4 } else { 0.65 })
                         * n.dot(Vec3::new(0.35, 0.25, 0.9).normalize()).abs();
-                    ([a[0] * fill, a[1] * fill, a[2] * fill], [a[0] * k, a[1] * k, a[2] * k])
+                    (
+                        [a[0] * fill, a[1] * fill, a[2] * fill],
+                        [a[0] * k, a[1] * k, a[2] * k],
+                    )
                 }
             }
         };
 
-        let normals = [Vec3::Z, Vec3::X, Vec3::new(0.3, -0.6, 0.74).normalize(), -Vec3::Z];
+        let normals = [
+            Vec3::Z,
+            Vec3::X,
+            Vec3::new(0.3, -0.6, 0.74).normalize(),
+            -Vec3::Z,
+        ];
         let colours = [[0.8, 0.1, 0.1], [0.2, 0.5, 0.9], [0.72; 3]];
         // A sky with real directional variation, so an SH mistake cannot hide behind a flat dome.
-        let sky = crate::env::Sky::new(Vec3::new(0.4, 0.3, 0.86).normalize(), crate::env::DEFAULT_TURBIDITY);
+        let sky = crate::env::Sky::new(
+            Vec3::new(0.4, 0.3, 0.86).normalize(),
+            crate::env::DEFAULT_TURBIDITY,
+        );
         let lit_sun = SunLightRaw {
             enabled: true,
             dir: Vec3::new(0.4, 0.3, 0.86).normalize(),
@@ -14321,7 +17313,11 @@ mod shader_twin {
             for &n in &normals {
                 for &c in &colours {
                     for furniture in [false, true] {
-                        let cpu = if furniture { shade_furniture(c, n) } else { shade(c, n) };
+                        let cpu = if furniture {
+                            shade_furniture(c, n)
+                        } else {
+                            shade(c, n)
+                        };
                         let (amb, dir) = shader(c, n, furniture, sun_on.then_some(&lit_sun));
                         // The twin splits into ambient + direct; the CPU packs the same two into a
                         // colour and the ambient's share of it. Recombine and compare.
@@ -14353,7 +17349,15 @@ mod daylight_match {
     /// about geometry rather than about a time of day at some latitude.
     fn sun_at_altitude(alt_deg: f32) -> SunEnv {
         let mut best = (f32::MAX, 12.0f32);
-        let mut e = SunEnv { enabled: true, lat_deg: 15.3, lon_deg: 74.0, utc_offset: 5.5, month: 1, day: 15, ..Default::default() };
+        let mut e = SunEnv {
+            enabled: true,
+            lat_deg: 15.3,
+            lon_deg: 74.0,
+            utc_offset: 5.5,
+            month: 1,
+            day: 15,
+            ..Default::default()
+        };
         for i in 0..(24 * 12) {
             e.hour = i as f32 / 12.0;
             let (_, dir, _, _, _) = e.resolve();
@@ -14375,12 +17379,21 @@ mod daylight_match {
         let e = sun_at_altitude(34.0);
         let (_, dir, sun, _, _) = e.resolve();
         let alt = dir.z.asin().to_degrees();
-        assert!((alt - 34.0).abs() < 3.0, "test set up a {alt:.1}° sun, wanted 34°");
+        assert!(
+            (alt - 34.0).abs() < 3.0,
+            "test set up a {alt:.1}° sun, wanted 34°"
+        );
         // Blender's own sun for this scene is (1.0, 0.745, 0.48): a red:blue ratio of 2.08.
         let ratio = sun[0] / sun[2];
-        assert!(ratio > 1.5, "a 34° sun should be amber (R/B {ratio:.2}, Blender's is 2.08)");
+        assert!(
+            ratio > 1.5,
+            "a 34° sun should be amber (R/B {ratio:.2}, Blender's is 2.08)"
+        );
         let g = sun[1] / sun[0];
-        assert!((0.65..0.85).contains(&g), "green should sit near Blender's 0.745, got {g:.3}");
+        assert!(
+            (0.65..0.85).contains(&g),
+            "green should sit near Blender's 0.745, got {g:.3}"
+        );
     }
 
     /// …but noon must NOT be orange. Warming a low sun is only right if the ramp still resolves
@@ -14390,7 +17403,10 @@ mod daylight_match {
         let e = sun_at_altitude(80.0);
         let (_, _, sun, _, _) = e.resolve();
         let ratio = sun[0] / sun[2];
-        assert!((1.0..1.35).contains(&ratio), "an overhead sun should be near-neutral, R/B {ratio:.2}");
+        assert!(
+            (1.0..1.35).contains(&ratio),
+            "an overhead sun should be near-neutral, R/B {ratio:.2}"
+        );
     }
 
     /// The direct-to-ambient BALANCE was already right, and must stay right — it is the one part
@@ -14403,7 +17419,10 @@ mod daylight_match {
         let (_, _, sun, sky, _) = e.resolve();
         let lum = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
         let r = lum(sun) / lum(sky);
-        assert!((1.2..3.0).contains(&r), "direct:ambient is {r:.2}:1, reference is ~1.8:1");
+        assert!(
+            (1.2..3.0).contains(&r),
+            "direct:ambient is {r:.2}:1, reference is ~1.8:1"
+        );
     }
 }
 
@@ -14420,7 +17439,10 @@ mod reflection_defaults {
     fn a_new_material_reflects_its_surroundings() {
         let t = TextureAsset::new("swatch".into(), 1, 1, vec![128, 128, 128, 255]);
         assert_eq!(t.reflect, 1.0, "a plain swatch is not matte by fiat");
-        assert_eq!(t.metallic, 0.0, "…and it is a dielectric, which is exactly the case that broke");
+        assert_eq!(
+            t.metallic, 0.0,
+            "…and it is a dielectric, which is exactly the case that broke"
+        );
 
         let p = TextureAsset::procedural("wood".into(), ProcDef::oak());
         assert_eq!(p.reflect, 1.0, "a procedural material too");
@@ -14435,7 +17457,10 @@ mod reflection_defaults {
         let mut chalk = TextureAsset::new("stucco".into(), 1, 1, vec![230, 228, 220, 255]);
         chalk.roughness = 0.95;
         assert_eq!((water.reflect, chalk.reflect), (1.0, 1.0));
-        assert!(water.roughness < chalk.roughness, "the difference lives in roughness alone");
+        assert!(
+            water.roughness < chalk.roughness,
+            "the difference lives in roughness alone"
+        );
     }
 
     /// Sidecars written while 0 was the default must not reload with their reflections switched
@@ -14444,13 +17469,28 @@ mod reflection_defaults {
     fn an_old_sidecars_zero_reflect_migrates_to_physical() {
         let png = TextureAsset::new("t".into(), 1, 1, vec![200, 200, 200, 255]).encoded_png();
         let rec = |reflect: f32| crate::simlux_io::TextureRec {
-            name: "t".into(), w: 1, h: 1, scale: 1.0, offset: [0.0, 0.0], rot_deg: 0.0,
-            opacity: 1.0, reflect, png_b64: png.clone(), ..Default::default()
+            name: "t".into(),
+            w: 1,
+            h: 1,
+            scale: 1.0,
+            offset: [0.0, 0.0],
+            rot_deg: 0.0,
+            opacity: 1.0,
+            reflect,
+            png_b64: png.clone(),
+            ..Default::default()
         };
-        assert_eq!(decode_texture_rec(&rec(0.0)).unwrap().reflect, 1.0, "0 = written before this worked");
+        assert_eq!(
+            decode_texture_rec(&rec(0.0)).unwrap().reflect,
+            1.0,
+            "0 = written before this worked"
+        );
         // …but a deliberate knock-down is still honoured.
         let dulled = decode_texture_rec(&rec(0.25)).unwrap().reflect;
-        assert!((dulled - 0.25).abs() < 1e-6, "an authored value survives the round trip");
+        assert!(
+            (dulled - 0.25).abs() < 1e-6,
+            "an authored value survives the round trip"
+        );
     }
 }
 
@@ -14459,14 +17499,24 @@ mod face_on_view {
     use super::*;
 
     fn cam(st: &FactoryState) -> Vec3 {
-        Vec3::from(crate::light3d::cam_eye(st.cam_yaw, st.cam_pitch, st.cam_dist, st.cam_target))
+        Vec3::from(crate::light3d::cam_eye(
+            st.cam_yaw,
+            st.cam_pitch,
+            st.cam_dist,
+            st.cam_target,
+        ))
     }
 
     /// Square-on means the camera sits along the face's normal, looking straight back down it.
     #[test]
     fn the_camera_ends_up_on_the_face_normal() {
         for n in [
-            Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z,
+            Vec3::X,
+            -Vec3::X,
+            Vec3::Y,
+            -Vec3::Y,
+            Vec3::Z,
+            -Vec3::Z,
             Vec3::new(1.0, 1.0, 0.0).normalize(),
             Vec3::new(-0.3, 0.7, 0.65).normalize(),
         ] {
@@ -14480,13 +17530,22 @@ mod face_on_view {
             // unrelated direction, which is what made the first version of this test wrong.)
             st.cam_target = (at + n * 100.0).to_array();
             st.cam_dist = 1.0;
-            assert!((cam(&st) - at).dot(n) > 0.0, "test setup: the eye must start on the +n side");
+            assert!(
+                (cam(&st) - at).dot(n) > 0.0,
+                "test setup: the eye must start on the +n side"
+            );
             st.look_at_frame(&frame, at);
 
             let to_eye = (cam(&st) - at).normalize();
             assert!(to_eye.dot(n) > 0.9999, "n={n:?} put the eye at {to_eye:?}");
-            assert!((Vec3::from(st.cam_target) - at).length() < 1e-4, "the face is centred");
-            assert!(st.ortho, "parallel projection — the scale across the face must be constant");
+            assert!(
+                (Vec3::from(st.cam_target) - at).length() < 1e-4,
+                "the face is centred"
+            );
+            assert!(
+                st.ortho,
+                "parallel projection — the scale across the face must be constant"
+            );
         }
     }
 
@@ -14503,7 +17562,10 @@ mod face_on_view {
         st.cam_target = [-8.0, 0.0, 0.0]; // …but we are standing at −X
         st.cam_dist = 10.0;
         st.look_at_frame(&frame, at);
-        assert!(cam(&st).x < 0.0, "the camera crossed the face instead of squaring up to it");
+        assert!(
+            cam(&st).x < 0.0,
+            "the camera crossed the face instead of squaring up to it"
+        );
     }
 
     /// Distance is preserved: this reframes, it does not also re-zoom.
@@ -14525,10 +17587,23 @@ mod face_on_view {
         let f = Frame::from_point_normal(Vec3::ZERO, Vec3::Z);
         st.cam_target = [0.0, 0.0, 5.0];
         st.look_at_frame(&f, Vec3::ZERO);
-        assert!((st.cam_pitch - std::f32::consts::FRAC_PI_2).abs() < 1e-5,
-            "pitch {} is not straight down", st.cam_pitch);
-        let m = crate::light3d::mvp(st.cam_yaw, st.cam_pitch, st.cam_dist, st.cam_target, 1.5, st.ortho);
-        assert!(m.iter().all(|v| v.is_finite()), "the look-at degeneracy produced a NaN matrix");
+        assert!(
+            (st.cam_pitch - std::f32::consts::FRAC_PI_2).abs() < 1e-5,
+            "pitch {} is not straight down",
+            st.cam_pitch
+        );
+        let m = crate::light3d::mvp(
+            st.cam_yaw,
+            st.cam_pitch,
+            st.cam_dist,
+            st.cam_target,
+            1.5,
+            st.ortho,
+        );
+        assert!(
+            m.iter().all(|v| v.is_finite()),
+            "the look-at degeneracy produced a NaN matrix"
+        );
     }
 
     /// A degenerate frame leaves the camera exactly where it was rather than producing NaNs.
@@ -14536,7 +17611,11 @@ mod face_on_view {
     fn a_degenerate_face_is_ignored() {
         let mut st = FactoryState::default();
         let (y, p) = (st.cam_yaw, st.cam_pitch);
-        let f = Frame { origin: Vec3::ZERO, u: Vec3::X, v: Vec3::X }; // u × v = 0
+        let f = Frame {
+            origin: Vec3::ZERO,
+            u: Vec3::X,
+            v: Vec3::X,
+        }; // u × v = 0
         st.look_at_frame(&f, Vec3::ZERO);
         assert_eq!((st.cam_yaw, st.cam_pitch), (y, p));
     }
@@ -14547,7 +17626,10 @@ mod water_material {
     use super::*;
 
     fn preset(name: &str) -> MaterialPreset {
-        *material_presets().iter().find(|p| p.name == name).expect("preset in the library")
+        *material_presets()
+            .iter()
+            .find(|p| p.name == name)
+            .expect("preset in the library")
     }
 
     /// The library has water, and it is a MEDIUM — which is the property everything else hangs off.
@@ -14556,20 +17638,33 @@ mod water_material {
     /// puddle drawn as one flat face all take the same material and get the same treatment.
     #[test]
     fn water_is_in_the_library_and_transmits() {
-        let waters: Vec<_> = material_presets().into_iter().filter(|p| p.category == "Water").collect();
+        let waters: Vec<_> = material_presets()
+            .into_iter()
+            .filter(|p| p.category == "Water")
+            .collect();
         assert!(waters.len() >= 3, "still / rippled / deep");
         for p in &waters {
-            assert!(p.transmission > 0.0, "{}: water is a medium, not coverage", p.name);
+            assert!(
+                p.transmission > 0.0,
+                "{}: water is a medium, not coverage",
+                p.name
+            );
             assert!(p.opacity < 1.0, "{}: and it is see-through", p.name);
-            assert!((p.ior - 1.333).abs() < 1e-3, "{}: water is IOR 1.333", p.name);
+            assert!(
+                (p.ior - 1.333).abs() < 1e-3,
+                "{}: water is IOR 1.333",
+                p.name
+            );
             assert_eq!(p.metallic, 0.0, "{}: water is a dielectric", p.name);
         }
         // Roughness is the ONLY thing separating them — still water is a mirror.
         let still = preset("Water (still)");
         let rippled = preset("Water (rippled)");
         assert!(still.roughness < rippled.roughness);
-        assert!(still.roughness < 0.35,
-            "still water must stay under the SSR roughness gate or it cannot reflect the scene");
+        assert!(
+            still.roughness < 0.35,
+            "still water must stay under the SSR roughness gate or it cannot reflect the scene"
+        );
     }
 
     /// GLASS is deliberately NOT transmissive. An architectural pane is modelled as a thin sheet
@@ -14591,10 +17686,22 @@ mod water_material {
         let i = st.add_preset_material(&preset("Water (still)"));
         let t = &st.textures[i];
         assert!(t.transmission > 0.0, "the material carries it");
-        assert!(t.opacity < ALPHA_OPAQUE, "…so the surface routes to the blended pass");
-        assert!(t.has_pbr(), "…and its PBR params are shipped to the renderer at all");
-        assert!(t.pbr_params().transmission > 0.0, "…including the transmission the shader reads");
-        assert_eq!(t.reflect, 1.0, "and it reflects its surroundings by the physical amount");
+        assert!(
+            t.opacity < ALPHA_OPAQUE,
+            "…so the surface routes to the blended pass"
+        );
+        assert!(
+            t.has_pbr(),
+            "…and its PBR params are shipped to the renderer at all"
+        );
+        assert!(
+            t.pbr_params().transmission > 0.0,
+            "…including the transmission the shader reads"
+        );
+        assert_eq!(
+            t.reflect, 1.0,
+            "and it reflects its surroundings by the physical amount"
+        );
     }
 
     /// It has to survive a save and reload. `opacity` says how much light gets past; this says
@@ -14606,14 +17713,28 @@ mod water_material {
         let i = st.add_preset_material(&preset("Water (still)"));
         let src = &st.textures[i];
         let rec = crate::simlux_io::TextureRec {
-            name: src.name.clone(), w: src.w, h: src.h, scale: src.scale, offset: src.offset,
-            rot_deg: src.rot_deg, opacity: src.opacity, reflect: src.reflect,
-            png_b64: src.encoded_png(), roughness: src.roughness, metallic: src.metallic,
-            ior: src.ior, transmission: src.transmission, ..Default::default()
+            name: src.name.clone(),
+            w: src.w,
+            h: src.h,
+            scale: src.scale,
+            offset: src.offset,
+            rot_deg: src.rot_deg,
+            opacity: src.opacity,
+            reflect: src.reflect,
+            png_b64: src.encoded_png(),
+            roughness: src.roughness,
+            metallic: src.metallic,
+            ior: src.ior,
+            transmission: src.transmission,
+            ..Default::default()
         };
         let back = decode_texture_rec(&rec).expect("round trip");
-        assert!((back.transmission - src.transmission).abs() < 1e-6,
-            "reloaded as {} instead of {}", back.transmission, src.transmission);
+        assert!(
+            (back.transmission - src.transmission).abs() < 1e-6,
+            "reloaded as {} instead of {}",
+            back.transmission,
+            src.transmission
+        );
     }
 }
 
@@ -14649,7 +17770,11 @@ mod working_unit {
             cad_solid::BoolOp::Union,
             cad_solid::Plane::default(),
             cad_solid::Placement::default(),
-            cad_solid::Primitive::Box { w: 6.0, d: 4.0, h: 3.0 },
+            cad_solid::Primitive::Box {
+                w: 6.0,
+                d: 4.0,
+                h: 3.0,
+            },
         );
         f.wall_height = 2.7;
         f.wall_thickness = 0.2;
@@ -14663,7 +17788,10 @@ mod working_unit {
                 "the solid changed when the working unit became {}",
                 f.units.label()
             );
-            assert_eq!(f.wall_height, 2.7, "a stored length is metres whatever the unit says");
+            assert_eq!(
+                f.wall_height, 2.7,
+                "a stored length is metres whatever the unit says"
+            );
             assert_eq!(f.wall_thickness, 0.2);
         }
     }
@@ -14693,18 +17821,34 @@ mod working_unit {
     /// hundredths is noise, and a metre field showing none has thrown the dimension away.
     #[test]
     fn a_length_is_shown_to_a_useful_precision() {
-        assert_eq!(length_decimals(&Units::from_metres_per_unit(Units::MM, UnitSource::User)), 0);
-        assert_eq!(length_decimals(&Units::from_metres_per_unit(Units::CM, UnitSource::User)), 1);
-        assert_eq!(length_decimals(&Units::from_metres_per_unit(Units::M, UnitSource::User)), 3);
+        assert_eq!(
+            length_decimals(&Units::from_metres_per_unit(Units::MM, UnitSource::User)),
+            0
+        );
+        assert_eq!(
+            length_decimals(&Units::from_metres_per_unit(Units::CM, UnitSource::User)),
+            1
+        );
+        assert_eq!(
+            length_decimals(&Units::from_metres_per_unit(Units::M, UnitSource::User)),
+            3
+        );
         assert_eq!(length_str(&mm(), 2.7), "2700 mm");
-        assert_eq!(length_str(&Units::from_metres_per_unit(Units::M, UnitSource::User), 2.7), "2.700 m");
+        assert_eq!(
+            length_str(
+                &Units::from_metres_per_unit(Units::M, UnitSource::User),
+                2.7
+            ),
+            "2.700 m"
+        );
     }
 
     /// The unit survives a save, so a project reopens showing the numbers it was authored with.
     #[test]
     fn the_working_unit_round_trips_through_the_sidecar() {
         let mut f = FactoryState::default();
-        f.units = cad_kernel::Units::from_metres_per_unit(cad_kernel::Units::INCH, UnitSource::User);
+        f.units =
+            cad_kernel::Units::from_metres_per_unit(cad_kernel::Units::INCH, UnitSource::User);
         let doc = f.to_persist();
         assert!((doc.working_unit_m - Units::INCH).abs() < 1e-12);
 
@@ -14768,7 +17912,10 @@ mod room_height_meaning {
             (overall - 4.25).abs() < 1e-3,
             "0.20 + 3.90 + 0.15 = 4.25 m overall, got {overall}",
         );
-        assert!(overall > f.building_height, "which is taller than the 4 m building");
+        assert!(
+            overall > f.building_height,
+            "which is taller than the 4 m building"
+        );
     }
 
     /// …and the app SAYS so, with the arithmetic and the overrun. The geometry was always right;
@@ -14784,8 +17931,14 @@ mod room_height_meaning {
         f.add_room(&square(4.4)).expect("the room builds");
 
         let s = &f.status;
-        assert!(s.contains("4250 mm"), "the overall height must be stated: {s}");
-        assert!(s.contains("3900 mm"), "beside the clear height that was typed: {s}");
+        assert!(
+            s.contains("4250 mm"),
+            "the overall height must be stated: {s}"
+        );
+        assert!(
+            s.contains("3900 mm"),
+            "beside the clear height that was typed: {s}"
+        );
         assert!(s.contains("taller than"), "and the overrun called out: {s}");
         assert!(s.contains("250 mm"), "by how much: {s}");
     }
@@ -14801,8 +17954,16 @@ mod room_height_meaning {
         f.room_open_top = false;
         f.building_height = 4.0; // 3.95 overall — fits
         f.add_room(&square(4.4)).expect("the room builds");
-        assert!(!f.status.contains("taller than"), "no warning when it fits: {}", f.status);
-        assert!(f.status.contains("3950 mm"), "but the overall is still stated: {}", f.status);
+        assert!(
+            !f.status.contains("taller than"),
+            "no warning when it fits: {}",
+            f.status
+        );
+        assert!(
+            f.status.contains("3950 mm"),
+            "but the overall is still stated: {}",
+            f.status
+        );
     }
 
     /// Open to sky: no ceiling slab, so only the floor is added to the clear height.
@@ -14821,7 +17982,11 @@ mod room_height_meaning {
             "0.20 + 3.90 with no ceiling = 4.10 m, got {}",
             mx[2] - mn[2],
         );
-        assert!(!f.status.contains("ceiling"), "and no ceiling in the breakdown: {}", f.status);
+        assert!(
+            !f.status.contains("ceiling"),
+            "and no ceiling in the breakdown: {}",
+            f.status
+        );
     }
 }
 
@@ -14875,13 +18040,22 @@ mod rooms {
         let id = f.rooms[0].id;
         f.recompute();
         let before = f.cached.bounds().expect("bounds").1[2];
-        assert!((before - 3.35).abs() < 1e-3, "0.20 + 3.00 + 0.15 = 3.35 m, got {before}");
+        assert!(
+            (before - 3.35).abs() < 1e-3,
+            "0.20 + 3.00 + 0.15 = 3.35 m, got {before}"
+        );
 
         f.set_room_height(id, 3.9);
         f.recompute();
         let after = f.cached.bounds().expect("bounds").1[2];
-        assert!((after - 4.25).abs() < 1e-3, "0.20 + 3.90 + 0.15 = 4.25 m, got {after}");
-        assert!((f.rooms[0].height - 3.9).abs() < 1e-6, "and the record agrees");
+        assert!(
+            (after - 4.25).abs() < 1e-3,
+            "0.20 + 3.90 + 0.15 = 4.25 m, got {after}"
+        );
+        assert!(
+            (f.rooms[0].height - 3.9).abs() < 1e-6,
+            "and the record agrees"
+        );
     }
 
     /// The edit happens IN PLACE — every feature id survives.
@@ -14939,8 +18113,16 @@ mod rooms {
         ])
         .expect("store");
         let store = f.rooms[1].id;
-        assert_eq!(f.room_at(Vec2::new(2.5, 2.5)), Some(store), "inside the store");
-        assert_eq!(f.room_at(Vec2::new(10.0, 10.0)), Some(hall), "out in the hall");
+        assert_eq!(
+            f.room_at(Vec2::new(2.5, 2.5)),
+            Some(store),
+            "inside the store"
+        );
+        assert_eq!(
+            f.room_at(Vec2::new(10.0, 10.0)),
+            Some(hall),
+            "out in the hall"
+        );
     }
 
     /// The area-weighted centroid lands INSIDE an L-shaped room. The mean of the corners does not,
@@ -14979,7 +18161,10 @@ mod rooms {
         f.delete_room(id);
         assert!(f.rooms.is_empty(), "the record is gone");
         for fid in feats {
-            assert!(!f.model.features.iter().any(|x| x.id == fid), "feature {fid} should be gone too");
+            assert!(
+                !f.model.features.iter().any(|x| x.id == fid),
+                "feature {fid} should be gone too"
+            );
         }
     }
 
@@ -15041,7 +18226,8 @@ mod carved_rooms {
         f.room_floor = 0.2;
         f.room_height = 3.0;
         f.ceiling_thickness = 0.15;
-        f.add_building_outline(&square(10.0), 4.0).expect("building");
+        f.add_building_outline(&square(10.0), 4.0)
+            .expect("building");
         f.add_room(&inner(1.0, 9.0)).expect("room");
         f
     }
@@ -15094,7 +18280,8 @@ mod carved_rooms {
         );
 
         // …and the same area accepts a new room.
-        f.add_room(&inner(1.0, 9.0)).expect("the area can be built in again");
+        f.add_room(&inner(1.0, 9.0))
+            .expect("the area can be built in again");
         assert_eq!(f.rooms.len(), 1);
     }
 
@@ -15105,14 +18292,28 @@ mod carved_rooms {
         let mut f = building_with_room();
         let id = f.rooms[0].id;
         let carve = f.rooms[0].carve.expect("carved");
-        let before = match f.model.features.iter().find(|x| x.id == carve).unwrap().primitive {
+        let before = match f
+            .model
+            .features
+            .iter()
+            .find(|x| x.id == carve)
+            .unwrap()
+            .primitive
+        {
             Primitive::Extrusion { h, .. } => h,
             _ => panic!("the void is an extrusion"),
         };
         // A MODEST raise must not shrink the void — that would leave a cap of building
         // material sitting over the room.
         f.set_room_height(id, 3.6);
-        let modest = match f.model.features.iter().find(|x| x.id == carve).unwrap().primitive {
+        let modest = match f
+            .model
+            .features
+            .iter()
+            .find(|x| x.id == carve)
+            .unwrap()
+            .primitive
+        {
             Primitive::Extrusion { h, .. } => h,
             _ => panic!("the void is an extrusion"),
         };
@@ -15122,11 +18323,21 @@ mod carved_rooms {
         );
         // Raising it PAST the building does grow the void, so the room is never capped.
         f.set_room_height(id, 6.0);
-        let tall = match f.model.features.iter().find(|x| x.id == carve).unwrap().primitive {
+        let tall = match f
+            .model
+            .features
+            .iter()
+            .find(|x| x.id == carve)
+            .unwrap()
+            .primitive
+        {
             Primitive::Extrusion { h, .. } => h,
             _ => panic!("the void is an extrusion"),
         };
-        assert!(tall > before, "the void grew with the room ({before} → {tall})");
+        assert!(
+            tall > before,
+            "the void grew with the room ({before} → {tall})"
+        );
     }
 
     /// The suggested height is the building less both slabs — the sum users were getting wrong.
@@ -15138,12 +18349,18 @@ mod carved_rooms {
         f.ceiling_thickness = 0.15;
         f.room_open_top = false;
         let want = f.suggested_room_height();
-        assert!((want - 3.65).abs() < 1e-6, "4.00 − 0.20 − 0.15 = 3.65, got {want}");
+        assert!(
+            (want - 3.65).abs() < 1e-6,
+            "4.00 − 0.20 − 0.15 = 3.65, got {want}"
+        );
 
         f.room_height = want;
         f.add_room(&square(5.0)).expect("room");
         let over = f.rooms[0].overall_height();
-        assert!((over - 4.0).abs() < 1e-6, "which builds to exactly the building height, got {over}");
+        assert!(
+            (over - 4.0).abs() < 1e-6,
+            "which builds to exactly the building height, got {over}"
+        );
     }
 
     /// Open to sky: no ceiling slab, so the suggestion has more room to give.
@@ -15154,7 +18371,10 @@ mod carved_rooms {
         f.room_floor = 0.2;
         f.ceiling_thickness = 0.15;
         f.room_open_top = true;
-        assert!((f.suggested_room_height() - 3.8).abs() < 1e-6, "4.00 − 0.20 = 3.80");
+        assert!(
+            (f.suggested_room_height() - 3.8).abs() < 1e-6,
+            "4.00 − 0.20 = 3.80"
+        );
     }
 
     /// Floor and ceiling thickness are adjustable after the fact, and everything above the floor
@@ -15174,12 +18394,18 @@ mod carved_rooms {
         f.set_room_floor(id, 0.4);
         f.recompute();
         let after = f.cached.bounds().expect("bounds").1[2];
-        assert!((after - 3.55).abs() < 1e-3, "0.40 + 3.00 + 0.15 = 3.55, got {after}");
+        assert!(
+            (after - 3.55).abs() < 1e-3,
+            "0.40 + 3.00 + 0.15 = 3.55, got {after}"
+        );
 
         f.set_room_ceiling(id, 0.3);
         f.recompute();
         let last = f.cached.bounds().expect("bounds").1[2];
-        assert!((last - 3.70).abs() < 1e-3, "0.40 + 3.00 + 0.30 = 3.70, got {last}");
+        assert!(
+            (last - 3.70).abs() < 1e-3,
+            "0.40 + 3.00 + 0.30 = 3.70, got {last}"
+        );
     }
 }
 
@@ -15249,21 +18475,34 @@ mod building_height_truth {
     #[test]
     fn the_building_is_measured_not_remembered() {
         let mut f = FactoryState::default();
-        assert!((f.building_height - 3.0).abs() < 1e-6, "the template starts at 3 m");
-        let id = f.add_building_outline(&square(10.0), 3.0).expect("building");
+        assert!(
+            (f.building_height - 3.0).abs() < 1e-6,
+            "the template starts at 3 m"
+        );
+        let id = f
+            .add_building_outline(&square(10.0), 3.0)
+            .expect("building");
         assert!((f.effective_building_height() - 3.0).abs() < 1e-3);
 
         // Raise it the way the properties panel does: edit the primitive directly.
         if let Some(feat) = f.model.get_mut(id) {
             if let Primitive::Extrusion { profile, w, d, .. } = feat.primitive {
-                feat.primitive = Primitive::Extrusion { profile, h: 4.0, w, d };
+                feat.primitive = Primitive::Extrusion {
+                    profile,
+                    h: 4.0,
+                    w,
+                    d,
+                };
             }
         }
         assert!(
             (f.effective_building_height() - 4.0).abs() < 1e-3,
             "the standing building is 4 m, whatever the template still says",
         );
-        assert!((f.building_height - 3.0).abs() < 1e-6, "and the template really is untouched");
+        assert!(
+            (f.building_height - 3.0).abs() < 1e-6,
+            "and the template really is untouched"
+        );
     }
 
     /// A 4 m room in a 4 m building raises NO warning. Against the stale 3 m template it claimed
@@ -15271,10 +18510,17 @@ mod building_height_truth {
     #[test]
     fn a_room_that_fits_the_real_building_is_not_warned_about() {
         let mut f = FactoryState::default();
-        let id = f.add_building_outline(&square(10.0), 3.0).expect("building");
+        let id = f
+            .add_building_outline(&square(10.0), 3.0)
+            .expect("building");
         if let Some(feat) = f.model.get_mut(id) {
             if let Primitive::Extrusion { profile, w, d, .. } = feat.primitive {
-                feat.primitive = Primitive::Extrusion { profile, h: 4.0, w, d };
+                feat.primitive = Primitive::Extrusion {
+                    profile,
+                    h: 4.0,
+                    w,
+                    d,
+                };
             }
         }
         f.room_floor = 0.05;
@@ -15305,10 +18551,17 @@ mod building_height_truth {
         let mut f = FactoryState::default();
         f.room_floor = 0.05;
         f.ceiling_thickness = 0.05;
-        let id = f.add_building_outline(&square(10.0), 3.0).expect("building");
+        let id = f
+            .add_building_outline(&square(10.0), 3.0)
+            .expect("building");
         if let Some(feat) = f.model.get_mut(id) {
             if let Primitive::Extrusion { profile, w, d, .. } = feat.primitive {
-                feat.primitive = Primitive::Extrusion { profile, h: 4.0, w, d };
+                feat.primitive = Primitive::Extrusion {
+                    profile,
+                    h: 4.0,
+                    w,
+                    d,
+                };
             }
         }
         assert!(
@@ -15322,7 +18575,8 @@ mod building_height_truth {
     #[test]
     fn setting_the_height_resizes_the_building() {
         let mut f = FactoryState::default();
-        f.add_building_outline(&square(10.0), 3.0).expect("building");
+        f.add_building_outline(&square(10.0), 3.0)
+            .expect("building");
         assert_eq!(f.set_building_height(4.5), 1, "one mass resized");
         f.recompute();
         let top = f.cached.bounds().expect("bounds").1[2];
@@ -15337,7 +18591,8 @@ mod building_height_truth {
         f.room_floor = 0.1;
         f.room_height = 2.7;
         f.ceiling_thickness = 0.1;
-        f.add_building_outline(&square(10.0), 3.0).expect("building");
+        f.add_building_outline(&square(10.0), 3.0)
+            .expect("building");
         f.add_room(&vec![
             Vec2::new(1.0, 1.0),
             Vec2::new(9.0, 1.0),
@@ -15348,7 +18603,14 @@ mod building_height_truth {
         .expect("room");
         let carve = f.rooms[0].carve.expect("carved");
         f.set_building_height(6.0);
-        let void_h = match f.model.features.iter().find(|x| x.id == carve).unwrap().primitive {
+        let void_h = match f
+            .model
+            .features
+            .iter()
+            .find(|x| x.id == carve)
+            .unwrap()
+            .primitive
+        {
             Primitive::Extrusion { h, .. } => h,
             _ => panic!("the void is an extrusion"),
         };
@@ -15368,7 +18630,11 @@ mod plan_footprint_tests {
             id: 1,
             op: cad_solid::BoolOp::Union,
             plane: cad_solid::Plane::default(),
-            placement: cad_solid::Placement { u: 0.0, v: 0.0, ..Default::default() },
+            placement: cad_solid::Placement {
+                u: 0.0,
+                v: 0.0,
+                ..Default::default()
+            },
             primitive: p,
             enabled: true,
             target: None,
@@ -15384,14 +18650,52 @@ mod plan_footprint_tests {
     fn every_primitive_has_a_plan_footprint() {
         let st = FactoryState::default();
         let all = [
-            Primitive::Box { w: 2.0, d: 3.0, h: 1.0 },
-            Primitive::Cylinder { r: 1.0, h: 2.0, sides: 24 },
-            Primitive::Sphere { r: 1.0, segments: 16, stacks: 8 },
-            Primitive::Frustum { r_bottom: 1.0, r_top: 0.5, h: 2.0, sides: 6 },
-            Primitive::Torus { major_r: 2.0, minor_r: 0.3, seg_major: 24, seg_minor: 8 },
-            Primitive::Capsule { r: 0.5, h: 2.0, segments: 16, stacks: 8 },
-            Primitive::Tube { r_outer: 1.0, r_inner: 0.6, h: 2.0, sides: 24 },
-            Primitive::Ellipsoid { rx: 2.0, ry: 1.0, rz: 0.5, segments: 16, stacks: 8 },
+            Primitive::Box {
+                w: 2.0,
+                d: 3.0,
+                h: 1.0,
+            },
+            Primitive::Cylinder {
+                r: 1.0,
+                h: 2.0,
+                sides: 24,
+            },
+            Primitive::Sphere {
+                r: 1.0,
+                segments: 16,
+                stacks: 8,
+            },
+            Primitive::Frustum {
+                r_bottom: 1.0,
+                r_top: 0.5,
+                h: 2.0,
+                sides: 6,
+            },
+            Primitive::Torus {
+                major_r: 2.0,
+                minor_r: 0.3,
+                seg_major: 24,
+                seg_minor: 8,
+            },
+            Primitive::Capsule {
+                r: 0.5,
+                h: 2.0,
+                segments: 16,
+                stacks: 8,
+            },
+            Primitive::Tube {
+                r_outer: 1.0,
+                r_inner: 0.6,
+                h: 2.0,
+                sides: 24,
+            },
+            Primitive::Ellipsoid {
+                rx: 2.0,
+                ry: 1.0,
+                rz: 0.5,
+                segments: 16,
+                stacks: 8,
+            },
         ];
         for p in all {
             let fp = st.feature_plan_footprint(&feat(p));
@@ -15418,7 +18722,11 @@ mod plan_footprint_tests {
     #[test]
     fn a_cylinder_is_round_in_plan() {
         let st = FactoryState::default();
-        let fp = st.feature_plan_footprint(&feat(Primitive::Cylinder { r: 1.5, h: 2.0, sides: 32 }));
+        let fp = st.feature_plan_footprint(&feat(Primitive::Cylinder {
+            r: 1.5,
+            h: 2.0,
+            sides: 32,
+        }));
         assert_eq!(fp.len(), 32);
         for q in &fp {
             let r = (q.x * q.x + q.y * q.y).sqrt();
@@ -15445,19 +18753,29 @@ mod plan_footprint_tests {
     #[test]
     fn a_tilted_solid_falls_back_to_a_bound_that_contains_it() {
         let st = FactoryState::default();
-        let mut f = feat(Primitive::Box { w: 4.0, d: 1.0, h: 1.0 });
+        let mut f = feat(Primitive::Box {
+            w: 4.0,
+            d: 1.0,
+            h: 1.0,
+        });
         f.placement.pitch_deg = 45.0;
         let fp = st.feature_plan_footprint(&f);
         let (mn, mx) = f.world_aabb();
         for q in &fp {
             assert!(
-                q.x >= mn.x - 1e-3 && q.x <= mx.x + 1e-3 && q.y >= mn.y - 1e-3 && q.y <= mx.y + 1e-3,
+                q.x >= mn.x - 1e-3
+                    && q.x <= mx.x + 1e-3
+                    && q.y >= mn.y - 1e-3
+                    && q.y <= mx.y + 1e-3,
                 "footprint point {q:?} escapes the solid's own bounds",
             );
         }
         let w = fp.iter().fold(f32::NEG_INFINITY, |a, q| a.max(q.x))
             - fp.iter().fold(f32::INFINITY, |a, q| a.min(q.x));
-        assert!((w - (mx.x - mn.x)).abs() < 1e-3, "the fallback must be the full bound");
+        assert!(
+            (w - (mx.x - mn.x)).abs() < 1e-3,
+            "the fallback must be the full bound"
+        );
     }
 }
 
@@ -15474,12 +18792,20 @@ mod placement_tests {
         let mut st = FactoryState::default();
         // A building well away from the world origin — the DXF-coordinate case that is the whole
         // reason `Centre` exists and is not simply (0,0).
-        let placement = Placement { u: 100.0, v: 50.0, ..Placement::default() };
+        let placement = Placement {
+            u: 100.0,
+            v: 50.0,
+            ..Placement::default()
+        };
         st.model.push(
             BoolOp::Union,
             Plane::default(),
             placement,
-            Primitive::Box { w: 10.0, d: 10.0, h: 3.0 },
+            Primitive::Box {
+                w: 10.0,
+                d: 10.0,
+                h: 3.0,
+            },
         );
         st.recompute();
         st
@@ -15500,7 +18826,10 @@ mod placement_tests {
 
         st.place_mode = PlaceMode::Origin;
         let o = st.place_at();
-        assert!(o.x.abs() < 1e-6 && o.y.abs() < 1e-6, "World origin means (0,0), got {o:?}");
+        assert!(
+            o.x.abs() < 1e-6 && o.y.abs() < 1e-6,
+            "World origin means (0,0), got {o:?}"
+        );
 
         st.place_mode = PlaceMode::Centre;
         let c = st.place_at();
@@ -15512,14 +18841,20 @@ mod placement_tests {
         st.place_mode = PlaceMode::Offset;
         st.place_offset = [3.0, 4.0, 0.0];
         let f = st.place_at();
-        assert!((f.x - 3.0).abs() < 1e-6 && (f.y - 4.0).abs() < 1e-6, "got {f:?}");
+        assert!(
+            (f.x - 3.0).abs() < 1e-6 && (f.y - 4.0).abs() < 1e-6,
+            "got {f:?}"
+        );
 
         // Click has to land somewhere VISIBLE while it waits, so it borrows Centre's answer. A piece
         // parked at (0,0) while the building is 100 m away is off-screen, and off-screen reads as
         // "nothing happened" — the bug this replaced.
         st.place_mode = PlaceMode::Click;
         let k = st.place_at();
-        assert!((k.x - 100.0).abs() < 1e-3, "Click must park it in view, got {k:?}");
+        assert!(
+            (k.x - 100.0).abs() < 1e-3,
+            "Click must park it in view, got {k:?}"
+        );
     }
 
     /// The default. The complaint was never that the origin is the wrong point — it is that nobody
@@ -15565,15 +18900,28 @@ mod placement_tests {
         assert_eq!(st.awaiting_place, Some(AwaitingPlace::Feature(id)));
 
         st.place_awaiting_at(Vec3::new(20.0, 30.0, 0.0));
-        let f = st.model.features.iter().find(|f| f.id == id).expect("still there");
+        let f = st
+            .model
+            .features
+            .iter()
+            .find(|f| f.id == id)
+            .expect("still there");
         // A Box's click point is its NEAR CORNER — the meaning `place_primitive` already gives it.
         // The same click must not mean two different things depending on how the box was made.
         let (w, d) = match f.primitive {
             Primitive::Box { w, d, .. } => (w, d),
             _ => panic!("a box"),
         };
-        assert!((f.placement.u - (20.0 + w * 0.5)).abs() < 1e-6, "u = {}", f.placement.u);
-        assert!((f.placement.v - (30.0 + d * 0.5)).abs() < 1e-6, "v = {}", f.placement.v);
+        assert!(
+            (f.placement.u - (20.0 + w * 0.5)).abs() < 1e-6,
+            "u = {}",
+            f.placement.u
+        );
+        assert!(
+            (f.placement.v - (30.0 + d * 0.5)).abs() < 1e-6,
+            "v = {}",
+            f.placement.v
+        );
     }
 
     /// In any mode but Click, nothing waits — the object is finished the moment it is added.
@@ -15586,7 +18934,10 @@ mod placement_tests {
             assert!(st.awaiting_place.is_none(), "{m:?} must not arm a click");
             st.awaiting_place = None;
             st.add_cylinder();
-            assert!(st.awaiting_place.is_none(), "{m:?} must not arm a click for a cylinder");
+            assert!(
+                st.awaiting_place.is_none(),
+                "{m:?} must not arm a click for a cylinder"
+            );
         }
     }
 
@@ -15641,7 +18992,11 @@ mod placement_tests {
         let mut back = FactoryState::default();
         back.place_mode = PlaceMode::Centre;
         back.apply_persist(doc);
-        assert_eq!(back.place_mode, PlaceMode::Centre, "an absent field must not overwrite");
+        assert_eq!(
+            back.place_mode,
+            PlaceMode::Centre,
+            "an absent field must not overwrite"
+        );
     }
 }
 
@@ -15669,8 +19024,16 @@ mod face_only_underlay {
             st.model.push(
                 BoolOp::Union,
                 Plane::default(),
-                Placement { u: k, v: k, ..Placement::default() },
-                Primitive::Box { w: 2.0, d: 2.0, h: 2.0 },
+                Placement {
+                    u: k,
+                    v: k,
+                    ..Placement::default()
+                },
+                Primitive::Box {
+                    w: 2.0,
+                    d: 2.0,
+                    h: 2.0,
+                },
             );
         }
         st.recompute();
@@ -15741,7 +19104,11 @@ mod face_only_underlay {
             Plane::default(),
             Placement::default(),
             // A 200 mm-thick wall: faces at y = -0.1 and y = +0.1.
-            Primitive::Box { w: 4.0, d: 0.2, h: 3.0 },
+            Primitive::Box {
+                w: 4.0,
+                d: 0.2,
+                h: 3.0,
+            },
         );
         st.recompute();
         let front = Frame::from_point_normal(Vec3::new(0.0, -0.1, 1.5), -Vec3::Y);
@@ -15772,7 +19139,10 @@ mod face_only_underlay {
             .flatten()
             .map(|p| p.x.abs().max(p.y.abs()))
             .fold(0.0_f32, f32::max);
-        assert!(widest > 3.0, "it must still reach the far box, got {widest:.2} m");
+        assert!(
+            widest > 3.0,
+            "it must still reach the far box, got {widest:.2} m"
+        );
     }
 
     /// The global view is what it is called now — "the ground plan is going to be renamed as global
@@ -15780,7 +19150,10 @@ mod face_only_underlay {
     #[test]
     fn the_ground_plane_is_called_the_global_view() {
         let st = FactoryState::default();
-        assert_eq!(st.sketch_auto_name(&FactoryState::ground_frame()), "Global view");
+        assert_eq!(
+            st.sketch_auto_name(&FactoryState::ground_frame()),
+            "Global view"
+        );
     }
 }
 
@@ -15800,8 +19173,16 @@ mod solids_follow_the_mode {
         st.model.push(
             BoolOp::Union,
             Plane::default(),
-            Placement { u: 100.0, v: 50.0, ..Placement::default() },
-            Primitive::Box { w: 10.0, d: 10.0, h: 3.0 },
+            Placement {
+                u: 100.0,
+                v: 50.0,
+                ..Placement::default()
+            },
+            Primitive::Box {
+                w: 10.0,
+                d: 10.0,
+                h: 3.0,
+            },
         );
         st.recompute();
         st
@@ -15809,7 +19190,11 @@ mod solids_follow_the_mode {
 
     fn newest(st: &FactoryState) -> &Feature {
         let id = *st.selection.first().expect("the new solid is selected");
-        st.model.features.iter().find(|f| f.id == id).expect("still there")
+        st.model
+            .features
+            .iter()
+            .find(|f| f.id == id)
+            .expect("still there")
     }
 
     /// A cylinder's point is its CENTRE, so its placement lands on the point exactly.
@@ -15846,8 +19231,16 @@ mod solids_follow_the_mode {
             Primitive::Box { w, d, .. } => (w, d),
             _ => panic!("a box"),
         };
-        assert!((f.placement.u - w * 0.5).abs() < 1e-4, "u = {}", f.placement.u);
-        assert!((f.placement.v - d * 0.5).abs() < 1e-4, "v = {}", f.placement.v);
+        assert!(
+            (f.placement.u - w * 0.5).abs() < 1e-4,
+            "u = {}",
+            f.placement.u
+        );
+        assert!(
+            (f.placement.v - d * 0.5).abs() < 1e-4,
+            "v = {}",
+            f.placement.v
+        );
 
         // …and a click to the SAME point puts it in the SAME place.
         let mut click = far_model();
@@ -15865,7 +19258,11 @@ mod solids_follow_the_mode {
         let mut st = far_model();
         st.place_mode = PlaceMode::Offset;
         st.place_offset = [7.0, 8.0, 0.0];
-        st.add_primitive(Primitive::Sphere { r: 1.0, segments: 16, stacks: 8 });
+        st.add_primitive(Primitive::Sphere {
+            r: 1.0,
+            segments: 16,
+            stacks: 8,
+        });
         let f = newest(&st);
         assert!((f.placement.u - 7.0).abs() < 1e-4, "u = {}", f.placement.u);
         assert!((f.placement.v - 8.0).abs() < 1e-4, "v = {}", f.placement.v);
@@ -15876,10 +19273,16 @@ mod solids_follow_the_mode {
     #[test]
     fn the_offset_z_lifts_above_the_storey() {
         let mut st = far_model();
-        st.storeys.push(Storey { name: "First".into(), height: 3.0 });
+        st.storeys.push(Storey {
+            name: "First".into(),
+            height: 3.0,
+        });
         st.active_storey = 1;
         let base = st.active_base_z();
-        assert!(base > 0.0, "precondition: the active storey is off the ground");
+        assert!(
+            base > 0.0,
+            "precondition: the active storey is off the ground"
+        );
 
         st.place_mode = PlaceMode::Offset;
         st.place_offset = [0.0, 0.0, 2.4];
@@ -16010,7 +19413,10 @@ mod ground_grid {
         };
         let close = spacing(2.0);
         let far = spacing(2000.0);
-        assert!(far > close * 50.0, "close {close}, far {far} — the spacing did not step");
+        assert!(
+            far > close * 50.0,
+            "close {close}, far {far} — the spacing did not step"
+        );
     }
 
     /// Snapped to its own spacing, so the lines stand still under the model instead of crawling
@@ -16028,7 +19434,11 @@ mod ground_grid {
         };
         for v in st.grid_lines() {
             let off = v.x / step - (v.x / step).round();
-            assert!(off.abs() < 1e-3, "a line at x = {} is not on the {step} m grid", v.x);
+            assert!(
+                off.abs() < 1e-3,
+                "a line at x = {} is not on the {step} m grid",
+                v.x
+            );
         }
     }
 
@@ -16043,7 +19453,10 @@ mod ground_grid {
         // …and the rest of the overlay (selection boxes, axes) is untouched by it.
         st.add_box();
         st.recompute();
-        assert!(!st.overlay_lines().is_empty(), "turning the grid off must not blank the overlay");
+        assert!(
+            !st.overlay_lines().is_empty(),
+            "turning the grid off must not blank the overlay"
+        );
     }
 
     /// The 1-2-5 ladder itself: rounds UP, which is what bounds the line count.
@@ -16061,8 +19474,14 @@ mod ground_grid {
             (250.0, 500.0),
         ] {
             let got = nice_step(want);
-            assert!((got - expect).abs() < 1e-4, "nice_step({want}) = {got}, want {expect}");
-            assert!(got >= want, "it must round UP, or the line count is not bounded");
+            assert!(
+                (got - expect).abs() < 1e-4,
+                "nice_step({want}) = {got}, want {expect}"
+            );
+            assert!(
+                got >= want,
+                "it must round UP, or the line count is not bounded"
+            );
         }
         // Nonsense in, something usable out — a zero or NaN reach must not divide by zero.
         assert_eq!(nice_step(0.0), 1.0);
@@ -16077,13 +19496,20 @@ mod ground_grid {
     #[test]
     fn the_zoom_out_limit_scales_with_the_model() {
         let mut st = FactoryState::default();
-        assert!((st.max_cam_dist() - 400.0).abs() < 1e-3, "an empty scene gets the 400 m floor");
+        assert!(
+            (st.max_cam_dist() - 400.0).abs() < 1e-3,
+            "an empty scene gets the 400 m floor"
+        );
 
         st.model.push(
             BoolOp::Union,
             Plane::default(),
             Placement::default(),
-            Primitive::Box { w: 1000.0, d: 10.0, h: 10.0 },
+            Primitive::Box {
+                w: 1000.0,
+                d: 10.0,
+                h: 10.0,
+            },
         );
         st.recompute();
         assert!(
@@ -16095,8 +19521,14 @@ mod ground_grid {
         // …and the grid keeps up all the way out to that limit.
         st.cam_dist = st.max_cam_dist();
         let (reach, segs) = extent(&st);
-        assert!(reach >= st.cam_dist, "the grid stops short at full zoom-out");
-        assert!(segs < 300, "…and does not explode getting there: {segs} segments");
+        assert!(
+            reach >= st.cam_dist,
+            "the grid stops short at full zoom-out"
+        );
+        assert!(
+            segs < 300,
+            "…and does not explode getting there: {segs} segments"
+        );
     }
 }
 
@@ -16108,7 +19540,10 @@ mod ground_plane {
     fn off_is_empty() {
         let mut st = FactoryState::default();
         st.show_ground = false;
-        assert!(st.ground_plane_verts().is_empty(), "the ground is empty when off");
+        assert!(
+            st.ground_plane_verts().is_empty(),
+            "the ground is empty when off"
+        );
     }
 
     /// The quad is two triangles (6 verts), rests a hair below z = 0 (so the ground-floor
@@ -16161,11 +19596,10 @@ mod grid_pitch {
     use super::*;
 
     fn reach_of(st: &FactoryState) -> f32 {
-        st.grid_lines()
-            .iter()
-            .fold(0.0_f32, |a, v| {
-                a.max((v.x - st.cam_target[0]).abs()).max((v.y - st.cam_target[1]).abs())
-            })
+        st.grid_lines().iter().fold(0.0_f32, |a, v| {
+            a.max((v.x - st.cam_target[0]).abs())
+                .max((v.y - st.cam_target[1]).abs())
+        })
     }
 
     #[test]
@@ -16196,7 +19630,10 @@ mod grid_pitch {
         for pitch in [0.0_f32, 0.001, 0.05, 0.16] {
             st.cam_pitch = pitch;
             let r = reach_of(&st);
-            assert!(r <= 50.0 * 10.0 + 1.0, "pitch {pitch}: reach {r:.0} m is past the cap");
+            assert!(
+                r <= 50.0 * 10.0 + 1.0,
+                "pitch {pitch}: reach {r:.0} m is past the cap"
+            );
             assert!(r.is_finite(), "pitch {pitch} produced a non-finite reach");
         }
     }
@@ -16211,7 +19648,11 @@ mod grid_pitch {
         st.cam_pitch = 0.0;
         let g = st.grid_lines();
         assert!(!g.is_empty(), "a level camera must still get a grid");
-        assert!(g.len() / 2 <= 260, "…and a bounded one: {} segments", g.len() / 2);
+        assert!(
+            g.len() / 2 <= 260,
+            "…and a bounded one: {} segments",
+            g.len() / 2
+        );
         for v in &g {
             assert!(v.x.is_finite() && v.y.is_finite(), "non-finite vertex");
         }
@@ -16227,7 +19668,10 @@ mod grid_pitch {
         let a = reach_of(&st);
         st.cam_pitch = 0.05;
         let b = reach_of(&st);
-        assert!((a - b).abs() < 1e-3, "ortho reach moved with pitch: {a} vs {b}");
+        assert!(
+            (a - b).abs() < 1e-3,
+            "ortho reach moved with pitch: {a} vs {b}"
+        );
     }
 
     /// And the count stays bounded through all of it — the spacing ladder scales with the reach, so
@@ -16266,7 +19710,11 @@ mod a_typed_coordinate_places_once {
             cad_solid::BoolOp::Union,
             cad_solid::Plane::default(),
             cad_solid::Placement::default(),
-            cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+            cad_solid::Primitive::Box {
+                w: 1.0,
+                d: 1.0,
+                h: 1.0,
+            },
         );
         f
     }
@@ -16288,11 +19736,19 @@ mod a_typed_coordinate_places_once {
         f.place_mode = PlaceMode::Centre;
         type_a_coordinate(&mut f, [3.0, 4.0, 0.0]);
 
-        assert_eq!(f.place_at(), Vec3::new(3.0, 4.0, 0.0), "the object being placed uses it");
+        assert_eq!(
+            f.place_at(),
+            Vec3::new(3.0, 4.0, 0.0),
+            "the object being placed uses it"
+        );
         f.arm_placement(AwaitingPlace::Feature(1)); // end of the add
         assert_eq!(f.place_mode, PlaceMode::Centre, "and the mode goes back");
         assert!(!f.place_offset_once);
-        assert_ne!(f.place_at(), Vec3::new(3.0, 4.0, 0.0), "the NEXT object does not stack on it");
+        assert_ne!(
+            f.place_at(),
+            Vec3::new(3.0, 4.0, 0.0),
+            "the NEXT object does not stack on it"
+        );
     }
 
     /// It goes back to whatever was in force, not to a hardcoded default — Click is the common
@@ -16304,7 +19760,10 @@ mod a_typed_coordinate_places_once {
             f.place_mode = before;
             type_a_coordinate(&mut f, [1.0, 2.0, 3.0]);
             f.arm_placement(AwaitingPlace::Feature(1));
-            assert_eq!(f.place_mode, before, "reverted to the wrong mode from {before:?}");
+            assert_eq!(
+                f.place_mode, before,
+                "reverted to the wrong mode from {before:?}"
+            );
         }
     }
 
@@ -16316,7 +19775,11 @@ mod a_typed_coordinate_places_once {
         f.place_mode = PlaceMode::Offset; // as the menu sets it — no one-shot flag
         f.place_offset = [5.0, 6.0, 0.0];
         f.arm_placement(AwaitingPlace::Feature(1));
-        assert_eq!(f.place_mode, PlaceMode::Offset, "an explicitly chosen mode must persist");
+        assert_eq!(
+            f.place_mode,
+            PlaceMode::Offset,
+            "an explicitly chosen mode must persist"
+        );
         assert_eq!(f.place_at(), Vec3::new(5.0, 6.0, 0.0));
     }
 
@@ -16329,7 +19792,11 @@ mod a_typed_coordinate_places_once {
         type_a_coordinate(&mut f, [1.0, 0.0, 0.0]);
         type_a_coordinate(&mut f, [2.0, 0.0, 0.0]); // before the first was consumed
         f.arm_placement(AwaitingPlace::Feature(1));
-        assert_eq!(f.place_mode, PlaceMode::Click, "the original mode was overwritten by Offset");
+        assert_eq!(
+            f.place_mode,
+            PlaceMode::Click,
+            "the original mode was overwritten by Offset"
+        );
     }
 
     /// A one-shot placement is not project state. Reloading a file must not re-arm it.
@@ -16340,7 +19807,10 @@ mod a_typed_coordinate_places_once {
         let doc = f.to_persist();
         let mut g = FactoryState::default();
         g.apply_persist(doc);
-        assert!(!g.place_offset_once, "a reopened project must not be holding a typed coordinate");
+        assert!(
+            !g.place_offset_once,
+            "a reopened project must not be holding a typed coordinate"
+        );
     }
 }
 
@@ -16376,7 +19846,10 @@ mod a_room_moves_as_one_object {
     fn picking_one_part_selects_the_room() {
         let mut f = a_room();
         let parts = f.model.features.len();
-        assert!(parts >= 3, "a room is built from several features, got {parts}");
+        assert!(
+            parts >= 3,
+            "a room is built from several features, got {parts}"
+        );
 
         let one = f.model.features[0].id;
         f.selection = vec![one];
@@ -16427,7 +19900,10 @@ mod a_room_moves_as_one_object {
         f.expand_selection_to_groups();
         f.move_selection(Vec3::new(25.0, 0.0, 0.0));
         f.recompute();
-        assert!((min_x(&f) - before - 25.0).abs() < 1e-3, "the whole room must travel 25 m");
+        assert!(
+            (min_x(&f) - before - 25.0).abs() < 1e-3,
+            "the whole room must travel 25 m"
+        );
     }
 
     /// THE TEXTURE WARNING. A face painted before the move must still be painted after it — the
@@ -16443,7 +19919,10 @@ mod a_room_moves_as_one_object {
         f.selection = vec![id];
         f.move_selection(Vec3::new(0.0, 0.0, 2.5)); // straight up: d changes by n·Δ = 2.5
 
-        assert!(!f.surface_texture.contains_key(&key), "the old key must not survive");
+        assert!(
+            !f.surface_texture.contains_key(&key),
+            "the old key must not survive"
+        );
         let want = surface_key(id, [0.0, 0.0, 2.5], [1.0, 0.0, 2.5], [0.0, 1.0, 2.5]);
         assert_eq!(
             f.surface_texture.get(&want).copied(),
@@ -16463,7 +19942,11 @@ mod a_room_moves_as_one_object {
         f.surface_texture.insert(key, 3);
         f.selection = vec![id];
         f.move_selection(Vec3::new(9.0, -4.0, 0.0)); // in the plane z = 0
-        assert_eq!(f.surface_texture.get(&key).copied(), Some(3), "an in-plane slide changes nothing");
+        assert_eq!(
+            f.surface_texture.get(&key).copied(),
+            Some(3),
+            "an in-plane slide changes nothing"
+        );
     }
 
     /// Paint on a feature that did NOT move must be left exactly where it is.
@@ -16489,7 +19972,11 @@ mod a_room_moves_as_one_object {
         let one = f.model.features[0].id;
         f.selection = vec![one];
         f.expand_selection_to_groups();
-        assert_eq!(f.selection, vec![one], "after Explode a part is its own object again");
+        assert_eq!(
+            f.selection,
+            vec![one],
+            "after Explode a part is its own object again"
+        );
     }
 }
 
@@ -16574,7 +20061,10 @@ mod a_carved_building_moves_as_one_object {
             );
         }
         let min_x = f.cached.bounds().unwrap().0[0];
-        assert!((min_x - 30.0).abs() < 1e-3, "and all of it travelled 30 m, got min x {min_x}");
+        assert!(
+            (min_x - 30.0).abs() < 1e-3,
+            "and all of it travelled 30 m, got min x {min_x}"
+        );
     }
 
     /// The room is still a void in the moved building — the carve has to travel too, or the
@@ -16655,7 +20145,10 @@ mod numeric_fields_do_not_clamp_mid_keystroke {
         ] {
             // Cut this module off first: it names both literals, so a whole-file count counts the
             // assertions themselves. That is how the first version of this test failed.
-            let src = src.split("mod numeric_fields_do_not_clamp_mid_keystroke").next().unwrap();
+            let src = src
+                .split("mod numeric_fields_do_not_clamp_mid_keystroke")
+                .next()
+                .unwrap();
             let fields = src.matches("DragValue::new(").count();
             let deferred = src.matches(".update_while_editing(false)").count();
             assert_eq!(
@@ -16674,8 +20167,14 @@ mod numeric_fields_do_not_clamp_mid_keystroke {
         let a = src.find("pub fn length_ui(").expect("the helper");
         let b = src[a..].find("\n}").map(|e| a + e).unwrap();
         let f = &src[a..b];
-        assert!(f.contains(".range("), "the field must still declare its limits");
-        assert!(f.contains(".update_while_editing(false)"), "…and defer them until commit");
+        assert!(
+            f.contains(".range("),
+            "the field must still declare its limits"
+        );
+        assert!(
+            f.contains(".update_while_editing(false)"),
+            "…and defer them until commit"
+        );
     }
 }
 
@@ -16698,20 +20197,30 @@ mod wall_opening_tests {
         let mut st = FactoryState::default();
 
         // Two walls, so there is a neighbour for an opening to defect to.
-        let a = st.add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0)], 0.2, 2.7)
+        let a = st
+            .add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0)], 0.2, 2.7)
             .expect("wall a");
         st.add_wall(vec![Vec2::new(0.0, 5.0), Vec2::new(4.0, 5.0)], 0.2, 2.7)
             .expect("wall b");
 
         // An opening in wall A's segment, placed the way a cut places one: directly behind it.
         let host = *st.walls[a].segments.first().expect("a segment");
-        let host_at = st.model.features.iter().position(|f| f.id == host).expect("host present");
+        let host_at = st
+            .model
+            .features
+            .iter()
+            .position(|f| f.id == host)
+            .expect("host present");
         let cutter = cad_solid::Feature {
             id: 9_000,
             op: cad_solid::BoolOp::Difference,
             plane: cad_solid::Plane::default(),
             placement: cad_solid::Placement::default(),
-            primitive: cad_solid::Primitive::Box { w: 0.9, d: 1.0, h: 1.2 },
+            primitive: cad_solid::Primitive::Box {
+                w: 0.9,
+                d: 1.0,
+                h: 1.2,
+            },
             enabled: true,
             target: None,
             through: None,
@@ -16721,14 +20230,26 @@ mod wall_opening_tests {
         // Drag a corner of wall A. Segment count is unchanged.
         st.wall_move_vertex(a, 1, Vec2::new(4.5, 0.3));
 
-        let new_host = *st.walls[a].segments.first().expect("a segment after the edit");
-        let host_now = st.model.features.iter().position(|f| f.id == new_host)
+        let new_host = *st.walls[a]
+            .segments
+            .first()
+            .expect("a segment after the edit");
+        let host_now = st
+            .model
+            .features
+            .iter()
+            .position(|f| f.id == new_host)
             .expect("the rebuilt segment is in the model");
-        let cutter_now = st.model.features.iter().position(|f| f.id == 9_000)
+        let cutter_now = st
+            .model
+            .features
+            .iter()
+            .position(|f| f.id == 9_000)
             .expect("the cutter is still in the model");
 
         assert_eq!(
-            cutter_now, host_now + 1,
+            cutter_now,
+            host_now + 1,
             "the opening is no longer directly behind its own wall — it is cutting a neighbour",
         );
     }
@@ -16747,19 +20268,35 @@ mod wall_opening_tests {
             op: cad_solid::BoolOp::Difference,
             plane: cad_solid::Plane::default(),
             placement: cad_solid::Placement {
-                u: at.x, v: at.y, lift: at.z, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0,
+                u: at.x,
+                v: at.y,
+                lift: at.z,
+                spin_deg: 0.0,
+                pitch_deg: 0.0,
+                roll_deg: 0.0,
             },
-            primitive: cad_solid::Primitive::Box { w: size[0], d: size[1], h: size[2] },
+            primitive: cad_solid::Primitive::Box {
+                w: size[0],
+                d: size[1],
+                h: size[2],
+            },
             enabled: true,
             target: None,
             through: None,
         };
-        assert!(st.model.insert_after(host, cutter), "the host body must exist");
+        assert!(
+            st.model.insert_after(host, cutter),
+            "the host body must exist"
+        );
         id
     }
 
     fn index_of(st: &FactoryState, id: u32) -> usize {
-        st.model.features.iter().position(|f| f.id == id).expect("feature is still in the model")
+        st.model
+            .features
+            .iter()
+            .position(|f| f.id == id)
+            .expect("feature is still in the model")
     }
 
     /// The wall index each feature id belongs to, or `None` — "did this opening change walls?"
@@ -16781,7 +20318,15 @@ mod wall_opening_tests {
         // Wall A is COLLINEAR in three points, so deleting the middle one merges its two
         // segments into a single segment covering exactly the same ground.
         let a = st
-            .add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), Vec2::new(8.0, 0.0)], 0.2, 2.7)
+            .add_wall(
+                vec![
+                    Vec2::new(0.0, 0.0),
+                    Vec2::new(4.0, 0.0),
+                    Vec2::new(8.0, 0.0),
+                ],
+                0.2,
+                2.7,
+            )
             .expect("wall a");
         // A neighbour AFTER wall A, so an appended cutter would land behind it — that is the
         // defect this whole area exists to prevent, and it must have somewhere to defect to.
@@ -16790,22 +20335,52 @@ mod wall_opening_tests {
             .expect("wall b");
 
         let (s0, s1) = (st.walls[a].segments[0], st.walls[a].segments[1]);
-        let w0 = cut_on(&mut st, s0, Vec3::new(2.0, 0.0, 1.2), [0.9, 1.0, 1.2], 9_001);
-        let w1 = cut_on(&mut st, s1, Vec3::new(6.0, 0.0, 1.2), [0.9, 1.0, 1.2], 9_002);
+        let w0 = cut_on(
+            &mut st,
+            s0,
+            Vec3::new(2.0, 0.0, 1.2),
+            [0.9, 1.0, 1.2],
+            9_001,
+        );
+        let w1 = cut_on(
+            &mut st,
+            s1,
+            Vec3::new(6.0, 0.0, 1.2),
+            [0.9, 1.0, 1.2],
+            9_002,
+        );
 
-        assert!(st.wall_delete_vertex(a, 1), "the middle vertex is deletable");
+        assert!(
+            st.wall_delete_vertex(a, 1),
+            "the middle vertex is deletable"
+        );
 
-        assert_eq!(st.walls[a].segments.len(), 1, "the two segments merged into one");
+        assert_eq!(
+            st.walls[a].segments.len(),
+            1,
+            "the two segments merged into one"
+        );
         let merged = st.walls[a].segments[0];
-        assert!(st.orphaned_cutouts().is_empty(), "both openings are still on the wall");
+        assert!(
+            st.orphaned_cutouts().is_empty(),
+            "both openings are still on the wall"
+        );
         for (w, name) in [(w0, "the first opening"), (w1, "the second opening")] {
             assert_eq!(owning_wall(&st, w), Some(a), "{name} changed walls");
             assert!(
                 index_of(&st, w) > index_of(&st, merged),
                 "{name} must sit behind the merged segment, not in front of it",
             );
-            assert_ne!(owning_wall(&st, w), Some(b), "{name} defected to the neighbour");
-            assert_eq!(st.model.is_enabled(w), Some(true), "{name} is still applied");
+            assert_ne!(
+                owning_wall(&st, w),
+                Some(b),
+                "{name} defected to the neighbour"
+            );
+            assert_eq!(
+                st.model.is_enabled(w),
+                Some(true),
+                "{name} is still applied"
+            );
         }
     }
 
@@ -16819,22 +20394,43 @@ mod wall_opening_tests {
             .add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(8.0, 0.0)], 0.2, 2.7)
             .expect("wall a");
         let s0 = st.walls[a].segments[0];
-        let near = cut_on(&mut st, s0, Vec3::new(1.0, 0.0, 1.2), [0.9, 1.0, 1.2], 9_010);
-        let far = cut_on(&mut st, s0, Vec3::new(7.0, 0.0, 1.2), [0.9, 1.0, 1.2], 9_011);
+        let near = cut_on(
+            &mut st,
+            s0,
+            Vec3::new(1.0, 0.0, 1.2),
+            [0.9, 1.0, 1.2],
+            9_010,
+        );
+        let far = cut_on(
+            &mut st,
+            s0,
+            Vec3::new(7.0, 0.0, 1.2),
+            [0.9, 1.0, 1.2],
+            9_011,
+        );
 
-        assert_eq!(st.wall_insert_vertex(a, 0, Vec2::new(4.0, 0.0)), Some(1), "vertex inserted");
+        assert_eq!(
+            st.wall_insert_vertex(a, 0, Vec2::new(4.0, 0.0)),
+            Some(1),
+            "vertex inserted"
+        );
         assert_eq!(st.walls[a].segments.len(), 2, "one segment became two");
         let (left, right) = (st.walls[a].segments[0], st.walls[a].segments[1]);
 
-        assert!(st.orphaned_cutouts().is_empty(), "both openings still sit on the wall");
+        assert!(
+            st.orphaned_cutouts().is_empty(),
+            "both openings still sit on the wall"
+        );
         // Directly behind, not merely after: `right` follows `left`, so "after left" is also
         // true of an opening that has drifted onto the far half.
         assert_eq!(
-            index_of(&st, near), index_of(&st, left) + 1,
+            index_of(&st, near),
+            index_of(&st, left) + 1,
             "the opening at x = 1 must cut the 0–4 half",
         );
         assert_eq!(
-            index_of(&st, far), index_of(&st, right) + 1,
+            index_of(&st, far),
+            index_of(&st, right) + 1,
             "the opening at x = 7 must cut the 4–8 half",
         );
     }
@@ -16849,21 +20445,47 @@ mod wall_opening_tests {
     fn an_opening_that_fits_no_rebuilt_segment_is_kept_and_flagged() {
         let mut st = FactoryState::default();
         let a = st
-            .add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), Vec2::new(4.0, 4.0)], 0.2, 2.7)
+            .add_wall(
+                vec![
+                    Vec2::new(0.0, 0.0),
+                    Vec2::new(4.0, 0.0),
+                    Vec2::new(4.0, 4.0),
+                ],
+                0.2,
+                2.7,
+            )
             .expect("wall a");
         let b = st
             .add_wall(vec![Vec2::new(0.0, 9.0), Vec2::new(8.0, 9.0)], 0.2, 2.7)
             .expect("wall b");
 
         let (s0, s1) = (st.walls[a].segments[0], st.walls[a].segments[1]);
-        let along = cut_on(&mut st, s0, Vec3::new(2.0, 0.0, 1.2), [0.9, 1.0, 1.2], 9_020);
-        let up = cut_on(&mut st, s1, Vec3::new(4.0, 2.0, 1.2), [0.9, 1.0, 1.2], 9_021);
+        let along = cut_on(
+            &mut st,
+            s0,
+            Vec3::new(2.0, 0.0, 1.2),
+            [0.9, 1.0, 1.2],
+            9_020,
+        );
+        let up = cut_on(
+            &mut st,
+            s1,
+            Vec3::new(4.0, 2.0, 1.2),
+            [0.9, 1.0, 1.2],
+            9_021,
+        );
 
         // Delete the corner: (0,0)–(4,0)–(4,4) becomes the diagonal (0,0)–(4,4). Both openings
         // are >1.4 m off that line, and the wall is 0.2 m thick.
-        assert!(st.wall_delete_vertex(a, 1), "the corner vertex is deletable");
+        assert!(
+            st.wall_delete_vertex(a, 1),
+            "the corner vertex is deletable"
+        );
 
-        let both = [(along, "the opening along the base"), (up, "the opening up the side")];
+        let both = [
+            (along, "the opening along the base"),
+            (up, "the opening up the side"),
+        ];
 
         // KEPT — asserted FIRST, and deliberately. An implementation that simply drops what it
         // cannot place satisfies every flag assertion below by leaving nothing to flag, so
@@ -16878,12 +20500,24 @@ mod wall_opening_tests {
         // FLAGGED — and not applied, which is what stops it cutting something it was never
         // drawn on.
         let orphans = st.orphaned_cutouts();
-        assert_eq!(orphans.len(), 2, "both openings lost their segment, got {orphans:?}");
+        assert_eq!(
+            orphans.len(),
+            2,
+            "both openings lost their segment, got {orphans:?}"
+        );
         for (w, name) in both {
             assert!(orphans.contains(&w), "{name} was not flagged");
-            assert_eq!(st.model.is_enabled(w), Some(false), "{name} is still being applied");
+            assert_eq!(
+                st.model.is_enabled(w),
+                Some(false),
+                "{name} is still being applied"
+            );
             // NOT RE-BOUND — and least of all to the neighbouring wall.
-            assert_ne!(owning_wall(&st, w), Some(b), "{name} was re-bound to the neighbour");
+            assert_ne!(
+                owning_wall(&st, w),
+                Some(b),
+                "{name} was re-bound to the neighbour"
+            );
         }
 
         // And it is SAID. A disabled cutter makes no hole, so the wall renders whole and there is
@@ -16894,8 +20528,14 @@ mod wall_opening_tests {
             st.status,
         );
         let overlay = st.overlay_lines();
-        let red = overlay.iter().filter(|v| v.r > 0.9 && v.g < 0.4 && v.b < 0.4).count();
-        assert!(red > 0, "no marker was drawn for an opening that has silently stopped existing");
+        let red = overlay
+            .iter()
+            .filter(|v| v.r > 0.9 && v.g < 0.4 && v.b < 0.4)
+            .count();
+        assert!(
+            red > 0,
+            "no marker was drawn for an opening that has silently stopped existing"
+        );
     }
 
     /// A CUT ON THE STOREY ABOVE IS NOT THIS WALL'S. The re-homing test is geometric, and in plan
@@ -16906,17 +20546,35 @@ mod wall_opening_tests {
     fn re_homing_does_not_adopt_an_opening_from_the_storey_above() {
         let mut st = FactoryState::default();
         let a = st
-            .add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), Vec2::new(8.0, 0.0)], 0.2, 2.7)
+            .add_wall(
+                vec![
+                    Vec2::new(0.0, 0.0),
+                    Vec2::new(4.0, 0.0),
+                    Vec2::new(8.0, 0.0),
+                ],
+                0.2,
+                2.7,
+            )
             .expect("wall a");
         let s0 = st.walls[a].segments[0];
         // Directly above the wall in plan, but on the floor above: z = 4.0 is clear of the
         // ground-floor band [0, 2.7].
-        let upstairs = cut_on(&mut st, s0, Vec3::new(2.0, 0.0, 4.0), [0.9, 1.0, 1.2], 9_030);
+        let upstairs = cut_on(
+            &mut st,
+            s0,
+            Vec3::new(2.0, 0.0, 4.0),
+            [0.9, 1.0, 1.2],
+            9_030,
+        );
 
-        assert!(st.wall_delete_vertex(a, 1), "the middle vertex is deletable");
+        assert!(
+            st.wall_delete_vertex(a, 1),
+            "the middle vertex is deletable"
+        );
 
         assert_eq!(
-            st.model.is_enabled(upstairs), Some(false),
+            st.model.is_enabled(upstairs),
+            Some(false),
             "a cut 1.3 m above the wall's own head height was adopted as one of its openings",
         );
     }
@@ -16941,19 +20599,30 @@ mod wall_opening_tests {
     #[test]
     fn an_opening_still_opens_after_its_wall_corner_is_dragged() {
         let mut st = FactoryState::default();
-        let a = st.add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0)], 0.2, 2.7)
+        let a = st
+            .add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0)], 0.2, 2.7)
             .expect("wall a");
         let s0 = st.walls[a].segments[0];
         // Takes everything past x = 3 away, so the hole is visible in the model's extent.
-        let cut = cut_on(&mut st, s0, Vec3::new(5.0, 0.0, 0.0), [4.0, 2.0, 4.0], 9_100);
-        assert!((model_max_x(&st) - 3.0).abs() < 0.05, "the fixture must cut before the edit");
+        let cut = cut_on(
+            &mut st,
+            s0,
+            Vec3::new(5.0, 0.0, 0.0),
+            [4.0, 2.0, 4.0],
+            9_100,
+        );
+        assert!(
+            (model_max_x(&st) - 3.0).abs() < 0.05,
+            "the fixture must cut before the edit"
+        );
 
         // Drag the NEAR corner, so the far end — where the opening is — does not move.
         st.wall_move_vertex(a, 0, Vec2::new(-1.0, 0.0));
 
         let seg = st.walls[a].segments[0];
         assert_eq!(
-            st.model.get(cut).and_then(|f| f.target), Some(seg),
+            st.model.get(cut).and_then(|f| f.target),
+            Some(seg),
             "the opening still names the segment it was cut in, which no longer exists",
         );
         assert!(
@@ -16969,18 +20638,33 @@ mod wall_opening_tests {
     #[test]
     fn a_re_homed_opening_still_opens_the_half_it_landed_on() {
         let mut st = FactoryState::default();
-        let a = st.add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(8.0, 0.0)], 0.2, 2.7)
+        let a = st
+            .add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(8.0, 0.0)], 0.2, 2.7)
             .expect("wall a");
         let s0 = st.walls[a].segments[0];
         // Takes everything past x = 6 away — squarely inside the right-hand half after the split.
-        let cut = cut_on(&mut st, s0, Vec3::new(8.0, 0.0, 0.0), [4.0, 2.0, 4.0], 9_101);
-        assert!((model_max_x(&st) - 6.0).abs() < 0.05, "the fixture must cut before the edit");
+        let cut = cut_on(
+            &mut st,
+            s0,
+            Vec3::new(8.0, 0.0, 0.0),
+            [4.0, 2.0, 4.0],
+            9_101,
+        );
+        assert!(
+            (model_max_x(&st) - 6.0).abs() < 0.05,
+            "the fixture must cut before the edit"
+        );
 
-        assert_eq!(st.wall_insert_vertex(a, 0, Vec2::new(4.0, 0.0)), Some(1), "vertex inserted");
+        assert_eq!(
+            st.wall_insert_vertex(a, 0, Vec2::new(4.0, 0.0)),
+            Some(1),
+            "vertex inserted"
+        );
         let right = st.walls[a].segments[1];
 
         assert_eq!(
-            st.model.get(cut).and_then(|f| f.target), Some(right),
+            st.model.get(cut).and_then(|f| f.target),
+            Some(right),
             "the re-homed opening does not name the half it was re-homed onto",
         );
         assert!(
@@ -17027,7 +20711,11 @@ mod a_painted_face_keeps_its_paint {
         for (i, k) in keys.iter().enumerate() {
             st.surface_color.insert(*k, [i as f32 * 0.05, 0.5, 0.5]);
         }
-        assert!(keys.len() >= 6, "a box has at least six faces, found {}", keys.len());
+        assert!(
+            keys.len() >= 6,
+            "a box has at least six faces, found {}",
+            keys.len()
+        );
         keys.len()
     }
 
@@ -17035,16 +20723,21 @@ mod a_painted_face_keeps_its_paint {
     /// have been lost along the way.
     fn assert_every_face_still_painted(st: &FactoryState, before: usize, what: &str) {
         assert_eq!(
-            st.surface_color.len(), before,
+            st.surface_color.len(),
+            before,
             "{what}: the paint table changed size — an entry was dropped or duplicated",
         );
         let now = surfaces(st);
-        let unpainted: Vec<_> = now.iter().filter(|k| !st.surface_color.contains_key(k)).collect();
+        let unpainted: Vec<_> = now
+            .iter()
+            .filter(|k| !st.surface_color.contains_key(k))
+            .collect();
         assert!(
             unpainted.is_empty(),
             "{what}: {} of {} faces came back unpainted — the paint is keyed to a plane that is \
              no longer anywhere",
-            unpainted.len(), now.len(),
+            unpainted.len(),
+            now.len(),
         );
     }
 
@@ -17108,7 +20801,8 @@ mod a_painted_face_keeps_its_paint {
         st.scale_selection(2.0);
 
         assert_eq!(
-            st.surface_color.get(&stranger), Some(&[1.0, 0.0, 0.0]),
+            st.surface_color.get(&stranger),
+            Some(&[1.0, 0.0, 0.0]),
             "another body's paint moved when this one did",
         );
     }
@@ -17138,7 +20832,9 @@ mod a_save_keeps_the_furniture {
         let a = st.add_furniture_asset("model_20260805-163358".into(), mesh);
         st.place_furniture(a, Vec3::new(2.99, 0.42, 0.68));
         st.add_texture("mat0".into(), 4, 4, vec![255; 4 * 4 * 4]);
-        assert!(!st.furniture_lib.is_empty() && !st.furniture.is_empty() && !st.textures.is_empty());
+        assert!(
+            !st.furniture_lib.is_empty() && !st.furniture.is_empty() && !st.textures.is_empty()
+        );
         st
     }
 
@@ -17164,7 +20860,8 @@ mod a_save_keeps_the_furniture {
         let st = furnished();
         let d = st.to_persist_lite();
         assert_eq!(
-            d.furniture_lib.len(), 1,
+            d.furniture_lib.len(),
+            1,
             "the lite path dropped the asset itself, not just its geometry — so the worker has \
              nothing to fill in and the file reopens without it",
         );
@@ -17181,11 +20878,16 @@ mod a_save_keeps_the_furniture {
         let d = st.to_persist_lite();
         let raw = st.furniture_geom_flat();
         assert_eq!(
-            raw.len(), d.furniture_lib.len(),
+            raw.len(),
+            d.furniture_lib.len(),
             "{} asset(s) listed but {} set(s) of geometry — the worker pairs these by index",
-            d.furniture_lib.len(), raw.len(),
+            d.furniture_lib.len(),
+            raw.len(),
         );
-        assert!(!raw.is_empty() && !raw[0].pos.is_empty(), "the geometry handed over is empty");
+        assert!(
+            !raw.is_empty() && !raw[0].pos.is_empty(),
+            "the geometry handed over is empty"
+        );
     }
 }
 
@@ -17216,7 +20918,10 @@ mod seam_preserving_lod {
                 let (x0, x1) = (i as f32 / n as f32, (i + 1) as f32 / n as f32);
                 let (y0, y1) = (j as f32 / n as f32, (j + 1) as f32 / n as f32);
                 let u = |x: f32| if x < 0.44 { 0.05 } else { 0.95 };
-                for (a, b, c) in [((x0, y0), (x1, y0), (x1, y1)), ((x0, y0), (x1, y1), (x0, y1))] {
+                for (a, b, c) in [
+                    ((x0, y0), (x1, y0), (x1, y1)),
+                    ((x0, y0), (x1, y1), (x0, y1)),
+                ] {
                     for (x, y) in [a, b, c] {
                         pos.push([x, y, 0.0]);
                         uv.push([u(x), y]);
@@ -17301,8 +21006,15 @@ mod seam_preserving_lod {
 
         let out = cluster_decimate_attr(&pos, &[], &uv, &[], &face, 8);
         assert!(!out.face.is_empty(), "the proxy must not be empty");
-        assert_eq!(out.face.len(), out.tri_count(), "one face id per proxy triangle");
-        assert!(out.face.contains(&0) && out.face.contains(&1), "both groups must survive");
+        assert_eq!(
+            out.face.len(),
+            out.tri_count(),
+            "one face id per proxy triangle"
+        );
+        assert!(
+            out.face.contains(&0) && out.face.contains(&1),
+            "both groups must survive"
+        );
         for t in 0..out.tri_count() {
             if out.face[t] == 2 {
                 continue; // the spacer
@@ -17325,11 +21037,24 @@ mod seam_preserving_lod {
     #[test]
     fn per_vertex_alpha_is_carried_and_stays_per_vertex() {
         let (pos, uv, face) = seamed_strip(20);
-        let alpha: Vec<f32> = pos.iter().map(|p| if p[1] < 0.5 { 0.3 } else { 1.0 }).collect();
+        let alpha: Vec<f32> = pos
+            .iter()
+            .map(|p| if p[1] < 0.5 { 0.3 } else { 1.0 })
+            .collect();
         let out = cluster_decimate_attr(&pos, &[], &uv, &alpha, &face, 8);
-        assert_eq!(out.alpha.len(), out.positions.len(), "alpha stays per-vertex");
-        assert!(out.alpha.iter().any(|&a| a < ALPHA_OPAQUE), "the see-through half must survive");
-        assert!(out.alpha.iter().any(|&a| a >= ALPHA_OPAQUE), "and so must the solid half");
+        assert_eq!(
+            out.alpha.len(),
+            out.positions.len(),
+            "alpha stays per-vertex"
+        );
+        assert!(
+            out.alpha.iter().any(|&a| a < ALPHA_OPAQUE),
+            "the see-through half must survive"
+        );
+        assert!(
+            out.alpha.iter().any(|&a| a >= ALPHA_OPAQUE),
+            "and so must the solid half"
+        );
     }
 
     /// A SOURCE WITH NO ATTRIBUTES PRODUCES A PROXY WITH NONE — callers test
@@ -17357,7 +21082,10 @@ mod seam_preserving_lod {
         );
         assert!(a.needs_lod(), "a bare heavy asset always did");
         a.uvs = vec![[0.0, 0.0]; n];
-        assert!(a.needs_lod(), "and now it does WITH texture coordinates — this was the bug");
+        assert!(
+            a.needs_lod(),
+            "and now it does WITH texture coordinates — this was the bug"
+        );
         a.alpha = vec![1.0; n];
         assert!(a.needs_lod(), "…and with per-vertex alpha");
     }
@@ -17427,14 +21155,20 @@ mod lod_consumers_read_one_mesh {
         let asset = &f.furniture_lib[0];
         assert!(asset.needs_lod(), "the fixture must actually be proxied");
         let lod = asset.lod_geom();
-        let proxy: std::collections::HashSet<[u32; 3]> =
-            lod.positions.iter().map(|p| [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()]).collect();
+        let proxy: std::collections::HashSet<[u32; 3]> = lod
+            .positions
+            .iter()
+            .map(|p| [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()])
+            .collect();
         let full_only = f.furniture_lib[0]
             .positions
             .iter()
             .filter(|p| !proxy.contains(&[p[0].to_bits(), p[1].to_bits(), p[2].to_bits()]))
             .count();
-        assert!(full_only > 0, "the two meshes must differ, or this test cannot fail");
+        assert!(
+            full_only > 0,
+            "the two meshes must differ, or this test cannot fail"
+        );
 
         // Give it a per-surface assignment so `furniture_faceted` actually runs.
         let tex = f.add_texture("t".into(), 2, 2, vec![255u8; 16]);
@@ -17450,7 +21184,9 @@ mod lod_consumers_read_one_mesh {
                 assert!(
                     proxy.contains(&[v.x.to_bits(), v.y.to_bits(), v.z.to_bits()]),
                     "a vertex at ({}, {}, {}) is not in the proxy — the split mixed two meshes",
-                    v.x, v.y, v.z,
+                    v.x,
+                    v.y,
+                    v.z,
                 );
             }
         }
@@ -17476,8 +21212,11 @@ mod lod_consumers_read_one_mesh {
         let tex = f.add_texture("t".into(), 2, 2, vec![255u8; 16]);
         f.furniture[0].texture = Some(tex);
         let lod = f.furniture_lib[0].lod_geom();
-        let proxy: std::collections::HashSet<[u32; 3]> =
-            lod.positions.iter().map(|p| [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()]).collect();
+        let proxy: std::collections::HashSet<[u32; 3]> = lod
+            .positions
+            .iter()
+            .map(|p| [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()])
+            .collect();
 
         let (_, _, verts) = f.furniture_textured_mesh(0).expect("a textured mesh");
         assert!(!verts.is_empty());
@@ -17485,7 +21224,9 @@ mod lod_consumers_read_one_mesh {
             assert!(
                 proxy.contains(&[v.x.to_bits(), v.y.to_bits(), v.z.to_bits()]),
                 "a vertex at ({}, {}, {}) is not in the proxy",
-                v.x, v.y, v.z,
+                v.x,
+                v.y,
+                v.z,
             );
         }
     }
@@ -17499,8 +21240,14 @@ mod lod_consumers_read_one_mesh {
         let total = lod.tri_count();
 
         let solid = f.furniture_local_mesh(0).len() / 3;
-        let glass = f.furniture_translucent_mesh(0).map(|(_, v)| v.len() / 3).unwrap_or(0);
-        assert!(glass > 0, "the fixture has glass in it, so the peel must find some");
+        let glass = f
+            .furniture_translucent_mesh(0)
+            .map(|(_, v)| v.len() / 3)
+            .unwrap_or(0);
+        assert!(
+            glass > 0,
+            "the fixture has glass in it, so the peel must find some"
+        );
         assert_eq!(
             solid + glass,
             total,
@@ -17542,7 +21289,10 @@ mod the_first_frame_after_a_load {
     fn decoding_the_library_leaves_the_proxy_already_built() {
         let lib = FactoryState::decode_furniture_lib(vec![a_heavy_rec()]);
         let a = &lib[0];
-        assert!(a.needs_lod(), "the fixture must be heavy enough to want a proxy");
+        assert!(
+            a.needs_lod(),
+            "the fixture must be heavy enough to want a proxy"
+        );
         assert!(
             a.lod.borrow().is_some(),
             "the proxy is still unbuilt, so the first frame that draws will pay for it",
@@ -17560,7 +21310,10 @@ mod the_first_frame_after_a_load {
         rec.positions.truncate(30);
         let lib = FactoryState::decode_furniture_lib(vec![rec]);
         assert!(!lib[0].needs_lod());
-        assert!(lib[0].lod.borrow().is_none(), "no proxy is wanted, so none should be built");
+        assert!(
+            lib[0].lod.borrow().is_none(),
+            "no proxy is wanted, so none should be built"
+        );
     }
 }
 
@@ -17575,10 +21328,17 @@ mod the_translucent_key {
             .map(|i| [(i % 5) as f32, (i / 5) as f32, (i % 3) as f32])
             .collect();
         let normals = vec![[0.0, 0.0, 1.0]; pos.len()];
-        let alpha: Vec<f32> = (0..pos.len()).map(|i| if i < 30 { 0.3 } else { 1.0 }).collect();
+        let alpha: Vec<f32> = (0..pos.len())
+            .map(|i| if i < 30 { 0.3 } else { 1.0 })
+            .collect();
         let idx = f.add_furniture_asset(
             "pane".into(),
-            crate::mesh_io::ObjMesh { positions: pos, normals, color: Some([1.0; 3]), alpha },
+            crate::mesh_io::ObjMesh {
+                positions: pos,
+                normals,
+                color: Some([1.0; 3]),
+                alpha,
+            },
         );
         f.place_furniture(idx, Vec3::ZERO);
         f
@@ -17595,7 +21355,9 @@ mod the_translucent_key {
     #[test]
     fn the_cheap_key_matches_the_one_the_geometry_carries() {
         let f = a_glassy_piece();
-        let (from_mesh, _) = f.furniture_translucent_mesh(0).expect("this piece has glass");
+        let (from_mesh, _) = f
+            .furniture_translucent_mesh(0)
+            .expect("this piece has glass");
         assert_eq!(
             f.furniture_translucent_key(0),
             Some(from_mesh),
@@ -17646,9 +21408,18 @@ mod the_section_is_a_floor_plan {
             ]
         };
         const FACES: [[usize; 3]; 12] = [
-            [0, 2, 3], [0, 3, 1], [4, 5, 7], [4, 7, 6],
-            [0, 1, 5], [0, 5, 4], [2, 6, 7], [2, 7, 3],
-            [0, 4, 6], [0, 6, 2], [1, 3, 7], [1, 7, 5],
+            [0, 2, 3],
+            [0, 3, 1],
+            [4, 5, 7],
+            [4, 7, 6],
+            [0, 1, 5],
+            [0, 5, 4],
+            [2, 6, 7],
+            [2, 7, 3],
+            [0, 4, 6],
+            [0, 6, 2],
+            [1, 3, 7],
+            [1, 7, 5],
         ];
         FACES.iter().flat_map(|f| f.iter().map(|&i| v(i))).collect()
     }
@@ -17666,7 +21437,10 @@ mod the_section_is_a_floor_plan {
     fn a_cut_through_a_box_traces_its_footprint() {
         let f = a_model(box_tris(Vec3::new(0.0, 0.0, 0.0), Vec3::new(4.0, 3.0, 2.5)));
         let segs = f.section_at_z(0.8);
-        assert!(!segs.is_empty(), "a plane through the box must cut something");
+        assert!(
+            !segs.is_empty(),
+            "a plane through the box must cut something"
+        );
 
         let on_outline = |p: glam::Vec2| {
             let ex = p.x.abs() < 1e-4 || (p.x - 4.0).abs() < 1e-4;
@@ -17675,7 +21449,10 @@ mod the_section_is_a_floor_plan {
         };
         for s in &segs {
             for p in s {
-                assert!(on_outline(*p), "a cut point sits off the box outline: {p:?}");
+                assert!(
+                    on_outline(*p),
+                    "a cut point sits off the box outline: {p:?}"
+                );
             }
         }
         let (mut lo, mut hi) = (glam::Vec2::splat(f32::MAX), glam::Vec2::splat(f32::MIN));
@@ -17685,7 +21462,10 @@ mod the_section_is_a_floor_plan {
                 hi = hi.max(*p);
             }
         }
-        assert!((lo.x).abs() < 1e-4 && (lo.y).abs() < 1e-4, "the cut must reach the near corner");
+        assert!(
+            (lo.x).abs() < 1e-4 && (lo.y).abs() < 1e-4,
+            "the cut must reach the near corner"
+        );
         assert!(
             (hi.x - 4.0).abs() < 1e-4 && (hi.y - 3.0).abs() < 1e-4,
             "and the far one — a cut missing a wall still draws convincingly",
@@ -17742,7 +21522,10 @@ mod the_section_is_a_floor_plan {
         for s in &segs {
             for p in s {
                 let inside_desk = p.x > 1.0001 && p.x < 1.9999 && p.y > 1.0001 && p.y < 1.9999;
-                assert!(!inside_desk, "the desk was cut into the wall drawing at {p:?}");
+                assert!(
+                    !inside_desk,
+                    "the desk was cut into the wall drawing at {p:?}"
+                );
             }
         }
     }
@@ -17761,7 +21544,10 @@ mod apertures_fill_the_gap_they_cut {
     fn wall_with_a_hole() -> Vec<[f32; 3]> {
         // Two stubs with a 1 m gap between them at x 1..2 — a doorway.
         let mut t = crate::factory::tests_box(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.2, 2.5));
-        t.extend(crate::factory::tests_box(Vec3::new(2.0, 0.0, 0.0), Vec3::new(3.0, 0.2, 2.5)));
+        t.extend(crate::factory::tests_box(
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(3.0, 0.2, 2.5),
+        ));
         t
     }
 
@@ -17773,7 +21559,10 @@ mod apertures_fill_the_gap_they_cut {
         f.cached.positions = wall_with_a_hole();
         for s in f.section_at_z(1.0) {
             for p in s {
-                assert!(p.x <= 1.0001 || p.x >= 1.9999, "the wall must not cross the opening");
+                assert!(
+                    p.x <= 1.0001 || p.x >= 1.9999,
+                    "the wall must not cross the opening"
+                );
             }
         }
     }
@@ -17801,7 +21590,10 @@ mod apertures_fill_the_gap_they_cut {
         f.furniture.last_mut().expect("placed").fit = Some([1.0, 1.0, 1.0]);
 
         let segs = f.aperture_section_at_z(1.0);
-        assert!(!segs.is_empty(), "the window must be drawn — that is the whole complaint");
+        assert!(
+            !segs.is_empty(),
+            "the window must be drawn — that is the whole complaint"
+        );
         assert!(
             segs.iter().flatten().any(|p| p.x > 1.0 && p.x < 2.0),
             "and it must land IN the opening the wall left: {segs:?}",
@@ -17826,7 +21618,10 @@ mod apertures_fill_the_gap_they_cut {
             },
         );
         f.place_furniture(idx, Vec3::new(0.0, 0.0, 0.0));
-        assert!(f.furniture.last().expect("placed").fit.is_none(), "a desk has no fit");
+        assert!(
+            f.furniture.last().expect("placed").fit.is_none(),
+            "a desk has no fit"
+        );
         assert!(
             f.aperture_section_at_z(0.8).is_empty(),
             "furniture must not be drawn into the wall plan",
@@ -17846,15 +21641,30 @@ mod native_geom_tests {
             pos: flat3(pos),
             nrm: flat3(pos), // normals need not be real for a transport test
             uv: uv.map(flat2).unwrap_or_default(),
-            alpha: if uv.is_some() { vec![1.0; pos.len()] } else { Vec::new() },
+            alpha: if uv.is_some() {
+                vec![1.0; pos.len()]
+            } else {
+                Vec::new()
+            },
         }
     }
 
     #[test]
     fn geometry_round_trips_through_the_native_blob() {
         let geom = vec![
-            raw(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], None),
-            raw(&[[2.0, 2.0, 2.0], [3.0, 2.0, 2.0], [2.0, 3.0, 2.0]], Some(&[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])),
+            raw(
+                &[
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                None,
+            ),
+            raw(
+                &[[2.0, 2.0, 2.0], [3.0, 2.0, 2.0], [2.0, 3.0, 2.0]],
+                Some(&[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]),
+            ),
         ];
         // A denser input for the shrink claim — deflate of a handful of verts can
         // legitimately grow (stream headers), which says nothing about real meshes.
@@ -17863,7 +21673,10 @@ mod native_geom_tests {
             dense.push([(k % 97) as f32, (k % 89) as f32, (k % 83) as f32]);
         }
         let dblob = furniture_geom_native(&[raw(&dense, None)]);
-        assert!(dblob.len() < dense.len() * 12, "deflate must shrink the dense arrays");
+        assert!(
+            dblob.len() < dense.len() * 12,
+            "deflate must shrink the dense arrays"
+        );
 
         let blob = furniture_geom_native(&geom);
         assert!(blob.starts_with(b"3DFG1"));
@@ -17878,7 +21691,10 @@ mod native_geom_tests {
     #[test]
     fn a_missing_or_truncated_blob_decodes_to_empties() {
         assert!(decode_furniture_geom_native(b"nope").is_empty());
-        assert!(decode_furniture_geom_native(b"3DFG1").is_empty(), "no count");
+        assert!(
+            decode_furniture_geom_native(b"3DFG1").is_empty(),
+            "no count"
+        );
         let geom = vec![raw(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], None)];
         let blob = furniture_geom_native(&geom);
         let cut = &blob[..blob.len() - 3]; // truncate mid-stream
@@ -17892,13 +21708,19 @@ mod native_geom_tests {
     #[test]
     fn records_decode_native_to_the_same_assets_as_the_json_route() {
         use crate::simlux_io::FurnitureAssetRec;
-        let mut recs = vec![FurnitureAssetRec { name: "chair".into(), ..Default::default() }];
+        let mut recs = vec![FurnitureAssetRec {
+            name: "chair".into(),
+            ..Default::default()
+        }];
         let pos = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let blob = furniture_geom_native(&[raw(&pos, None)]);
-        let assets = FactoryState::decode_furniture_lib_native(
-            std::mem::take(&mut recs), &blob);
+        let assets = FactoryState::decode_furniture_lib_native(std::mem::take(&mut recs), &blob);
         assert_eq!(assets.len(), 1);
-        assert_eq!(assets[0].positions.len(), 3, "geometry arrived from the blob");
+        assert_eq!(
+            assets[0].positions.len(),
+            3,
+            "geometry arrived from the blob"
+        );
         assert_eq!(assets[0].name, "chair");
         let local = (assets[0].local_min, assets[0].local_max);
         assert_eq!(local.0, [0.0, 0.0, 0.0]);

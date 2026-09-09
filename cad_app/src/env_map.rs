@@ -81,7 +81,10 @@ impl EnvMap {
         let rgb = img.to_rgb32f();
         let (w, h) = (rgb.width() as usize, rgb.height() as usize);
         if w < 2 || h < 2 {
-            return Err(format!("{}: too small to be an environment", path.display()));
+            return Err(format!(
+                "{}: too small to be an environment",
+                path.display()
+            ));
         }
         // `to_rgb32f` already linearises an 8-bit source and passes float data through untouched,
         // so both paths arrive as linear radiance and nothing is decoded twice.
@@ -97,7 +100,12 @@ impl EnvMap {
                 px.push(f(Self::texel_dir(x, y, w, h)));
             }
         }
-        Self { w, h, px, name: name.to_string() }
+        Self {
+            w,
+            h,
+            px,
+            name: name.to_string(),
+        }
     }
 
     /// Does this environment actually carry high dynamic range? An IBL lit by a map whose brightest
@@ -141,7 +149,8 @@ impl EnvMap {
                 // Solid angle of the texel: sinθ dθ dφ. Without it the poles — which are a sliver
                 // of sky spread across a whole row of pixels — would count as much as the horizon.
                 let theta = ((y as f32 + 0.5) / small.h as f32) * std::f32::consts::PI;
-                let dw = theta.sin() * (std::f32::consts::PI / small.h as f32)
+                let dw = theta.sin()
+                    * (std::f32::consts::PI / small.h as f32)
                     * (std::f32::consts::TAU / small.w as f32);
                 let c = small.px[y * small.w + x];
                 let b = sh_basis(d);
@@ -159,7 +168,11 @@ impl EnvMap {
         // to exactly 4π, so scale by however far off it came, which is a factor of ~1. Dividing by
         // 4π as well (the easy slip, since 4π appears in every derivation of this) darkens every
         // surface in the scene by 12.6× and reads as a broken tone map rather than a broken sum.
-        let k = if total > 1e-6 { 4.0 * std::f32::consts::PI / total } else { 1.0 };
+        let k = if total > 1e-6 {
+            4.0 * std::f32::consts::PI / total
+        } else {
+            1.0
+        };
         for c in &mut sh {
             for v in c.iter_mut() {
                 *v *= k;
@@ -184,7 +197,12 @@ impl EnvMap {
                 // precisely the "specular is approximated" failure this module exists to remove.
                 // There is nothing to convolve — a mirror gathers exactly one direction.
                 let m = self.resized(base, base / 2);
-                out.push(EnvMip { w: m.w, h: m.h, px: m.px, roughness: 0.0 });
+                out.push(EnvMip {
+                    w: m.w,
+                    h: m.h,
+                    px: m.px,
+                    roughness: 0.0,
+                });
                 continue;
             }
             let w = (base >> level).max(8);
@@ -197,7 +215,10 @@ impl EnvMap {
             let mut px = vec![[0.0f32; 3]; w * h];
             // Rows in parallel: a narrow lobe at low roughness costs 192 rays a texel, and the
             // whole chain has to be ready before the first frame draws.
-            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16);
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(1, 16);
             let band = h.div_ceil(threads);
             std::thread::scope(|s| {
                 for (bi, rows) in px.chunks_mut(band * w).enumerate() {
@@ -213,7 +234,12 @@ impl EnvMap {
                     });
                 }
             });
-            out.push(EnvMip { w, h, px, roughness: rough });
+            out.push(EnvMip {
+                w,
+                h,
+                px,
+                roughness: rough,
+            });
         }
         out
     }
@@ -246,7 +272,12 @@ impl EnvMap {
                 }
             }
         }
-        EnvMap { w, h, px, name: self.name.clone() }
+        EnvMap {
+            w,
+            h,
+            px,
+            name: self.name.clone(),
+        }
     }
 
     /// The whole chain flattened for GPU upload: every level's texels, back to back, plus each
@@ -370,7 +401,12 @@ mod tests {
     fn a_texel_samples_back_along_its_own_direction() {
         let m = EnvMap::from_fn(64, 32, "dirs", |d| [d.x, d.y, d.z]);
         for d in [
-            Vec3::Z, -Vec3::Z, Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y,
+            Vec3::Z,
+            -Vec3::Z,
+            Vec3::X,
+            -Vec3::X,
+            Vec3::Y,
+            -Vec3::Y,
             Vec3::new(0.5, -0.3, 0.8).normalize(),
         ] {
             let s = m.sample(d);
@@ -390,7 +426,12 @@ mod tests {
     fn a_uniform_environment_has_uniform_irradiance() {
         for v in [0.25f32, 1.0, 8.0] {
             let sh = grey(v).sh9();
-            for n in [Vec3::Z, -Vec3::Z, Vec3::X, Vec3::new(0.3, 0.7, -0.6).normalize()] {
+            for n in [
+                Vec3::Z,
+                -Vec3::Z,
+                Vec3::X,
+                Vec3::new(0.3, 0.7, -0.6).normalize(),
+            ] {
                 let a = crate::env::sh_ambient(&sh, n);
                 for k in 0..3 {
                     assert!(
@@ -406,13 +447,21 @@ mod tests {
     /// upward normal more than a downward one.
     #[test]
     fn irradiance_follows_where_the_light_is() {
-        let m = EnvMap::from_fn(64, 32, "split", |d| if d.z > 0.0 { [4.0; 3] } else { [0.1; 3] });
+        let m = EnvMap::from_fn(
+            64,
+            32,
+            "split",
+            |d| if d.z > 0.0 { [4.0; 3] } else { [0.1; 3] },
+        );
         let sh = m.sh9();
         let up = crate::env::sh_ambient(&sh, Vec3::Z)[0];
         let down = crate::env::sh_ambient(&sh, -Vec3::Z)[0];
         let side = crate::env::sh_ambient(&sh, Vec3::X)[0];
         assert!(up > side, "up ({up}) is brighter than sideways ({side})");
-        assert!(side > down, "sideways ({side}) is brighter than down ({down})");
+        assert!(
+            side > down,
+            "sideways ({side}) is brighter than down ({down})"
+        );
         assert!(up > down * 3.0, "and up is much brighter than down");
     }
 
@@ -427,7 +476,9 @@ mod tests {
                 for k in 0..3 {
                     assert!(
                         (p[k] - 2.0).abs() < 0.02,
-                        "roughness {}: {} should still be 2.0", mip.roughness, p[k]
+                        "roughness {}: {} should still be 2.0",
+                        mip.roughness,
+                        p[k]
                     );
                 }
             }
@@ -440,7 +491,11 @@ mod tests {
     fn a_bright_spot_spreads_as_roughness_rises() {
         let sun = Vec3::new(0.3, 0.2, 0.93).normalize();
         let m = EnvMap::from_fn(256, 128, "sun", |d| {
-            if d.dot(sun) > 0.995 { [400.0; 3] } else { [0.4, 0.5, 0.7] }
+            if d.dot(sun) > 0.995 {
+                [400.0; 3]
+            } else {
+                [0.4, 0.5, 0.7]
+            }
         });
         let chain = m.prefilter();
         let peaks: Vec<f32> = chain
@@ -451,14 +506,23 @@ mod tests {
         // texel centre rather than a corner shifts the peak by more than rounding — the trend is
         // the claim, not the individual step.
         for w in peaks.windows(2) {
-            assert!(w[1] <= w[0] * 1.2, "peak must not grow with roughness: {peaks:?}");
+            assert!(
+                w[1] <= w[0] * 1.2,
+                "peak must not grow with roughness: {peaks:?}"
+            );
         }
-        assert!(peaks[0] > peaks[PREFILTER_LEVELS - 1] * 5.0, "and it spreads a lot: {peaks:?}");
+        assert!(
+            peaks[0] > peaks[PREFILTER_LEVELS - 1] * 5.0,
+            "and it spreads a lot: {peaks:?}"
+        );
         // The blurriest level is still brighter toward the sun than away from it.
         let last = &chain[PREFILTER_LEVELS - 1];
         let toward = sample_px(&last.px, last.w, last.h, sun)[0];
         let away = sample_px(&last.px, last.w, last.h, -sun)[0];
-        assert!(toward > away, "the blur keeps the sun's direction ({toward} vs {away})");
+        assert!(
+            toward > away,
+            "the blur keeps the sun's direction ({toward} vs {away})"
+        );
     }
 
     /// Levels get smaller, and level 0 is the mirror.
@@ -466,11 +530,19 @@ mod tests {
     fn the_chain_is_a_chain() {
         let chain = grey(1.0).prefilter();
         assert_eq!(chain[0].roughness, 0.0, "level 0 is a mirror");
-        assert_eq!(chain[PREFILTER_LEVELS - 1].roughness, 1.0, "the last is fully rough");
+        assert_eq!(
+            chain[PREFILTER_LEVELS - 1].roughness,
+            1.0,
+            "the last is fully rough"
+        );
         for w in chain.windows(2) {
             assert!(w[1].w <= w[0].w, "sizes do not grow");
             assert!(w[1].roughness > w[0].roughness, "roughness does");
-            assert_eq!(w[1].px.len(), w[1].w * w[1].h, "each level is fully populated");
+            assert_eq!(
+                w[1].px.len(),
+                w[1].w * w[1].h,
+                "each level is fully populated"
+            );
         }
     }
 
@@ -483,11 +555,18 @@ mod tests {
         let src = EnvMap::from_fn(1024, 512, "detail", |d| {
             // A fine checker: only a high-resolution level can still resolve it.
             let f = (d.x * 40.0).sin() * (d.y * 40.0).sin() * (d.z * 40.0).sin();
-            if f > 0.0 { [4.0; 3] } else { [0.05; 3] }
+            if f > 0.0 {
+                [4.0; 3]
+            } else {
+                [0.05; 3]
+            }
         });
         let chain = src.prefilter();
         assert_eq!(chain[0].w, 1024, "the mirror keeps its resolution");
-        assert_eq!(chain[1].w, 512, "and each level halves 2014 a real GL mip chain");
+        assert_eq!(
+            chain[1].w, 512,
+            "and each level halves 2014 a real GL mip chain"
+        );
 
         // Contrast survives at level 0 and is gone by the end — detail, then blur.
         let spread = |m: &EnvMip| {
@@ -495,7 +574,10 @@ mod tests {
             let mn = m.px.iter().map(|p| p[0]).fold(f32::MAX, f32::min);
             mx - mn
         };
-        assert!(spread(&chain[0]) > 3.0, "the mirror still resolves the pattern");
+        assert!(
+            spread(&chain[0]) > 3.0,
+            "the mirror still resolves the pattern"
+        );
         assert!(
             spread(&chain[PREFILTER_LEVELS - 1]) < spread(&chain[0]) * 0.5,
             "and the roughest level has averaged it away"
@@ -512,11 +594,23 @@ mod tests {
     #[test]
     fn the_shader_and_the_cpu_agree_on_where_a_direction_lands() {
         let glsl = crate::env::SKY_GLSL;
-        assert!(glsl.contains("vec2 env_uv(vec3 d)"), "the shader still has env_uv");
-        assert!(glsl.contains("atan(d.y, d.x)"), "…using atan2(y, x), as the CPU does");
+        assert!(
+            glsl.contains("vec2 env_uv(vec3 d)"),
+            "the shader still has env_uv"
+        );
+        assert!(
+            glsl.contains("atan(d.y, d.x)"),
+            "…using atan2(y, x), as the CPU does"
+        );
         assert!(glsl.contains("6.28318530718"), "…over TAU");
-        assert!(glsl.contains("acos(clamp(d.z, -1.0, 1.0))"), "…and acos(z) for latitude");
-        assert!(glsl.contains("roughness * 5") || glsl.contains("* 5.0"), "lod = roughness × 5");
+        assert!(
+            glsl.contains("acos(clamp(d.z, -1.0, 1.0))"),
+            "…and acos(z) for latitude"
+        );
+        assert!(
+            glsl.contains("roughness * 5") || glsl.contains("* 5.0"),
+            "lod = roughness × 5"
+        );
 
         // The GLSL, line for line.
         let shader_uv = |d: Vec3| {
@@ -530,8 +624,15 @@ mod tests {
         // A map whose value IS its position, so a disagreement shows up as a wrong colour.
         let m = EnvMap::from_fn(256, 128, "twin", |d| [d.x, d.y, d.z]);
         for (i, d) in [
-            Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z,
-            Vec3::new(1.0, 1.0, 0.0), Vec3::new(-1.0, 0.3, 0.5), Vec3::new(0.2, -0.9, -0.4),
+            Vec3::X,
+            -Vec3::X,
+            Vec3::Y,
+            -Vec3::Y,
+            Vec3::Z,
+            -Vec3::Z,
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(-1.0, 0.3, 0.5),
+            Vec3::new(0.2, -0.9, -0.4),
             Vec3::new(-0.6, -0.6, 0.5),
         ]
         .into_iter()
@@ -597,15 +698,25 @@ mod tests {
             // smears across it — compare the way a circle does, so a sample beside the seam is not
             // read as being half a world away.
             let err = (got - want).abs().min(1.0 - (got - want).abs());
-            assert!(err < 0.01, "dir {d:?}: tracer looked at u={got:.4}, viewport at u={want:.4}");
+            assert!(
+                err < 0.01,
+                "dir {d:?}: tracer looked at u={got:.4}, viewport at u={want:.4}"
+            );
         }
 
         // Strength still multiplies, and nothing has been lost from the plain unrotated case.
-        env.hdri = Some(crate::env::HdriUse { strength: 3.0, rot: 0.0 });
+        env.hdri = Some(crate::env::HdriUse {
+            strength: 3.0,
+            rot: 0.0,
+        });
         let bright = std::sync::Arc::new(EnvMap::from_fn(64, 32, "flat", |_| [0.25; 3]));
         let sky2 = crate::pathtrace::Sky::from_env(Vec3::Z, [1.0; 3], &env).with_env(Some(bright));
         let r = crate::pathtrace::sky_radiance_for_test(&sky2, Vec3::X, true);
-        assert!((r[0] - 0.75).abs() < 1e-3, "strength 3 on a 0.25 map is 0.75, got {}", r[0]);
+        assert!(
+            (r[0] - 0.75).abs() < 1e-3,
+            "strength 3 on a 0.25 map is 0.75, got {}",
+            r[0]
+        );
     }
 
     /// An HDRI must draw its own backdrop, with or without the sun.
@@ -619,9 +730,16 @@ mod tests {
     #[test]
     fn an_hdri_draws_the_backdrop_without_needing_the_sun() {
         let glsl = crate::env::SKY_GLSL;
-        let at_env = glsl.find("u_env_on == 1").expect("sky_with_sun asks about the HDRI");
-        let at_sky = glsl.find("u_sky_on == 0) return c").expect("…and about the analytic sky");
-        assert!(at_env < at_sky, "the HDRI is consulted first, so the sun's state cannot veto it");
+        let at_env = glsl
+            .find("u_env_on == 1")
+            .expect("sky_with_sun asks about the HDRI");
+        let at_sky = glsl
+            .find("u_sky_on == 0) return c")
+            .expect("…and about the analytic sky");
+        assert!(
+            at_env < at_sky,
+            "the HDRI is consulted first, so the sun's state cannot veto it"
+        );
 
         let src = include_str!("light3d.rs");
         assert!(
@@ -629,16 +747,27 @@ mod tests {
             "the backdrop gate treats a loaded HDRI as a sky"
         );
         // …and the full-resolution copy has a fallback, so a failed upload is soft rather than black.
-        assert!(src.contains("self.env_bg_tex.or(self.env_tex)"), "the backdrop sampler always has a texture");
+        assert!(
+            src.contains("self.env_bg_tex.or(self.env_tex)"),
+            "the backdrop sampler always has a texture"
+        );
     }
 
     /// An 8-bit image is loadable but is NOT an HDR environment, and the difference is reportable —
     /// someone will point this at a JPEG and wonder why nothing looks lit.
     #[test]
     fn low_dynamic_range_is_recognised_as_such() {
-        assert!(!grey(1.0).is_hdr(), "a map that peaks at 1.0 has no sun in it");
+        assert!(
+            !grey(1.0).is_hdr(),
+            "a map that peaks at 1.0 has no sun in it"
+        );
         assert!(grey(50.0).is_hdr());
-        let sunny = EnvMap::from_fn(32, 16, "s", |d| if d.z > 0.99 { [900.0; 3] } else { [0.3; 3] });
+        let sunny = EnvMap::from_fn(
+            32,
+            16,
+            "s",
+            |d| if d.z > 0.99 { [900.0; 3] } else { [0.3; 3] },
+        );
         assert!(sunny.is_hdr());
         assert!(sunny.peak() > 800.0);
     }
@@ -649,16 +778,24 @@ mod tests {
     #[test]
     fn downsampling_keeps_the_energy_of_a_tiny_sun() {
         let m = EnvMap::from_fn(512, 256, "sun", |d| {
-            if d.dot(Vec3::Z) > 0.9995 { [10_000.0; 3] } else { [0.2; 3] }
+            if d.dot(Vec3::Z) > 0.9995 {
+                [10_000.0; 3]
+            } else {
+                [0.2; 3]
+            }
         });
-        let mean = |e: &EnvMap| {
-            e.px.iter().map(|p| p[0] as f64).sum::<f64>() / e.px.len() as f64
-        };
+        let mean = |e: &EnvMap| e.px.iter().map(|p| p[0] as f64).sum::<f64>() / e.px.len() as f64;
         let before = mean(&m);
         let after = mean(&m.resized(64, 32));
         // Equirect rows are not equal-area, so the means differ a little; an order of magnitude
         // apart would mean the sun was lost.
-        assert!(after > before * 0.3, "the sun survived downsampling ({before} → {after})");
-        assert!(m.resized(64, 32).peak() > 100.0, "and is still much brighter than the sky");
+        assert!(
+            after > before * 0.3,
+            "the sun survived downsampling ({before} → {after})"
+        );
+        assert!(
+            m.resized(64, 32).peak() > 100.0,
+            "and is still much brighter than the sky"
+        );
     }
 }

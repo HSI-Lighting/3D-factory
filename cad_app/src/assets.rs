@@ -43,7 +43,10 @@ fn roots() -> Vec<PathBuf> {
             let mut up = dir;
             for _ in 0..4 {
                 match up.parent() {
-                    Some(p) => { out.push(p.to_path_buf()); up = p; }
+                    Some(p) => {
+                        out.push(p.to_path_buf());
+                        up = p;
+                    }
                     None => break,
                 }
             }
@@ -100,9 +103,16 @@ mod tests {
     #[test]
     fn bundled_assets_resolve_from_the_executable() {
         let p = path("assets/apertures/window.obj");
-        assert!(p.exists(), "the bundled window must be found, looked at {}", p.display());
-        assert!(p.is_absolute() || p.starts_with("."),
-            "a resolved asset should be rooted, got {}", p.display());
+        assert!(
+            p.exists(),
+            "the bundled window must be found, looked at {}",
+            p.display()
+        );
+        assert!(
+            p.is_absolute() || p.starts_with("."),
+            "a resolved asset should be rooted, got {}",
+            p.display()
+        );
     }
 
     /// An unknown path comes back UNCHANGED rather than pointing somewhere plausible-but-wrong,

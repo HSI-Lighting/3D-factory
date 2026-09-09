@@ -17,7 +17,7 @@ use cad_kernel::plotstyle::{Offset, Orientation, PlotConfig, PlotScale};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PageXform {
     /// mm-on-paper per model-unit (isotropic — same in X and Y).
-    pub s:  f64,
+    pub s: f64,
     pub tx: f64,
     pub ty: f64,
     /// Physical page size in mm, AFTER the orientation swap.
@@ -41,7 +41,7 @@ impl PageXform {
         // Physical page, swapped for landscape.
         let (pw0, ph0) = cfg.paper.dims_mm();
         let (page_w, page_h) = match cfg.orientation {
-            Orientation::Portrait  => (pw0 as f64, ph0 as f64),
+            Orientation::Portrait => (pw0 as f64, ph0 as f64),
             Orientation::Landscape => (ph0 as f64, pw0 as f64),
         };
         let m = cfg.margins_mm.max(0.0) as f64;
@@ -59,7 +59,11 @@ impl PageXform {
             // Ratio{model, paper_mm}: `paper_mm` mm on paper == `model` model
             // units. e.g. 1:100 with model units in mm → Ratio{100, 1} → 0.01.
             PlotScale::Ratio { model, paper_mm } => {
-                if model.abs() < 1e-12 { 1.0 } else { paper_mm / model }
+                if model.abs() < 1e-12 {
+                    1.0
+                } else {
+                    paper_mm / model
+                }
             }
         };
 
@@ -83,7 +87,13 @@ impl PageXform {
             }
         };
 
-        PageXform { s, tx, ty, page_w_mm: page_w, page_h_mm: page_h }
+        PageXform {
+            s,
+            tx,
+            ty,
+            page_w_mm: page_w,
+            page_h_mm: page_h,
+        }
     }
 }
 
@@ -95,17 +105,17 @@ mod tests {
 
     fn cfg_with(scale: PlotScale, orient: Orientation, offset: Offset) -> PlotConfig {
         PlotConfig {
-            output:      PlotTarget::PdfFile(PathBuf::new()),
-            paper:       PaperSize::A3,
+            output: PlotTarget::PdfFile(PathBuf::new()),
+            paper: PaperSize::A3,
             orientation: orient,
-            area:        PlotArea::Extents,
+            area: PlotArea::Extents,
             scale,
             offset,
-            lw_scale:    1.0,
-            monochrome:  false,
-            margins_mm:  5.0,
+            lw_scale: 1.0,
+            monochrome: false,
+            margins_mm: 5.0,
             plot_layout_index: None,
-            ctb_tables:  Default::default(),
+            ctb_tables: Default::default(),
         }
     }
 
@@ -120,8 +130,14 @@ mod tests {
 
     #[test]
     fn ratio_1_to_100_gives_scale_0_01() {
-        let c = cfg_with(PlotScale::Ratio { model: 100.0, paper_mm: 1.0 },
-                         Orientation::Landscape, Offset::Center);
+        let c = cfg_with(
+            PlotScale::Ratio {
+                model: 100.0,
+                paper_mm: 1.0,
+            },
+            Orientation::Landscape,
+            Offset::Center,
+        );
         let t = PageXform::build(&c, Vec2::new(0.0, 0.0), Vec2::new(1000.0, 1000.0));
         assert!((t.s - 0.01).abs() < 1e-12, "expected s=0.01, got {}", t.s);
     }
@@ -135,8 +151,16 @@ mod tests {
         // The four corners must sit inside the printable area, and the
         // bbox centre must map to the page centre.
         let (cx, cy) = t.apply(50.0, 50.0);
-        assert!((cx - t.page_w_mm / 2.0).abs() < 1e-6, "x centre off: {}", cx);
-        assert!((cy - t.page_h_mm / 2.0).abs() < 1e-6, "y centre off: {}", cy);
+        assert!(
+            (cx - t.page_w_mm / 2.0).abs() < 1e-6,
+            "x centre off: {}",
+            cx
+        );
+        assert!(
+            (cy - t.page_h_mm / 2.0).abs() < 1e-6,
+            "y centre off: {}",
+            cy
+        );
     }
 
     #[test]
@@ -157,8 +181,16 @@ mod tests {
         let t = PageXform::build(&c, mn, mx);
         for &(x, y) in &[(mn.x, mn.y), (mx.x, mn.y), (mx.x, mx.y), (mn.x, mx.y)] {
             let (px, py) = t.apply(x, y);
-            assert!(px >= 5.0 - 1e-6 && px <= t.page_w_mm - 5.0 + 1e-6, "x {} out of printable", px);
-            assert!(py >= 5.0 - 1e-6 && py <= t.page_h_mm - 5.0 + 1e-6, "y {} out of printable", py);
+            assert!(
+                px >= 5.0 - 1e-6 && px <= t.page_w_mm - 5.0 + 1e-6,
+                "x {} out of printable",
+                px
+            );
+            assert!(
+                py >= 5.0 - 1e-6 && py <= t.page_h_mm - 5.0 + 1e-6,
+                "y {} out of printable",
+                py
+            );
         }
     }
 }

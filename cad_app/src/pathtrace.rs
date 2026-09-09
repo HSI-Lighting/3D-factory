@@ -205,7 +205,11 @@ impl TexImage {
         let w = {
             let a = [n.x.abs(), n.y.abs(), n.z.abs()];
             let s = a[0] + a[1] + a[2];
-            if s < 1e-6 { [0.0, 0.0, 1.0] } else { [a[0] / s, a[1] / s, a[2] / s] }
+            if s < 1e-6 {
+                [0.0, 0.0, 1.0]
+            } else {
+                [a[0] / s, a[1] / s, a[2] / s]
+            }
         };
         let x = self.sample(p.y * tpm, p.z * tpm);
         let y = self.sample(p.x * tpm, p.z * tpm);
@@ -277,7 +281,11 @@ impl Scene {
 
     /// Build with the app's material table: `procs[i]` is the procedural definition of texture `i`,
     /// which [`ExportTri::material`] indexes.
-    pub fn build_with(input: &[ExportTri], procs: &[Option<crate::factory::ProcDef>], proc_rot: f32) -> Self {
+    pub fn build_with(
+        input: &[ExportTri],
+        procs: &[Option<crate::factory::ProcDef>],
+        proc_rot: f32,
+    ) -> Self {
         Self::build_full(input, procs, proc_rot, Vec::new(), &[])
     }
 
@@ -329,7 +337,9 @@ impl Scene {
                         .material
                         .and_then(|i| procs.get(i as usize).copied().flatten())
                         .filter(|d| !d.is_solid() || d.varies_roughness() || d.bump > 0.0),
-                    tex: t.material.and_then(|i| tex_of.get(i as usize).copied().flatten()),
+                    tex: t
+                        .material
+                        .and_then(|i| tex_of.get(i as usize).copied().flatten()),
                 },
             });
         }
@@ -338,7 +348,13 @@ impl Scene {
         if !tris.is_empty() {
             build_node(&tris, &mut order, 0, tris.len(), &mut nodes);
         }
-        Self { tris, order, nodes, textures, proc_rot }
+        Self {
+            tris,
+            order,
+            nodes,
+            textures,
+            proc_rot,
+        }
     }
 
     pub fn tri_count(&self) -> usize {
@@ -363,8 +379,18 @@ impl Scene {
             tris.extend_from_slice(&[t.p0.x, t.p0.y, t.p0.z, t.mat.rough]);
             tris.extend_from_slice(&[t.e1.x, t.e1.y, t.e1.z, t.mat.metallic]);
             tris.extend_from_slice(&[t.e2.x, t.e2.y, t.e2.z, t.mat.opacity]);
-            tris.extend_from_slice(&[t.mat.albedo[0], t.mat.albedo[1], t.mat.albedo[2], pack_rgb8(t.mat.sheen_tint)]);
-            tris.extend_from_slice(&[t.mat.emission[0], t.mat.emission[1], t.mat.emission[2], t.mat.sheen]);
+            tris.extend_from_slice(&[
+                t.mat.albedo[0],
+                t.mat.albedo[1],
+                t.mat.albedo[2],
+                pack_rgb8(t.mat.sheen_tint),
+            ]);
+            tris.extend_from_slice(&[
+                t.mat.emission[0],
+                t.mat.emission[1],
+                t.mat.emission[2],
+                t.mat.sheen,
+            ]);
             tris.extend_from_slice(&[t.mat.clearcoat, t.mat.clearcoat_rough, 0.0, 0.0]);
         }
         let mut nodes = Vec::with_capacity(self.nodes.len() * 8);
@@ -372,8 +398,18 @@ impl Scene {
             nodes.extend_from_slice(&[n.mn.x, n.mn.y, n.mn.z, n.right_or_start as f32]);
             nodes.extend_from_slice(&[n.mx.x, n.mx.y, n.mx.z, n.count as f32]);
         }
-        let order = self.order.iter().flat_map(|&i| [i as f32, 0.0, 0.0, 0.0]).collect();
-        GpuPack { tris, nodes, order, tri_count: self.tris.len(), node_count: self.nodes.len() }
+        let order = self
+            .order
+            .iter()
+            .flat_map(|&i| [i as f32, 0.0, 0.0, 0.0])
+            .collect();
+        GpuPack {
+            tris,
+            nodes,
+            order,
+            tri_count: self.tris.len(),
+            node_count: self.nodes.len(),
+        }
     }
 }
 
@@ -404,7 +440,13 @@ fn tri_bounds(t: &Tri) -> (Vec3, Vec3) {
 
 /// Recursively build; returns this node's index. Children of an inner node: left = idx+1 (depth
 /// first), right stored in `right_or_start`.
-fn build_node(tris: &[Tri], order: &mut [u32], start: usize, count: usize, nodes: &mut Vec<BvhNode>) -> u32 {
+fn build_node(
+    tris: &[Tri],
+    order: &mut [u32],
+    start: usize,
+    count: usize,
+    nodes: &mut Vec<BvhNode>,
+) -> u32 {
     let mut mn = Vec3::splat(f32::INFINITY);
     let mut mx = Vec3::splat(f32::NEG_INFINITY);
     for &i in &order[start..start + count] {
@@ -413,13 +455,24 @@ fn build_node(tris: &[Tri], order: &mut [u32], start: usize, count: usize, nodes
         mx = mx.max(b);
     }
     let idx = nodes.len() as u32;
-    nodes.push(BvhNode { mn, mx, right_or_start: start as u32, count: count as u32 });
+    nodes.push(BvhNode {
+        mn,
+        mx,
+        right_or_start: start as u32,
+        count: count as u32,
+    });
     if count <= 4 {
         return idx; // leaf
     }
     // Median split on the longest centroid axis.
     let ext = mx - mn;
-    let axis = if ext.x >= ext.y && ext.x >= ext.z { 0 } else if ext.y >= ext.z { 1 } else { 2 };
+    let axis = if ext.x >= ext.y && ext.x >= ext.z {
+        0
+    } else if ext.y >= ext.z {
+        1
+    } else {
+        2
+    };
     let cen = |t: &Tri| (t.p0 + (t.p0 + t.e1) + (t.p0 + t.e2)) / 3.0;
     order[start..start + count].sort_unstable_by(|&a, &b| {
         let ca = cen(&tris[a as usize])[axis];
@@ -539,7 +592,9 @@ impl Scene {
     fn transmission(&self, mut ro: Vec3, rd: Vec3) -> [f32; 3] {
         let mut trans = [1.0f32; 3];
         for _ in 0..16 {
-            let Some(h) = self.intersect(ro, rd) else { return trans };
+            let Some(h) = self.intersect(ro, rd) else {
+                return trans;
+            };
             let m = &self.tris[h.tri as usize].mat;
             if m.opacity >= 0.99 {
                 return [0.0; 3]; // opaque blocker
@@ -616,7 +671,11 @@ fn sky_radiance(sky: &Sky, dir: Vec3, primary: bool) -> [f32; 3] {
         let (s, c) = sky.env_rot.sin_cos();
         let d = Vec3::new(dir.x * c - dir.y * s, dir.x * s + dir.y * c, dir.z);
         let r = m.sample(d);
-        return [r[0] * sky.env_strength, r[1] * sky.env_strength, r[2] * sky.env_strength];
+        return [
+            r[0] * sky.env_strength,
+            r[1] * sky.env_strength,
+            r[2] * sky.env_strength,
+        ];
     }
     match &sky.dome {
         Some(d) => {
@@ -659,7 +718,11 @@ fn v_smith(n_o_v: f32, n_o_l: f32, a: f32) -> f32 {
 
 fn f_schlick(f0: [f32; 3], u: f32) -> [f32; 3] {
     let k = (1.0 - u).clamp(0.0, 1.0).powi(5);
-    [f0[0] + (1.0 - f0[0]) * k, f0[1] + (1.0 - f0[1]) * k, f0[2] + (1.0 - f0[2]) * k]
+    [
+        f0[0] + (1.0 - f0[0]) * k,
+        f0[1] + (1.0 - f0[1]) * k,
+        f0[2] + (1.0 - f0[2]) * k,
+    ]
 }
 
 /// An orthonormal basis about `n` (Duff et al., branchless and stable at the poles).
@@ -687,7 +750,14 @@ fn sample_ggx_h(n: Vec3, a: f32, rng: &mut Rng) -> Vec3 {
 }
 
 /// Trace one path. Returns linear HDR radiance.
-fn trace(scene: &Scene, sky: &Sky, mut ro: Vec3, mut rd: Vec3, max_depth: u32, rng: &mut Rng) -> [f32; 3] {
+fn trace(
+    scene: &Scene,
+    sky: &Sky,
+    mut ro: Vec3,
+    mut rd: Vec3,
+    max_depth: u32,
+    rng: &mut Rng,
+) -> [f32; 3] {
     let mut radiance = [0.0f32; 3];
     let mut through = [1.0f32; 3];
     let mut primary = true;
@@ -742,7 +812,11 @@ fn trace(scene: &Scene, sky: &Sky, mut ro: Vec3, mut rd: Vec3, max_depth: u32, r
                 let smp = crate::proc_tex::sample(&def, local, n, m.rough);
                 // The bump was computed in the model frame; rotate it back with the geometry.
                 let bn = smp.normal;
-                (smp.albedo, smp.roughness, Vec3::new(bn.x * c - bn.y * s, bn.x * s + bn.y * c, bn.z))
+                (
+                    smp.albedo,
+                    smp.roughness,
+                    Vec3::new(bn.x * c - bn.y * s, bn.x * s + bn.y * c, bn.z),
+                )
             }
             // An IMAGE map, sampled at the hit. Procedurals win when both are present, because a
             // procedural material's "image" is only its average colour swatch.
@@ -762,7 +836,11 @@ fn trace(scene: &Scene, sky: &Sky, mut ro: Vec3, mut rd: Vec3, max_depth: u32, r
             f0d + (albedo[1] - f0d) * m.metallic,
             f0d + (albedo[2] - f0d) * m.metallic,
         ];
-        let mut diff = [albedo[0] * (1.0 - m.metallic), albedo[1] * (1.0 - m.metallic), albedo[2] * (1.0 - m.metallic)];
+        let mut diff = [
+            albedo[0] * (1.0 - m.metallic),
+            albedo[1] * (1.0 - m.metallic),
+            albedo[2] * (1.0 - m.metallic),
+        ];
         let mut f0 = f0;
         let a = (rough * rough).max(1e-3);
         let n_o_v = n.dot(v).max(1e-4);
@@ -798,7 +876,10 @@ fn trace(scene: &Scene, sky: &Sky, mut ro: Vec3, mut rd: Vec3, max_depth: u32, r
             if tr[0] + tr[1] + tr[2] > 0.0 {
                 let h = (sky.sun_dir + v).normalize();
                 let f = f_schlick(f0, v.dot(h).max(0.0));
-                let spec = d_ggx(n.dot(h).max(0.0), a) * v_smith(n_o_v, ndl, a) * ndl * std::f32::consts::PI;
+                let spec = d_ggx(n.dot(h).max(0.0), a)
+                    * v_smith(n_o_v, ndl, a)
+                    * ndl
+                    * std::f32::consts::PI;
                 // SHEEN, evaluated as an extra BRDF lobe: a Fresnel-shaped rim peaking where the
                 // half vector grazes the view, which is where a nap of fibres catches the light.
                 let fh = (1.0 - v.dot(h).max(0.0)).clamp(0.0, 1.0).powi(5);
@@ -811,7 +892,10 @@ fn trace(scene: &Scene, sky: &Sky, mut ro: Vec3, mut rd: Vec3, max_depth: u32, r
                     let ncv = coat_n.dot(v).max(1e-4);
                     let fc = (0.04 + 0.96 * (1.0 - v.dot(h).max(0.0)).powi(5)) * coat;
                     coat_spec = d_ggx(coat_n.dot(h).max(0.0), coat_a)
-                        * v_smith(ncv, ncl, coat_a) * ncl * std::f32::consts::PI * fc;
+                        * v_smith(ncv, ncl, coat_a)
+                        * ncl
+                        * std::f32::consts::PI
+                        * fc;
                 }
                 for i in 0..3 {
                     let s = diff[i] * ndl + f[i] * spec + m.sheen_tint[i] * sheen + coat_spec;
@@ -853,7 +937,9 @@ fn trace(scene: &Scene, sky: &Sky, mut ro: Vec3, mut rd: Vec3, max_depth: u32, r
             let n_o_h = coat_n.dot(h).max(1e-4);
             let v_o_h = v.dot(h).max(1e-4);
             let fc = (0.04 + 0.96 * (1.0 - v_o_h).powi(5)) * coat;
-            let w = fc * 4.0 * v_smith(coat_n.dot(v).max(1e-4), n_o_l, coat_a) * n_o_l * v_o_h / n_o_h / p_coat;
+            let w = fc * 4.0 * v_smith(coat_n.dot(v).max(1e-4), n_o_l, coat_a) * n_o_l * v_o_h
+                / n_o_h
+                / p_coat;
             for t in &mut through {
                 *t *= w;
             }
@@ -912,7 +998,11 @@ fn trace(scene: &Scene, sky: &Sky, mut ro: Vec3, mut rd: Vec3, max_depth: u32, r
 fn cam_ray_centred(cam: &Camera, set: &Settings, x: usize, y: usize) -> (Vec3, Vec3) {
     let fwd = (cam.target - cam.eye).normalize();
     let right = fwd.cross(Vec3::Z).normalize_or_zero();
-    let right = if right.length_squared() < 0.5 { Vec3::X } else { right };
+    let right = if right.length_squared() < 0.5 {
+        Vec3::X
+    } else {
+        right
+    };
     let up = right.cross(fwd);
     let half = (cam.fov_deg.to_radians() * 0.5).tan();
     let aspect = set.w as f32 / set.h.max(1) as f32;
@@ -925,7 +1015,11 @@ fn cam_ray_centred(cam: &Camera, set: &Settings, x: usize, y: usize) -> (Vec3, V
 fn cam_ray(cam: &Camera, set: &Settings, x: usize, y: usize, rng: &mut Rng) -> (Vec3, Vec3) {
     let fwd = (cam.target - cam.eye).normalize();
     let right = fwd.cross(Vec3::Z).normalize_or_zero();
-    let right = if right.length_squared() < 0.5 { Vec3::X } else { right };
+    let right = if right.length_squared() < 0.5 {
+        Vec3::X
+    } else {
+        right
+    };
     let up = right.cross(fwd);
     let half = (cam.fov_deg.to_radians() * 0.5).tan();
     let aspect = set.w as f32 / set.h.max(1) as f32;
@@ -995,7 +1089,12 @@ pub fn atrous(color: &[f32], g: &Guides, w: usize, h: usize, strength: f32) -> V
                     for dy in -1i32..=1 {
                         for dx in -1i32..=1 {
                             let (sx, sy) = (x as i32 + dx, y as i32 + dy);
-                            if sx < 0 || sy < 0 || sx >= w as i32 || sy >= h as i32 || (dx == 0 && dy == 0) {
+                            if sx < 0
+                                || sy < 0
+                                || sx >= w as i32
+                                || sy >= h as i32
+                                || (dx == 0 && dy == 0)
+                            {
                                 continue;
                             }
                             let v = src[(sy as usize * w + sx as usize) * 3 + c];
@@ -1055,14 +1154,21 @@ pub fn atrous(color: &[f32], g: &Guides, w: usize, h: usize, strength: f32) -> V
                         if g.depth[j] >= f32::MAX * 0.5 {
                             continue;
                         }
-                        let sn = Vec3::new(g.normal[j * 3], g.normal[j * 3 + 1], g.normal[j * 3 + 2]);
+                        let sn =
+                            Vec3::new(g.normal[j * 3], g.normal[j * 3 + 1], g.normal[j * 3 + 2]);
                         // Normal: reject anything facing meaningfully differently.
                         let dn = (1.0 - cn.dot(sn).clamp(-1.0, 1.0)).max(0.0);
                         // Depth: RELATIVE, so the same filter works at 2 m and at 200 m.
                         let dz = (g.depth[j] - cz).abs() / cz.abs().max(1e-3);
-                        let dc = (0..3).map(|c| (cur[j * 3 + c] - cc[c]).powi(2)).sum::<f32>();
-                        let wgt = kv * ku
-                            * (-dn / (sigma_n * sigma_n) - dz / (sigma_z * sigma_z) - dc / (sigma_c * sigma_c)).exp();
+                        let dc = (0..3)
+                            .map(|c| (cur[j * 3 + c] - cc[c]).powi(2))
+                            .sum::<f32>();
+                        let wgt = kv
+                            * ku
+                            * (-dn / (sigma_n * sigma_n)
+                                - dz / (sigma_z * sigma_z)
+                                - dc / (sigma_c * sigma_c))
+                                .exp();
                         if wgt <= 0.0 {
                             continue;
                         }
@@ -1154,7 +1260,8 @@ impl RenderJob {
                             let alb = match tri.mat.proc {
                                 Some(def) => {
                                     let (c, s) = (scene.proc_rot.cos(), scene.proc_rot.sin());
-                                    let local = Vec3::new(p.x * c + p.y * s, -p.x * s + p.y * c, p.z);
+                                    let local =
+                                        Vec3::new(p.x * c + p.y * s, -p.x * s + p.y * c, p.z);
                                     crate::proc_tex::sample(&def, local, n, tri.mat.rough).albedo
                                 }
                                 None => tri.mat.albedo,
@@ -1167,7 +1274,10 @@ impl RenderJob {
                 }
                 *sh.guides.lock().unwrap() = g;
             }
-            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(1);
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .max(1);
             for pass in 0..settings.passes {
                 if sh.cancel.load(Ordering::Relaxed) {
                     break;
@@ -1217,7 +1327,14 @@ impl RenderJob {
             }
             sh.done.store(true, Ordering::Relaxed);
         });
-        Self { shared, settings, device, started: std::time::Instant::now(), scene_tris, handle: Some(handle) }
+        Self {
+            shared,
+            settings,
+            device,
+            started: std::time::Instant::now(),
+            scene_tris,
+            handle: Some(handle),
+        }
     }
 
     /// Snapshot the accumulation as RGBA8 (tone-mapped), or None before the first pass lands.
@@ -1289,8 +1406,18 @@ mod tests {
 
     fn quad(z: f32, half: f32, rgb: [f32; 3], opacity: f32) -> [ExportTri; 2] {
         let v = |x: f32, y: f32| [x, y, z];
-        let mut a = ExportTri::plain([v(-half, -half), v(half, -half), v(half, half)], rgb, 0.5, opacity);
-        let mut b = ExportTri::plain([v(-half, -half), v(half, half), v(-half, half)], rgb, 0.5, opacity);
+        let mut a = ExportTri::plain(
+            [v(-half, -half), v(half, -half), v(half, half)],
+            rgb,
+            0.5,
+            opacity,
+        );
+        let mut b = ExportTri::plain(
+            [v(-half, -half), v(half, half), v(-half, half)],
+            rgb,
+            0.5,
+            opacity,
+        );
         a.opacity = opacity;
         b.opacity = opacity;
         [a, b]
@@ -1318,7 +1445,12 @@ mod tests {
         for i in 0..6 {
             for j in 0..6 {
                 let (x, y) = (i as f32, j as f32);
-                tris.push(ExportTri::plain([[x, y, 0.0], [x + 0.9, y, 0.0], [x, y + 0.9, 0.0]], [0.5; 3], 0.5, 1.0));
+                tris.push(ExportTri::plain(
+                    [[x, y, 0.0], [x + 0.9, y, 0.0], [x, y + 0.9, 0.0]],
+                    [0.5; 3],
+                    0.5,
+                    1.0,
+                ));
             }
         }
         let scene = Scene::build(&tris);
@@ -1343,8 +1475,18 @@ mod tests {
         // come out brighter than under the roof.
         let mut tris: Vec<ExportTri> = quad(0.0, 50.0, [0.7; 3], 1.0).into();
         tris.extend([
-            ExportTri::plain([[-30.0, -30.0, 3.0], [0.0, -30.0, 3.0], [0.0, 30.0, 3.0]], [0.7; 3], 0.5, 1.0),
-            ExportTri::plain([[-30.0, -30.0, 3.0], [0.0, 30.0, 3.0], [-30.0, 30.0, 3.0]], [0.7; 3], 0.5, 1.0),
+            ExportTri::plain(
+                [[-30.0, -30.0, 3.0], [0.0, -30.0, 3.0], [0.0, 30.0, 3.0]],
+                [0.7; 3],
+                0.5,
+                1.0,
+            ),
+            ExportTri::plain(
+                [[-30.0, -30.0, 3.0], [0.0, 30.0, 3.0], [-30.0, 30.0, 3.0]],
+                [0.7; 3],
+                0.5,
+                1.0,
+            ),
         ]);
         let scene = Scene::build(&tris);
         let sky = sky();
@@ -1361,11 +1503,21 @@ mod tests {
         let open = sample(10.0, &mut rng);
         let mut sum = 0.0;
         for _ in 0..64 {
-            let c = trace(&scene, &sky, Vec3::new(-10.0, 0.0, 2.0), Vec3::NEG_Z, 4, &mut rng);
+            let c = trace(
+                &scene,
+                &sky,
+                Vec3::new(-10.0, 0.0, 2.0),
+                Vec3::NEG_Z,
+                4,
+                &mut rng,
+            );
             sum += c[0];
         }
         let covered = sum / 64.0;
-        assert!(open > covered * 1.5, "open {open} should be well brighter than covered {covered}");
+        assert!(
+            open > covered * 1.5,
+            "open {open} should be well brighter than covered {covered}"
+        );
     }
 
     #[test]
@@ -1381,18 +1533,29 @@ mod tests {
         let mut tris2: Vec<ExportTri> = quad(0.0, 50.0, [0.7; 3], 1.0).into();
         tris2.extend(quad(3.0, 50.0, [0.5; 3], 1.0));
         let scene2 = Scene::build(&tris2);
-        assert_eq!(scene2.transmission(Vec3::new(0.0, 0.0, 0.1), Vec3::Z), [0.0; 3]);
+        assert_eq!(
+            scene2.transmission(Vec3::new(0.0, 0.0, 0.1), Vec3::Z),
+            [0.0; 3]
+        );
     }
 
     #[test]
     fn emissive_surface_glows() {
-        let mut t = ExportTri::plain([[-1.0, -1.0, 2.0], [1.0, -1.0, 2.0], [0.0, 1.0, 2.0]], [1.0; 3], 0.5, 1.0);
+        let mut t = ExportTri::plain(
+            [[-1.0, -1.0, 2.0], [1.0, -1.0, 2.0], [0.0, 1.0, 2.0]],
+            [1.0; 3],
+            0.5,
+            1.0,
+        );
         t.emission = [5.0, 1.0, 1.0];
         let scene = Scene::build(&[t]);
         let sky = sky();
         let mut rng = Rng::new(3);
         let c = trace(&scene, &sky, Vec3::new(0.0, 0.0, 0.0), Vec3::Z, 2, &mut rng);
-        assert!(c[0] >= 5.0, "looking at the emitter sees its radiance: {c:?}");
+        assert!(
+            c[0] >= 5.0,
+            "looking at the emitter sees its radiance: {c:?}"
+        );
     }
 
     /// A uniform environment of radiance `L` around a white surface must come back as `L`.
@@ -1410,7 +1573,16 @@ mod tests {
     #[test]
     fn a_white_surface_in_a_uniform_furnace_returns_what_it_receives() {
         const L: f32 = 0.6;
-        let furnace = Sky { sun_dir: Vec3::Z, sun_col: [0.0; 3], sky_col: [L; 3], ground_col: [L; 3], dome: None, env: None, env_strength: 1.0, env_rot: 0.0 };
+        let furnace = Sky {
+            sun_dir: Vec3::Z,
+            sun_col: [0.0; 3],
+            sky_col: [L; 3],
+            ground_col: [L; 3],
+            dome: None,
+            env: None,
+            env_strength: 1.0,
+            env_rot: 0.0,
+        };
         // A single large white quad; rays that miss it see the furnace directly.
         let mut tris: Vec<ExportTri> = quad(0.0, 50.0, [1.0; 3], 1.0).into();
         for t in &mut tris {
@@ -1420,7 +1592,7 @@ mod tests {
             (1.0f32, 0.0f32, 0.85f32, 1.30f32), // rough dielectric
             (0.3, 0.0, 0.85, 1.30),             // semi-gloss dielectric
             (0.1, 1.0, 0.70, 1.15),             // near-mirror metal (white F0)
-            (0.7, 1.0, 0.55, 1.10),             // rough metal — single-scattering GGX loses most here
+            (0.7, 1.0, 0.55, 1.10), // rough metal — single-scattering GGX loses most here
         ] {
             let mut src = tris.clone();
             for t in &mut src {
@@ -1433,7 +1605,14 @@ mod tests {
             const N: usize = 3000;
             for _ in 0..N {
                 // Straight down onto the quad, so every path starts on the surface.
-                let c = trace(&scene, &furnace, Vec3::new(0.0, 0.0, 4.0), Vec3::NEG_Z, 6, &mut rng);
+                let c = trace(
+                    &scene,
+                    &furnace,
+                    Vec3::new(0.0, 0.0, 4.0),
+                    Vec3::NEG_Z,
+                    6,
+                    &mut rng,
+                );
                 sum += c[0] as f64;
             }
             let got = (sum / N as f64) as f32 / L;
@@ -1447,23 +1626,41 @@ mod tests {
     /// The packed stream must hold exactly what the GPU shader expects to read.
     #[test]
     fn the_gpu_pack_carries_every_material_field() {
-        let mut t = ExportTri::plain([[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], [0.5; 3], 0.4, 1.0);
+        let mut t = ExportTri::plain(
+            [[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            [0.5; 3],
+            0.4,
+            1.0,
+        );
         t.clearcoat = 0.7;
         t.clearcoat_rough = 0.25;
         t.sheen = 0.6;
         t.sheen_tint = [0.2, 0.4, 0.8];
         let pack = Scene::build(&[t]).pack_gpu();
-        assert_eq!(pack.tris.len(), TRI_TEXELS * 4, "one triangle occupies exactly TRI_TEXELS texels");
-        assert!((pack.tris[4 * 4 + 3] - 0.6).abs() < 1e-6, "sheen rides in the emission texel's w");
+        assert_eq!(
+            pack.tris.len(),
+            TRI_TEXELS * 4,
+            "one triangle occupies exactly TRI_TEXELS texels"
+        );
+        assert!(
+            (pack.tris[4 * 4 + 3] - 0.6).abs() < 1e-6,
+            "sheen rides in the emission texel's w"
+        );
         assert!((pack.tris[5 * 4] - 0.7).abs() < 1e-6, "clearcoat");
-        assert!((pack.tris[5 * 4 + 1] - 0.25).abs() < 1e-6, "clearcoat roughness");
+        assert!(
+            (pack.tris[5 * 4 + 1] - 0.25).abs() < 1e-6,
+            "clearcoat roughness"
+        );
         // The tint packs and unpacks to within a 255th — the same arithmetic the shader does.
         let p = pack.tris[3 * 4 + 3];
         let r = (p / 65536.0).floor();
         let g = ((p - r * 65536.0) / 256.0).floor();
         let got = [r / 255.0, g / 255.0, (p - r * 65536.0 - g * 256.0) / 255.0];
         for i in 0..3 {
-            assert!((got[i] - [0.2, 0.4, 0.8][i]).abs() < 1.0 / 255.0, "tint channel {i}: {got:?}");
+            assert!(
+                (got[i] - [0.2, 0.4, 0.8][i]).abs() < 1.0 / 255.0,
+                "tint channel {i}: {got:?}"
+            );
         }
     }
 
@@ -1477,7 +1674,16 @@ mod tests {
     #[test]
     fn a_clearcoat_adds_a_reflection_without_adding_energy() {
         const L: f32 = 0.6;
-        let furnace = Sky { sun_dir: Vec3::Z, sun_col: [0.0; 3], sky_col: [L; 3], ground_col: [L; 3], dome: None, env: None, env_strength: 1.0, env_rot: 0.0 };
+        let furnace = Sky {
+            sun_dir: Vec3::Z,
+            sun_col: [0.0; 3],
+            sky_col: [L; 3],
+            ground_col: [L; 3],
+            dome: None,
+            env: None,
+            env_strength: 1.0,
+            env_rot: 0.0,
+        };
         let measure = |coat: f32| -> f32 {
             let mut tris: Vec<ExportTri> = quad(0.0, 50.0, [1.0; 3], 1.0).into();
             for t in &mut tris {
@@ -1490,7 +1696,14 @@ mod tests {
             let mut sum = 0.0f64;
             const N: usize = 4000;
             for _ in 0..N {
-                sum += trace(&scene, &furnace, Vec3::new(0.0, 0.0, 4.0), Vec3::NEG_Z, 6, &mut rng)[0] as f64;
+                sum += trace(
+                    &scene,
+                    &furnace,
+                    Vec3::new(0.0, 0.0, 4.0),
+                    Vec3::NEG_Z,
+                    6,
+                    &mut rng,
+                )[0] as f64;
             }
             (sum / N as f64) as f32 / L
         };
@@ -1526,7 +1739,16 @@ mod tests {
             Scene::build(&tris)
         };
         // The mirror configuration: eye and sun placed so the view reflects straight into the sun.
-        let sky = Sky { sun_dir: Vec3::new(0.0, 0.6, 0.8).normalize(), sun_col: [4.0; 3], sky_col: [0.0; 3], ground_col: [0.0; 3], dome: None, env: None, env_strength: 1.0, env_rot: 0.0 };
+        let sky = Sky {
+            sun_dir: Vec3::new(0.0, 0.6, 0.8).normalize(),
+            sun_col: [4.0; 3],
+            sky_col: [0.0; 3],
+            ground_col: [0.0; 3],
+            dome: None,
+            env: None,
+            env_strength: 1.0,
+            env_rot: 0.0,
+        };
         let eye = Vec3::new(0.0, -3.0, 4.0);
         let dir = (Vec3::ZERO - eye).normalize();
         let look = |scene: &Scene| {
@@ -1539,7 +1761,10 @@ mod tests {
         };
         let bare = look(&make(0.0));
         let coated = look(&make(1.0));
-        assert!(coated > bare * 3.0, "lacquered {coated:.4} vs bare {bare:.4} — no glint");
+        assert!(
+            coated > bare * 3.0,
+            "lacquered {coated:.4} vs bare {bare:.4} — no glint"
+        );
     }
 
     /// SHEEN must brighten a fabric at GRAZING angles and leave it alone head-on.
@@ -1558,7 +1783,16 @@ mod tests {
             }
             Scene::build(&tris)
         };
-        let sky = Sky { sun_dir: Vec3::new(0.0, 0.35, 0.94).normalize(), sun_col: [4.0; 3], sky_col: [0.0; 3], ground_col: [0.0; 3], dome: None, env: None, env_strength: 1.0, env_rot: 0.0 };
+        let sky = Sky {
+            sun_dir: Vec3::new(0.0, 0.35, 0.94).normalize(),
+            sun_col: [4.0; 3],
+            sky_col: [0.0; 3],
+            ground_col: [0.0; 3],
+            dome: None,
+            env: None,
+            env_strength: 1.0,
+            env_rot: 0.0,
+        };
         let look = |scene: &Scene, eye: Vec3| {
             let dir = (Vec3::ZERO - eye).normalize();
             let mut rng = Rng::new(23);
@@ -1578,7 +1812,10 @@ mod tests {
         // that was there before it.
         let d_head = look(&fabric, head_eye) - look(&plain, head_eye);
         let d_graze = look(&fabric, graze_eye) - look(&plain, graze_eye);
-        assert!(d_graze > 0.0, "sheen added nothing at all at a grazing angle");
+        assert!(
+            d_graze > 0.0,
+            "sheen added nothing at all at a grazing angle"
+        );
         assert!(
             d_graze > d_head * 3.0,
             "sheen added {d_graze:.4} grazing and {d_head:.4} head-on — that is a brighter albedo, not a rim"
@@ -1602,7 +1839,16 @@ mod tests {
         }
         let scene = Scene::build(&tris);
         // Sun low in +y so its mirror direction leaves along −y; look straight into that.
-        let sky = Sky { sun_dir: Vec3::new(0.0, 0.6, 0.8).normalize(), sun_col: [4.0; 3], sky_col: [0.0; 3], ground_col: [0.0; 3], dome: None, env: None, env_strength: 1.0, env_rot: 0.0 };
+        let sky = Sky {
+            sun_dir: Vec3::new(0.0, 0.6, 0.8).normalize(),
+            sun_col: [4.0; 3],
+            sky_col: [0.0; 3],
+            ground_col: [0.0; 3],
+            dome: None,
+            env: None,
+            env_strength: 1.0,
+            env_rot: 0.0,
+        };
         let mut rng = Rng::new(5);
         let eye = Vec3::new(0.0, -3.0, 4.0);
         let dir = (Vec3::ZERO - eye).normalize();
@@ -1612,13 +1858,23 @@ mod tests {
         }
         let lit = sum / 800.0;
         // …and with the sun switched off there is nothing at all to see.
-        let dark = Sky { sun_col: [0.0; 3], ..sky };
+        let dark = Sky {
+            sun_col: [0.0; 3],
+            ..sky
+        };
         let mut sum2 = 0.0f64;
         for _ in 0..800 {
             sum2 += trace(&scene, &dark, eye, dir, 3, &mut rng)[0] as f64;
         }
-        assert!(lit > 0.05, "the sun must produce a specular return on a black-diffuse metal: {lit}");
-        assert!(lit > sum2 / 800.0 * 10.0 + 0.01, "and it must be the sun doing it: {lit} vs {}", sum2 / 800.0);
+        assert!(
+            lit > 0.05,
+            "the sun must produce a specular return on a black-diffuse metal: {lit}"
+        );
+        assert!(
+            lit > sum2 / 800.0 * 10.0 + 0.01,
+            "and it must be the sun doing it: {lit} vs {}",
+            sum2 / 800.0
+        );
     }
 
     /// A procedural material must render its PATTERN, not its average colour. This is the whole
@@ -1632,7 +1888,16 @@ mod tests {
         }
         let scene = Scene::build_with(&tris, &[Some(oak)], 0.0);
         let flat = Scene::build(&tris);
-        let sky = Sky { sun_dir: Vec3::Z, sun_col: [1.5; 3], sky_col: [0.3; 3], ground_col: [0.3; 3], dome: None, env: None, env_strength: 1.0, env_rot: 0.0 };
+        let sky = Sky {
+            sun_dir: Vec3::Z,
+            sun_col: [1.5; 3],
+            sky_col: [0.3; 3],
+            ground_col: [0.3; 3],
+            dome: None,
+            env: None,
+            env_strength: 1.0,
+            env_rot: 0.0,
+        };
         // Sample a line of points across the plank direction and measure the spread of each.
         let spread = |sc: &Scene| {
             let mut rng = Rng::new(3);
@@ -1652,7 +1917,10 @@ mod tests {
         };
         let with = spread(&scene);
         let without = spread(&flat);
-        assert!(with > without * 2.0 + 0.05, "the grain must vary across the surface: {with:.3} vs flat {without:.3}");
+        assert!(
+            with > without * 2.0 + 0.05,
+            "the grain must vary across the surface: {with:.3} vs flat {without:.3}"
+        );
     }
 
     /// A 2×2 sRGB image: red / green on the bottom row, blue / white on the top.
@@ -1662,7 +1930,13 @@ mod tests {
             255, 0, 0, 255,   0, 255, 0, 255,   // v = 0 row: red, green
             0, 0, 255, 255,   255, 255, 255, 255, // v = 1 row: blue, white
         ];
-        TexImage { w: 2, h: 2, rgba: std::sync::Arc::new(rgba), triplanar, tiles_per_m }
+        TexImage {
+            w: 2,
+            h: 2,
+            rgba: std::sync::Arc::new(rgba),
+            triplanar,
+            tiles_per_m,
+        }
     }
 
     /// A quad whose UVs span the full 0..1 square, so each corner lands in a different texel.
@@ -1689,7 +1963,16 @@ mod tests {
             t.material = Some(0);
         }
         let scene = Scene::build_full(&tris, &[], 0.0, vec![checker_tex(false, 1.0)], &[Some(0)]);
-        let sky = Sky { sun_dir: Vec3::Z, sun_col: [1.5; 3], sky_col: [0.3; 3], ground_col: [0.3; 3], dome: None, env: None, env_strength: 1.0, env_rot: 0.0 };
+        let sky = Sky {
+            sun_dir: Vec3::Z,
+            sun_col: [1.5; 3],
+            sky_col: [0.3; 3],
+            ground_col: [0.3; 3],
+            dome: None,
+            env: None,
+            env_strength: 1.0,
+            env_rot: 0.0,
+        };
         // Trace at the centre of each quadrant → the centre of each texel.
         let at = |u: f32, v: f32| {
             let mut rng = Rng::new(11);
@@ -1708,11 +1991,23 @@ mod tests {
         let green = at(0.75, 0.25);
         let blue = at(0.25, 0.75);
         let white = at(0.75, 0.75);
-        assert!(red[0] > red[1] * 3.0 && red[0] > red[2] * 3.0, "bottom-left texel is red: {red:?}");
-        assert!(green[1] > green[0] * 3.0 && green[1] > green[2] * 3.0, "bottom-right is green: {green:?}");
-        assert!(blue[2] > blue[0] * 3.0 && blue[2] > blue[1] * 3.0, "top-left is blue: {blue:?}");
+        assert!(
+            red[0] > red[1] * 3.0 && red[0] > red[2] * 3.0,
+            "bottom-left texel is red: {red:?}"
+        );
+        assert!(
+            green[1] > green[0] * 3.0 && green[1] > green[2] * 3.0,
+            "bottom-right is green: {green:?}"
+        );
+        assert!(
+            blue[2] > blue[0] * 3.0 && blue[2] > blue[1] * 3.0,
+            "top-left is blue: {blue:?}"
+        );
         let w_min = white[0].min(white[1]).min(white[2]);
-        assert!(w_min > red[0] * 0.5, "top-right is white — brighter than any single primary: {white:?}");
+        assert!(
+            w_min > red[0] * 0.5,
+            "top-right is white — brighter than any single primary: {white:?}"
+        );
     }
 
     /// A surface with NO UV layer must still get its image, projected from world space the way the
@@ -1727,7 +2022,16 @@ mod tests {
             t.has_uv = false;
         }
         let scene = Scene::build_full(&tris, &[], 0.0, vec![checker_tex(true, 1.0)], &[Some(0)]);
-        let sky = Sky { sun_dir: Vec3::Z, sun_col: [1.5; 3], sky_col: [0.3; 3], ground_col: [0.3; 3], dome: None, env: None, env_strength: 1.0, env_rot: 0.0 };
+        let sky = Sky {
+            sun_dir: Vec3::Z,
+            sun_col: [1.5; 3],
+            sky_col: [0.3; 3],
+            ground_col: [0.3; 3],
+            dome: None,
+            env: None,
+            env_strength: 1.0,
+            env_rot: 0.0,
+        };
         let at = |x: f32, y: f32| {
             let mut rng = Rng::new(5);
             let mut s = [0.0f32; 3];
@@ -1744,7 +2048,10 @@ mod tests {
         let a = at(0.25, 0.25);
         let b = at(0.75, 0.25);
         let diff: f32 = (0..3).map(|k| (a[k] - b[k]).abs()).sum();
-        assert!(diff > 0.1, "a projected image must vary across the surface: {a:?} vs {b:?}");
+        assert!(
+            diff > 0.1,
+            "a projected image must vary across the surface: {a:?} vs {b:?}"
+        );
     }
 
     /// A material carrying only a 1x1 colour swatch must NOT become a texture fetch — the swatch
@@ -1753,7 +2060,12 @@ mod tests {
     fn a_one_by_one_swatch_is_not_promoted_to_a_texture() {
         let mut st = crate::factory::FactoryState::default();
         st.add_texture("swatch".into(), 1, 1, vec![200, 40, 40, 255]);
-        st.add_texture("image".into(), 2, 2, checker_tex(false, 1.0).rgba.as_ref().clone());
+        st.add_texture(
+            "image".into(),
+            2,
+            2,
+            checker_tex(false, 1.0).rgba.as_ref().clone(),
+        );
         let (pool, index) = st.export_texture_table();
         assert_eq!(pool.len(), 1, "only the real image joins the pool");
         assert_eq!(index[0], None, "the 1x1 swatch stays a flat albedo");
@@ -1766,7 +2078,11 @@ mod tests {
     #[test]
     fn the_denoiser_smooths_noise_but_not_silhouettes() {
         let (w, h) = (48usize, 32usize);
-        let mut g = Guides { albedo: vec![1.0; w * h * 3], normal: vec![0.0; w * h * 3], depth: vec![0.0; w * h] };
+        let mut g = Guides {
+            albedo: vec![1.0; w * h * 3],
+            normal: vec![0.0; w * h * 3],
+            depth: vec![0.0; w * h],
+        };
         let mut noisy = vec![0.0f32; w * h * 3];
         let mut rng = Rng::new(9);
         for y in 0..h {
@@ -1783,27 +2099,49 @@ mod tests {
         }
         let out = atrous(&noisy, &g, w, h, 1.0);
         let stats = |img: &[f32], x0: usize, x1: usize| {
-            let vals: Vec<f32> = (0..h).flat_map(|y| (x0..x1).map(move |x| (y * w + x) * 3)).map(|i| img[i]).collect();
+            let vals: Vec<f32> = (0..h)
+                .flat_map(|y| (x0..x1).map(move |x| (y * w + x) * 3))
+                .map(|i| img[i])
+                .collect();
             let mean = vals.iter().sum::<f32>() / vals.len() as f32;
             let var = vals.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / vals.len() as f32;
             (mean, var.sqrt())
         };
         let (m_in, s_in) = stats(&noisy, 4, w / 2 - 4);
         let (m_out, s_out) = stats(&out, 4, w / 2 - 4);
-        assert!(s_out < s_in * 0.4, "noise must actually fall: {s_in:.3} -> {s_out:.3}");
-        assert!((m_out - m_in).abs() < 0.05, "and the mean must survive: {m_in:.3} -> {m_out:.3}");
+        assert!(
+            s_out < s_in * 0.4,
+            "noise must actually fall: {s_in:.3} -> {s_out:.3}"
+        );
+        assert!(
+            (m_out - m_in).abs() < 0.05,
+            "and the mean must survive: {m_in:.3} -> {m_out:.3}"
+        );
         // The step across the silhouette must not have been rounded off.
         let left = stats(&out, w / 2 - 3, w / 2 - 1).0;
         let right = stats(&out, w / 2 + 1, w / 2 + 3).0;
-        assert!(left - right > 0.45, "the depth discontinuity must survive: {left:.3} vs {right:.3} (input step 0.6)");
+        assert!(
+            left - right > 0.45,
+            "the depth discontinuity must survive: {left:.3} vs {right:.3} (input step 0.6)"
+        );
     }
 
     #[test]
     fn render_job_runs_to_completion_and_snapshots() {
         let tris: Vec<ExportTri> = quad(0.0, 50.0, [0.6, 0.4, 0.3], 1.0).into();
         let scene = Scene::build(&tris);
-        let cam = Camera { eye: Vec3::new(0.0, -8.0, 5.0), target: Vec3::ZERO, fov_deg: 45.0 };
-        let set = Settings { w: 32, h: 24, passes: 2, max_depth: 3, color: crate::color::ColorPipeline::default() };
+        let cam = Camera {
+            eye: Vec3::new(0.0, -8.0, 5.0),
+            target: Vec3::ZERO,
+            fov_deg: 45.0,
+        };
+        let set = Settings {
+            w: 32,
+            h: 24,
+            passes: 2,
+            max_depth: 3,
+            color: crate::color::ColorPipeline::default(),
+        };
         let job = RenderJob::start(scene, cam, sky(), set, Device::Cpu);
         // Wait for completion (small image — fast).
         let t0 = std::time::Instant::now();

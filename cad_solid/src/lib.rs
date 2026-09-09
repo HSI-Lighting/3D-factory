@@ -65,20 +65,20 @@ pub fn init_boolean_tolerance() -> Result<f64, String> {
 }
 
 pub mod architecture; // staircase / spiral / ramp generators → SolidMesh
-pub mod dogleg; // parametric half-turn (dog-leg) staircase → editable CSG parts
-pub mod spiral; // parametric helical (spiral) staircase → editable CSG parts
-pub mod door; // parametric panelled door (leaf + lining + casing + hardware) → SolidMesh
-pub mod cupboard; // parametric cabinet configurator (grid of bays × tiers) → SolidMesh + per-part material
-pub mod kitchen; // parametric kitchen cabinet run (base + optional wall lanes, worktop, plinth) → SolidMesh
 pub mod cabin; // parametric handleless cabinet UNIT (close-range joinery: overlay fronts, grips, pin rows) → SolidMesh
-pub mod sweeplight; // curved office luminaires: a lighting profile swept along a path (RMF sweep) → SolidMesh
-pub mod desk; // parametric office workstation desk as a deletable feature tree → SolidMesh
 pub mod couch; // parametric run-chain sofa (straight / L / U sectionals) → SolidMesh
 mod csg;
-pub mod meshcut; // subtract a drawn prism from a finished MESH (furniture / architecture / apertures)
+pub mod cupboard; // parametric cabinet configurator (grid of bays × tiers) → SolidMesh + per-part material
 pub mod dbg_recorder; // copied VERBATIM from cad_app (identical to RUST_CAD's recorder)
+pub mod desk; // parametric office workstation desk as a deletable feature tree → SolidMesh
+pub mod dogleg; // parametric half-turn (dog-leg) staircase → editable CSG parts
+pub mod door; // parametric panelled door (leaf + lining + casing + hardware) → SolidMesh
 pub mod draw;
+pub mod kitchen; // parametric kitchen cabinet run (base + optional wall lanes, worktop, plinth) → SolidMesh
+pub mod meshcut; // subtract a drawn prism from a finished MESH (furniture / architecture / apertures)
 pub mod modify;
+pub mod spiral; // parametric helical (spiral) staircase → editable CSG parts
+pub mod sweeplight; // curved office luminaires: a lighting profile swept along a path (RMF sweep) → SolidMesh
 
 /// A flat triangle soup: `positions`/`normals` in lock-step, 3 consecutive
 /// entries = one triangle (metres, Z-up, f32). cad_solid's neutral output; the
@@ -158,7 +158,11 @@ pub struct Plane {
 
 impl Default for Plane {
     fn default() -> Self {
-        Self { kind: PlaneKind::XY, offset: 0.0, custom: None }
+        Self {
+            kind: PlaneKind::XY,
+            offset: 0.0,
+            custom: None,
+        }
     }
 }
 
@@ -258,18 +262,56 @@ pub struct Placement {
 /// dimensions are handled here.
 fn scale_primitive(p: &mut Primitive, k: f32) {
     match p {
-        Primitive::Box { w, d, h } => { *w *= k; *d *= k; *h *= k; }
-        Primitive::Cylinder { r, h, .. } => { *r *= k; *h *= k; }
+        Primitive::Box { w, d, h } => {
+            *w *= k;
+            *d *= k;
+            *h *= k;
+        }
+        Primitive::Cylinder { r, h, .. } => {
+            *r *= k;
+            *h *= k;
+        }
         Primitive::Sphere { r, .. } => *r *= k,
-        Primitive::Frustum { r_bottom, r_top, h, .. } => { *r_bottom *= k; *r_top *= k; *h *= k; }
-        Primitive::Torus { major_r, minor_r, .. } => { *major_r *= k; *minor_r *= k; }
-        Primitive::Capsule { r, h, .. } => { *r *= k; *h *= k; }
-        Primitive::Tube { r_outer, r_inner, h, .. } => { *r_outer *= k; *r_inner *= k; *h *= k; }
-        Primitive::Ellipsoid { rx, ry, rz, .. } => { *rx *= k; *ry *= k; *rz *= k; }
+        Primitive::Frustum {
+            r_bottom, r_top, h, ..
+        } => {
+            *r_bottom *= k;
+            *r_top *= k;
+            *h *= k;
+        }
+        Primitive::Torus {
+            major_r, minor_r, ..
+        } => {
+            *major_r *= k;
+            *minor_r *= k;
+        }
+        Primitive::Capsule { r, h, .. } => {
+            *r *= k;
+            *h *= k;
+        }
+        Primitive::Tube {
+            r_outer,
+            r_inner,
+            h,
+            ..
+        } => {
+            *r_outer *= k;
+            *r_inner *= k;
+            *h *= k;
+        }
+        Primitive::Ellipsoid { rx, ry, rz, .. } => {
+            *rx *= k;
+            *ry *= k;
+            *rz *= k;
+        }
         // `w`/`d` are a CACHE of the profile's extents (see the variant's docs). The profile
         // itself is scaled once in `Model::rescale`; these must track it or `local_aabb` —
         // which ray-pick and the selection highlight both use — reports the old size.
-        Primitive::Extrusion { h, w, d, .. } => { *h *= k; *w *= k; *d *= k; }
+        Primitive::Extrusion { h, w, d, .. } => {
+            *h *= k;
+            *w *= k;
+            *d *= k;
+        }
         // Same: cached local AABB of a swept solid, scaled to match its profile and path.
         Primitive::Sweep { bmin, bmax, .. } => {
             for v in bmin.iter_mut().chain(bmax.iter_mut()) {
@@ -302,12 +344,20 @@ mod self_intersect_tests {
         let n = p.len();
         let orient = |a: Vec2, b: Vec2, c: Vec2| {
             let v = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-            if v > 1e-9 { 1 } else if v < -1e-9 { -1 } else { 0 }
+            if v > 1e-9 {
+                1
+            } else if v < -1e-9 {
+                -1
+            } else {
+                0
+            }
         };
         for i in 0..n {
             let (a1, a2) = (p[i], p[(i + 1) % n]);
             for j in (i + 1)..n {
-                if j == i || (j + 1) % n == i || (i + 1) % n == j { continue; }
+                if j == i || (j + 1) % n == i || (i + 1) % n == j {
+                    continue;
+                }
                 let (b1, b2) = (p[j], p[(j + 1) % n]);
                 let (d1, d2) = (orient(a1, a2, b1), orient(a1, a2, b2));
                 let (d3, d4) = (orient(b1, b2, a1), orient(b1, b2, a2));
@@ -319,7 +369,9 @@ mod self_intersect_tests {
         false
     }
 
-    fn v(x: f32, y: f32) -> Vec2 { Vec2::new(x, y) }
+    fn v(x: f32, y: f32) -> Vec2 {
+        Vec2::new(x, y)
+    }
 
     /// A REJECT THAT CHANGES THE ANSWER IS NOT AN OPTIMISATION. The box test can only skip pairs
     /// that cannot cross — so on every shape, fast and reference must agree exactly.
@@ -331,19 +383,55 @@ mod self_intersect_tests {
     #[test]
     fn the_bbox_reject_never_changes_the_answer() {
         let shapes: Vec<(&str, Vec<Vec2>)> = vec![
-            ("square", vec![v(0.,0.), v(4.,0.), v(4.,4.), v(0.,4.)]),
-            ("bowtie — self-intersecting", vec![v(0.,0.), v(4.,4.), v(4.,0.), v(0.,4.)]),
-            ("concave L", vec![v(0.,0.), v(4.,0.), v(4.,2.), v(2.,2.), v(2.,4.), v(0.,4.)]),
-            ("touching boxes, no crossing", vec![v(0.,0.), v(2.,0.), v(2.,2.), v(4.,2.), v(4.,4.), v(0.,4.)]),
-            ("shared x, axis-aligned", vec![v(0.,0.), v(0.,4.), v(4.,4.), v(4.,0.)]),
-            ("slight overlap crossing", vec![v(0.,0.), v(10.,0.1), v(0.,0.2), v(10.,0.3)]),
-            ("narrow bowtie — ONE crossing, tiny x-overlap", vec![v(0.,0.), v(0.2,4.), v(0.2,0.), v(0.,4.)]),
-            ("collinear spike", vec![v(0.,0.), v(4.,0.), v(2.,0.), v(2.,3.)]),
-            ("triangle", vec![v(0.,0.), v(3.,0.), v(1.5,2.6)]),
+            ("square", vec![v(0., 0.), v(4., 0.), v(4., 4.), v(0., 4.)]),
+            (
+                "bowtie — self-intersecting",
+                vec![v(0., 0.), v(4., 4.), v(4., 0.), v(0., 4.)],
+            ),
+            (
+                "concave L",
+                vec![
+                    v(0., 0.),
+                    v(4., 0.),
+                    v(4., 2.),
+                    v(2., 2.),
+                    v(2., 4.),
+                    v(0., 4.),
+                ],
+            ),
+            (
+                "touching boxes, no crossing",
+                vec![
+                    v(0., 0.),
+                    v(2., 0.),
+                    v(2., 2.),
+                    v(4., 2.),
+                    v(4., 4.),
+                    v(0., 4.),
+                ],
+            ),
+            (
+                "shared x, axis-aligned",
+                vec![v(0., 0.), v(0., 4.), v(4., 4.), v(4., 0.)],
+            ),
+            (
+                "slight overlap crossing",
+                vec![v(0., 0.), v(10., 0.1), v(0., 0.2), v(10., 0.3)],
+            ),
+            (
+                "narrow bowtie — ONE crossing, tiny x-overlap",
+                vec![v(0., 0.), v(0.2, 4.), v(0.2, 0.), v(0., 4.)],
+            ),
+            (
+                "collinear spike",
+                vec![v(0., 0.), v(4., 0.), v(2., 0.), v(2., 3.)],
+            ),
+            ("triangle", vec![v(0., 0.), v(3., 0.), v(1.5, 2.6)]),
         ];
         for (name, pts) in shapes {
             assert_eq!(
-                self_intersects(&pts), reference(&pts),
+                self_intersects(&pts),
+                reference(&pts),
                 "the box reject changed the answer for: {name}",
             );
         }
@@ -362,7 +450,8 @@ mod self_intersect_tests {
                     })
                     .collect();
                 assert_eq!(
-                    self_intersects(&pts), reference(&pts),
+                    self_intersects(&pts),
+                    reference(&pts),
                     "disagreement at n={n} step={step}",
                 );
             }
@@ -374,7 +463,13 @@ fn self_intersects(p: &[Vec2]) -> bool {
     let n = p.len();
     let orient = |a: Vec2, b: Vec2, c: Vec2| {
         let v = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-        if v > 1e-9 { 1 } else if v < -1e-9 { -1 } else { 0 }
+        if v > 1e-9 {
+            1
+        } else if v < -1e-9 {
+            -1
+        } else {
+            0
+        }
     };
     for i in 0..n {
         let (a1, a2) = (p[i], p[(i + 1) % n]);
@@ -394,8 +489,10 @@ fn self_intersects(p: &[Vec2]) -> bool {
                 continue;
             }
             let (b1, b2) = (p[j], p[(j + 1) % n]);
-            if b1.x.min(b2.x) > ahi_x || b1.x.max(b2.x) < alo_x
-                || b1.y.min(b2.y) > ahi_y || b1.y.max(b2.y) < alo_y
+            if b1.x.min(b2.x) > ahi_x
+                || b1.x.max(b2.x) < alo_x
+                || b1.y.min(b2.y) > ahi_y
+                || b1.y.max(b2.y) < alo_y
             {
                 continue;
             }
@@ -480,17 +577,43 @@ pub enum Primitive {
     /// `r_top = 0` → **cone** · `r_top = r_bottom` → **prism** ·
     /// `sides = 4, r_top = 0` → **pyramid** · else → **frustum**.
     /// (This is why there is no separate Cone/Prism/Pyramid variant.)
-    Frustum { r_bottom: f32, r_top: f32, h: f32, sides: u32 },
+    Frustum {
+        r_bottom: f32,
+        r_top: f32,
+        h: f32,
+        sides: u32,
+    },
     /// Torus — `major_r` = ring radius, `minor_r` = tube thickness.
-    Torus { major_r: f32, minor_r: f32, seg_major: u32, seg_minor: u32 },
+    Torus {
+        major_r: f32,
+        minor_r: f32,
+        seg_major: u32,
+        seg_minor: u32,
+    },
     /// Capsule — a cylinder of length `h` with hemispherical caps of radius `r`.
     /// **COMPOSED** (csgrs has no capsule): cylinder ∪ sphere ∪ sphere.
     /// Total height = `h + 2r`.
-    Capsule { r: f32, h: f32, segments: u32, stacks: u32 },
+    Capsule {
+        r: f32,
+        h: f32,
+        segments: u32,
+        stacks: u32,
+    },
     /// Hollow tube — **COMPOSED** (csgrs has no tube): outer cylinder ∖ inner.
-    Tube { r_outer: f32, r_inner: f32, h: f32, sides: u32 },
+    Tube {
+        r_outer: f32,
+        r_inner: f32,
+        h: f32,
+        sides: u32,
+    },
     /// Ellipsoid with independent radii. Rests on the plane (lifted by `rz`).
-    Ellipsoid { rx: f32, ry: f32, rz: f32, segments: u32, stacks: u32 },
+    Ellipsoid {
+        rx: f32,
+        ry: f32,
+        rz: f32,
+        segments: u32,
+        stacks: u32,
+    },
     /// **Vertical extrusion of an arbitrary closed profile** — the building outline.
     ///
     /// The profile lives in [`Model::profiles`] and is referenced by [`ProfileId`] rather
@@ -504,13 +627,23 @@ pub enum Primitive {
     /// ray-pick selection and has no access to the `Model` — stays a pure function of the
     /// primitive. Profiles are IMMUTABLE once created (an edit mints a new one), so the
     /// cache cannot go stale.
-    Extrusion { profile: ProfileId, h: f32, w: f32, d: f32 },
+    Extrusion {
+        profile: ProfileId,
+        h: f32,
+        w: f32,
+        d: f32,
+    },
     /// **Sweep** — a closed cross-section (`profile`) swept along an open path (`path`),
     /// the section kept perpendicular to the path (csgrs `Sketch::sweep`). Both live in the
     /// shared tables and are referenced by id (keeps `Primitive` `Copy`, same as
     /// [`Primitive::Extrusion`]). `bmin`/`bmax` cache the local AABB so [`Primitive::local_aabb`]
     /// stays a pure function without the `Model` (a swept solid's bounds aren't a simple box).
-    Sweep { profile: ProfileId, path: PathId, bmin: [f32; 3], bmax: [f32; 3] },
+    Sweep {
+        profile: ProfileId,
+        path: PathId,
+        bmin: [f32; 3],
+        bmax: [f32; 3],
+    },
 }
 
 impl Primitive {
@@ -519,10 +652,19 @@ impl Primitive {
             Primitive::Box { .. } => "Box",
             Primitive::Cylinder { .. } => "Cylinder",
             Primitive::Sphere { .. } => "Sphere",
-            Primitive::Frustum { r_top, sides, r_bottom, .. } => {
+            Primitive::Frustum {
+                r_top,
+                sides,
+                r_bottom,
+                ..
+            } => {
                 // one variant, four shapes — name it by what it actually is
                 if *r_top <= 1e-6 {
-                    if *sides == 4 { "Pyramid" } else { "Cone" }
+                    if *sides == 4 {
+                        "Pyramid"
+                    } else {
+                        "Cone"
+                    }
                 } else if (*r_top - *r_bottom).abs() <= 1e-6 {
                     "Prism"
                 } else {
@@ -542,13 +684,17 @@ impl Primitive {
     /// centred on the local origin, resting on z = 0).
     pub fn local_aabb(&self) -> (Vec3, Vec3) {
         match *self {
-            Primitive::Box { w, d, h } => (Vec3::new(-w / 2.0, -d / 2.0, 0.0), Vec3::new(w / 2.0, d / 2.0, h)),
+            Primitive::Box { w, d, h } => (
+                Vec3::new(-w / 2.0, -d / 2.0, 0.0),
+                Vec3::new(w / 2.0, d / 2.0, h),
+            ),
             Primitive::Cylinder { r, h, .. } => (Vec3::new(-r, -r, 0.0), Vec3::new(r, r, h)),
             // The cached extents exist precisely so this stays a pure function of the
             // primitive — resolving the ProfileId here would need the Model.
-            Primitive::Extrusion { h, w, d, .. } => {
-                (Vec3::new(-w / 2.0, -d / 2.0, 0.0), Vec3::new(w / 2.0, d / 2.0, h))
-            }
+            Primitive::Extrusion { h, w, d, .. } => (
+                Vec3::new(-w / 2.0, -d / 2.0, 0.0),
+                Vec3::new(w / 2.0, d / 2.0, h),
+            ),
             // Cached at creation — the swept solid's true bounds (path bbox ± section reach).
             Primitive::Sweep { bmin, bmax, .. } => (Vec3::from(bmin), Vec3::from(bmax)),
             // sphere/ellipsoid are lifted so they REST on the plane
@@ -556,20 +702,27 @@ impl Primitive {
             Primitive::Ellipsoid { rx, ry, rz, .. } => {
                 (Vec3::new(-rx, -ry, 0.0), Vec3::new(rx, ry, 2.0 * rz))
             }
-            Primitive::Frustum { r_bottom, r_top, h, .. } => {
+            Primitive::Frustum {
+                r_bottom, r_top, h, ..
+            } => {
                 let r = r_bottom.max(r_top);
                 (Vec3::new(-r, -r, 0.0), Vec3::new(r, r, h))
             }
             // torus lies flat, lifted by minor_r → rests on the plane
-            Primitive::Torus { major_r, minor_r, .. } => {
+            Primitive::Torus {
+                major_r, minor_r, ..
+            } => {
                 let o = major_r + minor_r;
                 (Vec3::new(-o, -o, 0.0), Vec3::new(o, o, 2.0 * minor_r))
             }
             // capsule: caps of r at each end of an h-long barrel → total h + 2r
-            Primitive::Capsule { r, h, .. } => (Vec3::new(-r, -r, 0.0), Vec3::new(r, r, h + 2.0 * r)),
-            Primitive::Tube { r_outer, h, .. } => {
-                (Vec3::new(-r_outer, -r_outer, 0.0), Vec3::new(r_outer, r_outer, h))
+            Primitive::Capsule { r, h, .. } => {
+                (Vec3::new(-r, -r, 0.0), Vec3::new(r, r, h + 2.0 * r))
             }
+            Primitive::Tube { r_outer, h, .. } => (
+                Vec3::new(-r_outer, -r_outer, 0.0),
+                Vec3::new(r_outer, r_outer, h),
+            ),
         }
     }
 }
@@ -698,7 +851,10 @@ impl Feature {
     /// World position of the feature's local origin (footprint centre on its plane).
     pub fn world_origin(&self) -> Vec3 {
         let (u, v) = self.plane.axes();
-        self.plane.origin() + u * self.placement.u + v * self.placement.v + self.plane.normal() * self.placement.lift
+        self.plane.origin()
+            + u * self.placement.u
+            + v * self.placement.v
+            + self.plane.normal() * self.placement.lift
     }
 
     /// Copy of this feature relocated so its local origin sits at world point `w`
@@ -750,12 +906,16 @@ impl Feature {
             }
             // Uniform scale: every LENGTH scales, every SEGMENT COUNT does not.
             Primitive::Sphere { r, .. } => *r = (*r * k).max(0.001),
-            Primitive::Frustum { r_bottom, r_top, h, .. } => {
+            Primitive::Frustum {
+                r_bottom, r_top, h, ..
+            } => {
                 *r_bottom = (*r_bottom * k).max(0.0); // 0 is legal — that IS a cone
                 *r_top = (*r_top * k).max(0.0);
                 *h = (*h * k).max(0.001);
             }
-            Primitive::Torus { major_r, minor_r, .. } => {
+            Primitive::Torus {
+                major_r, minor_r, ..
+            } => {
                 *major_r = (*major_r * k).max(0.001);
                 *minor_r = (*minor_r * k).max(0.001);
             }
@@ -776,7 +936,12 @@ impl Feature {
                 *r = (*r * k).max(0.001);
                 *h = (*h * k).max(0.0); // 0 is legal — that IS a sphere
             }
-            Primitive::Tube { r_outer, r_inner, h, .. } => {
+            Primitive::Tube {
+                r_outer,
+                r_inner,
+                h,
+                ..
+            } => {
                 *r_outer = (*r_outer * k).max(0.001);
                 *r_inner = (*r_inner * k).max(0.0);
                 *h = (*h * k).max(0.001);
@@ -849,10 +1014,17 @@ pub fn coplanar_face(positions: &[[f32; 3]], start: usize) -> Vec<usize> {
     // Weld vertices onto a grid so shared edges match despite float noise.
     let key = |p: [f32; 3]| -> (i64, i64, i64) {
         let q = 1.0e4;
-        ((p[0] as f64 * q).round() as i64, (p[1] as f64 * q).round() as i64, (p[2] as f64 * q).round() as i64)
+        (
+            (p[0] as f64 * q).round() as i64,
+            (p[1] as f64 * q).round() as i64,
+            (p[2] as f64 * q).round() as i64,
+        )
     };
     let edge = |t: usize, e: usize| {
-        let (mut a, mut b) = (key(positions[3 * t + e]), key(positions[3 * t + (e + 1) % 3]));
+        let (mut a, mut b) = (
+            key(positions[3 * t + e]),
+            key(positions[3 * t + (e + 1) % 3]),
+        );
         if a > b {
             std::mem::swap(&mut a, &mut b);
         }
@@ -905,10 +1077,17 @@ pub fn surface_groups(positions: &[[f32; 3]]) -> (Vec<u32>, Vec<u32>) {
     let ntri = positions.len() / 3;
     let key = |p: [f32; 3]| -> (i64, i64, i64) {
         let q = 1.0e4;
-        ((p[0] as f64 * q).round() as i64, (p[1] as f64 * q).round() as i64, (p[2] as f64 * q).round() as i64)
+        (
+            (p[0] as f64 * q).round() as i64,
+            (p[1] as f64 * q).round() as i64,
+            (p[2] as f64 * q).round() as i64,
+        )
     };
     let edge = |t: usize, e: usize| {
-        let (mut a, mut b) = (key(positions[3 * t + e]), key(positions[3 * t + (e + 1) % 3]));
+        let (mut a, mut b) = (
+            key(positions[3 * t + e]),
+            key(positions[3 * t + (e + 1) % 3]),
+        );
         if a > b {
             std::mem::swap(&mut a, &mut b);
         }
@@ -1121,15 +1300,30 @@ pub fn geom_outlines_scaled(g: &cad_kernel::Geom, k: f64) -> Vec<Vec<Vec2>> {
     match g {
         G::Line(l) => vec![vec![gvec(l.a, k), gvec(l.b, k)]],
         G::Circle(c) => vec![circle_path(c.center, c.radius, 64, k)],
-        G::Arc(a) => vec![arc_path(a.center, a.radius, a.start_angle, a.sweep_angle, 48, k)],
+        G::Arc(a) => vec![arc_path(
+            a.center,
+            a.radius,
+            a.start_angle,
+            a.sweep_angle,
+            48,
+            k,
+        )],
         G::Ellipse(e) => {
             let n = 72;
-            vec![(0..=n).map(|i| gvec(e.point_at(std::f64::consts::TAU * i as f64 / n as f64), k)).collect()]
+            vec![(0..=n)
+                .map(|i| gvec(e.point_at(std::f64::consts::TAU * i as f64 / n as f64), k))
+                .collect()]
         }
         G::EllipseArc(ea) => {
             let n = 48;
             vec![(0..=n)
-                .map(|i| gvec(ea.ellipse.point_at(ea.start_param + ea.sweep_param * i as f64 / n as f64), k))
+                .map(|i| {
+                    gvec(
+                        ea.ellipse
+                            .point_at(ea.start_param + ea.sweep_param * i as f64 / n as f64),
+                        k,
+                    )
+                })
                 .collect()]
         }
         G::Polyline(p) => vec![polyline_path(p, k)],
@@ -1170,13 +1364,18 @@ pub fn geom_outlines_scaled(g: &cad_kernel::Geom, k: f64) -> Vec<Vec<Vec2>> {
 /// `depth` bounds block recursion. A block that contains itself is a cycle the DXF writer already
 /// has to defend against, and a viewport helper must not be the thing that overflows the stack.
 pub fn geom_display_outlines_scaled(
-    g: &cad_kernel::Geom, doc: &cad_kernel::Document, k: f64,
+    g: &cad_kernel::Geom,
+    doc: &cad_kernel::Document,
+    k: f64,
 ) -> Vec<Vec<Vec2>> {
     display_outlines_depth(g, doc, k, 8)
 }
 
 fn display_outlines_depth(
-    g: &cad_kernel::Geom, doc: &cad_kernel::Document, k: f64, depth: u32,
+    g: &cad_kernel::Geom,
+    doc: &cad_kernel::Document,
+    k: f64,
+    depth: u32,
 ) -> Vec<Vec<Vec2>> {
     use cad_kernel::Geom as G;
     match g {
@@ -1367,10 +1566,23 @@ impl Model {
     }
 
     /// Append a feature, assigning it a fresh id; returns that id.
-    pub fn push(&mut self, op: BoolOp, plane: Plane, placement: Placement, primitive: Primitive) -> u32 {
+    pub fn push(
+        &mut self,
+        op: BoolOp,
+        plane: Plane,
+        placement: Placement,
+        primitive: Primitive,
+    ) -> u32 {
         let id = self.take_feature_id();
         self.features.push(Feature {
-            id, op, plane, placement, primitive, enabled: true, target: None, through: None,
+            id,
+            op,
+            plane,
+            placement,
+            primitive,
+            enabled: true,
+            target: None,
+            through: None,
         });
         id
     }
@@ -1460,7 +1672,10 @@ impl Model {
     /// so extruded faces point consistently outward.
     ///
     /// Validation is refusal, not repair — see [`ProfileError`].
-    pub fn add_profile(&mut self, pts: &[Vec2]) -> Result<(ProfileId, Vec2, f32, f32), ProfileError> {
+    pub fn add_profile(
+        &mut self,
+        pts: &[Vec2],
+    ) -> Result<(ProfileId, Vec2, f32, f32), ProfileError> {
         self.add_profile_with_holes(pts, &[])
     }
 
@@ -1480,7 +1695,9 @@ impl Model {
     /// when it is a hole at all, and letting a stray ring stretch the box would move the whole
     /// plate rather than being ignored.
     pub fn add_profile_with_holes(
-        &mut self, pts: &[Vec2], holes: &[Vec<Vec2>],
+        &mut self,
+        pts: &[Vec2],
+        holes: &[Vec<Vec2>],
     ) -> Result<(ProfileId, Vec2, f32, f32), ProfileError> {
         let p = Self::clean_ring(pts)?;
         let mut rings: Vec<Vec<Vec2>> = Vec::with_capacity(holes.len());
@@ -1497,7 +1714,14 @@ impl Model {
         let shift = |r: &[Vec2]| -> Vec<[f32; 2]> {
             r.iter().map(|q| [q.x - centre.x, q.y - centre.y]).collect()
         };
-        let id = { if self.next_profile_id == 0 { self.reserve_ids_above_loaded(); } let i = self.next_profile_id; self.next_profile_id += 1; i };
+        let id = {
+            if self.next_profile_id == 0 {
+                self.reserve_ids_above_loaded();
+            }
+            let i = self.next_profile_id;
+            self.next_profile_id += 1;
+            i
+        };
         self.profiles.push(Profile {
             id,
             pts: shift(&p),
@@ -1564,8 +1788,18 @@ impl Model {
             mn = mn.min(*q);
             mx = mx.max(*q);
         }
-        let id = { if self.next_path_id == 0 { self.reserve_ids_above_loaded(); } let i = self.next_path_id; self.next_path_id += 1; i };
-        self.paths.push(Path { id, pts: p.iter().map(|q| [q.x, q.y, q.z]).collect() });
+        let id = {
+            if self.next_path_id == 0 {
+                self.reserve_ids_above_loaded();
+            }
+            let i = self.next_path_id;
+            self.next_path_id += 1;
+            i
+        };
+        self.paths.push(Path {
+            id,
+            pts: p.iter().map(|q| [q.x, q.y, q.z]).collect(),
+        });
         Some((id, mn, mx))
     }
 
@@ -1634,7 +1868,11 @@ impl Model {
 
     /// Next free feature id.
     pub fn next_id(&self) -> u32 {
-        self.features.iter().map(|f| f.id).max().map_or(1, |m| m + 1)
+        self.features
+            .iter()
+            .map(|f| f.id)
+            .max()
+            .map_or(1, |m| m + 1)
     }
 
     /// Append a fully-formed feature, re-stamping it with a fresh id (COPY).
@@ -1736,8 +1974,14 @@ mod tests {
             let v = |x: f32, y: f32, z: f32| [o[0] + x, o[1] + y, o[2] + z];
             // 8 corners, 6 faces × 2 tris.
             let c = [
-                v(0.0, 0.0, 0.0), v(1.0, 0.0, 0.0), v(1.0, 1.0, 0.0), v(0.0, 1.0, 0.0),
-                v(0.0, 0.0, 1.0), v(1.0, 0.0, 1.0), v(1.0, 1.0, 1.0), v(0.0, 1.0, 1.0),
+                v(0.0, 0.0, 0.0),
+                v(1.0, 0.0, 0.0),
+                v(1.0, 1.0, 0.0),
+                v(0.0, 1.0, 0.0),
+                v(0.0, 0.0, 1.0),
+                v(1.0, 0.0, 1.0),
+                v(1.0, 1.0, 1.0),
+                v(0.0, 1.0, 1.0),
             ];
             let quad = |a: usize, b: usize, cc: usize, d: usize, out: &mut Vec<[f32; 3]>| {
                 out.extend_from_slice(&[c[a], c[b], c[cc], c[a], c[cc], c[d]]);
@@ -1759,7 +2003,11 @@ mod tests {
         assert_eq!(nbody, 2, "two disjoint cubes → two bodies");
         assert_eq!(nface, 12, "each cube has 6 flat faces → 12 total");
         // Every triangle of cube 0 shares one body id, distinct from cube 1's.
-        assert_ne!(body[0], body[body.len() - 1], "the two cubes are different bodies");
+        assert_ne!(
+            body[0],
+            body[body.len() - 1],
+            "the two cubes are different bodies"
+        );
     }
 
     #[test]
@@ -1781,20 +2029,42 @@ mod tests {
         let plane = Plane::from_basis(Vec3::ZERO, Vec3::Y, Vec3::Z);
         assert!((plane.normal() - Vec3::X).length() < 1e-5, "normal is +X");
         let mut m = Model::default();
-        let (profile, centre, w, d) = m.add_profile(&[
-            Vec2::new(-0.5, -0.5), Vec2::new(0.5, -0.5),
-            Vec2::new(0.5, 0.5), Vec2::new(-0.5, 0.5),
-        ]).unwrap();
+        let (profile, centre, w, d) = m
+            .add_profile(&[
+                Vec2::new(-0.5, -0.5),
+                Vec2::new(0.5, -0.5),
+                Vec2::new(0.5, 0.5),
+                Vec2::new(-0.5, 0.5),
+            ])
+            .unwrap();
         m.push(
-            BoolOp::Union, plane,
-            Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
-            Primitive::Extrusion { profile, h: 3.0, w, d },
+            BoolOp::Union,
+            plane,
+            Placement {
+                u: centre.x,
+                v: centre.y,
+                lift: 0.0,
+                spin_deg: 0.0,
+                pitch_deg: 0.0,
+                roll_deg: 0.0,
+            },
+            Primitive::Extrusion {
+                profile,
+                h: 3.0,
+                w,
+                d,
+            },
         );
         let (mn, mx) = m.eval().bounds().expect("has geometry");
         // Extruded 3 m along +X ⇒ X spans ~0..3; the 1×1 profile stays thin in Y and Z.
-        assert!((mx[0] - mn[0] - 3.0).abs() < 0.05, "extrudes 3 m along the plane normal (+X)");
-        assert!((mx[1] - mn[1] - 1.0).abs() < 0.05 && (mx[2] - mn[2] - 1.0).abs() < 0.05,
-            "the 1×1 profile is preserved in the plane");
+        assert!(
+            (mx[0] - mn[0] - 3.0).abs() < 0.05,
+            "extrudes 3 m along the plane normal (+X)"
+        );
+        assert!(
+            (mx[1] - mn[1] - 1.0).abs() < 0.05 && (mx[2] - mn[2] - 1.0).abs() < 0.05,
+            "the 1×1 profile is preserved in the plane"
+        );
     }
 
     /// A shape drawn OFF-CENTRE on a custom plane must land at ONE world spot, not also its
@@ -1805,20 +2075,52 @@ mod tests {
         let plane = Plane::from_basis(Vec3::new(5.0, 0.0, 0.0), Vec3::Y, Vec3::Z);
         let mut m = Model::default();
         // A 1×1 square centred at uv (2, 1).
-        let (profile, centre, w, d) = m.add_profile(&[
-            Vec2::new(1.5, 0.5), Vec2::new(2.5, 0.5),
-            Vec2::new(2.5, 1.5), Vec2::new(1.5, 1.5),
-        ]).unwrap();
+        let (profile, centre, w, d) = m
+            .add_profile(&[
+                Vec2::new(1.5, 0.5),
+                Vec2::new(2.5, 0.5),
+                Vec2::new(2.5, 1.5),
+                Vec2::new(1.5, 1.5),
+            ])
+            .unwrap();
         m.push(
-            BoolOp::Union, plane,
-            Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
-            Primitive::Extrusion { profile, h: 2.0, w, d },
+            BoolOp::Union,
+            plane,
+            Placement {
+                u: centre.x,
+                v: centre.y,
+                lift: 0.0,
+                spin_deg: 0.0,
+                pitch_deg: 0.0,
+                roll_deg: 0.0,
+            },
+            Primitive::Extrusion {
+                profile,
+                h: 2.0,
+                w,
+                d,
+            },
         );
         let (mn, mx) = m.eval().bounds().unwrap();
         // world = (5,0,0) + Y*2 + Z*1 = (5,2,1); extrude +X by 2 ⇒ x 5..7, y 1.5..2.5, z 0.5..1.5.
-        assert!(mn[0] > 4.9 && mx[0] < 7.1, "x spans 5..7, got {}..{}", mn[0], mx[0]);
-        assert!(mn[1] > 1.4 && mx[1] < 2.6, "y around 2, got {}..{}", mn[1], mx[1]);
-        assert!(mn[2] > 0.4 && mx[2] < 1.6, "z around 1, got {}..{}", mn[2], mx[2]);
+        assert!(
+            mn[0] > 4.9 && mx[0] < 7.1,
+            "x spans 5..7, got {}..{}",
+            mn[0],
+            mx[0]
+        );
+        assert!(
+            mn[1] > 1.4 && mx[1] < 2.6,
+            "y around 2, got {}..{}",
+            mn[1],
+            mx[1]
+        );
+        assert!(
+            mn[2] > 0.4 && mx[2] < 1.6,
+            "z around 1, got {}..{}",
+            mn[2],
+            mx[2]
+        );
     }
 
     /// A whole-model rescale must shrink the evaluated geometry by exactly `k`.
@@ -1826,14 +2128,24 @@ mod tests {
     fn rescaling_the_model_scales_the_built_geometry() {
         let mut m = Model::default();
         m.push(
-            BoolOp::Union, Plane::default(), Placement::default(),
-            Primitive::Box { w: 3000.0, d: 1000.0, h: 2700.0 },
+            BoolOp::Union,
+            Plane::default(),
+            Placement::default(),
+            Primitive::Box {
+                w: 3000.0,
+                d: 1000.0,
+                h: 2700.0,
+            },
         );
         let (mn0, mx0) = m.eval().bounds().unwrap();
         assert!((mx0[0] - mn0[0] - 3000.0).abs() < 1.0, "starts 3000 wide");
         m.rescale(0.001);
         let (mn, mx) = m.eval().bounds().unwrap();
-        assert!((mx[0] - mn[0] - 3.0).abs() < 0.01, "3000 units → 3 m, got {}", mx[0] - mn[0]);
+        assert!(
+            (mx[0] - mn[0] - 3.0).abs() < 0.01,
+            "3000 units → 3 m, got {}",
+            mx[0] - mn[0]
+        );
         assert!((mx[2] - mn[2] - 2.7).abs() < 0.01, "height came with it");
     }
 
@@ -1844,24 +2156,48 @@ mod tests {
     #[test]
     fn a_shared_profile_is_scaled_exactly_once() {
         let mut m = Model::default();
-        let (profile, centre, w, d) = m.add_profile(&[
-            Vec2::new(0.0, 0.0), Vec2::new(1000.0, 0.0),
-            Vec2::new(1000.0, 1000.0), Vec2::new(0.0, 1000.0),
-        ]).unwrap();
+        let (profile, centre, w, d) = m
+            .add_profile(&[
+                Vec2::new(0.0, 0.0),
+                Vec2::new(1000.0, 0.0),
+                Vec2::new(1000.0, 1000.0),
+                Vec2::new(0.0, 1000.0),
+            ])
+            .unwrap();
         // TWO features referencing the SAME profile — the storey pattern.
         for lift in [0.0_f32, 1000.0] {
             m.push(
-                BoolOp::Union, Plane::default(),
-                Placement { u: centre.x, v: centre.y, lift, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
-                Primitive::Extrusion { profile, h: 1000.0, w, d },
+                BoolOp::Union,
+                Plane::default(),
+                Placement {
+                    u: centre.x,
+                    v: centre.y,
+                    lift,
+                    spin_deg: 0.0,
+                    pitch_deg: 0.0,
+                    roll_deg: 0.0,
+                },
+                Primitive::Extrusion {
+                    profile,
+                    h: 1000.0,
+                    w,
+                    d,
+                },
             );
         }
         m.rescale(0.001);
         let (mn, mx) = m.eval().bounds().unwrap();
         // 1000-unit footprint → 1 m; two 1000-tall storeys stacked → 2 m.
-        assert!((mx[0] - mn[0] - 1.0).abs() < 0.01,
-            "footprint scaled ONCE (got {}, would be 0.001 if scaled twice)", mx[0] - mn[0]);
-        assert!((mx[2] - mn[2] - 2.0).abs() < 0.01, "both storeys, {} tall", mx[2] - mn[2]);
+        assert!(
+            (mx[0] - mn[0] - 1.0).abs() < 0.01,
+            "footprint scaled ONCE (got {}, would be 0.001 if scaled twice)",
+            mx[0] - mn[0]
+        );
+        assert!(
+            (mx[2] - mn[2] - 2.0).abs() < 0.01,
+            "both storeys, {} tall",
+            mx[2] - mn[2]
+        );
     }
 
     /// Rescaling must not shear anything: a custom plane's basis vectors are DIRECTIONS, so
@@ -1873,7 +2209,11 @@ mod tests {
             BoolOp::Union,
             Plane::from_basis(Vec3::new(1000.0, 0.0, 0.0), Vec3::Y, Vec3::Z),
             Placement::default(),
-            Primitive::Box { w: 100.0, d: 100.0, h: 100.0 },
+            Primitive::Box {
+                w: 100.0,
+                d: 100.0,
+                h: 100.0,
+            },
         );
         m.rescale(0.001);
         let p = m.features[0].plane;
@@ -1881,7 +2221,10 @@ mod tests {
         assert_eq!(c.origin, [1.0, 0.0, 0.0], "origin moved");
         assert_eq!(c.u, [0.0, 1.0, 0.0], "u is a direction — unchanged");
         assert_eq!(c.v, [0.0, 0.0, 1.0], "v is a direction — unchanged");
-        assert!((p.normal().length() - 1.0).abs() < 1e-6, "still orthonormal");
+        assert!(
+            (p.normal().length() - 1.0).abs() < 1e-6,
+            "still orthonormal"
+        );
     }
 
     /// A no-op factor must be exactly that, and a nonsensical one must be refused rather
@@ -1889,8 +2232,16 @@ mod tests {
     #[test]
     fn rescale_refuses_nonsense_factors() {
         let mut m = Model::default();
-        m.push(BoolOp::Union, Plane::default(), Placement::default(),
-            Primitive::Box { w: 2.0, d: 2.0, h: 2.0 });
+        m.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement::default(),
+            Primitive::Box {
+                w: 2.0,
+                d: 2.0,
+                h: 2.0,
+            },
+        );
         for bad in [0.0_f32, -1.0, f32::NAN, f32::INFINITY, 1.0] {
             m.rescale(bad);
             match m.features[0].primitive {
@@ -1905,9 +2256,24 @@ mod tests {
         let f = Feature {
             id: 1,
             op: BoolOp::Union,
-            plane: Plane { kind: PlaneKind::XY, offset: 2.0, custom: None },
-            placement: Placement { u: 3.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
-            primitive: Primitive::Box { w: 2.0, d: 2.0, h: 1.0 },
+            plane: Plane {
+                kind: PlaneKind::XY,
+                offset: 2.0,
+                custom: None,
+            },
+            placement: Placement {
+                u: 3.0,
+                v: 0.0,
+                lift: 0.0,
+                spin_deg: 0.0,
+                pitch_deg: 0.0,
+                roll_deg: 0.0,
+            },
+            primitive: Primitive::Box {
+                w: 2.0,
+                d: 2.0,
+                h: 1.0,
+            },
             enabled: true,
             target: None,
             through: None,
@@ -1923,8 +2289,19 @@ mod tests {
             id: 1,
             op: BoolOp::Union,
             plane: Plane::default(),
-            placement: Placement { u, v, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
-            primitive: Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+            placement: Placement {
+                u,
+                v,
+                lift: 0.0,
+                spin_deg: 0.0,
+                pitch_deg: 0.0,
+                roll_deg: 0.0,
+            },
+            primitive: Primitive::Box {
+                w: 1.0,
+                d: 1.0,
+                h: 1.0,
+            },
             enabled: true,
             target: None,
             through: None,
@@ -1950,13 +2327,19 @@ mod tests {
             "primitive": { "Box": { "w": 1.0, "d": 1.0, "h": 1.0 } }
         }"#;
         let f: Feature = serde_json::from_str(legacy).expect("a pre-flag feature must still parse");
-        assert!(f.enabled, "an existing project would open as an empty scene");
+        assert!(
+            f.enabled,
+            "an existing project would open as an empty scene"
+        );
         // And the SAME JSON is what a pre-`target` file carries, which is every file ever saved.
         // `None` is the positional binding, so an older project's openings stay in the walls they
         // were cut in. Unlike `enabled` this one is safe by construction — pinned anyway, on the
         // hand-written JSON rather than a round trip, because a round trip writes the field and
         // so never exercises its absence.
-        assert_eq!(f.target, None, "an older feature must keep the positional binding");
+        assert_eq!(
+            f.target, None,
+            "an older feature must keep the positional binding"
+        );
     }
 
     /// `insert_after` is where "this cutter opens THAT body" is stated, so it has to be true both
@@ -1965,8 +2348,26 @@ mod tests {
     #[test]
     fn insert_after_binds_a_cutter_to_its_host_and_places_it_behind_it() {
         let mut m = Model::default();
-        let a = m.push(BoolOp::Union, Plane::default(), Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
-        let b = m.push(BoolOp::Union, Plane::default(), Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
+        let a = m.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement::default(),
+            Primitive::Box {
+                w: 1.0,
+                d: 1.0,
+                h: 1.0,
+            },
+        );
+        let b = m.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement::default(),
+            Primitive::Box {
+                w: 1.0,
+                d: 1.0,
+                h: 1.0,
+            },
+        );
 
         let mut cutter = box_at(0.0, 0.0);
         cutter.id = 900;
@@ -1974,9 +2375,17 @@ mod tests {
         assert!(m.insert_after(a, cutter), "host `a` is present");
 
         let at = |id: u32, m: &Model| m.features.iter().position(|f| f.id == id).expect("present");
-        assert_eq!(at(900, &m), at(a, &m) + 1, "the cutter must sit directly behind body a");
+        assert_eq!(
+            at(900, &m),
+            at(a, &m) + 1,
+            "the cutter must sit directly behind body a"
+        );
         assert!(at(900, &m) < at(b, &m), "…and therefore before body b");
-        assert_eq!(m.get(900).and_then(|f| f.target), Some(a), "the binding was not recorded");
+        assert_eq!(
+            m.get(900).and_then(|f| f.target),
+            Some(a),
+            "the binding was not recorded"
+        );
     }
 
     /// A MISSING HOST IS REPORTED, AND THE CUTTER OPENS NOTHING.
@@ -1988,15 +2397,32 @@ mod tests {
     #[test]
     fn a_cutter_whose_host_is_gone_is_reported_and_opens_nothing() {
         let mut m = Model::default();
-        let a = m.push(BoolOp::Union, Plane::default(), Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
+        let a = m.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement::default(),
+            Primitive::Box {
+                w: 1.0,
+                d: 1.0,
+                h: 1.0,
+            },
+        );
 
         let mut stray = box_at(0.0, 0.0);
         stray.id = 901;
         stray.op = BoolOp::Difference;
-        assert!(!m.insert_after(4_242, stray), "an unknown host must be reported, not hidden");
-        assert_eq!(m.features.last().map(|f| f.id), Some(901), "it is kept, at the end");
+        assert!(
+            !m.insert_after(4_242, stray),
+            "an unknown host must be reported, not hidden"
+        );
         assert_eq!(
-            m.get(901).and_then(|f| f.target), Some(4_242),
+            m.features.last().map(|f| f.id),
+            Some(901),
+            "it is kept, at the end"
+        );
+        assert_eq!(
+            m.get(901).and_then(|f| f.target),
+            Some(4_242),
             "it must keep naming the body it was meant for, so it cuts nothing rather than \
              opening whichever body is last",
         );
@@ -2004,7 +2430,10 @@ mod tests {
         // And the geometry agrees: body `a` is a 1 m cube at the origin, and the stray cutter is
         // a 1 m cube at the origin too — if it were ever applied, `a` would vanish.
         let _ = a;
-        assert!(m.eval().bounds().is_some(), "the appended cutter dissolved the body it landed on");
+        assert!(
+            m.eval().bounds().is_some(),
+            "the appended cutter dissolved the body it landed on"
+        );
     }
 
     #[test]
@@ -2019,8 +2448,14 @@ mod tests {
         // A feature at (1,0) rotated +90° about Z lands at (0,1), spin +90.
         let f = box_at(1.0, 0.0).rotated(Vec3::ZERO, Vec3::Z, std::f32::consts::FRAC_PI_2);
         let o = f.world_origin();
-        assert!((o - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-4, "origin orbits to (0,1), got {o:?}");
-        assert!((f.placement.spin_deg - 90.0).abs() < 1e-3, "spin picks up +90°");
+        assert!(
+            (o - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-4,
+            "origin orbits to (0,1), got {o:?}"
+        );
+        assert!(
+            (f.placement.spin_deg - 90.0).abs() < 1e-3,
+            "spin picks up +90°"
+        );
     }
 
     #[test]
@@ -2028,7 +2463,9 @@ mod tests {
         let f = box_at(1.0, 0.0).scaled(Vec3::ZERO, 2.0);
         assert!((f.world_origin() - Vec3::new(2.0, 0.0, 0.0)).length() < 1e-4);
         match f.primitive {
-            Primitive::Box { w, d, h } => assert!((w - 2.0).abs() < 1e-4 && (d - 2.0).abs() < 1e-4 && (h - 2.0).abs() < 1e-4),
+            Primitive::Box { w, d, h } => {
+                assert!((w - 2.0).abs() < 1e-4 && (d - 2.0).abs() < 1e-4 && (h - 2.0).abs() < 1e-4)
+            }
             _ => panic!("still a box"),
         }
     }
@@ -2036,7 +2473,11 @@ mod tests {
     #[test]
     fn ray_triangle_hits_and_misses() {
         // Triangle in the z=1 plane; ray from below straight up hits at t=1.
-        let (a, b, c) = (Vec3::new(-1.0, -1.0, 1.0), Vec3::new(1.0, -1.0, 1.0), Vec3::new(0.0, 1.0, 1.0));
+        let (a, b, c) = (
+            Vec3::new(-1.0, -1.0, 1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(0.0, 1.0, 1.0),
+        );
         let t = ray_triangle(Vec3::ZERO, Vec3::Z, a, b, c);
         assert!(t.map_or(false, |t| (t - 1.0).abs() < 1e-4));
         // A ray off to the side misses.
@@ -2058,19 +2499,31 @@ mod tests {
     fn coplanar_face_groups_only_the_same_plane() {
         // Two coplanar tris (z=0 quad) + one tri on the x=0 plane sharing an edge.
         let positions = vec![
-            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], // tri 0 (z=0)
-            [0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0], // tri 1 (z=0, adjacent)
-            [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], // tri 2 (x=0)
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0], // tri 0 (z=0)
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0], // tri 1 (z=0, adjacent)
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0], // tri 2 (x=0)
         ];
         let face = coplanar_face(&positions, 0);
         assert_eq!(face.len(), 2, "the z=0 face is the two coplanar tris");
         assert!(face.contains(&0) && face.contains(&1));
-        assert!(!face.contains(&2), "the perpendicular tri is a different face");
+        assert!(
+            !face.contains(&2),
+            "the perpendicular tri is a different face"
+        );
     }
 
     #[test]
     fn circle_geom_outlines_to_a_closed_loop() {
-        let g = cad_kernel::Geom::Circle(cad_kernel::Circle { center: KVec2::new(0.0, 0.0), radius: 2.0 });
+        let g = cad_kernel::Geom::Circle(cad_kernel::Circle {
+            center: KVec2::new(0.0, 0.0),
+            radius: 2.0,
+        });
         let paths = geom_outlines(&g);
         assert_eq!(paths.len(), 1);
         let p = &paths[0];
@@ -2087,8 +2540,12 @@ mod profile_tests {
 
     fn ell() -> Vec<Vec2> {
         vec![
-            Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), Vec2::new(4.0, 2.0),
-            Vec2::new(2.0, 2.0), Vec2::new(2.0, 4.0), Vec2::new(0.0, 4.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(4.0, 0.0),
+            Vec2::new(4.0, 2.0),
+            Vec2::new(2.0, 2.0),
+            Vec2::new(2.0, 4.0),
+            Vec2::new(0.0, 4.0),
         ]
     }
 
@@ -2112,14 +2569,19 @@ mod profile_tests {
         let (id, centre, w, d) = m.add_profile(&ell()).expect("an L is a valid outline");
         assert_eq!((w, d), (4.0, 4.0));
         assert_eq!(centre, Vec2::new(2.0, 2.0));
-        let p = m.profile(id).expect("the profile must be retrievable by id");
+        let p = m
+            .profile(id)
+            .expect("the profile must be retrievable by id");
         assert_eq!(p.pts.len(), 6, "6 corners, no repeated wrap point");
         let (mut mnx, mut mxx) = (f32::INFINITY, f32::NEG_INFINITY);
         for q in &p.pts {
             mnx = mnx.min(q[0]);
             mxx = mxx.max(q[0]);
         }
-        assert!((mnx + mxx).abs() < 1e-6, "stored points must be centred on the origin");
+        assert!(
+            (mnx + mxx).abs() < 1e-6,
+            "stored points must be centred on the origin"
+        );
     }
 
     /// A closed ring must not keep its repeated first point, or the extrusion would carry
@@ -2140,9 +2602,17 @@ mod profile_tests {
         let mut cw = ell();
         cw.reverse();
         let (id, ..) = m.add_profile(&cw).unwrap();
-        let pts: Vec<Vec2> =
-            m.profile(id).unwrap().pts.iter().map(|q| Vec2::new(q[0], q[1])).collect();
-        assert!(signed_area2(&pts) > 0.0, "stored winding must be CCW whatever came in");
+        let pts: Vec<Vec2> = m
+            .profile(id)
+            .unwrap()
+            .pts
+            .iter()
+            .map(|q| Vec2::new(q[0], q[1]))
+            .collect();
+        assert!(
+            signed_area2(&pts) > 0.0,
+            "stored winding must be CCW whatever came in"
+        );
     }
 
     /// Refusal, not repair. earcut's behaviour on a self-intersecting loop is undefined,
@@ -2162,12 +2632,17 @@ mod profile_tests {
         // A bow-tie: the two diagonals cross.
         assert_eq!(
             m.add_profile(&[
-                Vec2::new(0.0, 0.0), Vec2::new(4.0, 4.0),
-                Vec2::new(4.0, 0.0), Vec2::new(0.0, 4.0),
+                Vec2::new(0.0, 0.0),
+                Vec2::new(4.0, 4.0),
+                Vec2::new(4.0, 0.0),
+                Vec2::new(0.0, 4.0),
             ]),
             Err(ProfileError::SelfIntersecting)
         );
-        assert!(m.profiles.is_empty(), "a refused outline must not be stored");
+        assert!(
+            m.profiles.is_empty(),
+            "a refused outline must not be stored"
+        );
     }
 
     /// A convex square is NOT self-intersecting — the adjacency skip must not produce
@@ -2177,10 +2652,16 @@ mod profile_tests {
         let mut m = Model::default();
         assert!(m
             .add_profile(&[
-                Vec2::ZERO, Vec2::new(4.0, 0.0), Vec2::new(4.0, 4.0), Vec2::new(0.0, 4.0)
+                Vec2::ZERO,
+                Vec2::new(4.0, 0.0),
+                Vec2::new(4.0, 4.0),
+                Vec2::new(0.0, 4.0)
             ])
             .is_ok());
-        assert!(m.add_profile(&ell()).is_ok(), "an L-shape is a valid building outline");
+        assert!(
+            m.add_profile(&ell()).is_ok(),
+            "an L-shape is a valid building outline"
+        );
     }
 
     /// Ids are KEYS, not indices — the rule the rest of this crate already follows.
@@ -2191,7 +2672,10 @@ mod profile_tests {
         let (b, ..) = m.add_profile(&ell()).unwrap();
         assert_ne!(a, b);
         assert_eq!(m.profile(a).map(|p| p.id), Some(a));
-        assert!(m.profile(999).is_none(), "a stale id resolves to None, never a panic");
+        assert!(
+            m.profile(999).is_none(),
+            "a stale id resolves to None, never a panic"
+        );
     }
 
     /// The whole point: an L-shaped outline becomes a real solid — the shape no Box
@@ -2203,14 +2687,32 @@ mod profile_tests {
         m.push(
             BoolOp::Union,
             Plane::default(),
-            Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
-            Primitive::Extrusion { profile: id, h: 3.0, w, d },
+            Placement {
+                u: centre.x,
+                v: centre.y,
+                lift: 0.0,
+                spin_deg: 0.0,
+                pitch_deg: 0.0,
+                roll_deg: 0.0,
+            },
+            Primitive::Extrusion {
+                profile: id,
+                h: 3.0,
+                w,
+                d,
+            },
         );
         let mesh = m.eval();
         assert!(mesh.tri_count() > 0, "the extrusion must produce geometry");
         let (mn, mx) = mesh.bounds().expect("a solid has bounds");
-        assert!((mx[2] - mn[2] - 3.0).abs() < 1e-3, "it must rise to its height");
-        assert!((mx[0] - mn[0] - 4.0).abs() < 1e-3, "and span the outline's width");
+        assert!(
+            (mx[2] - mn[2] - 3.0).abs() < 1e-3,
+            "it must rise to its height"
+        );
+        assert!(
+            (mx[0] - mn[0] - 4.0).abs() < 1e-3,
+            "and span the outline's width"
+        );
     }
 
     /// A dangling profile id must degrade to empty geometry, never a panic — a stale id
@@ -2222,7 +2724,12 @@ mod profile_tests {
             BoolOp::Union,
             Plane::default(),
             Placement::default(),
-            Primitive::Extrusion { profile: 404, h: 2.0, w: 1.0, d: 1.0 },
+            Primitive::Extrusion {
+                profile: 404,
+                h: 2.0,
+                w: 1.0,
+                d: 1.0,
+            },
         );
         assert_eq!(m.eval().tri_count(), 0);
     }
@@ -2231,7 +2738,12 @@ mod profile_tests {
     /// has no Model) — which is why the extents are cached in the variant.
     #[test]
     fn local_aabb_uses_the_cached_extents() {
-        let p = Primitive::Extrusion { profile: 1, h: 3.0, w: 4.0, d: 6.0 };
+        let p = Primitive::Extrusion {
+            profile: 1,
+            h: 3.0,
+            w: 4.0,
+            d: 6.0,
+        };
         let (mn, mx) = p.local_aabb();
         assert_eq!(mn, Vec3::new(-2.0, -3.0, 0.0));
         assert_eq!(mx, Vec3::new(2.0, 3.0, 3.0));
@@ -2257,11 +2769,17 @@ mod a_sketch_plane_is_canonical {
         // metres away from the corner at the world origin.
         let clicked = Frame::from_point_normal(Vec3::new(4.5, 0.0, 1.9), Vec3::new(0.0, -1.0, 0.0));
         let before = clicked.to_uv(Vec3::ZERO);
-        assert!(before.length() > 4.0, "precondition: the click puts the corner far from (0,0): {before:?}");
+        assert!(
+            before.length() > 4.0,
+            "precondition: the click puts the corner far from (0,0): {before:?}"
+        );
 
         let f = clicked.canonical();
         let after = f.to_uv(Vec3::ZERO);
-        assert!(after.length() < 1e-5, "the corner must be the sketch origin, got {after:?}");
+        assert!(
+            after.length() < 1e-5,
+            "the corner must be the sketch origin, got {after:?}"
+        );
     }
 
     /// …and it must not depend on WHERE on the face you clicked.
@@ -2270,7 +2788,12 @@ mod a_sketch_plane_is_canonical {
         let n = Vec3::new(0.0, -1.0, 0.0);
         let a = Frame::from_point_normal(Vec3::new(1.0, 0.0, 0.5), n).canonical();
         let b = Frame::from_point_normal(Vec3::new(8.0, 0.0, 2.9), n).canonical();
-        assert!((a.origin - b.origin).length() < 1e-5, "{:?} vs {:?}", a.origin, b.origin);
+        assert!(
+            (a.origin - b.origin).length() < 1e-5,
+            "{:?} vs {:?}",
+            a.origin,
+            b.origin
+        );
         assert!((a.u - b.u).length() < 1e-5 && (a.v - b.v).length() < 1e-5);
     }
 
@@ -2284,7 +2807,10 @@ mod a_sketch_plane_is_canonical {
         assert!((f.v - Vec3::Y).length() < 1e-5, "v = {:?}", f.v);
         // A point 2 m east and 1 m north of the origin reads as (2, 1).
         let uv = f.to_uv(Vec3::new(2.0, 1.0, 0.0));
-        assert!((uv.x - 2.0).abs() < 1e-5 && (uv.y - 1.0).abs() < 1e-5, "{uv:?}");
+        assert!(
+            (uv.x - 2.0).abs() < 1e-5 && (uv.y - 1.0).abs() < 1e-5,
+            "{uv:?}"
+        );
     }
 
     /// A sketch on a WALL must read like an elevation: across, then UP.
@@ -2292,8 +2818,16 @@ mod a_sketch_plane_is_canonical {
     fn a_vertical_face_reads_like_an_elevation() {
         for n in [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y] {
             let f = Frame::from_point_normal(n * 2.0, n).canonical();
-            assert!(f.u.z.abs() < 1e-5, "u must be horizontal for n = {n:?}, got {:?}", f.u);
-            assert!((f.v - Vec3::Z).length() < 1e-5, "v must be up for n = {n:?}, got {:?}", f.v);
+            assert!(
+                f.u.z.abs() < 1e-5,
+                "u must be horizontal for n = {n:?}, got {:?}",
+                f.u
+            );
+            assert!(
+                (f.v - Vec3::Z).length() < 1e-5,
+                "v must be up for n = {n:?}, got {:?}",
+                f.v
+            );
         }
     }
 
@@ -2304,19 +2838,33 @@ mod a_sketch_plane_is_canonical {
         for (p, n) in [
             (Vec3::new(4.5, 0.0, 1.9), Vec3::new(0.0, -1.0, 0.0)),
             (Vec3::new(1.0, 2.0, 3.0), Vec3::Z),
-            (Vec3::new(-7.0, 5.0, 2.0), Vec3::new(1.0, 1.0, 0.0).normalize()),
-            (Vec3::new(0.5, 0.5, 4.0), Vec3::new(0.3, -0.2, 0.9).normalize()),
+            (
+                Vec3::new(-7.0, 5.0, 2.0),
+                Vec3::new(1.0, 1.0, 0.0).normalize(),
+            ),
+            (
+                Vec3::new(0.5, 0.5, 4.0),
+                Vec3::new(0.3, -0.2, 0.9).normalize(),
+            ),
         ] {
             let a = Frame::from_point_normal(p, n);
             let b = a.canonical();
-            assert!(a.normal().dot(b.normal()) > 0.9999, "the normal turned: {:?} → {:?}", a.normal(), b.normal());
+            assert!(
+                a.normal().dot(b.normal()) > 0.9999,
+                "the normal turned: {:?} → {:?}",
+                a.normal(),
+                b.normal()
+            );
             // The original origin still lies IN the canonical plane.
             let off = (p - b.origin).dot(b.normal());
             assert!(off.abs() < 1e-4, "the plane moved by {off} m");
             // …and the frame is still right-handed and orthonormal.
             assert!((b.u.length() - 1.0).abs() < 1e-5 && (b.v.length() - 1.0).abs() < 1e-5);
             assert!(b.u.dot(b.v).abs() < 1e-5, "axes are not perpendicular");
-            assert!(b.u.cross(b.v).dot(b.normal()) > 0.9999, "left-handed — a sketch would mirror");
+            assert!(
+                b.u.cross(b.v).dot(b.normal()) > 0.9999,
+                "left-handed — a sketch would mirror"
+            );
         }
     }
 
@@ -2324,8 +2872,13 @@ mod a_sketch_plane_is_canonical {
     /// deposit geometry slightly off it.
     #[test]
     fn uv_round_trips() {
-        let f = Frame::from_point_normal(Vec3::new(4.5, 0.0, 1.9), Vec3::new(0.0, -1.0, 0.0)).canonical();
-        for w in [Vec3::new(0.0, 0.0, 0.0), Vec3::new(9.4, 0.0, 3.05), Vec3::new(2.0, 0.0, 1.0)] {
+        let f = Frame::from_point_normal(Vec3::new(4.5, 0.0, 1.9), Vec3::new(0.0, -1.0, 0.0))
+            .canonical();
+        for w in [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(9.4, 0.0, 3.05),
+            Vec3::new(2.0, 0.0, 1.0),
+        ] {
             let back = f.from_uv(f.to_uv(w));
             assert!((back - w).length() < 1e-5, "{w:?} → {back:?}");
         }

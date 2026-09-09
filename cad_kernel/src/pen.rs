@@ -9,14 +9,14 @@
 // itself never appears in DXF or the on-disk format.
 
 use crate::color::Color;
-use crate::lineweight::Lineweight;
 use crate::linetype::LinetypeTable;
+use crate::lineweight::Lineweight;
 
 #[derive(Clone, Debug)]
 pub struct Pen {
-    pub name:       String,
-    pub color:      Color,
-    pub linetype:   u32,        // LinetypeId
+    pub name: String,
+    pub color: Color,
+    pub linetype: u32, // LinetypeId
     pub lineweight: Lineweight,
 }
 
@@ -37,22 +37,63 @@ impl Default for PenTable {
         // primary picker.
         Self {
             pens: vec![
-                Pen { name: "ByLayer".into(),         color: Color::ByLayer,   linetype: LinetypeTable::CONTINUOUS, lineweight: Lineweight::ByLayer },
-                Pen { name: "Red 0.25 mm".into(),     color: Color::Aci(1),    linetype: LinetypeTable::CONTINUOUS, lineweight: Lineweight::Custom(0.25) },
-                Pen { name: "Green 0.25 mm".into(),   color: Color::Aci(3),    linetype: LinetypeTable::CONTINUOUS, lineweight: Lineweight::Custom(0.25) },
-                Pen { name: "Blue 0.25 mm".into(),    color: Color::Aci(5),    linetype: LinetypeTable::CONTINUOUS, lineweight: Lineweight::Custom(0.25) },
-                Pen { name: "Heavy black 0.7".into(), color: Color::Aci(250),  linetype: LinetypeTable::CONTINUOUS, lineweight: Lineweight::Custom(0.7) },
-                Pen { name: "Dashed gray".into(),     color: Color::Aci(8),    linetype: 1, lineweight: Lineweight::Default },
-                Pen { name: "Dash-dot center".into(), color: Color::Aci(40),   linetype: 2, lineweight: Lineweight::Default },
+                Pen {
+                    name: "ByLayer".into(),
+                    color: Color::ByLayer,
+                    linetype: LinetypeTable::CONTINUOUS,
+                    lineweight: Lineweight::ByLayer,
+                },
+                Pen {
+                    name: "Red 0.25 mm".into(),
+                    color: Color::Aci(1),
+                    linetype: LinetypeTable::CONTINUOUS,
+                    lineweight: Lineweight::Custom(0.25),
+                },
+                Pen {
+                    name: "Green 0.25 mm".into(),
+                    color: Color::Aci(3),
+                    linetype: LinetypeTable::CONTINUOUS,
+                    lineweight: Lineweight::Custom(0.25),
+                },
+                Pen {
+                    name: "Blue 0.25 mm".into(),
+                    color: Color::Aci(5),
+                    linetype: LinetypeTable::CONTINUOUS,
+                    lineweight: Lineweight::Custom(0.25),
+                },
+                Pen {
+                    name: "Heavy black 0.7".into(),
+                    color: Color::Aci(250),
+                    linetype: LinetypeTable::CONTINUOUS,
+                    lineweight: Lineweight::Custom(0.7),
+                },
+                Pen {
+                    name: "Dashed gray".into(),
+                    color: Color::Aci(8),
+                    linetype: 1,
+                    lineweight: Lineweight::Default,
+                },
+                Pen {
+                    name: "Dash-dot center".into(),
+                    color: Color::Aci(40),
+                    linetype: 2,
+                    lineweight: Lineweight::Default,
+                },
             ],
         }
     }
 }
 
 impl PenTable {
-    pub fn get(&self, i: usize) -> Option<&Pen> { self.pens.get(i) }
-    pub fn len(&self) -> usize { self.pens.len() }
-    pub fn is_empty(&self) -> bool { self.pens.is_empty() }
+    pub fn get(&self, i: usize) -> Option<&Pen> {
+        self.pens.get(i)
+    }
+    pub fn len(&self) -> usize {
+        self.pens.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.pens.is_empty()
+    }
 }
 
 #[cfg(test)]

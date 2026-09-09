@@ -30,7 +30,10 @@ pub fn scene_to_png_bytes(scene: &Scene, dpi: f32) -> Result<Vec<u8>, String> {
 
     // Fills first, strokes on top.
     for prim in &scene.prims {
-        if let Prim::Fill { loops, rgb, dither, .. } = prim {
+        if let Prim::Fill {
+            loops, rgb, dither, ..
+        } = prim
+        {
             for lp in loops {
                 draw_filled_polygon(&mut img, lp, *rgb, *dither, scale, h);
             }
@@ -39,10 +42,21 @@ pub fn scene_to_png_bytes(scene: &Scene, dpi: f32) -> Result<Vec<u8>, String> {
     for prim in &scene.prims {
         match prim {
             Prim::Stroke {
-                pts, closed, width_mm, rgb, dash_mm, dash_offset_mm, cap, join, dither, ..
+                pts,
+                closed,
+                width_mm,
+                rgb,
+                dash_mm,
+                dash_offset_mm,
+                cap,
+                join,
+                dither,
+                ..
             } => {
                 if dash_mm.is_empty() {
-                    draw_stroke(&mut img, pts, *closed, *width_mm, *rgb, *cap, *join, *dither, scale, h);
+                    draw_stroke(
+                        &mut img, pts, *closed, *width_mm, *rgb, *cap, *join, *dither, scale, h,
+                    );
                     continue;
                 }
                 // Linetype dashes: walk the pattern along the polyline (both in
@@ -53,14 +67,22 @@ pub fn scene_to_png_bytes(scene: &Scene, dpi: f32) -> Result<Vec<u8>, String> {
                         // A dot (zero-length dash): a filled round cap.
                         let (cx, cy) = to_px(run[0].0, run[0].1, scale, h);
                         let r = ((*width_mm as f64 * scale) * 0.5).max(0.6) as i32;
-                        draw_filled_circle(&mut img, cx, cy, r,
-                            Rgba([rgb.0, rgb.1, rgb.2, 255]), *dither);
+                        draw_filled_circle(
+                            &mut img,
+                            cx,
+                            cy,
+                            r,
+                            Rgba([rgb.0, rgb.1, rgb.2, 255]),
+                            *dither,
+                        );
                     } else {
                         // Dash runs inherit the pen's cap AND join — matching
                         // PDF (per-combo layer caps) and SVG (stroke-linecap /
                         // stroke-linejoin). Interior corners inside a run get
                         // the join style; the run's two ends get the cap.
-                        draw_stroke(&mut img, &run, false, *width_mm, *rgb, *cap, *join, *dither, scale, h);
+                        draw_stroke(
+                            &mut img, &run, false, *width_mm, *rgb, *cap, *join, *dither, scale, h,
+                        );
                     }
                 }
             }
@@ -77,7 +99,8 @@ pub fn scene_to_png_bytes(scene: &Scene, dpi: f32) -> Result<Vec<u8>, String> {
     let raw = img.into_raw();
     let mut buf = Cursor::new(Vec::new());
     let encoder = image::codecs::png::PngEncoder::new(&mut buf);
-    encoder.write_image(&raw, w, h, image::ExtendedColorType::Rgba8)
+    encoder
+        .write_image(&raw, w, h, image::ExtendedColorType::Rgba8)
         .map_err(|e| format!("PNG encode: {e}"))?;
     Ok(buf.into_inner())
 }
@@ -111,9 +134,8 @@ fn draw_stroke(
         return;
     }
     let (rr, gg, bb) = rgb;
-    let color = |a: f32| -> Rgba<u8> {
-        Rgba([rr, gg, bb, (a.clamp(0.0, 1.0) * 255.0).round() as u8])
-    };
+    let color =
+        |a: f32| -> Rgba<u8> { Rgba([rr, gg, bb, (a.clamp(0.0, 1.0) * 255.0).round() as u8]) };
     let width_px = (width_mm as f64 * scale).max(0.5);
 
     if width_px <= 1.2 {
@@ -179,7 +201,11 @@ fn draw_stroke(
     // Joins at interior vertices (and the closed seam) — the pen's join style.
     let join_round = matches!(join, JoinStyle::Round | JoinStyle::Diamond);
     if join_round {
-        let idxs: Vec<usize> = if closed { (0..n).collect() } else { (1..n - 1).collect() };
+        let idxs: Vec<usize> = if closed {
+            (0..n).collect()
+        } else {
+            (1..n - 1).collect()
+        };
         for &i in &idxs {
             let (cx, cy) = to_px(pts[i].0, pts[i].1, scale, img_h);
             if r_px > 0 {
@@ -193,19 +219,31 @@ fn draw_stroke(
         // fills the butt notch with a straight edge; a miter extends to the
         // edge intersection, capped by the shared miter limit.
         let want_miter = join == JoinStyle::Miter;
-        let idxs: Vec<usize> = if closed { (0..n).collect() } else { (1..n - 1).collect() };
+        let idxs: Vec<usize> = if closed {
+            (0..n).collect()
+        } else {
+            (1..n - 1).collect()
+        };
         for &i in &idxs {
             let prev = if closed { (i + n - 1) % n } else { i - 1 };
             let next = if closed { (i + 1) % n } else { i + 1 };
             let v = Vec2::new(pts[i].0, pts[i].1);
             let d1 = (v - Vec2::new(pts[prev].0, pts[prev].1)).normalized();
             let d2 = (Vec2::new(pts[next].0, pts[next].1) - v).normalized();
-            let Some(w) = cad_kernel::math::join_wedge(v, d1, d2, half_mm) else { continue };
+            let Some(w) = cad_kernel::math::join_wedge(v, d1, d2, half_mm) else {
+                continue;
+            };
             let mm = |p: Vec2| (p.x, p.y);
             if want_miter {
                 if let Some(apex) = w.apex {
-                    draw_filled_polygon(img, &[mm(v), mm(w.a), mm(apex), mm(w.b)],
-                        rgb, dither, scale, img_h);
+                    draw_filled_polygon(
+                        img,
+                        &[mm(v), mm(w.a), mm(apex), mm(w.b)],
+                        rgb,
+                        dither,
+                        scale,
+                        img_h,
+                    );
                     continue;
                 }
             }
@@ -336,8 +374,10 @@ fn dash_runs(
 
 fn draw_wu_line(
     img: &mut RgbaImage,
-    x0: f32, y0: f32,
-    x1: f32, y1: f32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
     color: &dyn Fn(f32) -> Rgba<u8>,
     dither: bool,
 ) {
@@ -436,7 +476,8 @@ fn draw_filled_polygon(
     let (rr, gg, bb) = rgb;
     let color = Rgba([rr, gg, bb, 255]);
 
-    let pxs: Vec<(f32, f32)> = pts.iter()
+    let pxs: Vec<(f32, f32)> = pts
+        .iter()
         .map(|&(x, y)| to_px(x, y, scale, img_h))
         .collect();
 
@@ -485,7 +526,14 @@ fn draw_filled_polygon(
 // Filled circle
 // ---------------------------------------------------------------------------
 
-fn draw_filled_circle(img: &mut RgbaImage, cx: f32, cy: f32, r: i32, color: Rgba<u8>, dither: bool) {
+fn draw_filled_circle(
+    img: &mut RgbaImage,
+    cx: f32,
+    cy: f32,
+    r: i32,
+    color: Rgba<u8>,
+    dither: bool,
+) {
     if r < 1 {
         return;
     }
@@ -527,12 +575,16 @@ fn blend_pixel(img: &mut RgbaImage, x: u32, y: u32, src: Rgba<u8>) {
     let r = (src[0] as f32 * sa + dst[0] as f32 * da * (1.0 - sa)) / out_a;
     let g = (src[1] as f32 * sa + dst[1] as f32 * da * (1.0 - sa)) / out_a;
     let b = (src[2] as f32 * sa + dst[2] as f32 * da * (1.0 - sa)) / out_a;
-    img.put_pixel(x, y, Rgba([
-        r.round() as u8,
-        g.round() as u8,
-        b.round() as u8,
-        (out_a * 255.0).round() as u8,
-    ]));
+    img.put_pixel(
+        x,
+        y,
+        Rgba([
+            r.round() as u8,
+            g.round() as u8,
+            b.round() as u8,
+            (out_a * 255.0).round() as u8,
+        ]),
+    );
 }
 
 #[cfg(test)]
@@ -541,12 +593,7 @@ mod tests {
     use crate::scene::Scene;
     use cad_kernel::plotstyle::{EndStyle, JoinStyle};
 
-    fn stroke(
-        pts: Vec<(f64, f64)>,
-        width_mm: f32,
-        rgb: (u8, u8, u8),
-        dash_mm: Vec<f32>,
-    ) -> Prim {
+    fn stroke(pts: Vec<(f64, f64)>, width_mm: f32, rgb: (u8, u8, u8), dash_mm: Vec<f32>) -> Prim {
         Prim::Stroke {
             pts,
             closed: false,
@@ -569,8 +616,14 @@ mod tests {
         let dpi = 300.0;
         let scale = dpi as f64 / 25.4;
         let scene = Scene {
-            page_w_mm: 50.0, page_h_mm: 50.0,
-            prims: vec![stroke(vec![(35.0, 10.0), (35.0, 40.0)], 2.0, (0, 255, 0), Vec::new())],
+            page_w_mm: 50.0,
+            page_h_mm: 50.0,
+            prims: vec![stroke(
+                vec![(35.0, 10.0), (35.0, 40.0)],
+                2.0,
+                (0, 255, 0),
+                Vec::new(),
+            )],
             skipped_dims: 0,
         };
         let bytes = scene_to_png_bytes(&scene, dpi).unwrap();
@@ -585,19 +638,27 @@ mod tests {
         // The stroke centre row: walk right from the centre until white.
         let y = 25.0;
         let mut x_max = 35.0;
-        while x_max < 45.0 && green_at(x_max, y) { x_max += 0.1; }
+        while x_max < 45.0 && green_at(x_max, y) {
+            x_max += 0.1;
+        }
         let mut x_min = 35.0;
-        while x_min > 30.0 && green_at(x_min, y) { x_min -= 0.1; }
+        while x_min > 30.0 && green_at(x_min, y) {
+            x_min -= 0.1;
+        }
         let w_mm = x_max - x_min;
-        assert!((w_mm - 2.0).abs() < 0.5,
-            "2 mm stroke must rasterise ~2 mm wide, got {w_mm:.2} mm");
+        assert!(
+            (w_mm - 2.0).abs() < 0.5,
+            "2 mm stroke must rasterise ~2 mm wide, got {w_mm:.2} mm"
+        );
     }
 
     #[test]
     fn empty_scene_produces_png() {
         let scene = Scene {
-            page_w_mm: 50.0, page_h_mm: 50.0,
-            prims: Vec::new(), skipped_dims: 0,
+            page_w_mm: 50.0,
+            page_h_mm: 50.0,
+            prims: Vec::new(),
+            skipped_dims: 0,
         };
         let bytes = scene_to_png_bytes(&scene, 72.0).unwrap();
         assert!(bytes.len() > 100);
@@ -608,8 +669,14 @@ mod tests {
     #[test]
     fn stroke_produces_nonempty_png() {
         let scene = Scene {
-            page_w_mm: 100.0, page_h_mm: 100.0,
-            prims: vec![stroke(vec![(10.0, 10.0), (90.0, 50.0)], 0.5, (255, 0, 0), Vec::new())],
+            page_w_mm: 100.0,
+            page_h_mm: 100.0,
+            prims: vec![stroke(
+                vec![(10.0, 10.0), (90.0, 50.0)],
+                0.5,
+                (255, 0, 0),
+                Vec::new(),
+            )],
             skipped_dims: 0,
         };
         let bytes = scene_to_png_bytes(&scene, 300.0).unwrap();
@@ -644,7 +711,12 @@ mod tests {
         // length: gap 0-2, dash 2-6, gap 6-8, dash 8-10.
         let pts = vec![(0.0, 0.0), (10.0, 0.0)];
         let runs = dash_runs(&pts, false, &[4.0, 2.0], 4.0);
-        assert_eq!(runs.len(), 2, "two dashes after a boundary phase: {:?}", runs);
+        assert_eq!(
+            runs.len(),
+            2,
+            "two dashes after a boundary phase: {:?}",
+            runs
+        );
         assert_eq!(runs[0], vec![(2.0, 0.0), (6.0, 0.0)]);
         assert_eq!(runs[1], vec![(8.0, 0.0), (10.0, 0.0)]);
     }
@@ -663,8 +735,14 @@ mod tests {
     #[test]
     fn dashed_stroke_produces_nonempty_png() {
         let scene = Scene {
-            page_w_mm: 100.0, page_h_mm: 100.0,
-            prims: vec![stroke(vec![(10.0, 50.0), (90.0, 50.0)], 0.5, (0, 0, 255), vec![4.0, 2.0])],
+            page_w_mm: 100.0,
+            page_h_mm: 100.0,
+            prims: vec![stroke(
+                vec![(10.0, 50.0), (90.0, 50.0)],
+                0.5,
+                (0, 0, 255),
+                vec![4.0, 2.0],
+            )],
             skipped_dims: 0,
         };
         let bytes = scene_to_png_bytes(&scene, 300.0).unwrap();
@@ -676,7 +754,8 @@ mod tests {
     fn dithered_fill_produces_nonempty_png() {
         // Dither smoke: a dithered fill + stroke still rasterise to a valid PNG.
         let scene = Scene {
-            page_w_mm: 100.0, page_h_mm: 100.0,
+            page_w_mm: 100.0,
+            page_h_mm: 100.0,
             prims: vec![
                 Prim::Fill {
                     loops: vec![vec![(10.0, 10.0), (90.0, 10.0), (90.0, 90.0), (10.0, 90.0)]],
@@ -684,8 +763,15 @@ mod tests {
                     dither: true,
                 },
                 {
-                    let mut s = stroke(vec![(10.0, 50.0), (90.0, 50.0)], 0.5, (0, 0, 255), Vec::new());
-                    if let Prim::Stroke { dither, .. } = &mut s { *dither = true; }
+                    let mut s = stroke(
+                        vec![(10.0, 50.0), (90.0, 50.0)],
+                        0.5,
+                        (0, 0, 255),
+                        Vec::new(),
+                    );
+                    if let Prim::Stroke { dither, .. } = &mut s {
+                        *dither = true;
+                    }
                     s
                 },
             ],
@@ -704,27 +790,36 @@ mod tests {
         let pts = vec![(10.0, 50.0), (30.0, 50.0)];
         let mut sq = stroke(pts.clone(), 2.0, (0, 0, 0), Vec::new());
         let mut bt = stroke(pts.clone(), 2.0, (0, 0, 0), Vec::new());
-        if let Prim::Stroke { cap, .. } = &mut sq { *cap = EndStyle::Square; }
-        if let Prim::Stroke { cap, .. } = &mut bt { *cap = EndStyle::Butt; }
+        if let Prim::Stroke { cap, .. } = &mut sq {
+            *cap = EndStyle::Square;
+        }
+        if let Prim::Stroke { cap, .. } = &mut bt {
+            *cap = EndStyle::Butt;
+        }
 
         let scene_sq = Scene {
-            page_w_mm: 100.0, page_h_mm: 100.0,
-            prims: vec![sq], skipped_dims: 0,
+            page_w_mm: 100.0,
+            page_h_mm: 100.0,
+            prims: vec![sq],
+            skipped_dims: 0,
         };
         let scene_bt = Scene {
-            page_w_mm: 100.0, page_h_mm: 100.0,
-            prims: vec![bt], skipped_dims: 0,
+            page_w_mm: 100.0,
+            page_h_mm: 100.0,
+            prims: vec![bt],
+            skipped_dims: 0,
         };
         let px_sq = scene_to_png_bytes(&scene_sq, 72.0).unwrap();
         let px_bt = scene_to_png_bytes(&scene_bt, 72.0).unwrap();
         let img_sq = image::load_from_memory(&px_sq).unwrap().to_rgba8();
         let img_bt = image::load_from_memory(&px_bt).unwrap().to_rgba8();
-        let dark = |img: &RgbaImage| {
-            img.pixels().filter(|p| p[0] < 200).count()
-        };
-        assert!(dark(&img_sq) > dark(&img_bt),
+        let dark = |img: &RgbaImage| img.pixels().filter(|p| p[0] < 200).count();
+        assert!(
+            dark(&img_sq) > dark(&img_bt),
             "square caps must extend past butt caps: sq={} bt={}",
-            dark(&img_sq), dark(&img_bt));
+            dark(&img_sq),
+            dark(&img_bt)
+        );
     }
 
     #[test]
@@ -735,25 +830,37 @@ mod tests {
         let pts = vec![(0.0, 40.0), (30.0, 40.0), (30.0, 60.0)];
         let mut mt = stroke(pts.clone(), 2.0, (0, 0, 0), Vec::new());
         let mut bv = stroke(pts.clone(), 2.0, (0, 0, 0), Vec::new());
-        if let Prim::Stroke { join, .. } = &mut mt { *join = JoinStyle::Miter; }
-        if let Prim::Stroke { join, .. } = &mut bv { *join = JoinStyle::Bevel; }
+        if let Prim::Stroke { join, .. } = &mut mt {
+            *join = JoinStyle::Miter;
+        }
+        if let Prim::Stroke { join, .. } = &mut bv {
+            *join = JoinStyle::Bevel;
+        }
 
         let scene_mt = Scene {
-            page_w_mm: 100.0, page_h_mm: 100.0,
-            prims: vec![mt], skipped_dims: 0,
+            page_w_mm: 100.0,
+            page_h_mm: 100.0,
+            prims: vec![mt],
+            skipped_dims: 0,
         };
         let scene_bv = Scene {
-            page_w_mm: 100.0, page_h_mm: 100.0,
-            prims: vec![bv], skipped_dims: 0,
+            page_w_mm: 100.0,
+            page_h_mm: 100.0,
+            prims: vec![bv],
+            skipped_dims: 0,
         };
         let img_mt = image::load_from_memory(&scene_to_png_bytes(&scene_mt, 72.0).unwrap())
-            .unwrap().to_rgba8();
+            .unwrap()
+            .to_rgba8();
         let img_bv = image::load_from_memory(&scene_to_png_bytes(&scene_bv, 72.0).unwrap())
-            .unwrap().to_rgba8();
+            .unwrap()
+            .to_rgba8();
         let dark = |img: &RgbaImage| img.pixels().filter(|p| p[0] < 200).count();
-        assert!(dark(&img_mt) > dark(&img_bv),
+        assert!(
+            dark(&img_mt) > dark(&img_bv),
             "miter join must reach further than bevel: miter={} bevel={}",
-            dark(&img_mt), dark(&img_bv));
+            dark(&img_mt),
+            dark(&img_bv)
+        );
     }
 }
-

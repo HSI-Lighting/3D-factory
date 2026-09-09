@@ -16,7 +16,9 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use cad_kernel::geom::Geom;
 use cad_kernel::math::Vec2;
-use cad_kernel::{Arc as GeomArc, Circle, Ellipse, Line, Point as GeomPoint, PolyVertex, Polyline, Text};
+use cad_kernel::{
+    Arc as GeomArc, Circle, Ellipse, Line, Point as GeomPoint, PolyVertex, Polyline, Text,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyDict, PyList, PyModule};
 
@@ -74,10 +76,7 @@ pub fn set_meta_mode(py: Python<'_>, rasm: &Bound<'_, PyAny>, on: bool) -> PyRes
 }
 
 /// Read the spec `rasm.main` recorded during a metadata pass.
-pub fn read_meta_spec(
-    _py: Python<'_>,
-    rasm: &Bound<'_, PyAny>,
-) -> PyResult<Option<ScriptMeta>> {
+pub fn read_meta_spec(_py: Python<'_>, rasm: &Bound<'_, PyAny>) -> PyResult<Option<ScriptMeta>> {
     let spec = rasm.getattr("_meta_spec")?;
     if spec.is_none() {
         return Ok(None);
@@ -88,7 +87,11 @@ pub fn read_meta_spec(
         let d = item.downcast::<PyDict>()?;
         let name: String = match d.get_item("name")? {
             Some(v) => v.extract()?,
-            None => return Err(pyo3::exceptions::PyRuntimeError::new_err("param without name")),
+            None => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "param without name",
+                ))
+            }
         };
         let ty: String = match d.get_item("type")? {
             Some(v) => v.extract()?,
@@ -152,14 +155,19 @@ pub fn read_meta_spec(
 fn dummy_reply(op: &ScriptOp) -> ScriptOpReply {
     match op {
         ScriptOp::DocCount => ScriptOpReply::Count(0),
-        ScriptOp::DocGet { .. } => ScriptOpReply::Error("parameter scan does not read the document".into()),
+        ScriptOp::DocGet { .. } => {
+            ScriptOpReply::Error("parameter scan does not read the document".into())
+        }
         ScriptOp::DocAll => ScriptOpReply::Entities(Vec::new()),
         ScriptOp::SelectionGet => ScriptOpReply::Indices(Vec::new()),
         ScriptOp::LayersGet => ScriptOpReply::Layers(Vec::new()),
         ScriptOp::LayerActive => ScriptOpReply::LayerActive(0),
         ScriptOp::BlocksGet => ScriptOpReply::Blocks(Vec::new()),
         ScriptOp::SysVarGet { .. } => ScriptOpReply::SysVar(None),
-        ScriptOp::ViewGet => ScriptOpReply::View(ViewInfo { center: Vec2::ZERO, scale: 1.0 }),
+        ScriptOp::ViewGet => ScriptOpReply::View(ViewInfo {
+            center: Vec2::ZERO,
+            scale: 1.0,
+        }),
         ScriptOp::SelectionSet { .. } => ScriptOpReply::Indices(Vec::new()),
         ScriptOp::AddLine { .. }
         | ScriptOp::AddCircle { .. }
@@ -178,7 +186,10 @@ fn dummy_reply(op: &ScriptOp) -> ScriptOpReply {
         | ScriptOp::ViewSet { .. } => ScriptOpReply::OkUnit,
         ScriptOp::Command { .. } => ScriptOpReply::CommandOutput(Vec::new()),
         ScriptOp::Save { .. } | ScriptOp::Open { .. } => ScriptOpReply::CommandOutput(Vec::new()),
-        ScriptOp::DocUnits => ScriptOpReply::Units(UnitsInfo { name: "mm".into(), scene_per_unit: 1.0 }),
+        ScriptOp::DocUnits => ScriptOpReply::Units(UnitsInfo {
+            name: "mm".into(),
+            scene_per_unit: 1.0,
+        }),
         ScriptOp::DocBounds => ScriptOpReply::Bounds(None),
         ScriptOp::LayoutsGet => ScriptOpReply::Layouts(Vec::new()),
         ScriptOp::LinetypesGet => ScriptOpReply::Linetypes(Vec::new()),
@@ -284,9 +295,16 @@ fn doc_count(py: Python<'_>) -> PyResult<usize> {
 #[pyfunction(name = "get")]
 fn doc_get(py: Python<'_>, index: i64) -> PyResult<Py<PyDict>> {
     if index < 0 {
-        return Err(pyo3::exceptions::PyIndexError::new_err("index must be >= 0"));
+        return Err(pyo3::exceptions::PyIndexError::new_err(
+            "index must be >= 0",
+        ));
     }
-    let rep = round_trip(py, ScriptOp::DocGet { index: index as usize })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::DocGet {
+            index: index as usize,
+        },
+    )?;
     match rep {
         ScriptOpReply::Entity(e) => Ok(entity_dict(py, &e).unbind()),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -300,7 +318,8 @@ fn doc_entities(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
     let rep = round_trip(py, ScriptOp::DocAll)?;
     match rep {
         ScriptOpReply::Entities(v) => {
-            let out = v.iter()
+            let out = v
+                .iter()
                 .map(|e| Python::with_gil(|py| entity_dict(py, e).unbind()))
                 .collect();
             Ok(out)
@@ -316,18 +335,21 @@ fn doc_layers(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
     let rep = round_trip(py, ScriptOp::LayersGet)?;
     match rep {
         ScriptOpReply::Layers(v) => {
-            let out = v.iter()
-                .map(|l| Python::with_gil(|py| {
-                    let d = PyDict::new(py);
-                    let _ = d.set_item("id", l.id);
-                    let _ = d.set_item("name", &l.name);
-                    let _ = d.set_item("visible", l.visible);
-                    let _ = d.set_item("locked", l.locked);
-                    let _ = d.set_item("frozen", l.frozen);
-                    let _ = d.set_item("plottable", l.plottable);
-                    let _ = d.set_item("color", &l.color);
-                    d.unbind()
-                }))
+            let out = v
+                .iter()
+                .map(|l| {
+                    Python::with_gil(|py| {
+                        let d = PyDict::new(py);
+                        let _ = d.set_item("id", l.id);
+                        let _ = d.set_item("name", &l.name);
+                        let _ = d.set_item("visible", l.visible);
+                        let _ = d.set_item("locked", l.locked);
+                        let _ = d.set_item("frozen", l.frozen);
+                        let _ = d.set_item("plottable", l.plottable);
+                        let _ = d.set_item("color", &l.color);
+                        d.unbind()
+                    })
+                })
                 .collect();
             Ok(out)
         }
@@ -455,9 +477,13 @@ fn set_selection(py: Python<'_>, indices: Vec<usize>) -> PyResult<Vec<usize>> {
 
 #[pyfunction]
 fn add_line(py: Python<'_>, a: (f64, f64), b: (f64, f64)) -> PyResult<usize> {
-    let rep = round_trip(py, ScriptOp::AddLine {
-        a: Vec2::new(a.0, a.1), b: Vec2::new(b.0, b.1),
-    })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::AddLine {
+            a: Vec2::new(a.0, a.1),
+            b: Vec2::new(b.0, b.1),
+        },
+    )?;
     match rep {
         ScriptOpReply::Ok(i) => Ok(i),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -468,11 +494,17 @@ fn add_line(py: Python<'_>, a: (f64, f64), b: (f64, f64)) -> PyResult<usize> {
 #[pyfunction]
 fn add_circle(py: Python<'_>, center: (f64, f64), radius: f64) -> PyResult<usize> {
     if !(radius > 0.0) {
-        return Err(pyo3::exceptions::PyValueError::new_err("radius must be > 0"));
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "radius must be > 0",
+        ));
     }
-    let rep = round_trip(py, ScriptOp::AddCircle {
-        center: Vec2::new(center.0, center.1), radius,
-    })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::AddCircle {
+            center: Vec2::new(center.0, center.1),
+            radius,
+        },
+    )?;
     match rep {
         ScriptOpReply::Ok(i) => Ok(i),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -489,12 +521,19 @@ fn add_arc(
     sweep_deg: f64,
 ) -> PyResult<usize> {
     if !(radius > 0.0) {
-        return Err(pyo3::exceptions::PyValueError::new_err("radius must be > 0"));
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "radius must be > 0",
+        ));
     }
-    let rep = round_trip(py, ScriptOp::AddArc {
-        center: Vec2::new(center.0, center.1),
-        radius, start_deg, sweep_deg,
-    })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::AddArc {
+            center: Vec2::new(center.0, center.1),
+            radius,
+            start_deg,
+            sweep_deg,
+        },
+    )?;
     match rep {
         ScriptOpReply::Ok(i) => Ok(i),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -511,11 +550,18 @@ fn add_ellipse(
 ) -> PyResult<usize> {
     let m = Vec2::new(major.0, major.1);
     if m.len() <= 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err("major axis must be non-zero"));
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "major axis must be non-zero",
+        ));
     }
-    let rep = round_trip(py, ScriptOp::AddEllipse {
-        center: Vec2::new(center.0, center.1), major: m, ratio,
-    })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::AddEllipse {
+            center: Vec2::new(center.0, center.1),
+            major: m,
+            ratio,
+        },
+    )?;
     match rep {
         ScriptOpReply::Ok(i) => Ok(i),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -524,20 +570,19 @@ fn add_ellipse(
 }
 
 #[pyfunction(signature = (points, closed = false))]
-fn add_polyline(
-    py: Python<'_>,
-    points: Vec<(f64, f64)>,
-    closed: bool,
-) -> PyResult<usize> {
+fn add_polyline(py: Python<'_>, points: Vec<(f64, f64)>, closed: bool) -> PyResult<usize> {
     if points.len() < 2 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "a polyline needs at least 2 points",
         ));
     }
-    let rep = round_trip(py, ScriptOp::AddPolyline {
-        vertices: points.iter().map(|p| Vec2::new(p.0, p.1)).collect(),
-        closed,
-    })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::AddPolyline {
+            vertices: points.iter().map(|p| Vec2::new(p.0, p.1)).collect(),
+            closed,
+        },
+    )?;
     match rep {
         ScriptOpReply::Ok(i) => Ok(i),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -547,7 +592,12 @@ fn add_polyline(
 
 #[pyfunction]
 fn add_point(py: Python<'_>, at: (f64, f64)) -> PyResult<usize> {
-    let rep = round_trip(py, ScriptOp::AddPoint { at: Vec2::new(at.0, at.1) })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::AddPoint {
+            at: Vec2::new(at.0, at.1),
+        },
+    )?;
     match rep {
         ScriptOpReply::Ok(i) => Ok(i),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -564,11 +614,19 @@ fn add_text(
     angle_deg: f64,
 ) -> PyResult<usize> {
     if text.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err("text cannot be empty"));
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "text cannot be empty",
+        ));
     }
-    let rep = round_trip(py, ScriptOp::AddText {
-        text, at: Vec2::new(at.0, at.1), height, angle_deg,
-    })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::AddText {
+            text,
+            at: Vec2::new(at.0, at.1),
+            height,
+            angle_deg,
+        },
+    )?;
     match rep {
         ScriptOpReply::Ok(i) => Ok(i),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -594,9 +652,13 @@ fn delete(py: Python<'_>, indices: Vec<usize>) -> PyResult<usize> {
 /// Move the entities at `indices` by (dx, dy) — in place, undoable.
 #[pyfunction(name = "move")]
 fn move_entities(py: Python<'_>, indices: Vec<usize>, dx: f64, dy: f64) -> PyResult<usize> {
-    let rep = round_trip(py, ScriptOp::ModifyMove {
-        indices, delta: Vec2::new(dx, dy),
-    })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::ModifyMove {
+            indices,
+            delta: Vec2::new(dx, dy),
+        },
+    )?;
     match rep {
         ScriptOpReply::Ok(n) => Ok(n),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -607,9 +669,13 @@ fn move_entities(py: Python<'_>, indices: Vec<usize>, dx: f64, dy: f64) -> PyRes
 /// Copy the entities at `indices` by (dx, dy); returns the NEW indices.
 #[pyfunction(name = "copy")]
 fn copy_entities(py: Python<'_>, indices: Vec<usize>, dx: f64, dy: f64) -> PyResult<Vec<usize>> {
-    let rep = round_trip(py, ScriptOp::ModifyCopy {
-        indices, delta: Vec2::new(dx, dy),
-    })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::ModifyCopy {
+            indices,
+            delta: Vec2::new(dx, dy),
+        },
+    )?;
     match rep {
         ScriptOpReply::Indices(v) => Ok(v),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -625,11 +691,14 @@ fn rotate_entities(
     center: (f64, f64),
     angle_deg: f64,
 ) -> PyResult<usize> {
-    let rep = round_trip(py, ScriptOp::ModifyRotate {
-        indices,
-        pivot: Vec2::new(center.0, center.1),
-        angle_deg,
-    })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::ModifyRotate {
+            indices,
+            pivot: Vec2::new(center.0, center.1),
+            angle_deg,
+        },
+    )?;
     match rep {
         ScriptOpReply::Ok(n) => Ok(n),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -651,11 +720,14 @@ fn scale_entities(
             "scale factor must be > 0",
         ));
     }
-    let rep = round_trip(py, ScriptOp::ModifyScale {
-        indices,
-        pivot: Vec2::new(center.0, center.1),
-        factor,
-    })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::ModifyScale {
+            indices,
+            pivot: Vec2::new(center.0, center.1),
+            factor,
+        },
+    )?;
     match rep {
         ScriptOpReply::Ok(n) => Ok(n),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -671,11 +743,14 @@ fn mirror_entities(
     a: (f64, f64),
     b: (f64, f64),
 ) -> PyResult<usize> {
-    let rep = round_trip(py, ScriptOp::ModifyMirror {
-        indices,
-        a: Vec2::new(a.0, a.1),
-        b: Vec2::new(b.0, b.1),
-    })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::ModifyMirror {
+            indices,
+            a: Vec2::new(a.0, a.1),
+            b: Vec2::new(b.0, b.1),
+        },
+    )?;
     match rep {
         ScriptOpReply::Ok(n) => Ok(n),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -743,15 +818,14 @@ fn set_layer_of(py: Python<'_>, indices: Vec<usize>, name: String) -> PyResult<u
 
 /// Set the linetype of the entities at `indices` (None/"" = ByLayer).
 #[pyfunction]
-fn set_linetype(
-    py: Python<'_>,
-    indices: Vec<usize>,
-    name: Option<String>,
-) -> PyResult<usize> {
-    let rep = round_trip(py, ScriptOp::SetEntityLinetype {
-        indices,
-        name: name.unwrap_or_default(),
-    })?;
+fn set_linetype(py: Python<'_>, indices: Vec<usize>, name: Option<String>) -> PyResult<usize> {
+    let rep = round_trip(
+        py,
+        ScriptOp::SetEntityLinetype {
+            indices,
+            name: name.unwrap_or_default(),
+        },
+    )?;
     match rep {
         ScriptOpReply::Ok(n) => Ok(n),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -761,15 +835,14 @@ fn set_linetype(
 
 /// Set the lineweight of the entities at `indices` in mm (negative = ByLayer).
 #[pyfunction]
-fn set_lineweight(
-    py: Python<'_>,
-    indices: Vec<usize>,
-    mm: Option<f64>,
-) -> PyResult<usize> {
-    let rep = round_trip(py, ScriptOp::SetEntityLineweight {
-        indices,
-        mm: mm.unwrap_or(-1.0),
-    })?;
+fn set_lineweight(py: Python<'_>, indices: Vec<usize>, mm: Option<f64>) -> PyResult<usize> {
+    let rep = round_trip(
+        py,
+        ScriptOp::SetEntityLineweight {
+            indices,
+            mm: mm.unwrap_or(-1.0),
+        },
+    )?;
     match rep {
         ScriptOpReply::Ok(n) => Ok(n),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -812,17 +885,13 @@ fn geom_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Geom> {
     let pt = |key: &str| -> PyResult<Vec2> {
         let (x, y): (f64, f64) = d
             .get_item(key)?
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(format!("missing '{key}'"))
-            })?
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("missing '{key}'")))?
             .extract()?;
         Ok(Vec2::new(x, y))
     };
     let f = |key: &str| -> PyResult<f64> {
         d.get_item(key)?
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(format!("missing '{key}'"))
-            })?
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("missing '{key}'")))?
             .extract()
     };
     match ty.as_str() {
@@ -931,9 +1000,17 @@ fn layer_set(
     plottable: Option<bool>,
     color: Option<u8>,
 ) -> PyResult<()> {
-    let rep = round_trip(py, ScriptOp::LayerSet {
-        name, visible, locked, frozen, plottable, color_aci: color,
-    })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::LayerSet {
+            name,
+            visible,
+            locked,
+            frozen,
+            plottable,
+            color_aci: color,
+        },
+    )?;
     match rep {
         ScriptOpReply::OkUnit => Ok(()),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -949,9 +1026,13 @@ fn layer_set(
 /// `base` (the selection is consumed — mirrors the `block <name>` command).
 #[pyfunction]
 fn create_block(py: Python<'_>, name: String, base: (f64, f64)) -> PyResult<()> {
-    let rep = round_trip(py, ScriptOp::BlockCreate {
-        name, base: Vec2::new(base.0, base.1),
-    })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::BlockCreate {
+            name,
+            base: Vec2::new(base.0, base.1),
+        },
+    )?;
     match rep {
         ScriptOpReply::OkUnit => Ok(()),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -960,17 +1041,15 @@ fn create_block(py: Python<'_>, name: String, base: (f64, f64)) -> PyResult<()> 
 }
 
 #[pyfunction(signature = (name, at, rotation_deg = 0.0))]
-fn insert_block(
-    py: Python<'_>,
-    name: String,
-    at: (f64, f64),
-    rotation_deg: f64,
-) -> PyResult<()> {
-    let rep = round_trip(py, ScriptOp::BlockInsert {
-        name,
-        at: Vec2::new(at.0, at.1),
-        rotation: rotation_deg.to_radians(),
-    })?;
+fn insert_block(py: Python<'_>, name: String, at: (f64, f64), rotation_deg: f64) -> PyResult<()> {
+    let rep = round_trip(
+        py,
+        ScriptOp::BlockInsert {
+            name,
+            at: Vec2::new(at.0, at.1),
+            rotation: rotation_deg.to_radians(),
+        },
+    )?;
     match rep {
         ScriptOpReply::OkUnit => Ok(()),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -1039,9 +1118,13 @@ fn view(py: Python<'_>) -> PyResult<Py<PyDict>> {
 /// scale is px-per-world-unit (None = pan only).
 #[pyfunction]
 fn set_view(py: Python<'_>, center: (f64, f64), scale: Option<f64>) -> PyResult<()> {
-    let rep = round_trip(py, ScriptOp::ViewSet {
-        center: Vec2::new(center.0, center.1), scale,
-    })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::ViewSet {
+            center: Vec2::new(center.0, center.1),
+            scale,
+        },
+    )?;
     match rep {
         ScriptOpReply::OkUnit => Ok(()),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -1103,10 +1186,7 @@ fn undo_group(py: Python<'_>) -> PyResult<()> {
 /// Set the CURRENT color for NEW entities (the script's own adds).
 /// Same argument forms as set_color.
 #[pyfunction]
-fn set_current_color(
-    py: Python<'_>,
-    color: Option<Bound<'_, PyAny>>,
-) -> PyResult<()> {
+fn set_current_color(py: Python<'_>, color: Option<Bound<'_, PyAny>>) -> PyResult<()> {
     let c = parse_color_opt(color.as_ref())?;
     let rep = round_trip(py, ScriptOp::SetCurrentColor { color: c })?;
     match rep {
@@ -1170,10 +1250,13 @@ fn hatch_patterns(py: Python<'_>) -> PyResult<Vec<String>> {
 /// name from `rasm.hatch_patterns()`. Returns the new hatch's index.
 #[pyfunction]
 fn add_hatch(py: Python<'_>, boundary_indices: Vec<usize>, pattern: String) -> PyResult<usize> {
-    let rep = round_trip(py, ScriptOp::AddHatch {
-        boundary_indices,
-        pattern,
-    })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::AddHatch {
+            boundary_indices,
+            pattern,
+        },
+    )?;
     match rep {
         ScriptOpReply::Ok(i) => Ok(i),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -1187,10 +1270,13 @@ fn add_hatch(py: Python<'_>, boundary_indices: Vec<usize>, pattern: String) -> P
 /// contains the point (a normal search outcome, not an error).
 #[pyfunction]
 fn hatch_at(py: Python<'_>, point: (f64, f64), pattern: String) -> PyResult<Vec<usize>> {
-    let rep = round_trip(py, ScriptOp::HatchAt {
-        point: Vec2::new(point.0, point.1),
-        pattern,
-    })?;
+    let rep = round_trip(
+        py,
+        ScriptOp::HatchAt {
+            point: Vec2::new(point.0, point.1),
+            pattern,
+        },
+    )?;
     match rep {
         ScriptOpReply::Indices(v) => Ok(v),
         ScriptOpReply::Error(e) => Err(op_failed(e)),
@@ -1202,7 +1288,9 @@ fn hatch_at(py: Python<'_>, point: (f64, f64), pattern: String) -> PyResult<Vec<
 // value conversion + module installation
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn pt(p: Vec2) -> (f64, f64) { (p.x, p.y) }
+fn pt(p: Vec2) -> (f64, f64) {
+    (p.x, p.y)
+}
 
 /// One dobject → a Python dict of owned values. Geometry-specific keys sit
 /// flat next to `handle` / `layer` / `type` so scripts can read them
@@ -1243,7 +1331,10 @@ fn entity_dict<'a>(py: Python<'a>, e: &'a Entity) -> Bound<'a, PyDict> {
         }
         Geom::Region(rg) => {
             let _ = d.set_item("type", "region");
-            let _ = d.set_item("loop_pts", rg.loop_pts.iter().map(|p| pt(*p)).collect::<Vec<_>>());
+            let _ = d.set_item(
+                "loop_pts",
+                rg.loop_pts.iter().map(|p| pt(*p)).collect::<Vec<_>>(),
+            );
         }
         Geom::Xref(x) => {
             let _ = d.set_item("type", "xref");

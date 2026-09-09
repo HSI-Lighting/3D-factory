@@ -38,9 +38,13 @@ impl Xref {
         let mut mx = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
         for d in &self.cached {
             let (a, b) = self.transform_geom(&d.geom).bbox();
-            if b.x < a.x || b.y < a.y { continue; }
-            mn.x = mn.x.min(a.x); mn.y = mn.y.min(a.y);
-            mx.x = mx.x.max(b.x); mx.y = mx.y.max(b.y);
+            if b.x < a.x || b.y < a.y {
+                continue;
+            }
+            mn.x = mn.x.min(a.x);
+            mn.y = mn.y.min(a.y);
+            mx.x = mx.x.max(b.x);
+            mx.y = mx.y.max(b.y);
         }
         if !self.cached.is_empty() && mx.x < mn.x {
             (self.insert, self.insert)
@@ -85,7 +89,9 @@ mod tests {
         let w = x.transform_geom(&g);
         if let Geom::Point(p) = w {
             assert!((p.location - Vec2::new(100.0, 2.0)).len() < 1e-9);
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
@@ -98,9 +104,13 @@ mod tests {
             rotation: 0.0,
             cached: vec![
                 DObject::new(Geom::Line(Line {
-                    a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 0.0) })),
+                    a: Vec2::new(0.0, 0.0),
+                    b: Vec2::new(10.0, 0.0),
+                })),
                 DObject::new(Geom::Circle(Circle {
-                    center: Vec2::new(5.0, 3.0), radius: 1.0 })),
+                    center: Vec2::new(5.0, 3.0),
+                    radius: 1.0,
+                })),
             ],
         };
         let (mn, mx) = x.bbox();

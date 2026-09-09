@@ -23,10 +23,16 @@ fn env_str(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
 }
 fn env_f32(k: &str, d: f32) -> f32 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 fn env_u32(k: &str, d: u32) -> u32 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 /// Load a `.glb` into a `FactoryState` the way `App::import_scene_file` does: one asset at 1:1
@@ -42,8 +48,16 @@ pub fn load_scene(path: &str) -> Option<FactoryState> {
     }
     let mut st = FactoryState::default();
     let idx = st.add_furniture_asset("scene".into(), mesh);
-    let ntri = st.furniture_lib.get(idx).map(|a| a.positions.len() / 3).unwrap_or(0);
-    let k = st.furniture_lib.get(idx).map(|a| a.import_scale).unwrap_or(1.0);
+    let ntri = st
+        .furniture_lib
+        .get(idx)
+        .map(|a| a.positions.len() / 3)
+        .unwrap_or(0);
+    let k = st
+        .furniture_lib
+        .get(idx)
+        .map(|a| a.import_scale)
+        .unwrap_or(1.0);
     if let Some(a) = st.furniture_lib.get_mut(idx) {
         if !pbr.uvs.is_empty() {
             a.uvs = pbr.uvs.clone();
@@ -58,13 +72,19 @@ pub fn load_scene(path: &str) -> Option<FactoryState> {
         .enumerate()
         .map(|(i, (w, h, rgba))| st.add_texture(format!("mat{i}"), *w, *h, rgba.clone()))
         .collect();
-    let per_part: Vec<Option<usize>> =
-        pbr.part_texture.iter().map(|s| s.and_then(|s| globals.get(s).copied())).collect();
+    let per_part: Vec<Option<usize>> = pbr
+        .part_texture
+        .iter()
+        .map(|s| s.and_then(|s| globals.get(s).copied()))
+        .collect();
     // The material's surface properties, exactly as the app import applies them — scalars AND
     // maps. Letting the maps diverge here would quietly cost this probe its whole purpose: it
     // would go on rendering the flat version of a scene the app renders with relief.
     let map_of = |v: &Vec<Option<usize>>, part: usize| -> Option<usize> {
-        v.get(part).copied().flatten().and_then(|s| globals.get(s).copied())
+        v.get(part)
+            .copied()
+            .flatten()
+            .and_then(|s| globals.get(s).copied())
     };
     for (part, g) in per_part.iter().enumerate() {
         let Some(g) = g else { continue };
@@ -79,10 +99,18 @@ pub fn load_scene(path: &str) -> Option<FactoryState> {
             if let Some(m) = pbr.part_metal.get(part) {
                 t.metallic = m.clamp(0.0, 1.0);
             }
-            if nrm.is_some() { t.normal_map = nrm; }
-            if rgh.is_some() { t.rough_map = rgh; }
-            if mtl.is_some() { t.metal_map = mtl; }
-            if ao.is_some() { t.ao_map = ao; }
+            if nrm.is_some() {
+                t.normal_map = nrm;
+            }
+            if rgh.is_some() {
+                t.rough_map = rgh;
+            }
+            if mtl.is_some() {
+                t.metal_map = mtl;
+            }
+            if ao.is_some() {
+                t.ao_map = ao;
+            }
             t.triplanar = false;
         }
     }
@@ -132,8 +160,14 @@ pub fn goa_sun(hour: f32) -> SunEnv {
 pub fn write_png(path: &std::path::Path, w: usize, h: usize, rgba: &[u8]) -> std::io::Result<()> {
     let f = std::fs::File::create(path)?;
     let enc = image::codecs::png::PngEncoder::new(std::io::BufWriter::new(f));
-    image::ImageEncoder::write_image(enc, rgba, w as u32, h as u32, image::ExtendedColorType::Rgba8)
-        .map_err(std::io::Error::other)
+    image::ImageEncoder::write_image(
+        enc,
+        rgba,
+        w as u32,
+        h as u32,
+        image::ExtendedColorType::Rgba8,
+    )
+    .map_err(std::io::Error::other)
 }
 
 #[cfg(test)]

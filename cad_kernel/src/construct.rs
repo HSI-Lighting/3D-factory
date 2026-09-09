@@ -11,7 +11,7 @@
 // degenerate (collinear / chord longer than 2·radius / chord longer than arc length).
 
 use crate::geom::{Arc, Ellipse, Line};
-use crate::math::{norm_angle, PARALLEL_SIN_EPS, Vec2, EPS};
+use crate::math::{norm_angle, Vec2, EPS, PARALLEL_SIN_EPS};
 use std::f64::consts::{PI, TAU};
 
 // ---- Wall: two parallel lines from a centerline + thickness -----------------
@@ -37,12 +37,20 @@ use std::f64::consts::{PI, TAU};
 pub fn wall_sides(start: Vec2, end: Vec2, thickness: f64) -> Option<(Line, Line)> {
     let dir = end - start;
     let len = dir.len();
-    if len < EPS || thickness <= EPS { return None; }
+    if len < EPS || thickness <= EPS {
+        return None;
+    }
     let perp = (dir / len).perp();
     let off = perp * (thickness * 0.5);
     Some((
-        Line { a: start + off, b: end + off },
-        Line { a: start - off, b: end - off },
+        Line {
+            a: start + off,
+            b: end + off,
+        },
+        Line {
+            a: start - off,
+            b: end - off,
+        },
     ))
 }
 
@@ -58,8 +66,14 @@ pub fn ellipse_center_major_minor(
 ) -> Option<Ellipse> {
     let major = major_end - center;
     let a = major.len();
-    if a < EPS || semi_minor < EPS { return None; }
-    Some(Ellipse { center, major, ratio: (semi_minor / a).min(1.0) })
+    if a < EPS || semi_minor < EPS {
+        return None;
+    }
+    Some(Ellipse {
+        center,
+        major,
+        ratio: (semi_minor / a).min(1.0),
+    })
 }
 
 // ---- 2. center + start + end (CCW) ----------------------------------------
@@ -69,12 +83,19 @@ pub fn ellipse_center_major_minor(
 /// *angle from the center* — its distance is ignored. CCW sweep.
 pub fn arc_center_start_end(center: Vec2, start: Vec2, end: Vec2) -> Option<Arc> {
     let radius = center.dist(start);
-    if radius < EPS { return None; }
+    if radius < EPS {
+        return None;
+    }
     let start_angle = norm_angle((start - center).angle());
-    let end_angle   = (end - center).angle();
-    let sweep_raw   = norm_angle(end_angle - start_angle);
+    let end_angle = (end - center).angle();
+    let sweep_raw = norm_angle(end_angle - start_angle);
     let sweep = if sweep_raw < EPS { TAU } else { sweep_raw };
-    Some(Arc { center, radius, start_angle, sweep_angle: sweep })
+    Some(Arc {
+        center,
+        radius,
+        start_angle,
+        sweep_angle: sweep,
+    })
 }
 
 // ---- 3. three points on the arc -------------------------------------------
@@ -83,9 +104,7 @@ pub fn arc_center_start_end(center: Vec2, start: Vec2, end: Vec2) -> Option<Arc>
 /// circumcenter of the triangle. Returns None if the three points are collinear.
 pub fn arc_three_points(p1: Vec2, p2: Vec2, p3: Vec2) -> Option<Arc> {
     // Twice the signed area of the triangle.
-    let d = 2.0 * (p1.x * (p2.y - p3.y)
-                 + p2.x * (p3.y - p1.y)
-                 + p3.x * (p1.y - p2.y));
+    let d = 2.0 * (p1.x * (p2.y - p3.y) + p2.x * (p3.y - p1.y) + p3.x * (p1.y - p2.y));
     // G8: `d` ≈ 2·area = |e1|·|e2|·sin(angle)·2. A RELATIVE collinearity test on
     // sin(angle) — `PARALLEL_SIN_EPS · |e1| · |e2|` — is scale-free for tiny and
     // huge triangles alike. (Bare, NOT `scaled_tol`: its .max(1.0) floor makes the
@@ -103,12 +122,8 @@ pub fn arc_three_points(p1: Vec2, p2: Vec2, p3: Vec2) -> Option<Arc> {
     let p2_sq = p2.x * p2.x + p2.y * p2.y;
     let p3_sq = p3.x * p3.x + p3.y * p3.y;
 
-    let ux = (p1_sq * (p2.y - p3.y)
-            + p2_sq * (p3.y - p1.y)
-            + p3_sq * (p1.y - p2.y)) / d;
-    let uy = (p1_sq * (p3.x - p2.x)
-            + p2_sq * (p1.x - p3.x)
-            + p3_sq * (p2.x - p1.x)) / d;
+    let ux = (p1_sq * (p2.y - p3.y) + p2_sq * (p3.y - p1.y) + p3_sq * (p1.y - p2.y)) / d;
+    let uy = (p1_sq * (p3.x - p2.x) + p2_sq * (p1.x - p3.x) + p3_sq * (p2.x - p1.x)) / d;
     let center = Vec2::new(ux, uy);
     let radius = center.dist(p1);
 
@@ -116,7 +131,7 @@ pub fn arc_three_points(p1: Vec2, p2: Vec2, p3: Vec2) -> Option<Arc> {
     let a2 = (p2 - center).angle();
     let a3 = (p3 - center).angle();
 
-    let ccw_total  = norm_angle(a3 - a1);
+    let ccw_total = norm_angle(a3 - a1);
     let ccw_to_mid = norm_angle(a2 - a1);
 
     if ccw_to_mid <= ccw_total + EPS {
@@ -146,16 +161,22 @@ pub fn arc_three_points(p1: Vec2, p2: Vec2, p3: Vec2) -> Option<Arc> {
 /// returns the one with sweep > π, `false` returns sweep < π.
 /// Returns None if the chord is longer than 2·radius or the radius is zero.
 pub fn arc_chord_radius(start: Vec2, end: Vec2, radius: f64, major: bool) -> Option<Arc> {
-    if radius < EPS { return None; }
+    if radius < EPS {
+        return None;
+    }
     let chord = end - start;
     let chord_len = chord.len();
-    if chord_len < EPS { return None; }
+    if chord_len < EPS {
+        return None;
+    }
     let half_chord = chord_len * 0.5;
-    if half_chord > radius + EPS { return None; }
+    if half_chord > radius + EPS {
+        return None;
+    }
 
-    let mid  = (start + end) * 0.5;
+    let mid = (start + end) * 0.5;
     let h_sq = (radius * radius - half_chord * half_chord).max(0.0);
-    let h    = h_sq.sqrt();
+    let h = h_sq.sqrt();
     let perp = chord.normalized().perp();
 
     let from_center = |center: Vec2| -> Arc {
@@ -175,7 +196,11 @@ pub fn arc_chord_radius(start: Vec2, end: Vec2, radius: f64, major: bool) -> Opt
 
     // Exactly one of the two has sweep > π (the "major" arc).
     let arc_a_is_major = arc_a.sweep_angle > PI;
-    Some(if arc_a_is_major == major { arc_a } else { arc_b })
+    Some(if arc_a_is_major == major {
+        arc_a
+    } else {
+        arc_b
+    })
 }
 
 // ---- 5. chord + arc length (numerical) ------------------------------------
@@ -189,10 +214,16 @@ pub fn arc_chord_radius(start: Vec2, end: Vec2, radius: f64, major: bool) -> Opt
 ///
 /// Returns None if the chord is longer than the arc length (impossible), or zero length.
 pub fn arc_chord_length(start: Vec2, end: Vec2, arc_length: f64, flip: bool) -> Option<Arc> {
-    if arc_length < EPS { return None; }
+    if arc_length < EPS {
+        return None;
+    }
     let chord_len = (end - start).len();
-    if chord_len < EPS { return None; }
-    if chord_len > arc_length + EPS { return None; }
+    if chord_len < EPS {
+        return None;
+    }
+    if chord_len > arc_length + EPS {
+        return None;
+    }
 
     // ratio = chord / arc_length = sin(θ/2) / (θ/2)  ∈ (0, 1]
     let ratio = chord_len / arc_length;
@@ -201,7 +232,11 @@ pub fn arc_chord_length(start: Vec2, end: Vec2, arc_length: f64, flip: bool) -> 
     // f(θ) = sin(θ/2)/(θ/2) - ratio  →  positive at θ → 0, negative at θ → 2π.
     let f = |theta: f64| -> f64 {
         let x = theta * 0.5;
-        if x < EPS { 1.0 - ratio } else { x.sin() / x - ratio }
+        if x < EPS {
+            1.0 - ratio
+        } else {
+            x.sin() / x - ratio
+        }
     };
 
     let mut lo = 1e-9_f64;
@@ -211,11 +246,19 @@ pub fn arc_chord_length(start: Vec2, end: Vec2, arc_length: f64, flip: bool) -> 
     // `f(lo) == 0.0` exactly, which the strict `< 0.0` let slip through — then
     // bisection drives θ → 0 and `radius = arc_length/θ` explodes to ~1e10. Reject
     // `<= 0.0` so an exact straight line is `None`, not a vast bogus arc.
-    if f(lo) <= 0.0 { return None; }
+    if f(lo) <= 0.0 {
+        return None;
+    }
     for _ in 0..100 {
         let mid = 0.5 * (lo + hi);
-        if f(mid) > 0.0 { lo = mid; } else { hi = mid; }
-        if (hi - lo).abs() < 1e-13 { break; }
+        if f(mid) > 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if (hi - lo).abs() < 1e-13 {
+            break;
+        }
     }
     let theta = 0.5 * (lo + hi);
     // Belt-and-braces for the NEAR-miss `ratio = 1 − 1e-15`: there `f(lo) ≈ 1e-15
@@ -223,7 +266,9 @@ pub fn arc_chord_length(start: Vec2, end: Vec2, arc_length: f64, flip: bool) -> 
     // ≈ 1e7·arc_length — the same explosion one ULP away. A sub-µrad sweep is a
     // straight line at any real scale. (θ is a scale-free angle, so an absolute
     // floor is the right convention here, like the 1e-13 bisection stop above.)
-    if theta < 1e-6 { return None; }
+    if theta < 1e-6 {
+        return None;
+    }
     let radius = arc_length / theta;
 
     // Now we have radius + chord → two candidate arcs (major flag matters).
@@ -252,9 +297,10 @@ mod tests {
     fn center_start_end_quarter_arc() {
         let a = arc_center_start_end(
             Vec2::new(0.0, 0.0),
-            Vec2::new(5.0, 0.0),      // start at 0°
-            Vec2::new(0.0, 5.0),      // end   at 90°
-        ).unwrap();
+            Vec2::new(5.0, 0.0), // start at 0°
+            Vec2::new(0.0, 5.0), // end   at 90°
+        )
+        .unwrap();
         assert!(approx_pt(a.center, 0.0, 0.0));
         assert!(approx_eq(a.radius, 5.0));
         assert!(approx_eq(a.start_angle, 0.0));
@@ -265,11 +311,8 @@ mod tests {
     fn three_points_quarter_arc() {
         // p1=(5,0), p2=(5/√2, 5/√2)=(3.536...), p3=(0,5) on a circle of radius 5
         let s2 = 5.0 / 2.0_f64.sqrt();
-        let a = arc_three_points(
-            Vec2::new(5.0, 0.0),
-            Vec2::new(s2, s2),
-            Vec2::new(0.0, 5.0),
-        ).unwrap();
+        let a =
+            arc_three_points(Vec2::new(5.0, 0.0), Vec2::new(s2, s2), Vec2::new(0.0, 5.0)).unwrap();
         assert!(approx_pt(a.center, 0.0, 0.0));
         assert!(approx_eq(a.radius, 5.0));
         assert!(approx_eq(a.sweep_angle, PI * 0.5));
@@ -297,7 +340,8 @@ mod tests {
             Vec2::new(5.0, 0.0),
             Vec2::new(0.0, -5.0),
             Vec2::new(-5.0, 0.0),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(approx_eq(a.radius, 5.0));
         assert!(approx_pt(a.center, 0.0, 0.0));
         // p2 must lie within the swept arc
@@ -309,24 +353,14 @@ mod tests {
     #[test]
     fn chord_radius_minor() {
         // chord from (-3,0) to (3,0), radius 5 → minor arc with sweep < π
-        let a = arc_chord_radius(
-            Vec2::new(-3.0, 0.0),
-            Vec2::new( 3.0, 0.0),
-            5.0,
-            false,
-        ).unwrap();
+        let a = arc_chord_radius(Vec2::new(-3.0, 0.0), Vec2::new(3.0, 0.0), 5.0, false).unwrap();
         assert!(approx_eq(a.radius, 5.0));
         assert!(a.sweep_angle < PI);
     }
 
     #[test]
     fn chord_radius_major() {
-        let a = arc_chord_radius(
-            Vec2::new(-3.0, 0.0),
-            Vec2::new( 3.0, 0.0),
-            5.0,
-            true,
-        ).unwrap();
+        let a = arc_chord_radius(Vec2::new(-3.0, 0.0), Vec2::new(3.0, 0.0), 5.0, true).unwrap();
         assert!(a.sweep_angle > PI);
     }
 
@@ -334,8 +368,8 @@ mod tests {
     fn chord_radius_chord_too_long_is_none() {
         let r = arc_chord_radius(
             Vec2::new(-10.0, 0.0),
-            Vec2::new( 10.0, 0.0),
-            5.0,         // chord 20 > 2·5
+            Vec2::new(10.0, 0.0),
+            5.0, // chord 20 > 2·5
             false,
         );
         assert!(r.is_none());
@@ -346,43 +380,34 @@ mod tests {
         // A quarter-circle of radius 5: arc length = 5 * π/2 ≈ 7.854
         // chord = 5·√2 ≈ 7.071, from (5,0) to (0,5)
         let arc_len = 5.0 * PI * 0.5;
-        let a = arc_chord_length(
-            Vec2::new(5.0, 0.0),
-            Vec2::new(0.0, 5.0),
-            arc_len,
-            false,
-        ).unwrap();
+        let a = arc_chord_length(Vec2::new(5.0, 0.0), Vec2::new(0.0, 5.0), arc_len, false).unwrap();
         // numerical, so allow a looser tolerance
-        assert!((a.radius - 5.0).abs() < 1e-8,
-            "radius {} ≠ 5.0", a.radius);
-        assert!((a.sweep_angle - PI * 0.5).abs() < 1e-8,
-            "sweep {} ≠ π/2", a.sweep_angle);
+        assert!((a.radius - 5.0).abs() < 1e-8, "radius {} ≠ 5.0", a.radius);
+        assert!(
+            (a.sweep_angle - PI * 0.5).abs() < 1e-8,
+            "sweep {} ≠ π/2",
+            a.sweep_angle
+        );
     }
 
     #[test]
     fn chord_length_impossible_is_none() {
         // chord 10, arc length 5 — impossible (arc ≥ chord)
-        let r = arc_chord_length(
-            Vec2::new(0.0, 0.0),
-            Vec2::new(10.0, 0.0),
-            5.0,
-            false,
-        );
+        let r = arc_chord_length(Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), 5.0, false);
         assert!(r.is_none());
     }
 
     #[test]
     fn wall_sides_horizontal() {
         // Horizontal centerline (0,0)→(10,0), thickness 2 → sides at y=±1.
-        let (l, r) = wall_sides(
-            Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), 2.0,
-        ).expect("non-degenerate");
+        let (l, r) =
+            wall_sides(Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), 2.0).expect("non-degenerate");
         // dir = (1,0); perp = (0,1) (CCW); off = (0,1).
         // left  = (0,1) → (10,1); right = (0,-1) → (10,-1).
-        assert!((l.a - Vec2::new(0.0,  1.0)).len() < 1e-12);
+        assert!((l.a - Vec2::new(0.0, 1.0)).len() < 1e-12);
         assert!((l.b - Vec2::new(10.0, 1.0)).len() < 1e-12);
         assert!((r.a - Vec2::new(0.0, -1.0)).len() < 1e-12);
-        assert!((r.b - Vec2::new(10.0,-1.0)).len() < 1e-12);
+        assert!((r.b - Vec2::new(10.0, -1.0)).len() < 1e-12);
     }
 
     #[test]
@@ -401,13 +426,10 @@ mod tests {
     #[test]
     fn wall_sides_degenerate_returns_none() {
         // Zero-length centerline.
-        assert!(wall_sides(
-            Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 1.0).is_none());
+        assert!(wall_sides(Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 1.0).is_none());
         // Non-positive thickness.
-        assert!(wall_sides(
-            Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), 0.0).is_none());
-        assert!(wall_sides(
-            Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), -1.0).is_none());
+        assert!(wall_sides(Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), 0.0).is_none());
+        assert!(wall_sides(Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), -1.0).is_none());
     }
 
     // ---- FIX 3 (G5): arc_chord_length degenerate straight line --------------
@@ -419,8 +441,10 @@ mod tests {
         // to ~1e10. Must be None.
         let s = Vec2::new(0.0, 0.0);
         let e = Vec2::new(100.0, 0.0);
-        assert!(arc_chord_length(s, e, 100.0, false).is_none(),
-            "chord == length must be None, not a giant bogus arc");
+        assert!(
+            arc_chord_length(s, e, 100.0, false).is_none(),
+            "chord == length must be None, not a giant bogus arc"
+        );
     }
 
     #[test]
@@ -429,10 +453,13 @@ mod tests {
         // check; the θ-floor guard must still reject it (no ~1e7-radius arc).
         let s = Vec2::new(0.0, 0.0);
         let e = Vec2::new(100.0, 0.0);
-        let arc_length = 100.0 * (1.0 + 1.0e-15);   // chord/length = 1 − ~1e-15
+        let arc_length = 100.0 * (1.0 + 1.0e-15); // chord/length = 1 − ~1e-15
         match arc_chord_length(s, e, arc_length, false) {
             None => {}
-            Some(a) => panic!("near-straight line produced radius={} (should be None)", a.radius),
+            Some(a) => panic!(
+                "near-straight line produced radius={} (should be None)",
+                a.radius
+            ),
         }
     }
 
@@ -443,7 +470,11 @@ mod tests {
         let s = Vec2::new(0.0, 0.0);
         let e = Vec2::new(100.0, 0.0);
         let arc = arc_chord_length(s, e, 50.0 * PI, false).expect("semicircle must build");
-        assert!((arc.radius - 50.0).abs() < 1e-6, "radius {} != 50", arc.radius);
+        assert!(
+            (arc.radius - 50.0).abs() < 1e-6,
+            "radius {} != 50",
+            arc.radius
+        );
     }
 
     // ---- FIX 4b (G8): arc_three_points relative collinearity ----------------
@@ -462,7 +493,11 @@ mod tests {
             .expect("a small right-angle triple must build an arc, not None");
         // Right angle → hypotenuse is the diameter; centre at the midpoint of p2p3.
         let mid = (p2 + p3) * 0.5;
-        assert!((arc.center - mid).len() < 1e-9, "circumcentre off: {:?}", arc.center);
+        assert!(
+            (arc.center - mid).len() < 1e-9,
+            "circumcentre off: {:?}",
+            arc.center
+        );
     }
 
     #[test]
@@ -480,7 +515,9 @@ mod tests {
         let p1 = Vec2::new(bx, by);
         let p2 = Vec2::new(bx + 4.83e11 * dx, by + 4.83e11 * dy);
         let p3 = Vec2::new(bx + 1.17e12 * dx, by + 1.17e12 * dy);
-        assert!(arc_three_points(p1, p2, p3).is_none(),
-            "collinear points spanning 1e12 must be None, not a bogus arc");
+        assert!(
+            arc_three_points(p1, p2, p3).is_none(),
+            "collinear points spanning 1e12 must be None, not a bogus arc"
+        );
     }
 }

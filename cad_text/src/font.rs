@@ -184,8 +184,11 @@ impl FontIndex {
         // Seed the embedded fonts: a family already installed on the system
         // keeps its file path; otherwise the embedded copy becomes resolvable.
         for (key, display_name, _) in EMBEDDED {
-            map.entry(key.to_string()).or_insert_with(|| (PathBuf::new(), 0));
-            display.entry(key.to_string()).or_insert(display_name.to_string());
+            map.entry(key.to_string())
+                .or_insert_with(|| (PathBuf::new(), 0));
+            display
+                .entry(key.to_string())
+                .or_insert(display_name.to_string());
         }
 
         // A fontless system still gets a default (the embedded Liberation Sans).
@@ -433,7 +436,10 @@ const MAC_ROMAN: [u16; 128] = [
 
 /// Bytes of the embedded font with the given lowercased family key.
 fn embedded_bytes(key: &str) -> Option<&'static [u8]> {
-    EMBEDDED.iter().find(|(k, _, _)| *k == key).map(|(_, _, b)| *b)
+    EMBEDDED
+        .iter()
+        .find(|(k, _, _)| *k == key)
+        .map(|(_, _, b)| *b)
 }
 
 /// The embedded RTL-capable font (Arabic + Hebrew + Latin) used as the
@@ -530,7 +536,10 @@ mod tests {
 
     #[test]
     fn utf16be_name_decodes() {
-        assert_eq!(decode_utf16_be(&utf16("Far Nazanin")).as_deref(), Some("Far Nazanin"));
+        assert_eq!(
+            decode_utf16_be(&utf16("Far Nazanin")).as_deref(),
+            Some("Far Nazanin")
+        );
         // Odd length can't be UTF-16BE → None (record skipped, never mojibake).
         assert_eq!(decode_utf16_be(b"Far"), None);
     }
@@ -538,7 +547,10 @@ mod tests {
     #[test]
     fn mac_roman_name_decodes() {
         assert_eq!(decode_mac_roman(b"Caf\x8E").as_deref(), Some("Café"));
-        assert_eq!(decode_mac_roman(b"Plain ASCII").as_deref(), Some("Plain ASCII"));
+        assert_eq!(
+            decode_mac_roman(b"Plain ASCII").as_deref(),
+            Some("Plain ASCII")
+        );
     }
 
     #[test]
@@ -582,8 +594,7 @@ mod tests {
         // End-to-end through FontIndex: a font whose family is stored UTF-16BE
         // must resolve by name and appear in the picker under its real name.
         let font = minimal_ttf(&[(3, 1, 0x0409, 1, utf16("Far Nazanin"))]);
-        let dir = std::env::temp_dir()
-            .join(format!("cad_text_font_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cad_text_font_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("far_nazanin.ttf");
         std::fs::write(&path, &font).unwrap();
@@ -597,7 +608,10 @@ mod tests {
             sorted_names: vec!["Far Nazanin".into()],
             pending_collections: Vec::new(),
         };
-        assert_eq!(index.resolve("far nazanin"), FontSource::Path(path.clone(), 0));
+        assert_eq!(
+            index.resolve("far nazanin"),
+            FontSource::Path(path.clone(), 0)
+        );
         assert!(index.names().iter().any(|n| n == "Far Nazanin"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -612,16 +626,28 @@ mod tests {
         ]);
         let face = ttf_parser::Face::parse(&font, 0).unwrap();
         let legacy = family_name_legacy(&face);
-        assert!(legacy.is_some(), "old decoder produced SOMETHING for this font");
-        assert_ne!(legacy.as_deref(), Some("Far.Nazanin"), "old output was wrong");
+        assert!(
+            legacy.is_some(),
+            "old decoder produced SOMETHING for this font"
+        );
+        assert_ne!(
+            legacy.as_deref(),
+            Some("Far.Nazanin"),
+            "old output was wrong"
+        );
         let mut map = HashMap::new();
         let mut display = HashMap::new();
-        register_face_families(&font, std::path::Path::new("/tmp/x.ttf"),
-            &mut map, &mut display);
+        register_face_families(
+            &font,
+            std::path::Path::new("/tmp/x.ttf"),
+            &mut map,
+            &mut display,
+        );
         let key = legacy.unwrap().to_lowercase();
-        assert_eq!(map.get(&key), Some(&(std::path::PathBuf::from("/tmp/x.ttf"), 0)),
-            "legacy name must be registered as a resolution alias");
+        assert_eq!(
+            map.get(&key),
+            Some(&(std::path::PathBuf::from("/tmp/x.ttf"), 0)),
+            "legacy name must be registered as a resolution alias"
+        );
     }
 }
-
-

@@ -68,9 +68,19 @@ fn png_data_uri(w: usize, h: usize, rgba: &[u8]) -> String {
     let mut buf: Vec<u8> = Vec::new();
     {
         let enc = image::codecs::png::PngEncoder::new(&mut buf);
-        image::ImageEncoder::write_image(enc, rgba, w as u32, h as u32, image::ExtendedColorType::Rgba8).expect("png encode");
+        image::ImageEncoder::write_image(
+            enc,
+            rgba,
+            w as u32,
+            h as u32,
+            image::ExtendedColorType::Rgba8,
+        )
+        .expect("png encode");
     }
-    format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&buf))
+    format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&buf)
+    )
 }
 
 // ── the figures ──────────────────────────────────────────────────────────────────────────────
@@ -108,8 +118,15 @@ fn fig_tone_curves() -> (usize, usize, Vec<u8>) {
         (ViewTransform::PbrNeutral, [110, 190, 140]),
         (ViewTransform::AgX, [235, 180, 90]),
     ] {
-        let p = ColorPipeline { view, ..Default::default() };
-        plot(&mut c, &move |x| crate::color::tonemap(p, [x, x, x])[0], col);
+        let p = ColorPipeline {
+            view,
+            ..Default::default()
+        };
+        plot(
+            &mut c,
+            &move |x| crate::color::tonemap(p, [x, x, x])[0],
+            col,
+        );
     }
     c.rect(0, y1 as usize + 2, w, h, [24, 26, 32]);
     (w, h, c.px)
@@ -124,15 +141,32 @@ fn fig_tone_strip() -> (usize, usize, Vec<u8>) {
     let rows: [(&str, Box<dyn Fn([f32; 3]) -> [u8; 3]>); 3] = [
         // What actually shipped: 1 − e⁻ˣ per channel, written straight into an 8-bit buffer with
         // no display encode at all.
-        ("old", Box::new(|l: [f32; 3]| {
-            [
-                ((1.0 - (-l[0]).exp()) * 255.0) as u8,
-                ((1.0 - (-l[1]).exp()) * 255.0) as u8,
-                ((1.0 - (-l[2]).exp()) * 255.0) as u8,
-            ]
-        })),
-        ("standard", Box::new(|l| crate::color::tonemap8(ColorPipeline { view: ViewTransform::Standard, ..Default::default() }, l))),
-        ("agx", Box::new(|l| crate::color::tonemap8(ColorPipeline::default(), l))),
+        (
+            "old",
+            Box::new(|l: [f32; 3]| {
+                [
+                    ((1.0 - (-l[0]).exp()) * 255.0) as u8,
+                    ((1.0 - (-l[1]).exp()) * 255.0) as u8,
+                    ((1.0 - (-l[2]).exp()) * 255.0) as u8,
+                ]
+            }),
+        ),
+        (
+            "standard",
+            Box::new(|l| {
+                crate::color::tonemap8(
+                    ColorPipeline {
+                        view: ViewTransform::Standard,
+                        ..Default::default()
+                    },
+                    l,
+                )
+            }),
+        ),
+        (
+            "agx",
+            Box::new(|l| crate::color::tonemap8(ColorPipeline::default(), l)),
+        ),
     ];
     for (r, (_, f)) in rows.iter().enumerate() {
         let y0 = 10 + r * 66;
@@ -196,7 +230,10 @@ fn fig_ambient_compare() -> (usize, usize, Vec<u8>) {
     let (sky_col, ground_col) = ([0.85, 0.92, 1.10], [0.24, 0.23, 0.20]);
     sky.calibrate(sky_col, ground_col, [2.6, 2.5, 2.35]);
     let sh = sky.sh9();
-    let p = ColorPipeline { exposure: 0.6, ..Default::default() };
+    let p = ColorPipeline {
+        exposure: 0.6,
+        ..Default::default()
+    };
     let mut px = vec![0u8; w * h * 4];
     for y in 0..h {
         for x in 0..w {
@@ -249,10 +286,19 @@ fn fig_ambient_compare() -> (usize, usize, Vec<u8>) {
 
 fn ball_of(p: &crate::matball::Preview, size: usize) -> (usize, usize, Vec<u8>) {
     let (sky, sh, sun) = crate::matball::preview_sky();
-    (size, size, crate::matball::render(p, &sky, &sh, sun, ColorPipeline::default(), size))
+    (
+        size,
+        size,
+        crate::matball::render(p, &sky, &sh, sun, ColorPipeline::default(), size),
+    )
 }
 
-fn preview(albedo: [f32; 3], rough: f32, metallic: f32, proc: Option<ProcDef>) -> crate::matball::Preview {
+fn preview(
+    albedo: [f32; 3],
+    rough: f32,
+    metallic: f32,
+    proc: Option<ProcDef>,
+) -> crate::matball::Preview {
     crate::matball::Preview {
         albedo: crate::color::srgb_to_linear3(albedo),
         roughness: rough,
@@ -270,20 +316,46 @@ fn fig_denoise() -> ((usize, usize, Vec<u8>), (usize, usize, Vec<u8>)) {
     use crate::radiance_export::ExportTri;
 
     let mut tris: Vec<ExportTri> = Vec::new();
-    let mut quad = |a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3], rgb: [f32; 3], rough: f32| {
-        tris.push(ExportTri::plain([a, b, c], rgb, rough, 1.0));
-        tris.push(ExportTri::plain([a, c, d], rgb, rough, 1.0));
-    };
+    let mut quad =
+        |a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3], rgb: [f32; 3], rough: f32| {
+            tris.push(ExportTri::plain([a, b, c], rgb, rough, 1.0));
+            tris.push(ExportTri::plain([a, c, d], rgb, rough, 1.0));
+        };
     // Floor, back wall, side wall — a corner, which is where indirect light gets interesting.
-    quad([-3.0, -3.0, 0.0], [3.0, -3.0, 0.0], [3.0, 3.0, 0.0], [-3.0, 3.0, 0.0], [0.55, 0.53, 0.5], 0.7);
-    quad([-3.0, 3.0, 0.0], [3.0, 3.0, 0.0], [3.0, 3.0, 3.0], [-3.0, 3.0, 3.0], [0.7, 0.35, 0.28], 0.9);
-    quad([-3.0, -3.0, 0.0], [-3.0, 3.0, 0.0], [-3.0, 3.0, 3.0], [-3.0, -3.0, 3.0], [0.35, 0.5, 0.4], 0.9);
+    quad(
+        [-3.0, -3.0, 0.0],
+        [3.0, -3.0, 0.0],
+        [3.0, 3.0, 0.0],
+        [-3.0, 3.0, 0.0],
+        [0.55, 0.53, 0.5],
+        0.7,
+    );
+    quad(
+        [-3.0, 3.0, 0.0],
+        [3.0, 3.0, 0.0],
+        [3.0, 3.0, 3.0],
+        [-3.0, 3.0, 3.0],
+        [0.7, 0.35, 0.28],
+        0.9,
+    );
+    quad(
+        [-3.0, -3.0, 0.0],
+        [-3.0, 3.0, 0.0],
+        [-3.0, 3.0, 3.0],
+        [-3.0, -3.0, 3.0],
+        [0.35, 0.5, 0.4],
+        0.9,
+    );
     // A faceted sphere (icosphere-ish by lat/long) sitting on the floor.
     let (cx, cy, cz, r) = (0.3f32, 0.2f32, 0.75f32, 0.75f32);
     let pt = |i: usize, j: usize| {
         let th = (i as f32 / 16.0) * std::f32::consts::PI;
         let ph = (j as f32 / 24.0) * std::f32::consts::TAU;
-        [cx + r * th.sin() * ph.cos(), cy + r * th.sin() * ph.sin(), cz + r * th.cos()]
+        [
+            cx + r * th.sin() * ph.cos(),
+            cy + r * th.sin() * ph.sin(),
+            cz + r * th.cos(),
+        ]
     };
     for i in 0..16 {
         for j in 0..24 {
@@ -300,11 +372,34 @@ fn fig_denoise() -> ((usize, usize, Vec<u8>), (usize, usize, Vec<u8>)) {
     let sun = Vec3::new(-0.4, -0.5, 0.77).normalize();
     let mut dome = Sky::new(sun, env::DEFAULT_TURBIDITY);
     dome.calibrate([0.55, 0.60, 0.72], [0.16, 0.15, 0.13], [2.4, 2.3, 2.15]);
-    let sky = PtSky { sun_dir: sun, sun_col: [2.4, 2.3, 2.15], sky_col: dome.radiance(Vec3::Z), ground_col: dome.ground, dome: Some(dome), env: None, env_strength: 1.0, env_rot: 0.0 };
-    let cam = Camera { eye: Vec3::new(2.6, -3.4, 2.0), target: Vec3::new(0.0, 0.3, 0.8), fov_deg: 45.0 };
+    let sky = PtSky {
+        sun_dir: sun,
+        sun_col: [2.4, 2.3, 2.15],
+        sky_col: dome.radiance(Vec3::Z),
+        ground_col: dome.ground,
+        dome: Some(dome),
+        env: None,
+        env_strength: 1.0,
+        env_rot: 0.0,
+    };
+    let cam = Camera {
+        eye: Vec3::new(2.6, -3.4, 2.0),
+        target: Vec3::new(0.0, 0.3, 0.8),
+        fov_deg: 45.0,
+    };
     let (w, h) = (400usize, 300usize);
-    let set = Settings { w, h, passes: 8, max_depth: 5, color: ColorPipeline { exposure: 0.4, ..Default::default() } };
-    let job = crate::pathtrace::RenderJob::start(scene, cam, sky, set, crate::pathtrace::Device::Cpu);
+    let set = Settings {
+        w,
+        h,
+        passes: 8,
+        max_depth: 5,
+        color: ColorPipeline {
+            exposure: 0.4,
+            ..Default::default()
+        },
+    };
+    let job =
+        crate::pathtrace::RenderJob::start(scene, cam, sky, set, crate::pathtrace::Device::Cpu);
     let t0 = std::time::Instant::now();
     while !job.is_done() && t0.elapsed().as_secs() < 300 {
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -317,14 +412,22 @@ fn fig_denoise() -> ((usize, usize, Vec<u8>), (usize, usize, Vec<u8>)) {
 #[test]
 #[ignore = "writes report figures; run explicitly"]
 fn generate_report_figures() {
-    let dir = std::env::var("SIMLUX_FIG_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+    let dir = std::env::var("SIMLUX_FIG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
     std::fs::create_dir_all(&dir).expect("figure dir");
     let mut figs: Vec<(String, String)> = Vec::new();
     let pngdir = dir.clone();
     let mut add = |name: &str, (w, h, px): (usize, usize, Vec<u8>)| {
         let uri = png_data_uri(w, h, &px);
         // Also drop the PNG on disk, so a figure can be eyeballed without opening the report.
-        let _ = image::save_buffer(pngdir.join(format!("{name}.png")), &px, w as u32, h as u32, image::ExtendedColorType::Rgba8);
+        let _ = image::save_buffer(
+            pngdir.join(format!("{name}.png")),
+            &px,
+            w as u32,
+            h as u32,
+            image::ExtendedColorType::Rgba8,
+        );
         figs.push((name.to_string(), uri));
         eprintln!("  {name}: {w}×{h}");
     };
@@ -339,7 +442,10 @@ fn generate_report_figures() {
 
     // The rebuilt library, on measured values.
     for p in crate::factory::material_presets() {
-        let name = format!("mat_{}", p.name.to_lowercase().replace([' ', '(', ')', '—'], "_"));
+        let name = format!(
+            "mat_{}",
+            p.name.to_lowercase().replace([' ', '(', ')', '—'], "_")
+        );
         let prev = crate::matball::Preview {
             albedo: crate::color::srgb_to_linear3(p.def.avg_color()),
             roughness: p.roughness,
@@ -348,7 +454,11 @@ fn generate_report_figures() {
             opacity: p.opacity,
             emission: {
                 let e = crate::color::srgb_to_linear3(p.emission);
-                [e[0] * p.emission_strength, e[1] * p.emission_strength, e[2] * p.emission_strength]
+                [
+                    e[0] * p.emission_strength,
+                    e[1] * p.emission_strength,
+                    e[2] * p.emission_strength,
+                ]
             },
             proc: Some(p.def),
         };
@@ -356,13 +466,26 @@ fn generate_report_figures() {
     }
 
     // Procedural PBR: the same oak with and without the finish/relief the pattern now drives.
-    let plain_oak = ProcDef { surf_rough: [0.5, 0.5], bump: 0.0, ..ProcDef::oak() };
-    add("proc_before", ball_of(&preview([0.5; 3], 0.6, 0.0, Some(plain_oak)), 200));
-    add("proc_after", ball_of(&preview([0.5; 3], 0.6, 0.0, Some(ProcDef::oak())), 200));
+    let plain_oak = ProcDef {
+        surf_rough: [0.5, 0.5],
+        bump: 0.0,
+        ..ProcDef::oak()
+    };
+    add(
+        "proc_before",
+        ball_of(&preview([0.5; 3], 0.6, 0.0, Some(plain_oak)), 200),
+    );
+    add(
+        "proc_after",
+        ball_of(&preview([0.5; 3], 0.6, 0.0, Some(ProcDef::oak())), 200),
+    );
 
     // Roughness sweep on a metal — what the split-sum environment term buys.
     for (k, r) in [0.05f32, 0.2, 0.45, 0.8].iter().enumerate() {
-        add(&format!("rough_{k}"), ball_of(&preview([0.95, 0.96, 0.97], *r, 1.0, None), 128));
+        add(
+            &format!("rough_{k}"),
+            ball_of(&preview([0.95, 0.96, 0.97], *r, 1.0, None), 128),
+        );
     }
     // …and a checker, which is the clearest demonstration that roughness follows the pattern.
     let tiles = ProcDef {
@@ -377,7 +500,10 @@ fn generate_report_figures() {
         surf_rough: [0.08, 0.75],
         bump: 0.0,
     };
-    add("proc_tiles", ball_of(&preview([0.5; 3], 0.3, 0.0, Some(tiles)), 200));
+    add(
+        "proc_tiles",
+        ball_of(&preview([0.5; 3], 0.3, 0.0, Some(tiles)), 200),
+    );
 
     let (raw, den) = fig_denoise();
     add("pt_noisy", raw);
@@ -391,5 +517,10 @@ fn generate_report_figures() {
     js.push_str("};\n</script>\n");
     let out = dir.join("figs.js");
     std::fs::write(&out, &js).expect("write figs.js");
-    eprintln!("\n{} figures -> {} ({} KB)", figs.len(), out.display(), js.len() / 1024);
+    eprintln!(
+        "\n{} figures -> {} ({} KB)",
+        figs.len(),
+        out.display(),
+        js.len() / 1024
+    );
 }

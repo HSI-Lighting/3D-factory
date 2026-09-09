@@ -85,13 +85,15 @@ fn parse_mtl_opacity(text: &str) -> std::collections::HashMap<String, f32> {
                 seen_d = false;
             }
             Some("d") => {
-                if let (Some(name), Some(v)) = (&cur, it.next().and_then(|s| s.parse::<f32>().ok())) {
+                if let (Some(name), Some(v)) = (&cur, it.next().and_then(|s| s.parse::<f32>().ok()))
+                {
                     map.insert(name.clone(), v.clamp(0.0, 1.0));
                     seen_d = true;
                 }
             }
             Some("Tr") if !seen_d => {
-                if let (Some(name), Some(v)) = (&cur, it.next().and_then(|s| s.parse::<f32>().ok())) {
+                if let (Some(name), Some(v)) = (&cur, it.next().and_then(|s| s.parse::<f32>().ok()))
+                {
                     map.insert(name.clone(), (1.0 - v).clamp(0.0, 1.0));
                 }
             }
@@ -143,8 +145,11 @@ pub fn parse_obj_dir(text: &str, base_dir: Option<&std::path::Path>) -> ObjMesh 
             if let Ok(rd) = std::fs::read_dir(dir) {
                 for ent in rd.flatten() {
                     let p = ent.path();
-                    let is_mtl = p.extension().and_then(|e| e.to_str())
-                        .map(|e| e.eq_ignore_ascii_case("mtl")).unwrap_or(false);
+                    let is_mtl = p
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("mtl"))
+                        .unwrap_or(false);
                     if is_mtl {
                         if let Ok(mtl) = std::fs::read_to_string(&p) {
                             opacity.extend(parse_mtl_opacity(&mtl));
@@ -173,7 +178,10 @@ pub fn parse_obj_dir(text: &str, base_dir: Option<&std::path::Path>) -> ObjMesh 
                 }
             }
             Some("usemtl") => {
-                cur_alpha = it.next().and_then(|n| opacity.get(n).copied()).unwrap_or(1.0);
+                cur_alpha = it
+                    .next()
+                    .and_then(|n| opacity.get(n).copied())
+                    .unwrap_or(1.0);
             }
             Some("f") => {
                 let refs: Vec<(i64, Option<i64>)> = it.filter_map(parse_ref).collect();
@@ -189,7 +197,10 @@ pub fn parse_obj_dir(text: &str, base_dir: Option<&std::path::Path>) -> ObjMesh 
                     for (j, &(vi, ni)) in tri.iter().enumerate() {
                         match resolve(vi, verts.len()) {
                             Some(i) => ps[j] = verts[i],
-                            None => { ok = false; break; }
+                            None => {
+                                ok = false;
+                                break;
+                            }
                         }
                         ns[j] = ni.and_then(|n| resolve(n, norms.len())).map(|i| norms[i]);
                     }
@@ -307,7 +318,11 @@ fn read_color(b: &[u8], mut pos: usize, end: usize) -> Option<[f32; 3]> {
         let body = pos + 6;
         match id {
             0x0011 | 0x0012 if body + 3 <= ce => {
-                return Some([b[body] as f32 / 255.0, b[body + 1] as f32 / 255.0, b[body + 2] as f32 / 255.0]);
+                return Some([
+                    b[body] as f32 / 255.0,
+                    b[body + 1] as f32 / 255.0,
+                    b[body + 2] as f32 / 255.0,
+                ]);
             }
             0x0010 | 0x0013 if body + 12 <= ce => {
                 return Some([le_f32(b, body), le_f32(b, body + 4), le_f32(b, body + 8)]);
@@ -340,7 +355,9 @@ fn walk_3ds(b: &[u8], mut pos: usize, end: usize, out: &mut ObjMesh) {
                     while p + 6 <= ce {
                         let sid = le_u16(b, p);
                         let slen = le_u32(b, p + 2) as usize;
-                        if slen < 6 { break; }
+                        if slen < 6 {
+                            break;
+                        }
                         let sce = (p + slen).min(ce);
                         if sid == 0xa020 {
                             out.color = read_color(b, p + 6, sce);
@@ -497,16 +514,24 @@ impl<'a> FbxCursor<'a> {
         self.pos = end;
         Some(s)
     }
-    fn u8(&mut self) -> Option<u8> { self.take(1).map(|b| b[0]) }
+    fn u8(&mut self) -> Option<u8> {
+        self.take(1).map(|b| b[0])
+    }
     fn u32(&mut self) -> Option<u32> {
-        self.take(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        self.take(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
     fn u64(&mut self) -> Option<u64> {
-        self.take(8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        self.take(8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
     }
     /// A node offset field: `u64` on FBX 7.5+, else `u32`.
     fn offset(&mut self, v75: bool) -> Option<u64> {
-        if v75 { self.u64() } else { self.u32().map(|x| x as u64) }
+        if v75 {
+            self.u64()
+        } else {
+            self.u32().map(|x| x as u64)
+        }
     }
 }
 
@@ -535,36 +560,65 @@ impl FbxNode {
         self.children.iter().find(|c| c.name == name)
     }
     fn i64_at(&self, i: usize) -> Option<i64> {
-        match self.props.get(i)? { FbxVal::I(x) => Some(*x), _ => None }
+        match self.props.get(i)? {
+            FbxVal::I(x) => Some(*x),
+            _ => None,
+        }
     }
     fn str_at(&self, i: usize) -> Option<&str> {
-        match self.props.get(i)? { FbxVal::S(s) => Some(s.as_str()), _ => None }
+        match self.props.get(i)? {
+            FbxVal::S(s) => Some(s.as_str()),
+            _ => None,
+        }
     }
     /// The last F64 property value — an FBX `P` scalar (e.g. `Opacity`) puts its number last.
     fn last_f64(&self) -> Option<f64> {
-        self.props.iter().rev().find_map(|p| if let FbxVal::F(x) = p { Some(*x) } else { None })
+        self.props
+            .iter()
+            .rev()
+            .find_map(|p| if let FbxVal::F(x) = p { Some(*x) } else { None })
     }
     /// The last three F64 property values (FBX `P` vectors put x,y,z at the tail).
     fn f64_tail3(&self) -> [f64; 3] {
-        let fs: Vec<f64> = self.props.iter()
+        let fs: Vec<f64> = self
+            .props
+            .iter()
             .filter_map(|p| if let FbxVal::F(x) = p { Some(*x) } else { None })
             .collect();
         let n = fs.len();
-        if n >= 3 { [fs[n - 3], fs[n - 2], fs[n - 1]] } else { [0.0; 3] }
+        if n >= 3 {
+            [fs[n - 3], fs[n - 2], fs[n - 1]]
+        } else {
+            [0.0; 3]
+        }
     }
     fn first_f64_arr(&self) -> Option<&Vec<f64>> {
-        self.props.iter().find_map(|p| if let FbxVal::Fa(a) = p { Some(a) } else { None })
+        self.props
+            .iter()
+            .find_map(|p| if let FbxVal::Fa(a) = p { Some(a) } else { None })
     }
     fn first_i32_arr(&self) -> Option<&Vec<i32>> {
-        self.props.iter().find_map(|p| if let FbxVal::Ia(a) = p { Some(a) } else { None })
+        self.props
+            .iter()
+            .find_map(|p| if let FbxVal::Ia(a) = p { Some(a) } else { None })
     }
     /// The first raw blob property — an embedded texture's image bytes (`Video > Content`).
     fn first_raw(&self) -> Option<&[u8]> {
-        self.props.iter().find_map(|p| if let FbxVal::Raw(b) = p { Some(b.as_slice()) } else { None })
+        self.props.iter().find_map(|p| {
+            if let FbxVal::Raw(b) = p {
+                Some(b.as_slice())
+            } else {
+                None
+            }
+        })
     }
     /// The string value of the first child named in `names` that carries a non-empty one.
     fn str_child(&self, names: &[&str]) -> Option<&str> {
-        names.iter().find_map(|k| self.child(k).and_then(|c| c.str_at(0)).filter(|s| !s.is_empty()))
+        names.iter().find_map(|k| {
+            self.child(k)
+                .and_then(|c| c.str_at(0))
+                .filter(|s| !s.is_empty())
+        })
     }
 }
 
@@ -603,7 +657,11 @@ fn fbx_parse_node(cur: &mut FbxCursor, v75: bool) -> Option<Option<FbxNode>> {
     if end_offset >= cur.pos && end_offset <= cur.buf.len() {
         cur.pos = end_offset;
     }
-    Some(Some(FbxNode { name, props, children }))
+    Some(Some(FbxNode {
+        name,
+        props,
+        children,
+    }))
 }
 
 /// Read one property value, advancing the cursor. Scalars, strings and raw blobs are always
@@ -612,16 +670,35 @@ fn fbx_parse_node(cur: &mut FbxCursor, v75: bool) -> Option<Option<FbxNode>> {
 fn fbx_value(cur: &mut FbxCursor) -> Option<FbxVal> {
     let ty = cur.u8()?;
     Some(match ty {
-        b'Y' => { let b = cur.take(2)?; FbxVal::I(i16::from_le_bytes([b[0], b[1]]) as i64) }
+        b'Y' => {
+            let b = cur.take(2)?;
+            FbxVal::I(i16::from_le_bytes([b[0], b[1]]) as i64)
+        }
         b'C' => FbxVal::I(cur.u8()? as i64),
-        b'I' => { let b = cur.take(4)?; FbxVal::I(i32::from_le_bytes(b.try_into().unwrap()) as i64) }
-        b'L' => { let b = cur.take(8)?; FbxVal::I(i64::from_le_bytes(b.try_into().unwrap())) }
-        b'F' => { let b = cur.take(4)?; FbxVal::F(f32::from_le_bytes(b.try_into().unwrap()) as f64) }
-        b'D' => { let b = cur.take(8)?; FbxVal::F(f64::from_le_bytes(b.try_into().unwrap())) }
+        b'I' => {
+            let b = cur.take(4)?;
+            FbxVal::I(i32::from_le_bytes(b.try_into().unwrap()) as i64)
+        }
+        b'L' => {
+            let b = cur.take(8)?;
+            FbxVal::I(i64::from_le_bytes(b.try_into().unwrap()))
+        }
+        b'F' => {
+            let b = cur.take(4)?;
+            FbxVal::F(f32::from_le_bytes(b.try_into().unwrap()) as f64)
+        }
+        b'D' => {
+            let b = cur.take(8)?;
+            FbxVal::F(f64::from_le_bytes(b.try_into().unwrap()))
+        }
         b'S' | b'R' => {
             let n = cur.u32()? as usize;
             let b = cur.take(n)?;
-            if ty == b'S' { FbxVal::S(String::from_utf8_lossy(b).into_owned()) } else { FbxVal::Raw(b.to_vec()) }
+            if ty == b'S' {
+                FbxVal::S(String::from_utf8_lossy(b).into_owned())
+            } else {
+                FbxVal::Raw(b.to_vec())
+            }
         }
         b'f' | b'd' | b'l' | b'i' | b'b' => {
             let len = cur.u32()? as usize;
@@ -638,15 +715,27 @@ fn fbx_value(cur: &mut FbxCursor) -> Option<FbxVal> {
             };
             match ty {
                 b'd' if bytes.len() >= len * 8 => FbxVal::Fa(
-                    bytes.chunks_exact(8).take(len).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect(),
+                    bytes
+                        .chunks_exact(8)
+                        .take(len)
+                        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                        .collect(),
                 ),
                 // f32 arrays widen to the same Fa. Blender writes UVs as `d`, but the Autodesk SDK
                 // (Max/Maya) writes some layers as `f` — skipping those lost their UVs entirely.
                 b'f' if bytes.len() >= len * 4 => FbxVal::Fa(
-                    bytes.chunks_exact(4).take(len).map(|c| f32::from_le_bytes(c.try_into().unwrap()) as f64).collect(),
+                    bytes
+                        .chunks_exact(4)
+                        .take(len)
+                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()) as f64)
+                        .collect(),
                 ),
                 b'i' if bytes.len() >= len * 4 => FbxVal::Ia(
-                    bytes.chunks_exact(4).take(len).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect(),
+                    bytes
+                        .chunks_exact(4)
+                        .take(len)
+                        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                        .collect(),
                 ),
                 _ => FbxVal::Skip,
             }
@@ -698,17 +787,28 @@ fn fbx_local_matrix(x: &FbxXform) -> glam::DMat4 {
     let tr = |v: [f64; 3]| M::from_translation(V::from(v));
     let tri = |v: [f64; 3]| M::from_translation(-V::from(v));
     let r = fbx_euler(x.order, x.r);
-    let rpre = fbx_euler(0, x.pre_r);          // pre/post rotation are always XYZ order
+    let rpre = fbx_euler(0, x.pre_r); // pre/post rotation are always XYZ order
     let rpost = fbx_euler(0, x.post_r).inverse();
     let s = M::from_scale(V::from(x.s));
-    tr(x.t) * tr(x.r_off) * tr(x.r_piv) * rpre * r * rpost * tri(x.r_piv)
-        * tr(x.s_off) * tr(x.s_piv) * s * tri(x.s_piv)
+    tr(x.t)
+        * tr(x.r_off)
+        * tr(x.r_piv)
+        * rpre
+        * r
+        * rpost
+        * tri(x.r_piv)
+        * tr(x.s_off)
+        * tr(x.s_piv)
+        * s
+        * tri(x.s_piv)
 }
 
 /// Simple TRS (translate·rotate·scale, XYZ) — used for the geometric transform, which has no
 /// pivots/offsets in the FBX spec.
 fn fbx_trs(t: [f64; 3], r_deg: [f64; 3], s: [f64; 3]) -> glam::DMat4 {
-    glam::DMat4::from_translation(glam::DVec3::from(t)) * fbx_euler(0, r_deg) * glam::DMat4::from_scale(glam::DVec3::from(s))
+    glam::DMat4::from_translation(glam::DVec3::from(t))
+        * fbx_euler(0, r_deg)
+        * glam::DMat4::from_scale(glam::DVec3::from(s))
 }
 
 /// Recursively collect the pieces we need from the node tree: every `Geometry`'s
@@ -729,18 +829,24 @@ fn fbx_scan<'a>(
             "Geometry" => {
                 if let (Some(v), Some(i)) = (
                     n.child("Vertices").and_then(|c| c.first_f64_arr()),
-                    n.child("PolygonVertexIndex").and_then(|c| c.first_i32_arr()),
+                    n.child("PolygonVertexIndex")
+                        .and_then(|c| c.first_i32_arr()),
                 ) {
                     geoms.push((n.i64_at(0), v, i));
                 }
             }
             "Model" => {
                 if let Some(id) = n.i64_at(0) {
-                    let mut x = FbxXform { s: [1.0; 3], ..Default::default() };
+                    let mut x = FbxXform {
+                        s: [1.0; 3],
+                        ..Default::default()
+                    };
                     let (mut gt, mut gr, mut gs) = ([0.0; 3], [0.0; 3], [1.0; 3]);
                     if let Some(p70) = n.child("Properties70") {
                         for c in &p70.children {
-                            if c.name != "P" { continue; }
+                            if c.name != "P" {
+                                continue;
+                            }
                             match c.str_at(0) {
                                 Some("Lcl Translation") => x.t = c.f64_tail3(),
                                 Some("Lcl Rotation") => x.r = c.f64_tail3(),
@@ -752,7 +858,9 @@ fn fbx_scan<'a>(
                                 Some("ScalingOffset") => x.s_off = c.f64_tail3(),
                                 Some("ScalingPivot") => x.s_piv = c.f64_tail3(),
                                 Some("RotationOrder") => {
-                                    if let Some(FbxVal::I(o)) = c.props.last() { x.order = *o; }
+                                    if let Some(FbxVal::I(o)) = c.props.last() {
+                                        x.order = *o;
+                                    }
                                 }
                                 Some("GeometricTranslation") => gt = c.f64_tail3(),
                                 Some("GeometricRotation") => gr = c.f64_tail3(),
@@ -762,7 +870,10 @@ fn fbx_scan<'a>(
                         }
                     }
                     if std::env::var("RUSTCAD_FBX_DEBUG").is_ok()
-                        && (x.r != [0.0; 3] || x.pre_r != [0.0; 3] || x.post_r != [0.0; 3] || x.order != 0)
+                        && (x.r != [0.0; 3]
+                            || x.pre_r != [0.0; 3]
+                            || x.post_r != [0.0; 3]
+                            || x.order != 0)
                     {
                         eprintln!(
                             "  MODEL id={id} order={} lcl_r=({:.1},{:.1},{:.1}) pre_r=({:.1},{:.1},{:.1}) post_r=({:.1},{:.1},{:.1})",
@@ -781,7 +892,9 @@ fn fbx_scan<'a>(
                 }
             }
             "P" if n.str_at(0) == Some("UpAxis") => {
-                if let Some(FbxVal::I(x)) = n.props.last() { *up_axis = *x; }
+                if let Some(FbxVal::I(x)) = n.props.last() {
+                    *up_axis = *x;
+                }
             }
             // FBX measures in CENTIMETRES: `UnitScaleFactor` is how many centimetres one file unit
             // is. Ignoring it meant every FBX imported 100x too big — invisible for furniture,
@@ -789,7 +902,9 @@ fn fbx_scan<'a>(
             // scale, like a door handle.
             "P" if n.str_at(0) == Some("UnitScaleFactor") => {
                 if let Some(u) = n.last_f64() {
-                    if u > 1e-9 { *unit_cm = u; }
+                    if u > 1e-9 {
+                        *unit_cm = u;
+                    }
                 }
             }
             _ => {}
@@ -804,7 +919,10 @@ fn fbx_model_world(
     models: &std::collections::HashMap<i64, (glam::DMat4, glam::DMat4)>,
     parent: &std::collections::HashMap<i64, i64>,
 ) -> glam::DMat4 {
-    let mut m = models.get(&id).map(|x| x.0).unwrap_or(glam::DMat4::IDENTITY);
+    let mut m = models
+        .get(&id)
+        .map(|x| x.0)
+        .unwrap_or(glam::DMat4::IDENTITY);
     let mut cur = id;
     for _ in 0..256 {
         // Walk up while the parent is ALSO a Model (stop at the scene root).
@@ -832,39 +950,64 @@ fn fbx_build_scene(root: &[FbxNode]) -> (ObjMesh, usize, usize, usize) {
 /// shell (the bundled door's frame), which reads as an opaque grey block from behind. The wall
 /// opening provides the real frame, so dropping it lets the door read correctly from both sides.
 /// ONLY used for the aperture door — ordinary furniture/window import passes `false`.
-fn fbx_build_scene_opt(root: &[FbxNode], drop_full_depth_shell: bool) -> (ObjMesh, usize, usize, usize) {
+fn fbx_build_scene_opt(
+    root: &[FbxNode],
+    drop_full_depth_shell: bool,
+) -> (ObjMesh, usize, usize, usize) {
     let mut out = ObjMesh::default();
     let mut geoms: Vec<(Option<i64>, &Vec<f64>, &Vec<i32>)> = Vec::new();
     let mut models = std::collections::HashMap::new();
     let mut parent = std::collections::HashMap::new();
     let mut up_axis: i64 = 1; // FBX default Y-up
     let mut unit_cm: f64 = 1.0; // centimetres per file unit
-    fbx_scan(root, &mut geoms, &mut models, &mut parent, &mut up_axis, &mut unit_cm);
+    fbx_scan(
+        root,
+        &mut geoms,
+        &mut models,
+        &mut parent,
+        &mut up_axis,
+        &mut unit_cm,
+    );
 
     // Resolve each geometry's world transform up front (needed twice: for the shell test and to emit).
     let world_of = |gid: &Option<i64>| -> glam::DMat4 {
         let mid = gid.and_then(|g| parent.get(&g)).copied();
         match mid {
-            Some(mid) if models.contains_key(&mid) => fbx_model_world(mid, &models, &parent) * models[&mid].1,
+            Some(mid) if models.contains_key(&mid) => {
+                fbx_model_world(mid, &models, &parent) * models[&mid].1
+            }
             _ => glam::DMat4::IDENTITY,
         }
     };
     // Per-geometry world AABB, and the overall AABB, so we can find the thin (depth) axis.
-    let boxes: Vec<([f64; 3], [f64; 3])> = geoms.iter().map(|(gid, verts, _)| {
-        let world = world_of(gid);
-        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
-        for c in verts.chunks_exact(3) {
-            let w = world.transform_point3(glam::DVec3::new(c[0], c[1], c[2]));
-            for (k, v) in [w.x, w.y, w.z].into_iter().enumerate() { lo[k] = lo[k].min(v); hi[k] = hi[k].max(v); }
-        }
-        (lo, hi)
-    }).collect();
+    let boxes: Vec<([f64; 3], [f64; 3])> = geoms
+        .iter()
+        .map(|(gid, verts, _)| {
+            let world = world_of(gid);
+            let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+            for c in verts.chunks_exact(3) {
+                let w = world.transform_point3(glam::DVec3::new(c[0], c[1], c[2]));
+                for (k, v) in [w.x, w.y, w.z].into_iter().enumerate() {
+                    lo[k] = lo[k].min(v);
+                    hi[k] = hi[k].max(v);
+                }
+            }
+            (lo, hi)
+        })
+        .collect();
     let (mut olo, mut ohi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
     for (lo, hi) in &boxes {
-        for k in 0..3 { if lo[k].is_finite() { olo[k] = olo[k].min(lo[k]); ohi[k] = ohi[k].max(hi[k]); } }
+        for k in 0..3 {
+            if lo[k].is_finite() {
+                olo[k] = olo[k].min(lo[k]);
+                ohi[k] = ohi[k].max(hi[k]);
+            }
+        }
     }
-    let osize = [ohi[0]-olo[0], ohi[1]-olo[1], ohi[2]-olo[2]];
-    let thin = (0..3).min_by(|&a, &b| osize[a].partial_cmp(&osize[b]).unwrap()).unwrap_or(2);
+    let osize = [ohi[0] - olo[0], ohi[1] - olo[1], ohi[2] - olo[2]];
+    let thin = (0..3)
+        .min_by(|&a, &b| osize[a].partial_cmp(&osize[b]).unwrap())
+        .unwrap_or(2);
     let shell_cut = osize[thin] * 0.85; // a part spanning ≥85% of the depth is the surround shell
 
     let n_geoms = geoms.len();
@@ -879,7 +1022,9 @@ fn fbx_build_scene_opt(root: &[FbxNode], drop_full_depth_shell: bool) -> (ObjMes
         if drop_full_depth_shell {
             let (lo, hi) = boxes[i];
             if osize[thin] > 1e-6 && (hi[thin] - lo[thin]) >= shell_cut {
-                if dbg { eprintln!("  DROP shell geom id={:?} (spans full depth)", gid); }
+                if dbg {
+                    eprintln!("  DROP shell geom id={:?} (spans full depth)", gid);
+                }
                 continue;
             }
         }
@@ -887,12 +1032,18 @@ fn fbx_build_scene_opt(root: &[FbxNode], drop_full_depth_shell: bool) -> (ObjMes
             // Local bbox of this part + its placement, to spot a mis-transformed piece.
             let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
             for c in verts.chunks_exact(3) {
-                for k in 0..3 { lo[k] = lo[k].min(c[k]); hi[k] = hi[k].max(c[k]); }
+                for k in 0..3 {
+                    lo[k] = lo[k].min(c[k]);
+                    hi[k] = hi[k].max(c[k]);
+                }
             }
             let (mut wlo, mut whi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
             for c in verts.chunks_exact(3) {
                 let w = world.transform_point3(glam::DVec3::new(c[0], c[1], c[2]));
-                for (k, v) in [w.x, w.y, w.z].into_iter().enumerate() { wlo[k]=wlo[k].min(v); whi[k]=whi[k].max(v); }
+                for (k, v) in [w.x, w.y, w.z].into_iter().enumerate() {
+                    wlo[k] = wlo[k].min(v);
+                    whi[k] = whi[k].max(v);
+                }
             }
             eprintln!(
                 "  geom id={:?} verts={} local=({:.0},{:.0},{:.0}) world[X {:.0}..{:.0} Y {:.0}..{:.0} Z {:.0}..{:.0}]",
@@ -909,25 +1060,54 @@ fn fbx_build_scene_opt(root: &[FbxNode], drop_full_depth_shell: bool) -> (ObjMes
 /// Fan-triangulate one geometry, transforming each vertex by `world` and converting to Z-up.
 /// A negative `PolygonVertexIndex` is the bit-negated LAST vertex of a polygon (`real = !neg`).
 /// `unit_cm` is centimetres per file unit (`UnitScaleFactor`); metres = unit * unit_cm / 100.
-fn fbx_emit_geometry(verts: &[f64], indices: &[i32], world: &glam::DMat4, up_axis: i64, unit_cm: f64, out: &mut ObjMesh) {
+fn fbx_emit_geometry(
+    verts: &[f64],
+    indices: &[i32],
+    world: &glam::DMat4,
+    up_axis: i64,
+    unit_cm: f64,
+    out: &mut ObjMesh,
+) {
     let to_m = unit_cm / 100.0;
     let vcount = verts.len() / 3;
     let pos = |i: usize| -> [f32; 3] {
-        let w = world.transform_point3(glam::DVec3::new(verts[3 * i], verts[3 * i + 1], verts[3 * i + 2]));
+        let w = world.transform_point3(glam::DVec3::new(
+            verts[3 * i],
+            verts[3 * i + 1],
+            verts[3 * i + 2],
+        ));
         // Scene up-axis → app Z-up. UpAxis 1=Y (default) rotates; 2=Z is already correct.
-        let v = if up_axis == 2 { w } else { glam::DVec3::new(w.x, -w.z, w.y) };
-        [(v.x * to_m) as f32, (v.y * to_m) as f32, (v.z * to_m) as f32]
+        let v = if up_axis == 2 {
+            w
+        } else {
+            glam::DVec3::new(w.x, -w.z, w.y)
+        };
+        [
+            (v.x * to_m) as f32,
+            (v.y * to_m) as f32,
+            (v.z * to_m) as f32,
+        ]
     };
     let mut poly: Vec<usize> = Vec::new();
     for &raw in indices {
-        let (idx, last) = if raw < 0 { ((!raw) as usize, true) } else { (raw as usize, false) };
-        if idx < vcount { poly.push(idx); }
+        let (idx, last) = if raw < 0 {
+            ((!raw) as usize, true)
+        } else {
+            (raw as usize, false)
+        };
+        if idx < vcount {
+            poly.push(idx);
+        }
         if last {
             for k in 1..poly.len().saturating_sub(1) {
                 let (a, b, c) = (pos(poly[0]), pos(poly[k]), pos(poly[k + 1]));
                 let n = flat_normal(a, b, c);
-                out.positions.push(a); out.positions.push(b); out.positions.push(c);
-                out.normals.push(n); out.normals.push(n); out.normals.push(n);
+                out.positions.push(a);
+                out.positions.push(b);
+                out.positions.push(c);
+                out.normals.push(n);
+                out.normals.push(n);
+                out.normals.push(n);
             }
             poly.clear();
         }
@@ -1009,8 +1189,21 @@ struct FbxPbrScan<'a> {
 /// matched as substrings against the `OP` connection's property name (`"NormalMap"`,
 /// `"Maya|specularColor"`, `"3dsMax|Parameters|bump_map"`, …).
 const NON_COLOUR_MAPS: &[&str] = &[
-    "normal", "bump", "specular", "shininess", "reflect", "displacement", "emissive",
-    "transparen", "ambient", "occlusion", "roughness", "metal", "gloss", "opacity", "vector",
+    "normal",
+    "bump",
+    "specular",
+    "shininess",
+    "reflect",
+    "displacement",
+    "emissive",
+    "transparen",
+    "ambient",
+    "occlusion",
+    "roughness",
+    "metal",
+    "gloss",
+    "opacity",
+    "vector",
 ];
 
 /// The filename a Texture/Video node carries. `RelativeFilename` is tried FIRST because it is
@@ -1074,12 +1267,27 @@ fn fbx_uv_layer(g: &FbxNode) -> FbxUvLayer<'_> {
     const NONE_I: &[i32] = &[];
     let n = match g.child("LayerElementUV") {
         Some(n) => n,
-        None => return FbxUvLayer { uvs: NONE_F, index: NONE_I, indexed: false, by_vertex: false },
+        None => {
+            return FbxUvLayer {
+                uvs: NONE_F,
+                index: NONE_I,
+                indexed: false,
+                by_vertex: false,
+            }
+        }
     };
     let mode = |k: &str| n.child(k).and_then(|c| c.str_at(0)).unwrap_or("");
     FbxUvLayer {
-        uvs: n.child("UV").and_then(|c| c.first_f64_arr()).map(|v| v.as_slice()).unwrap_or(NONE_F),
-        index: n.child("UVIndex").and_then(|c| c.first_i32_arr()).map(|v| v.as_slice()).unwrap_or(NONE_I),
+        uvs: n
+            .child("UV")
+            .and_then(|c| c.first_f64_arr())
+            .map(|v| v.as_slice())
+            .unwrap_or(NONE_F),
+        index: n
+            .child("UVIndex")
+            .and_then(|c| c.first_i32_arr())
+            .map(|v| v.as_slice())
+            .unwrap_or(NONE_I),
         indexed: mode("ReferenceInformationType").contains("IndexToDirect"),
         by_vertex: {
             let m = mode("MappingInformationType");
@@ -1101,7 +1309,11 @@ fn fbx_material_layer(g: &FbxNode) -> (&[i32], bool) {
         .and_then(|c| c.str_at(0))
         .map(|m| m.contains("AllSame"))
         .unwrap_or(false);
-    let m = n.child("Materials").and_then(|c| c.first_i32_arr()).map(|v| v.as_slice()).unwrap_or(NONE_I);
+    let m = n
+        .child("Materials")
+        .and_then(|c| c.first_i32_arr())
+        .map(|v| v.as_slice())
+        .unwrap_or(NONE_I);
     (m, all_same || m.len() <= 1)
 }
 
@@ -1143,7 +1355,14 @@ pub fn parse_fbx_pbr_at(data: &[u8], base: Option<&std::path::Path>) -> (ObjMesh
     let mut parent = HashMap::new();
     let mut up_axis: i64 = 1;
     let mut unit_cm: f64 = 1.0;
-    fbx_scan(&root, &mut geoms_vi, &mut models, &mut parent, &mut up_axis, &mut unit_cm);
+    fbx_scan(
+        &root,
+        &mut geoms_vi,
+        &mut models,
+        &mut parent,
+        &mut up_axis,
+        &mut unit_cm,
+    );
 
     let mut mat_color: HashMap<i64, [f32; 3]> = HashMap::new();
     let mut mat_opac: HashMap<i64, f32> = HashMap::new();
@@ -1189,7 +1408,9 @@ pub fn parse_fbx_pbr_at(data: &[u8], base: Option<&std::path::Path>) -> (ObjMesh
     let world_of = |gid: &Option<i64>| -> glam::DMat4 {
         let mid = gid.and_then(|g| parent.get(&g)).copied();
         match mid {
-            Some(mid) if models.contains_key(&mid) => fbx_model_world(mid, &models, &parent) * models[&mid].1,
+            Some(mid) if models.contains_key(&mid) => {
+                fbx_model_world(mid, &models, &parent) * models[&mid].1
+            }
             _ => glam::DMat4::IDENTITY,
         }
     };
@@ -1223,7 +1444,11 @@ pub fn parse_fbx_pbr_at(data: &[u8], base: Option<&std::path::Path>) -> (ObjMesh
             }
             // 2. the image file it names, beside the FBX
             if slot.is_none() {
-                if let Some(name) = sc.tex_file.get(&tid).or_else(|| vid.and_then(|v| sc.vid_file.get(&v))) {
+                if let Some(name) = sc
+                    .tex_file
+                    .get(&tid)
+                    .or_else(|| vid.and_then(|v| sc.vid_file.get(&v)))
+                {
                     let k = format!("f:{name}");
                     if let Some(&s) = img_slot.get(&k) {
                         slot = Some(s);
@@ -1237,7 +1462,10 @@ pub fn parse_fbx_pbr_at(data: &[u8], base: Option<&std::path::Path>) -> (ObjMesh
         }
         // 3. no image: a 1×1 swatch of the diffuse colour, so the part still reads as itself.
         if slot.is_none() {
-            let d = mid.and_then(|m| mat_color.get(&m)).copied().unwrap_or([0.72; 3]);
+            let d = mid
+                .and_then(|m| mat_color.get(&m))
+                .copied()
+                .unwrap_or([0.72; 3]);
             let rgba = [
                 (d[0].clamp(0.0, 1.0) * 255.0) as u8,
                 (d[1].clamp(0.0, 1.0) * 255.0) as u8,
@@ -1260,7 +1488,8 @@ pub fn parse_fbx_pbr_at(data: &[u8], base: Option<&std::path::Path>) -> (ObjMesh
         let gid = g.i64_at(0);
         let (verts, indices) = match (
             g.child("Vertices").and_then(|c| c.first_f64_arr()),
-            g.child("PolygonVertexIndex").and_then(|c| c.first_i32_arr()),
+            g.child("PolygonVertexIndex")
+                .and_then(|c| c.first_i32_arr()),
         ) {
             (Some(v), Some(i)) => (v, i),
             _ => continue,
@@ -1277,9 +1506,17 @@ pub fn parse_fbx_pbr_at(data: &[u8], base: Option<&std::path::Path>) -> (ObjMesh
         let vcount = verts.len() / 3;
 
         let pos = |i: usize| -> [f32; 3] {
-            let w = world.transform_point3(glam::DVec3::new(verts[3 * i], verts[3 * i + 1], verts[3 * i + 2]));
+            let w = world.transform_point3(glam::DVec3::new(
+                verts[3 * i],
+                verts[3 * i + 1],
+                verts[3 * i + 2],
+            ));
             // Metres = file unit x UnitScaleFactor / 100 — FBX measures in centimetres.
-            let v = if up_axis == 2 { w } else { glam::DVec3::new(w.x, -w.z, w.y) } * (unit_cm / 100.0);
+            let v = if up_axis == 2 {
+                w
+            } else {
+                glam::DVec3::new(w.x, -w.z, w.y)
+            } * (unit_cm / 100.0);
             [v.x as f32, v.y as f32, v.z as f32]
         };
         let uv_at = |pv: usize, vi: usize| -> [f32; 2] {
@@ -1303,7 +1540,11 @@ pub fn parse_fbx_pbr_at(data: &[u8], base: Option<&std::path::Path>) -> (ObjMesh
         let mut pv = 0usize;
         let mut poly_i = 0usize;
         for &raw in indices {
-            let (vi, last) = if raw < 0 { ((!raw) as usize, true) } else { (raw as usize, false) };
+            let (vi, last) = if raw < 0 {
+                ((!raw) as usize, true)
+            } else {
+                (raw as usize, false)
+            };
             if vi < vcount {
                 poly.push((vi, uv_at(pv, vi)));
             }
@@ -1375,13 +1616,21 @@ enum AVal {
 }
 impl AVal {
     fn num(&self) -> Option<f64> {
-        if let AVal::Num(n) = self { Some(*n) } else { None }
+        if let AVal::Num(n) = self {
+            Some(*n)
+        } else {
+            None
+        }
     }
     fn as_u64(&self) -> Option<u64> {
         self.num().map(|n| n as u64)
     }
     fn str(&self) -> Option<&str> {
-        if let AVal::Str(s) = self { Some(s) } else { None }
+        if let AVal::Str(s) = self {
+            Some(s)
+        } else {
+            None
+        }
     }
 }
 
@@ -1502,7 +1751,11 @@ impl<'a> AParse<'a> {
                 self.i += 1;
             }
         }
-        Some(ANode { name, props, children })
+        Some(ANode {
+            name,
+            props,
+            children,
+        })
     }
     fn read_value(&mut self) -> Option<AVal> {
         let c = self.b[self.i];
@@ -1532,7 +1785,9 @@ impl<'a> AParse<'a> {
                     break;
                 }
             }
-            Some(AVal::Str(String::from_utf8_lossy(&self.b[s..self.i]).into_owned()))
+            Some(AVal::Str(
+                String::from_utf8_lossy(&self.b[s..self.i]).into_owned(),
+            ))
         } else {
             None
         }
@@ -1547,7 +1802,10 @@ impl<'a> AParse<'a> {
                 break;
             }
         }
-        std::str::from_utf8(&self.b[s..self.i]).ok()?.parse::<f64>().ok()
+        std::str::from_utf8(&self.b[s..self.i])
+            .ok()?
+            .parse::<f64>()
+            .ok()
     }
 }
 
@@ -1560,7 +1818,10 @@ fn fbx_load_texture(name: &str, base: Option<&std::path::Path>) -> Option<(u32, 
     let basename = norm.rsplit('/').next().unwrap_or(&norm);
     let mut candidates: Vec<std::path::PathBuf> = vec![base.join(&norm), base.join(basename)];
     // Also strip any leading `../` so an export-machine path still resolves beside the file.
-    let trimmed: String = norm.trim_start_matches("../").trim_start_matches("./").to_string();
+    let trimmed: String = norm
+        .trim_start_matches("../")
+        .trim_start_matches("./")
+        .to_string();
     if trimmed != norm {
         candidates.push(base.join(&trimmed));
     }
@@ -1595,9 +1856,9 @@ pub fn parse_fbx_ascii(text: &[u8], base: Option<&std::path::Path>) -> (ObjMesh,
         .find(|n| n.name == "GlobalSettings")
         .and_then(|g| g.child("Properties70"))
         .and_then(|p| {
-            p.children.iter().find(|c| {
-                c.name == "P" && c.props.first().and_then(|v| v.str()) == Some("UpAxis")
-            })
+            p.children
+                .iter()
+                .find(|c| c.name == "P" && c.props.first().and_then(|v| v.str()) == Some("UpAxis"))
         })
         .and_then(|c| c.props.iter().rev().find_map(|v| v.num()))
         .map(|n| n as i64)
@@ -1707,13 +1968,20 @@ pub fn parse_fbx_ascii(text: &[u8], base: Option<&std::path::Path>) -> (ObjMesh,
             None => continue,
         };
         let verts = n.child("Vertices").map(|c| c.arr()).unwrap_or_default();
-        let indices = n.child("PolygonVertexIndex").map(|c| c.arr()).unwrap_or_default();
+        let indices = n
+            .child("PolygonVertexIndex")
+            .map(|c| c.arr())
+            .unwrap_or_default();
         if verts.is_empty() || indices.is_empty() {
             continue;
         }
         let uv_node = n.child("LayerElementUV");
-        let uvs = uv_node.map(|u| u.child("UV").map(|c| c.arr()).unwrap_or_default()).unwrap_or_default();
-        let uv_index = uv_node.map(|u| u.child("UVIndex").map(|c| c.arr()).unwrap_or_default()).unwrap_or_default();
+        let uvs = uv_node
+            .map(|u| u.child("UV").map(|c| c.arr()).unwrap_or_default())
+            .unwrap_or_default();
+        let uv_index = uv_node
+            .map(|u| u.child("UVIndex").map(|c| c.arr()).unwrap_or_default())
+            .unwrap_or_default();
         let uv_ref = uv_node
             .and_then(|u| u.child("ReferenceInformationType"))
             .and_then(|c| c.props.first())
@@ -1779,11 +2047,7 @@ pub fn parse_fbx_ascii(text: &[u8], base: Option<&std::path::Path>) -> (ObjMesh,
         // Transform a vertex to app space (Y-up→Z-up unless the file is already Z-up).
         let tp = |vi: usize| -> [f32; 3] {
             let (x, y, z) = (verts[3 * vi], verts[3 * vi + 1], verts[3 * vi + 2]);
-            let v = if up_axis == 2 {
-                [x, y, z]
-            } else {
-                [x, -z, y]
-            };
+            let v = if up_axis == 2 { [x, y, z] } else { [x, -z, y] };
             [v[0] as f32, v[1] as f32, v[2] as f32]
         };
         let vcount = verts.len() / 3;
@@ -1810,7 +2074,11 @@ pub fn parse_fbx_ascii(text: &[u8], base: Option<&std::path::Path>) -> (ObjMesh,
         let mut pv = 0usize;
         for &raw in &indices {
             let r = raw as i64;
-            let (vi, last) = if r < 0 { ((!r) as usize, true) } else { (r as usize, false) };
+            let (vi, last) = if r < 0 {
+                ((!r) as usize, true)
+            } else {
+                (r as usize, false)
+            };
             if vi < vcount {
                 poly.push((vi, uv_at(pv, vi)));
             }
@@ -1859,7 +2127,8 @@ pub fn parse_fbx_ascii(text: &[u8], base: Option<&std::path::Path>) -> (ObjMesh,
 /// Bounds-checked little-endian u32 read (the file's other `le_u32` panics on OOB; glTF
 /// offsets come from untrusted files, so these must fail soft).
 fn ck_u32(b: &[u8], off: usize) -> Option<u32> {
-    b.get(off..off + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    b.get(off..off + 4)
+        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
 /// Split a `.glb` container into its JSON string and optional BIN chunk. Returns `None` if
@@ -1902,15 +2171,27 @@ fn gltf_buffers(
     base_dir: Option<&std::path::Path>,
 ) -> Vec<Vec<u8>> {
     use base64::Engine;
-    let arr = doc.get("buffers").and_then(|b| b.as_array()).cloned().unwrap_or_default();
+    let arr = doc
+        .get("buffers")
+        .and_then(|b| b.as_array())
+        .cloned()
+        .unwrap_or_default();
     let mut out = Vec::with_capacity(arr.len());
     for (i, b) in arr.iter().enumerate() {
         match b.get("uri").and_then(|u| u.as_str()) {
-            None => out.push(if i == 0 { glb_bin.clone().unwrap_or_default() } else { Vec::new() }),
+            None => out.push(if i == 0 {
+                glb_bin.clone().unwrap_or_default()
+            } else {
+                Vec::new()
+            }),
             Some(uri) if uri.starts_with("data:") => {
                 let bytes = uri
                     .find(";base64,")
-                    .and_then(|p| base64::engine::general_purpose::STANDARD.decode(&uri[p + 8..]).ok())
+                    .and_then(|p| {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(&uri[p + 8..])
+                            .ok()
+                    })
                     .unwrap_or_default();
                 out.push(bytes);
             }
@@ -1970,8 +2251,14 @@ fn accessor_floats(
     let buf_idx = bv.get("buffer").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let bv_off = bv.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let elem = comps * 4;
-    let stride = bv.get("byteStride").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(elem);
-    let Some(buf) = bufs.get(buf_idx) else { return Vec::new() };
+    let stride = bv
+        .get("byteStride")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(elem);
+    let Some(buf) = bufs.get(buf_idx) else {
+        return Vec::new();
+    };
     let mut out = Vec::with_capacity(count * comps);
     for e in 0..count {
         let base = bv_off + acc_off + e * stride;
@@ -1990,24 +2277,41 @@ fn accessor_floats(
 fn accessor_indices(doc: &serde_json::Value, bufs: &[Vec<u8>], idx: usize) -> Vec<u32> {
     let acc = &doc["accessors"][idx];
     let count = acc.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let ct = acc.get("componentType").and_then(|v| v.as_u64()).unwrap_or(0);
+    let ct = acc
+        .get("componentType")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let acc_off = acc.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let Some(bv_idx) = acc.get("bufferView").and_then(|v| v.as_u64()) else { return Vec::new() };
+    let Some(bv_idx) = acc.get("bufferView").and_then(|v| v.as_u64()) else {
+        return Vec::new();
+    };
     let bv = &doc["bufferViews"][bv_idx as usize];
     let buf_idx = bv.get("buffer").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let bv_off = bv.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let Some(buf) = bufs.get(buf_idx) else { return Vec::new() };
-    let size = match ct { 5121 => 1, 5123 => 2, 5125 => 4, _ => return Vec::new() };
+    let Some(buf) = bufs.get(buf_idx) else {
+        return Vec::new();
+    };
+    let size = match ct {
+        5121 => 1,
+        5123 => 2,
+        5125 => 4,
+        _ => return Vec::new(),
+    };
     let mut out = Vec::with_capacity(count);
     for e in 0..count {
         let o = bv_off + acc_off + e * size;
         let v = match ct {
             5121 => buf.get(o).map(|&b| b as u32),
-            5123 => buf.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]]) as u32),
+            5123 => buf
+                .get(o..o + 2)
+                .map(|s| u16::from_le_bytes([s[0], s[1]]) as u32),
             5125 => ck_u32(buf, o),
             _ => None,
         };
-        match v { Some(v) => out.push(v), None => return out }
+        match v {
+            Some(v) => out.push(v),
+            None => return out,
+        }
     }
     out
 }
@@ -2017,22 +2321,39 @@ fn gltf_node_matrix(node: &serde_json::Value) -> glam::Mat4 {
     if let Some(m) = node.get("matrix").and_then(|v| v.as_array()) {
         if m.len() == 16 {
             let mut a = [0f32; 16];
-            for (i, x) in m.iter().enumerate() { a[i] = x.as_f64().unwrap_or(0.0) as f32; }
+            for (i, x) in m.iter().enumerate() {
+                a[i] = x.as_f64().unwrap_or(0.0) as f32;
+            }
             return glam::Mat4::from_cols_array(&a);
         }
     }
     let f3 = |v: &serde_json::Value, def: glam::Vec3| -> glam::Vec3 {
-        v.as_array().filter(|a| a.len() == 3).map(|a| {
-            glam::Vec3::new(a[0].as_f64().unwrap_or(0.0) as f32,
-                a[1].as_f64().unwrap_or(0.0) as f32, a[2].as_f64().unwrap_or(0.0) as f32)
-        }).unwrap_or(def)
+        v.as_array()
+            .filter(|a| a.len() == 3)
+            .map(|a| {
+                glam::Vec3::new(
+                    a[0].as_f64().unwrap_or(0.0) as f32,
+                    a[1].as_f64().unwrap_or(0.0) as f32,
+                    a[2].as_f64().unwrap_or(0.0) as f32,
+                )
+            })
+            .unwrap_or(def)
     };
     let t = f3(&node["translation"], glam::Vec3::ZERO);
     let s = f3(&node["scale"], glam::Vec3::ONE);
-    let r = node.get("rotation").and_then(|v| v.as_array()).filter(|a| a.len() == 4).map(|a| {
-        glam::Quat::from_xyzw(a[0].as_f64().unwrap_or(0.0) as f32, a[1].as_f64().unwrap_or(0.0) as f32,
-            a[2].as_f64().unwrap_or(0.0) as f32, a[3].as_f64().unwrap_or(1.0) as f32)
-    }).unwrap_or(glam::Quat::IDENTITY);
+    let r = node
+        .get("rotation")
+        .and_then(|v| v.as_array())
+        .filter(|a| a.len() == 4)
+        .map(|a| {
+            glam::Quat::from_xyzw(
+                a[0].as_f64().unwrap_or(0.0) as f32,
+                a[1].as_f64().unwrap_or(0.0) as f32,
+                a[2].as_f64().unwrap_or(0.0) as f32,
+                a[3].as_f64().unwrap_or(1.0) as f32,
+            )
+        })
+        .unwrap_or(glam::Quat::IDENTITY);
     glam::Mat4::from_scale_rotation_translation(s, r, t)
 }
 
@@ -2126,14 +2447,23 @@ impl GltfBuild {
     /// Resolve a material's base colour to a `textures` slot: its base-colour IMAGE if it has one
     /// (deduped by image source), else a 1×1 swatch of its `baseColorFactor`, else `None`.
     fn material_slot(
-        &mut self, doc: &serde_json::Value, bufs: &[Vec<u8>], base_dir: Option<&std::path::Path>,
+        &mut self,
+        doc: &serde_json::Value,
+        bufs: &[Vec<u8>],
+        base_dir: Option<&std::path::Path>,
         material_idx: Option<usize>,
     ) -> Option<usize> {
         let m = material_idx.map(|mi| &doc["materials"][mi]);
         // 1) base-colour texture image
         if let Some(m) = m {
-            if let Some(ti) = m.pointer("/pbrMetallicRoughness/baseColorTexture/index").and_then(|v| v.as_u64()) {
-                if let Some(src) = doc["textures"][ti as usize].get("source").and_then(|v| v.as_u64()) {
+            if let Some(ti) = m
+                .pointer("/pbrMetallicRoughness/baseColorTexture/index")
+                .and_then(|v| v.as_u64())
+            {
+                if let Some(src) = doc["textures"][ti as usize]
+                    .get("source")
+                    .and_then(|v| v.as_u64())
+                {
                     let src = src as usize;
                     if let Some(&slot) = self.img_slot.get(&src) {
                         return Some(slot);
@@ -2162,7 +2492,12 @@ impl GltfBuild {
             // read as pale grey rather than as water.
             //
             // ALPHA is coverage, not colour: it is linear on both sides and must not be encoded.
-            let chan = |i: usize| f.get(i).and_then(|v| v.as_f64()).unwrap_or(1.0).clamp(0.0, 1.0) as f32;
+            let chan = |i: usize| {
+                f.get(i)
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0) as f32
+            };
             let to8 = |v: f32| (v * 255.0).round() as u8;
             let rgba = [
                 to8(crate::color::linear_to_srgb(chan(0))),
@@ -2184,10 +2519,16 @@ impl GltfBuild {
     /// Load the image behind a `textures[]` entry as a MAP, taking `chan` from it, and return its
     /// `textures` slot. Deduped on `(image source, channel)`.
     fn map_slot(
-        &mut self, doc: &serde_json::Value, bufs: &[Vec<u8>], base_dir: Option<&std::path::Path>,
-        tex_idx: usize, chan: Chan,
+        &mut self,
+        doc: &serde_json::Value,
+        bufs: &[Vec<u8>],
+        base_dir: Option<&std::path::Path>,
+        tex_idx: usize,
+        chan: Chan,
     ) -> Option<usize> {
-        let src = doc["textures"][tex_idx].get("source").and_then(|v| v.as_u64())? as usize;
+        let src = doc["textures"][tex_idx]
+            .get("source")
+            .and_then(|v| v.as_u64())? as usize;
         if let Some(&slot) = self.aux_slot.get(&(src, chan)) {
             return Some(slot);
         }
@@ -2218,7 +2559,10 @@ impl GltfBuild {
     /// Record every map this material carries, in lockstep with `part_texture`. Called ONCE per
     /// part, so all four vectors stay parallel whether or not the material has any maps at all.
     fn push_material_maps(
-        &mut self, doc: &serde_json::Value, bufs: &[Vec<u8>], base_dir: Option<&std::path::Path>,
+        &mut self,
+        doc: &serde_json::Value,
+        bufs: &[Vec<u8>],
+        base_dir: Option<&std::path::Path>,
         material_idx: Option<usize>,
     ) {
         let tex_at = |p: &str| -> Option<usize> {
@@ -2245,27 +2589,43 @@ impl GltfBuild {
 /// becomes its own PART (`build.next_part`) carrying its material's base-colour slot, and UVs are
 /// pushed in lockstep with positions.
 fn gltf_emit_mesh(
-    doc: &serde_json::Value, bufs: &[Vec<u8>], base_dir: Option<&std::path::Path>,
-    mesh_idx: usize, world: glam::Mat4, build: &mut GltfBuild,
+    doc: &serde_json::Value,
+    bufs: &[Vec<u8>],
+    base_dir: Option<&std::path::Path>,
+    mesh_idx: usize,
+    world: glam::Mat4,
+    build: &mut GltfBuild,
 ) {
     let normal_mat = glam::Mat3::from_mat4(world).inverse().transpose();
-    let prims = doc["meshes"][mesh_idx].get("primitives").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+    let prims = doc["meshes"][mesh_idx]
+        .get("primitives")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
     for prim in &prims {
         // mode 4 = TRIANGLES (default). Skip lines/points/strips — we only draw solids.
         if prim.get("mode").and_then(|m| m.as_u64()).unwrap_or(4) != 4 {
             continue;
         }
         let attr = &prim["attributes"];
-        let Some(pos_acc) = attr.get("POSITION").and_then(|v| v.as_u64()) else { continue };
+        let Some(pos_acc) = attr.get("POSITION").and_then(|v| v.as_u64()) else {
+            continue;
+        };
         let positions = accessor_floats(doc, bufs, pos_acc as usize, 3);
         if positions.is_empty() {
             continue;
         }
         let nverts = positions.len() / 3;
-        let normals = attr.get("NORMAL").and_then(|v| v.as_u64())
-            .map(|n| accessor_floats(doc, bufs, n as usize, 3)).unwrap_or_default();
-        let uv = attr.get("TEXCOORD_0").and_then(|v| v.as_u64())
-            .map(|t| accessor_floats(doc, bufs, t as usize, 2)).unwrap_or_default();
+        let normals = attr
+            .get("NORMAL")
+            .and_then(|v| v.as_u64())
+            .map(|n| accessor_floats(doc, bufs, n as usize, 3))
+            .unwrap_or_default();
+        let uv = attr
+            .get("TEXCOORD_0")
+            .and_then(|v| v.as_u64())
+            .map(|t| accessor_floats(doc, bufs, t as usize, 2))
+            .unwrap_or_default();
         if uv.len() >= nverts * 2 {
             build.had_uv = true;
         }
@@ -2278,7 +2638,10 @@ fn gltf_emit_mesh(
             continue;
         }
         // This primitive is one PART. Resolve + record its material's base-colour slot ONCE.
-        let material_idx = prim.get("material").and_then(|v| v.as_u64()).map(|m| m as usize);
+        let material_idx = prim
+            .get("material")
+            .and_then(|v| v.as_u64())
+            .map(|m| m as usize);
         let slot = build.material_slot(doc, bufs, base_dir, material_idx);
         let part = build.next_part;
         build.next_part += 1;
@@ -2288,26 +2651,46 @@ fn gltf_emit_mesh(
         // metallic reads as 0 — dielectric — which is what an architectural export means.
         let m = material_idx.map(|mi| &doc["materials"][mi]);
         let num = |p: &str, d: f32| {
-            m.and_then(|m| m.pointer(p)).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d)
+            m.and_then(|m| m.pointer(p))
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32)
+                .unwrap_or(d)
         };
-        build.part_rough.push(num("/pbrMetallicRoughness/roughnessFactor", 0.5).clamp(0.0, 1.0));
-        build.part_metal.push(num("/pbrMetallicRoughness/metallicFactor", 0.0).clamp(0.0, 1.0));
+        build
+            .part_rough
+            .push(num("/pbrMetallicRoughness/roughnessFactor", 0.5).clamp(0.0, 1.0));
+        build
+            .part_metal
+            .push(num("/pbrMetallicRoughness/metallicFactor", 0.0).clamp(0.0, 1.0));
         // …and the MAPS beside those scalars, pushed here so all the per-part vectors advance
         // together even for a material that has none.
         build.push_material_maps(doc, bufs, base_dir, material_idx);
-        build.part_transmission.push(gltf_transmission(doc, material_idx));
+        build
+            .part_transmission
+            .push(gltf_transmission(doc, material_idx));
 
         let gp = |i: u32| -> glam::Vec3 {
             let k = i as usize * 3;
-            world.transform_point3(glam::Vec3::new(positions[k], positions[k + 1], positions[k + 2]))
+            world.transform_point3(glam::Vec3::new(
+                positions[k],
+                positions[k + 1],
+                positions[k + 2],
+            ))
         };
         let gn = |i: u32| -> Option<glam::Vec3> {
             let k = i as usize * 3;
-            (k + 2 < normals.len()).then(|| (normal_mat * glam::Vec3::new(normals[k], normals[k + 1], normals[k + 2])).normalize_or_zero())
+            (k + 2 < normals.len()).then(|| {
+                (normal_mat * glam::Vec3::new(normals[k], normals[k + 1], normals[k + 2]))
+                    .normalize_or_zero()
+            })
         };
         let guv = |i: u32| -> [f32; 2] {
             let k = i as usize * 2;
-            if k + 1 < uv.len() { [uv[k], uv[k + 1]] } else { [0.0, 0.0] }
+            if k + 1 < uv.len() {
+                [uv[k], uv[k + 1]]
+            } else {
+                [0.0, 0.0]
+            }
         };
         // glTF is Y-up; the app is Z-up → (x, y, z) → (x, -z, y).
         let z_up = |v: glam::Vec3| [v.x, -v.z, v.y];
@@ -2319,7 +2702,9 @@ fn gltf_emit_mesh(
             let (a, b, c) = (gp(t[0]), gp(t[1]), gp(t[2]));
             let face_n = (b - a).cross(c - a).normalize_or_zero();
             for (vi, p) in [(t[0], a), (t[1], b), (t[2], c)] {
-                let n = gn(vi).filter(|n| n.length_squared() > 1e-8).unwrap_or(face_n);
+                let n = gn(vi)
+                    .filter(|n| n.length_squared() > 1e-8)
+                    .unwrap_or(face_n);
                 build.out.positions.push(z_up(p));
                 build.out.normals.push(z_up(n));
                 build.out.alpha.push(mat_alpha);
@@ -2332,8 +2717,13 @@ fn gltf_emit_mesh(
 
 /// Walk the scene node hierarchy from `node_idx`, composing transforms and emitting meshes.
 fn gltf_walk(
-    doc: &serde_json::Value, bufs: &[Vec<u8>], base_dir: Option<&std::path::Path>,
-    node_idx: usize, parent: glam::Mat4, build: &mut GltfBuild, depth: u32,
+    doc: &serde_json::Value,
+    bufs: &[Vec<u8>],
+    base_dir: Option<&std::path::Path>,
+    node_idx: usize,
+    parent: glam::Mat4,
+    build: &mut GltfBuild,
+    depth: u32,
 ) {
     if depth > 256 {
         return; // cycle / pathological nesting guard
@@ -2358,7 +2748,10 @@ fn gltf_walk(
 /// Decode glTF `images[src]` to `(w, h, rgba8)` — resolving a `uri` (data:/external) OR an
 /// embedded `bufferView`.
 fn gltf_image_at(
-    doc: &serde_json::Value, bufs: &[Vec<u8>], base_dir: Option<&std::path::Path>, src: usize,
+    doc: &serde_json::Value,
+    bufs: &[Vec<u8>],
+    base_dir: Option<&std::path::Path>,
+    src: usize,
 ) -> Option<(u32, u32, Vec<u8>)> {
     let img = &doc["images"][src];
     let bytes = if img.get("uri").is_some() {
@@ -2379,15 +2772,22 @@ fn gltf_image_at(
 
 /// Raw bytes of a glTF `images[]` entry addressed by `uri` — a `data:` URI or an external
 /// file relative to `base_dir`. The embedded `bufferView` case is handled by the caller.
-fn gltf_image_bytes(img: &serde_json::Value, base_dir: Option<&std::path::Path>) -> Option<Vec<u8>> {
+fn gltf_image_bytes(
+    img: &serde_json::Value,
+    base_dir: Option<&std::path::Path>,
+) -> Option<Vec<u8>> {
     use base64::Engine;
     let uri = img.get("uri").and_then(|v| v.as_str())?;
     if uri.starts_with("data:") {
         let p = uri.find(";base64,")?;
-        return base64::engine::general_purpose::STANDARD.decode(&uri[p + 8..]).ok();
+        return base64::engine::general_purpose::STANDARD
+            .decode(&uri[p + 8..])
+            .ok();
     }
     let dec = percent_decode(uri);
-    base_dir.map(|d| d.join(&dec)).and_then(|p| std::fs::read(p).ok())
+    base_dir
+        .map(|d| d.join(&dec))
+        .and_then(|p| std::fs::read(p).ok())
 }
 
 /// A glTF primitive's opacity in `0..=1`.
@@ -2405,7 +2805,9 @@ fn gltf_image_bytes(img: &serde_json::Value, base_dir: Option<&std::path::Path>)
 ///
 /// Whichever admits more light wins, so a material using both is not double-counted.
 fn gltf_material_alpha(doc: &serde_json::Value, prim: &serde_json::Value) -> f32 {
-    let Some(mi) = prim.get("material").and_then(|v| v.as_u64()) else { return 1.0 };
+    let Some(mi) = prim.get("material").and_then(|v| v.as_u64()) else {
+        return 1.0;
+    };
     let m = &doc["materials"][mi as usize];
     let blend = if m.get("alphaMode").and_then(|v| v.as_str()) == Some("BLEND") {
         m.pointer("/pbrMetallicRoughness/baseColorFactor/3")
@@ -2415,7 +2817,14 @@ fn gltf_material_alpha(doc: &serde_json::Value, prim: &serde_json::Value) -> f32
     } else {
         1.0
     };
-    blend.min(1.0 - gltf_transmission(doc, prim.get("material").and_then(|v| v.as_u64()).map(|m| m as usize)))
+    blend.min(
+        1.0 - gltf_transmission(
+            doc,
+            prim.get("material")
+                .and_then(|v| v.as_u64())
+                .map(|m| m as usize),
+        ),
+    )
 }
 
 /// A material's `KHR_materials_transmission` factor, 0 when it has none.
@@ -2448,7 +2857,9 @@ pub fn parse_gltf_ex(data: &[u8], base_dir: Option<&std::path::Path>) -> (ObjMes
         Some(v) => v,
         None => (String::from_utf8_lossy(data).into_owned(), None),
     };
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&json) else { return (ObjMesh::default(), pbr) };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&json) else {
+        return (ObjMesh::default(), pbr);
+    };
     let bufs = gltf_buffers(&doc, glb_bin, base_dir);
 
     // Root nodes: the default scene's `nodes`, else scene 0, else every node.
@@ -2456,13 +2867,30 @@ pub fn parse_gltf_ex(data: &[u8], base_dir: Option<&std::path::Path>) -> (ObjMes
     let roots: Vec<usize> = doc["scenes"][scene_idx]
         .get("nodes")
         .and_then(|n| n.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as usize)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_u64().map(|x| x as usize))
+                .collect()
+        })
         .unwrap_or_else(|| {
-            (0..doc.get("nodes").and_then(|n| n.as_array()).map(|a| a.len()).unwrap_or(0)).collect()
+            (0..doc
+                .get("nodes")
+                .and_then(|n| n.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0))
+                .collect()
         });
     let mut build = GltfBuild::default();
     for r in roots {
-        gltf_walk(&doc, &bufs, base_dir, r, glam::Mat4::IDENTITY, &mut build, 0);
+        gltf_walk(
+            &doc,
+            &bufs,
+            base_dir,
+            r,
+            glam::Mat4::IDENTITY,
+            &mut build,
+            0,
+        );
     }
     let mut out = std::mem::take(&mut build.out);
     // Keep UVs only if the model actually supplied them (else box-projection in the app).
@@ -2503,15 +2931,24 @@ mod tests {
     #[test]
     #[ignore]
     fn villa_material_probe() {
-        let data = std::fs::read(r"G:\blender dev\staircase\villa model\build\villa_v1.fbx").unwrap();
+        let data =
+            std::fs::read(r"G:\blender dev\staircase\villa model\build\villa_v1.fbx").unwrap();
         const MAGIC: &[u8] = b"Kaydara FBX Binary  \x00\x1a\x00";
         assert_eq!(&data[..MAGIC.len()], MAGIC, "binary FBX");
         let version = u32::from_le_bytes([data[23], data[24], data[25], data[26]]);
         let v75 = version >= 7500;
-        let mut cur = FbxCursor { buf: &data, pos: 27 };
+        let mut cur = FbxCursor {
+            buf: &data,
+            pos: 27,
+        };
         let root = fbx_parse_siblings(&mut cur, v75, data.len());
 
-        fn walk<'a>(nodes: &'a [FbxNode], counts: &mut std::collections::BTreeMap<String, usize>, mats: &mut Vec<String>, imgs: &mut Vec<String>) {
+        fn walk<'a>(
+            nodes: &'a [FbxNode],
+            counts: &mut std::collections::BTreeMap<String, usize>,
+            mats: &mut Vec<String>,
+            imgs: &mut Vec<String>,
+        ) {
             for n in nodes {
                 *counts.entry(n.name.clone()).or_default() += 1;
                 if n.name == "Material" {
@@ -2520,19 +2957,29 @@ mod tests {
                     if let Some(p70) = n.child("Properties70") {
                         for p in &p70.children {
                             if let Some(k) = p.str_at(0) {
-                                if k == "DiffuseColor" || k == "Diffuse" { diff = p.f64_tail3(); }
+                                if k == "DiffuseColor" || k == "Diffuse" {
+                                    diff = p.f64_tail3();
+                                }
                             }
                         }
                     }
-                    mats.push(format!("{name}  diffuse=({:.2},{:.2},{:.2})", diff[0], diff[1], diff[2]));
+                    mats.push(format!(
+                        "{name}  diffuse=({:.2},{:.2},{:.2})",
+                        diff[0], diff[1], diff[2]
+                    ));
                 }
                 if n.name == "Video" || n.name == "Texture" {
-                    let f = n.child("RelativeFilename").and_then(|c| c.str_at(0))
+                    let f = n
+                        .child("RelativeFilename")
+                        .and_then(|c| c.str_at(0))
                         .or_else(|| n.child("FileName").and_then(|c| c.str_at(0)))
                         .or_else(|| n.str_at(1))
                         .unwrap_or("?");
                     let has_content = n.child("Content").is_some();
-                    imgs.push(format!("{}  file={f}  embedded_content={has_content}", n.name));
+                    imgs.push(format!(
+                        "{}  file={f}  embedded_content={has_content}",
+                        n.name
+                    ));
                 }
                 walk(&n.children, counts, mats, imgs);
             }
@@ -2543,22 +2990,44 @@ mod tests {
         walk(&root, &mut counts, &mut mats, &mut imgs);
         eprintln!("\n=== villa_v1.fbx node counts ===");
         for (k, v) in &counts {
-            if ["Geometry", "Model", "Material", "Texture", "Video", "Connections", "C", "Objects"].contains(&k.as_str()) {
+            if [
+                "Geometry",
+                "Model",
+                "Material",
+                "Texture",
+                "Video",
+                "Connections",
+                "C",
+                "Objects",
+            ]
+            .contains(&k.as_str())
+            {
                 eprintln!("  {k}: {v}");
             }
         }
         eprintln!("--- {} materials ---", mats.len());
-        for m in &mats { eprintln!("  {m}"); }
+        for m in &mats {
+            eprintln!("  {m}");
+        }
         eprintln!("--- {} texture/video (image) nodes ---", imgs.len());
-        for i in &imgs { eprintln!("  {i}"); }
+        for i in &imgs {
+            eprintln!("  {i}");
+        }
 
         // Report per-material opacity too (glass should read < 1).
         let mut mcol = std::collections::HashMap::new();
         let mut mop = std::collections::HashMap::new();
         fbx_collect_materials(&root, &mut mcol, &mut mop);
         let translucent_mats = mop.values().filter(|&&o| o < 0.996).count();
-        eprintln!("--- materials with opacity<1: {translucent_mats} (of {})", mop.len());
-        for (id, o) in &mop { if *o < 0.996 { eprintln!("  mat {id} opacity={o:.3}"); } }
+        eprintln!(
+            "--- materials with opacity<1: {translucent_mats} (of {})",
+            mop.len()
+        );
+        for (id, o) in &mop {
+            if *o < 0.996 {
+                eprintln!("  mat {id} opacity={o:.3}");
+            }
+        }
 
         // Now exercise the actual import path: geometry + per-material colour swatches + alpha.
         let (mesh, pbr) = parse_fbx_pbr(&data);
@@ -2569,10 +3038,20 @@ mod tests {
             mesh.tri_count(), pbr.part_ids.len(), pbr.textures.len(), distinct.len(),
             mesh.alpha.len(), translucent_verts,
         );
-        assert_eq!(pbr.part_ids.len(), mesh.tri_count(), "one part id per triangle");
+        assert_eq!(
+            pbr.part_ids.len(),
+            mesh.tri_count(),
+            "one part id per triangle"
+        );
         assert!(pbr.textures.len() >= 10, "villa has many colour materials");
-        assert!(translucent_mats >= 1, "villa glass material reads opacity < 1");
-        assert!(translucent_verts > 0, "villa glass panes import see-through (per-vertex alpha)");
+        assert!(
+            translucent_mats >= 1,
+            "villa glass material reads opacity < 1"
+        );
+        assert!(
+            translucent_verts > 0,
+            "villa glass panes import see-through (per-vertex alpha)"
+        );
     }
 
     /// INVESTIGATIVE (ignored by default): parse the user's real FBX files and print what the
@@ -2596,7 +3075,10 @@ mod tests {
                     let mut mn = [f32::INFINITY; 3];
                     let mut mx = [f32::NEG_INFINITY; 3];
                     for p in &mesh.positions {
-                        for k in 0..3 { mn[k] = mn[k].min(p[k]); mx[k] = mx[k].max(p[k]); }
+                        for k in 0..3 {
+                            mn[k] = mn[k].min(p[k]);
+                            mx[k] = mx[k].max(p[k]);
+                        }
                     }
                     eprintln!(
                         "\n=== {f}\n  ascii={} ver={} geoms={} verts={} indices={} tris={}\n  bbox min=({:.2},{:.2},{:.2}) max=({:.2},{:.2},{:.2}) size=({:.2},{:.2},{:.2})",
@@ -2635,7 +3117,13 @@ mod tests {
         let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
         fbx_prop_array(b'i', &raw, vals.len(), compress)
     }
-    fn fbx_node(start: usize, name: &[u8], num_props: u32, props: &[u8], children: &[u8]) -> Vec<u8> {
+    fn fbx_node(
+        start: usize,
+        name: &[u8],
+        num_props: u32,
+        props: &[u8],
+        children: &[u8],
+    ) -> Vec<u8> {
         let end = start + 13 + name.len() + props.len() + children.len(); // 13 = 4+4+4+1 (32-bit)
         let mut out = Vec::new();
         out.extend((end as u32).to_le_bytes());
@@ -2656,7 +3144,13 @@ mod tests {
         let vprops = fbx_prop_d(&[0., 0., 0., 1., 0., 0., 0., 1., 0.], compress);
         let vnode = fbx_node(children_start, b"Vertices", 1, &vprops, &[]);
         let iprops = fbx_prop_i(&[0, 1, !2], compress); // !2 = -3 → closes poly (0,1,2)
-        let pnode = fbx_node(children_start + vnode.len(), b"PolygonVertexIndex", 1, &iprops, &[]);
+        let pnode = fbx_node(
+            children_start + vnode.len(),
+            b"PolygonVertexIndex",
+            1,
+            &iprops,
+            &[],
+        );
         let mut children = Vec::new();
         children.extend_from_slice(&vnode);
         children.extend_from_slice(&pnode);
@@ -2676,14 +3170,24 @@ mod tests {
     #[ignore]
     fn gltf_probe_multimaterial() {
         let path = "C:/Users/hsili/Desktop/stairstest2.glb";
-        let Ok(bytes) = std::fs::read(path) else { eprintln!("no file — skip"); return };
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("no file — skip");
+            return;
+        };
         let (mesh, pbr) = parse_gltf_ex(&bytes, None);
         let ntri = mesh.positions.len() / 3;
-        let parts = pbr.part_ids.iter().copied().max().map(|m| m + 1).unwrap_or(0);
+        let parts = pbr
+            .part_ids
+            .iter()
+            .copied()
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
         let with_tex = pbr.part_texture.iter().filter(|t| t.is_some()).count();
         eprintln!(
             "GLB: {ntri} tris, {} textures, {parts} parts ({with_tex} with a base colour), uvs={}",
-            pbr.textures.len(), pbr.uvs.len(),
+            pbr.textures.len(),
+            pbr.uvs.len(),
         );
         assert!(!pbr.textures.is_empty(), "extracts material images");
         assert_eq!(pbr.part_ids.len(), ntri, "one part id per triangle");
@@ -2744,12 +3248,31 @@ Connections:  {
 "#;
         let (mesh, pbr) = parse_fbx_ascii(src, None);
         assert_eq!(mesh.tri_count(), 2, "a quad fan-triangulates to two tris");
-        assert_eq!(pbr.uvs.len(), mesh.positions.len(), "one UV per emitted vertex");
-        assert_eq!(pbr.part_ids.len(), mesh.tri_count(), "one part id per triangle");
-        assert_eq!(pbr.textures.len(), 1, "the material's diffuse becomes one swatch");
-        assert_eq!(pbr.part_texture, vec![Some(0)], "the part points at that swatch");
+        assert_eq!(
+            pbr.uvs.len(),
+            mesh.positions.len(),
+            "one UV per emitted vertex"
+        );
+        assert_eq!(
+            pbr.part_ids.len(),
+            mesh.tri_count(),
+            "one part id per triangle"
+        );
+        assert_eq!(
+            pbr.textures.len(),
+            1,
+            "the material's diffuse becomes one swatch"
+        );
+        assert_eq!(
+            pbr.part_texture,
+            vec![Some(0)],
+            "the part points at that swatch"
+        );
         // Y-up→Z-up: local (1,0,1) becomes (1,-1,0).
-        assert!(mesh.positions.iter().any(|p| (p[1] + 1.0).abs() < 1e-5), "Y-up converted to Z-up");
+        assert!(
+            mesh.positions.iter().any(|p| (p[1] + 1.0).abs() < 1e-5),
+            "Y-up converted to Z-up"
+        );
         // Diffuse 0.6,0.4,0.2 → the 1×1 swatch pixels.
         let (w, h, px) = &pbr.textures[0];
         assert_eq!((*w, *h), (1, 1));
@@ -2762,12 +3285,25 @@ Connections:  {
     #[ignore]
     fn ascii_fbx_probe_real() {
         let path = "D:/Dropbox/03--PROJECTS/03-PROJECTS/2026/SAEEDA MAM/SAEEDA MA'AM'S PROJECT-02/NEW LAYOUT/furniture/fbx/sketchup/stairs/modern_stair.fbx";
-        let Ok(bytes) = std::fs::read(path) else { eprintln!("no file — skip"); return };
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("no file — skip");
+            return;
+        };
         let base = std::path::Path::new(path).parent();
         let (mesh, pbr) = parse_fbx_ascii(&bytes, base);
         let ntri = mesh.tri_count();
-        let parts = pbr.part_ids.iter().copied().max().map(|m| m + 1).unwrap_or(0);
-        let img = pbr.textures.iter().filter(|(w, h, _)| *w > 1 || *h > 1).count();
+        let parts = pbr
+            .part_ids
+            .iter()
+            .copied()
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        let img = pbr
+            .textures
+            .iter()
+            .filter(|(w, h, _)| *w > 1 || *h > 1)
+            .count();
         let with_tex = pbr.part_texture.iter().filter(|t| t.is_some()).count();
         eprintln!(
             "ASCII FBX: {ntri} tris, {parts} parts ({with_tex} bound), textures={} (images={}), uvs={}",
@@ -2792,7 +3328,11 @@ Connections:  {
     #[test]
     fn fbx_binary_reads_one_triangle_zlib_compressed() {
         let m = parse_fbx(&synth_fbx(true));
-        assert_eq!(m.tri_count(), 1, "compressed arrays inflate to the same triangle");
+        assert_eq!(
+            m.tri_count(),
+            1,
+            "compressed arrays inflate to the same triangle"
+        );
         // Centimetres, as above — no `GlobalSettings` in the synthetic blob.
         assert_eq!(m.positions[1], [0.01, 0.0, 0.0]);
     }
@@ -2855,7 +3395,11 @@ f 1//1 2//1 3//1
     #[test]
     fn skips_malformed_faces() {
         let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2\nf 1 2 3\nf 9 9 9\n";
-        assert_eq!(parse_obj(obj).tri_count(), 1, "only the valid, in-range face");
+        assert_eq!(
+            parse_obj(obj).tri_count(),
+            1,
+            "only the valid, in-range face"
+        );
     }
 
     // Helpers to hand-assemble a tiny valid 3DS file for the parser test.
@@ -2875,13 +3419,17 @@ f 1//1 2//1 3//1
         let mut verts = Vec::new();
         verts.extend_from_slice(&3u16.to_le_bytes());
         for p in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
-            for c in p { verts.extend_from_slice(&c.to_le_bytes()); }
+            for c in p {
+                verts.extend_from_slice(&c.to_le_bytes());
+            }
         }
         let verts_chunk = chunk(0x4110, &verts);
         // face list (0x4120): 1 face (a,b,c,flags)
         let mut faces = Vec::new();
         faces.extend_from_slice(&1u16.to_le_bytes());
-        for x in [0u16, 1, 2, 0] { faces.extend_from_slice(&x.to_le_bytes()); }
+        for x in [0u16, 1, 2, 0] {
+            faces.extend_from_slice(&x.to_le_bytes());
+        }
         let faces_chunk = chunk(0x4120, &faces);
 
         let mesh = chunk(0x4100, &[verts_chunk, faces_chunk].concat());
@@ -2893,7 +3441,11 @@ f 1//1 2//1 3//1
         let main = chunk(0x4d4d, &editor);
 
         let m = parse_3ds(&main);
-        assert_eq!(m.tri_count(), 1, "the single triangle must survive the chunk walk");
+        assert_eq!(
+            m.tri_count(),
+            1,
+            "the single triangle must survive the chunk walk"
+        );
         assert_eq!(m.positions[1], [1.0, 0.0, 0.0]);
     }
 
@@ -2910,9 +3462,14 @@ f 1//1 2//1 3//1
         // BIN: 3 positions (VEC3 f32) then 3 indices (u16).
         let pos: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
         let mut bin = Vec::new();
-        for f in pos { bin.extend_from_slice(&f.to_le_bytes()); }
-        for i in [0u16, 1, 2] { bin.extend_from_slice(&i.to_le_bytes()); }
-        let json = format!(r#"{{
+        for f in pos {
+            bin.extend_from_slice(&f.to_le_bytes());
+        }
+        for i in [0u16, 1, 2] {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        let json = format!(
+            r#"{{
             "asset":{{"version":"2.0"}},
             "scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
             "meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}},"indices":1}}]}}],
@@ -2923,11 +3480,17 @@ f 1//1 2//1 3//1
             "accessors":[
                 {{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"}},
                 {{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"}}]
-        }}"#, bin.len());
+        }}"#,
+            bin.len()
+        );
         // Assemble the GLB container.
         let mut jb = json.into_bytes();
-        while jb.len() % 4 != 0 { jb.push(b' '); }
-        while bin.len() % 4 != 0 { bin.push(0); }
+        while jb.len() % 4 != 0 {
+            jb.push(b' ');
+        }
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
         let total = 12 + 8 + jb.len() + 8 + bin.len();
         let mut glb = Vec::new();
         glb.extend_from_slice(b"glTF"); // magic — the REAL bytes, so this exercises glb_split
@@ -2951,8 +3514,12 @@ f 1//1 2//1 3//1
     /// Wrap a JSON doc + BIN chunk into a GLB container.
     fn glb_of(json: String, mut bin: Vec<u8>) -> Vec<u8> {
         let mut jb = json.into_bytes();
-        while jb.len() % 4 != 0 { jb.push(b' '); }
-        while bin.len() % 4 != 0 { bin.push(0); }
+        while jb.len() % 4 != 0 {
+            jb.push(b' ');
+        }
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
         let total = 12 + 8 + jb.len() + 8 + bin.len();
         let mut glb = Vec::new();
         glb.extend_from_slice(b"glTF");
@@ -2978,18 +3545,27 @@ f 1//1 2//1 3//1
         // A 2×1 image with distinguishable channels: px0 = (10, 20, 30), px1 = (40, 50, 60).
         let img = image::RgbaImage::from_raw(2, 1, vec![10, 20, 30, 255, 40, 50, 60, 255]).unwrap();
         let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(img).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
         let png = png.into_inner();
 
         let pos: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
         let mut bin = Vec::new();
-        for f in pos { bin.extend_from_slice(&f.to_le_bytes()); }
-        for i in [0u16, 1, 2] { bin.extend_from_slice(&i.to_le_bytes()); }
-        while bin.len() % 4 != 0 { bin.push(0); }
+        for f in pos {
+            bin.extend_from_slice(&f.to_le_bytes());
+        }
+        for i in [0u16, 1, 2] {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
         let png_off = bin.len();
         bin.extend_from_slice(&png);
 
-        let json = format!(r#"{{
+        let json = format!(
+            r#"{{
             "asset":{{"version":"2.0"}},
             "scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
             "meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}},"indices":1,"material":0}}]}}],
@@ -3011,33 +3587,66 @@ f 1//1 2//1 3//1
             "accessors":[
                 {{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"}},
                 {{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"}}]
-        }}"#, bin.len(), png_off, png.len());
+        }}"#,
+            bin.len(),
+            png_off,
+            png.len()
+        );
 
         let (mesh, pbr) = parse_gltf_ex(&glb_of(json, bin), None);
         assert_eq!(mesh.tri_count(), 1);
 
         // The scalar still arrives…
-        assert!((pbr.part_rough[0] - 0.035).abs() < 1e-6, "roughnessFactor survives");
+        assert!(
+            (pbr.part_rough[0] - 0.035).abs() < 1e-6,
+            "roughnessFactor survives"
+        );
         // …and so do the maps, each as its OWN slot — one image became four textures.
-        let (n, r, m, o) = (pbr.part_normal[0], pbr.part_rough_map[0],
-                            pbr.part_metal_map[0], pbr.part_ao_map[0]);
-        for (name, s) in [("normal", n), ("roughness", r), ("metallic", m), ("occlusion", o)] {
+        let (n, r, m, o) = (
+            pbr.part_normal[0],
+            pbr.part_rough_map[0],
+            pbr.part_metal_map[0],
+            pbr.part_ao_map[0],
+        );
+        for (name, s) in [
+            ("normal", n),
+            ("roughness", r),
+            ("metallic", m),
+            ("occlusion", o),
+        ] {
             assert!(s.is_some(), "the {name} map must be imported");
         }
-        assert_eq!([n, r, m, o].iter().flatten().collect::<std::collections::HashSet<_>>().len(), 4,
-            "four distinct channels ⇒ four distinct slots, not one image reused four times");
+        assert_eq!(
+            [n, r, m, o]
+                .iter()
+                .flatten()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4,
+            "four distinct channels ⇒ four distinct slots, not one image reused four times"
+        );
 
         // The normal map keeps all three channels; the others are their own channel broadcast.
         let px = |slot: Option<usize>| pbr.textures[slot.unwrap()].2.clone();
-        assert_eq!(&px(n)[0..3], &[10, 20, 30], "a normal map is not a single channel");
+        assert_eq!(
+            &px(n)[0..3],
+            &[10, 20, 30],
+            "a normal map is not a single channel"
+        );
         assert_eq!(&px(r)[0..3], &[20, 20, 20], "roughness comes from GREEN");
         assert_eq!(&px(m)[0..3], &[30, 30, 30], "metallic comes from BLUE");
         assert_eq!(&px(o)[0..3], &[10, 10, 10], "occlusion comes from RED");
-        assert_eq!(&px(r)[4..7], &[50, 50, 50], "…for every texel, not just the first");
+        assert_eq!(
+            &px(r)[4..7],
+            &[50, 50, 50],
+            "…for every texel, not just the first"
+        );
 
         // Transmission 0.45 ⇒ 55% opaque, even though alphaMode is (correctly) absent/OPAQUE.
-        assert!((mesh.alpha[0] - 0.55).abs() < 1e-6,
-            "KHR_materials_transmission must make the surface see-through");
+        assert!(
+            (mesh.alpha[0] - 0.55).abs() < 1e-6,
+            "KHR_materials_transmission must make the surface see-through"
+        );
     }
 
     /// A flat `baseColorFactor` has to survive the round trip through the swatch and back out of
@@ -3051,9 +3660,14 @@ f 1//1 2//1 3//1
     fn gltf_flat_base_colour_survives_the_srgb_round_trip() {
         let pos: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
         let mut bin = Vec::new();
-        for f in pos { bin.extend_from_slice(&f.to_le_bytes()); }
-        for i in [0u16, 1, 2] { bin.extend_from_slice(&i.to_le_bytes()); }
-        let json = format!(r#"{{
+        for f in pos {
+            bin.extend_from_slice(&f.to_le_bytes());
+        }
+        for i in [0u16, 1, 2] {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        let json = format!(
+            r#"{{
             "asset":{{"version":"2.0"}},
             "scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
             "meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}},"indices":1,"material":0}}]}}],
@@ -3065,16 +3679,27 @@ f 1//1 2//1 3//1
             "accessors":[
                 {{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"}},
                 {{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"}}]
-        }}"#, bin.len());
+        }}"#,
+            bin.len()
+        );
         let (_m, pbr) = parse_gltf_ex(&glb_of(json, bin), None);
         let px = &pbr.textures[pbr.part_texture[0].expect("a swatch")].2;
         // Decode the swatch the way the GPU's SRGB8_ALPHA8 sampler does.
-        let back: Vec<f32> = px[0..3].iter().map(|&b| crate::color::srgb_to_linear(b as f32 / 255.0)).collect();
+        let back: Vec<f32> = px[0..3]
+            .iter()
+            .map(|&b| crate::color::srgb_to_linear(b as f32 / 255.0))
+            .collect();
         for (got, want) in back.iter().zip([0.055f32, 0.30, 0.34]) {
-            assert!((got - want).abs() < 0.01,
-                "authored {want}, the shader would see {got} — {:?} vs the linear factor", back);
+            assert!(
+                (got - want).abs() < 0.01,
+                "authored {want}, the shader would see {got} — {:?} vs the linear factor",
+                back
+            );
         }
-        assert_eq!(px[3], 255, "alpha is coverage, not colour — never sRGB-encoded");
+        assert_eq!(
+            px[3], 255,
+            "alpha is coverage, not colour — never sRGB-encoded"
+        );
     }
 
     /// Garbage bytes → empty mesh, no panic (fail-soft on untrusted files).
@@ -3089,7 +3714,9 @@ f 1//1 2//1 3//1
     #[test]
     #[ignore]
     fn gltf_probe_real() {
-        let Ok(p) = std::env::var("RUSTCAD_GLTF_PROBE") else { return };
+        let Ok(p) = std::env::var("RUSTCAD_GLTF_PROBE") else {
+            return;
+        };
         let bytes = std::fs::read(&p).expect("read probe file");
         let base = std::path::Path::new(&p).parent();
         let (m, pbr) = parse_gltf_ex(&bytes, base);
@@ -3097,7 +3724,12 @@ f 1//1 2//1 3//1
         let tex = pbr.texture.as_ref().map(|(w, h, _)| (*w, *h));
         eprintln!(
             "gltf probe: {} tris, bbox {:?}..{:?}, uvs={} (verts={}), base_color={:?}",
-            m.tri_count(), mn, mx, pbr.uvs.len(), m.positions.len(), tex,
+            m.tri_count(),
+            mn,
+            mx,
+            pbr.uvs.len(),
+            m.positions.len(),
+            tex,
         );
         assert!(m.tri_count() > 0, "real glTF must yield triangles");
         assert_eq!(pbr.uvs.len(), m.positions.len(), "one UV per vertex");
@@ -3121,13 +3753,21 @@ f 1//1 2//1 3//1
         let full = parse_fbx_ex(&bytes).0;
         let door = parse_fbx_door(&bytes).0;
         assert!(full.tri_count() > 0, "the full door parses");
-        assert!(door.tri_count() > 0, "the shell-dropped door still has geometry");
+        assert!(
+            door.tri_count() > 0,
+            "the shell-dropped door still has geometry"
+        );
         assert!(
             door.tri_count() < full.tri_count(),
-            "the surround shell was dropped: {} → {}", full.tri_count(), door.tri_count()
+            "the surround shell was dropped: {} → {}",
+            full.tri_count(),
+            door.tri_count()
         );
         // The dropped part was the FRAME, so the door is now shallower (thinner overall depth).
-        let dep = |m: &ObjMesh| { let (mn, mx) = m.bounds().unwrap(); (mx[1]-mn[1]).min(mx[0]-mn[0]).min(mx[2]-mn[2]) };
+        let dep = |m: &ObjMesh| {
+            let (mn, mx) = m.bounds().unwrap();
+            (mx[1] - mn[1]).min(mx[0] - mn[0]).min(mx[2] - mn[2])
+        };
         assert!(dep(&door) <= dep(&full) + 1e-3, "no part grew");
     }
 
@@ -3140,7 +3780,9 @@ f 1//1 2//1 3//1
         data.extend_from_slice(&2u32.to_le_bytes()); // version
         let json = br#"{"asset":{"version":"2.0"}}"#;
         let mut jb = json.to_vec();
-        while jb.len() % 4 != 0 { jb.push(b' '); }
+        while jb.len() % 4 != 0 {
+            jb.push(b' ');
+        }
         let bin = vec![1u8, 2, 3, 4];
         let total = 12 + 8 + jb.len() + 8 + bin.len();
         data.extend_from_slice(&(total as u32).to_le_bytes());
@@ -3151,9 +3793,16 @@ f 1//1 2//1 3//1
         data.extend_from_slice(b"BIN\0");
         data.extend_from_slice(&bin);
         let split = glb_split(&data);
-        assert!(split.is_some(), "real 'glTF' magic must be recognised as GLB");
+        assert!(
+            split.is_some(),
+            "real 'glTF' magic must be recognised as GLB"
+        );
         let (_json, glb_bin) = split.unwrap();
-        assert_eq!(glb_bin.as_deref(), Some(&[1u8, 2, 3, 4][..]), "BIN chunk extracted");
+        assert_eq!(
+            glb_bin.as_deref(),
+            Some(&[1u8, 2, 3, 4][..]),
+            "BIN chunk extracted"
+        );
     }
 
     /// The bundled casement window must import with see-through glass: its OBJ's `mtllib` names a
@@ -3174,12 +3823,19 @@ f 1//1 2//1 3//1
         let dir = std::path::Path::new(path).parent();
         let m = parse_obj_dir(&text, dir);
         assert!(m.tri_count() > 0, "window parses");
-        assert_eq!(m.alpha.len(), m.positions.len(), "per-vertex opacity recovered from the .mtl");
+        assert_eq!(
+            m.alpha.len(),
+            m.positions.len(),
+            "per-vertex opacity recovered from the .mtl"
+        );
         assert!(
             m.alpha.iter().any(|&a| a < 0.5),
             "at least one glass pane is see-through (Window_Mat d=0.2)"
         );
-        assert!(m.alpha.iter().any(|&a| a >= 0.996), "the frame stays opaque");
+        assert!(
+            m.alpha.iter().any(|&a| a >= 0.996),
+            "the frame stays opaque"
+        );
     }
 
     /// INVESTIGATIVE (ignored): parse the user's REAL window files and report per-vertex alpha,
@@ -3219,7 +3875,10 @@ f 1//1 2//1 3//1
         let m = parse_mtl_opacity(mtl);
         assert_eq!(m["frame"], 1.0);
         assert_eq!(m["glass"], 0.2, "d wins when present");
-        assert!((m["fromtr"] - 0.7).abs() < 1e-6, "opacity = 1 - Tr when only Tr is given");
+        assert!(
+            (m["fromtr"] - 0.7).abs() < 1e-6,
+            "opacity = 1 - Tr when only Tr is given"
+        );
     }
 
     #[test]
@@ -3228,7 +3887,11 @@ f 1//1 2//1 3//1
         // .mtl is resolved from the base dir, so the glass face's vertices carry low opacity.
         let dir = std::env::temp_dir().join("simlux_obj_alpha_test");
         let _ = std::fs::create_dir_all(&dir);
-        std::fs::write(dir.join("w.mtl"), "newmtl frame\nd 1.0\nnewmtl glass\nd 0.2\n").unwrap();
+        std::fs::write(
+            dir.join("w.mtl"),
+            "newmtl frame\nd 1.0\nnewmtl glass\nd 0.2\n",
+        )
+        .unwrap();
         let obj = "\
             mtllib w.mtl\n\
             v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\n\
@@ -3259,12 +3922,28 @@ f 1//1 2//1 3//1
                 {"alphaMode":"BLEND","pbrMetallicRoughness":{"baseColorFactor":[1,1,1,0.3]}},
                 {"alphaMode":"BLEND"}
             ]}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let mat = |i: u64| serde_json::json!({ "material": i });
-        assert_eq!(gltf_material_alpha(&doc, &mat(0)), 1.0, "OPAQUE stays solid even with a<1");
-        assert!((gltf_material_alpha(&doc, &mat(1)) - 0.3).abs() < 1e-6, "BLEND takes baseColorFactor.a");
-        assert_eq!(gltf_material_alpha(&doc, &mat(2)), 1.0, "BLEND with no factor defaults to 1");
-        assert_eq!(gltf_material_alpha(&doc, &serde_json::json!({})), 1.0, "no material ⇒ opaque");
+        assert_eq!(
+            gltf_material_alpha(&doc, &mat(0)),
+            1.0,
+            "OPAQUE stays solid even with a<1"
+        );
+        assert!(
+            (gltf_material_alpha(&doc, &mat(1)) - 0.3).abs() < 1e-6,
+            "BLEND takes baseColorFactor.a"
+        );
+        assert_eq!(
+            gltf_material_alpha(&doc, &mat(2)),
+            1.0,
+            "BLEND with no factor defaults to 1"
+        );
+        assert_eq!(
+            gltf_material_alpha(&doc, &serde_json::json!({})),
+            1.0,
+            "no material ⇒ opaque"
+        );
     }
 
     /// `KHR_materials_transmission` is the OTHER way a glTF says see-through, and the one a
@@ -3283,12 +3962,24 @@ f 1//1 2//1 3//1
             ]}"#,
         ).unwrap();
         let mat = |i: u64| serde_json::json!({ "material": i });
-        assert!((gltf_material_alpha(&doc, &mat(0)) - 0.55).abs() < 1e-6, "0.45 transmitted ⇒ 0.55 opaque");
-        assert_eq!(gltf_material_alpha(&doc, &mat(1)), 1.0, "the extension's own default is 0 transmission");
-        assert!((gltf_material_alpha(&doc, &mat(2)) - 0.1).abs() < 1e-6,
-            "coverage and transmission together ⇒ whichever passes MORE light, not the product");
-        assert_eq!(gltf_material_alpha(&doc, &mat(3)), 1.0,
-            "a different KHR extension must not be mistaken for transmission");
+        assert!(
+            (gltf_material_alpha(&doc, &mat(0)) - 0.55).abs() < 1e-6,
+            "0.45 transmitted ⇒ 0.55 opaque"
+        );
+        assert_eq!(
+            gltf_material_alpha(&doc, &mat(1)),
+            1.0,
+            "the extension's own default is 0 transmission"
+        );
+        assert!(
+            (gltf_material_alpha(&doc, &mat(2)) - 0.1).abs() < 1e-6,
+            "coverage and transmission together ⇒ whichever passes MORE light, not the product"
+        );
+        assert_eq!(
+            gltf_material_alpha(&doc, &mat(3)),
+            1.0,
+            "a different KHR extension must not be mistaken for transmission"
+        );
     }
 
     /// Transmission has to reach the renderer as ITSELF, not folded into the coverage alpha.
@@ -3310,9 +4001,20 @@ f 1//1 2//1 3//1
         assert!((gltf_transmission(&doc, Some(0)) - 0.45).abs() < 1e-6);
         assert!((gltf_material_alpha(&doc, &mat(0)) - 0.55).abs() < 1e-6);
         // A leaf card: just as see-through, and not a medium at all.
-        assert_eq!(gltf_transmission(&doc, Some(1)), 0.0, "coverage is not transmission");
-        assert!((gltf_material_alpha(&doc, &mat(1)) - 0.4).abs() < 1e-6, "…but it is still see-through");
-        assert_eq!(gltf_transmission(&doc, None), 0.0, "no material ⇒ not a medium");
+        assert_eq!(
+            gltf_transmission(&doc, Some(1)),
+            0.0,
+            "coverage is not transmission"
+        );
+        assert!(
+            (gltf_material_alpha(&doc, &mat(1)) - 0.4).abs() < 1e-6,
+            "…but it is still see-through"
+        );
+        assert_eq!(
+            gltf_transmission(&doc, None),
+            0.0,
+            "no material ⇒ not a medium"
+        );
     }
 }
 
@@ -3332,34 +4034,67 @@ mod villa_import_tests {
         let (mesh, pbr) = super::parse_gltf_ex(&bytes, path.parent());
 
         let nparts = pbr.part_texture.len();
-        let mapped = (0..nparts).filter(|&i| pbr.part_normal[i].is_some()).count();
-        let rough_mapped = (0..nparts).filter(|&i| pbr.part_rough_map[i].is_some()).count();
+        let mapped = (0..nparts)
+            .filter(|&i| pbr.part_normal[i].is_some())
+            .count();
+        let rough_mapped = (0..nparts)
+            .filter(|&i| pbr.part_rough_map[i].is_some())
+            .count();
         println!("{nparts} parts, {} textures, {mapped} with a normal map, {rough_mapped} with a roughness map",
             pbr.textures.len());
 
         // The five textured surfaces (stucco, painted wood, roof tiles, granite paving, pool
         // tiles) each carry a normal map AND a packed metallic-roughness map. Before this they
         // imported with the base colour alone and rendered dead flat.
-        assert!(mapped >= 5, "expected at least the five mapped surfaces, got {mapped}");
-        assert!(rough_mapped >= 5, "…each of which also carries roughness, got {rough_mapped}");
+        assert!(
+            mapped >= 5,
+            "expected at least the five mapped surfaces, got {mapped}"
+        );
+        assert!(
+            rough_mapped >= 5,
+            "…each of which also carries roughness, got {rough_mapped}"
+        );
 
         // The pool: authored roughness 0.035 (a mirror) and transmission 0.45.
         let water = (0..nparts)
             .find(|&i| (pbr.part_rough[i] - 0.035).abs() < 1e-4)
             .expect("the pool_water part, by its unmistakable roughness");
-        println!("pool_water: part {water}, rough {:.3}, metal {:.3}", pbr.part_rough[water], pbr.part_metal[water]);
+        println!(
+            "pool_water: part {water}, rough {:.3}, metal {:.3}",
+            pbr.part_rough[water], pbr.part_metal[water]
+        );
         // …and the colour the SHADER will see: the swatch decoded the way an sRGB sampler decodes it.
         let sw = &pbr.textures[pbr.part_texture[water].expect("water swatch")].2;
-        let lin: Vec<f32> = sw[0..3].iter().map(|&b| crate::color::srgb_to_linear(b as f32 / 255.0)).collect();
-        println!("pool_water albedo: bytes {:?} → linear {:.3?} (authored 0.055, 0.300, 0.340)", &sw[0..4], lin);
+        let lin: Vec<f32> = sw[0..3]
+            .iter()
+            .map(|&b| crate::color::srgb_to_linear(b as f32 / 255.0))
+            .collect();
+        println!(
+            "pool_water albedo: bytes {:?} → linear {:.3?} (authored 0.055, 0.300, 0.340)",
+            &sw[0..4],
+            lin
+        );
         for (got, want) in lin.iter().zip([0.055f32, 0.30, 0.34]) {
-            assert!((got - want).abs() < 0.01, "the water must keep its own colour: {lin:.3?}");
+            assert!(
+                (got - want).abs() < 0.01,
+                "the water must keep its own colour: {lin:.3?}"
+            );
         }
-        assert_eq!(pbr.part_metal[water], 0.0, "water is a dielectric — the case that used to reflect nothing");
+        assert_eq!(
+            pbr.part_metal[water], 0.0,
+            "water is a dielectric — the case that used to reflect nothing"
+        );
 
         // …and it must reach the mesh see-through, which only the transmission extension says.
-        let clear = mesh.alpha.iter().filter(|&&a| (a - 0.55).abs() < 1e-4).count();
-        assert!(clear > 0, "the pool surface must import at 55% opacity (0.45 transmitted)");
+        let clear = mesh
+            .alpha
+            .iter()
+            .filter(|&&a| (a - 0.55).abs() < 1e-4)
+            .count();
+        assert!(
+            clear > 0,
+            "the pool surface must import at 55% opacity (0.45 transmitted)"
+        );
         println!("{clear} vertices at 0.55 opacity — the water reads as water");
     }
 
@@ -3382,7 +4117,9 @@ mod villa_import_tests {
         // Group each part's triangles by the PLANE they lie in (normal, offset), quantised.
         let mut planes: std::collections::HashMap<(usize, [i64; 4]), usize> = Default::default();
         for (t, part) in pbr.part_ids.iter().enumerate() {
-            let p: Vec<glam::Vec3> = (0..3).map(|k| glam::Vec3::from(mesh.positions[t * 3 + k])).collect();
+            let p: Vec<glam::Vec3> = (0..3)
+                .map(|k| glam::Vec3::from(mesh.positions[t * 3 + k]))
+                .collect();
             let n = (p[1] - p[0]).cross(p[2] - p[0]);
             if n.length_squared() < 1e-12 {
                 continue;
@@ -3390,16 +4127,25 @@ mod villa_import_tests {
             let n = n.normalize();
             let d = n.dot(p[0]);
             let q = |v: f32| (v * 1000.0).round() as i64;
-            *planes.entry((*part as usize, [q(n.x), q(n.y), q(n.z), q(d)])).or_default() += 1;
+            *planes
+                .entry((*part as usize, [q(n.x), q(n.y), q(n.z), q(d)]))
+                .or_default() += 1;
         }
 
-        let water = (0..pbr.part_rough.len()).find(|&i| (pbr.part_rough[i] - 0.035).abs() < 1e-4).unwrap();
+        let water = (0..pbr.part_rough.len())
+            .find(|&i| (pbr.part_rough[i] - 0.035).abs() < 1e-4)
+            .unwrap();
         let mut mine: Vec<_> = planes.iter().filter(|((p, _), _)| *p == water).collect();
         mine.sort_by_key(|((_, k), _)| *k);
         println!("pool_water is part {water}: {} distinct planes", mine.len());
         for ((_, k), n) in &mine {
-            println!("   normal ({:.2},{:.2},{:.2})  offset {:.3} m   {n} triangles",
-                k[0] as f32 / 1000.0, k[1] as f32 / 1000.0, k[2] as f32 / 1000.0, k[3] as f32 / 1000.0);
+            println!(
+                "   normal ({:.2},{:.2},{:.2})  offset {:.3} m   {n} triangles",
+                k[0] as f32 / 1000.0,
+                k[1] as f32 / 1000.0,
+                k[2] as f32 / 1000.0,
+                k[3] as f32 / 1000.0
+            );
         }
 
         // Does any OTHER part share one of those planes?
@@ -3445,24 +4191,55 @@ mod villa_import_tests {
                 mx[k] = mx[k].max(p[k]);
             }
         }
-        let tex_px: usize = pbr.textures.iter().map(|(w, h, _)| *w as usize * *h as usize).sum();
-        println!("file      : {:.1} MB, read {read_ms} ms", bytes.len() as f64 / 1e6);
+        let tex_px: usize = pbr
+            .textures
+            .iter()
+            .map(|(w, h, _)| *w as usize * *h as usize)
+            .sum();
+        println!(
+            "file      : {:.1} MB, read {read_ms} ms",
+            bytes.len() as f64 / 1e6
+        );
         println!("parse     : {parse_ms} ms");
         println!("triangles : {tris}");
-        println!("uvs       : {} (verts {})", pbr.uvs.len(), mesh.positions.len());
+        println!(
+            "uvs       : {} (verts {})",
+            pbr.uvs.len(),
+            mesh.positions.len()
+        );
         println!("parts     : {} distinct", pbr.part_texture.len());
-        println!("textures  : {} images, {:.1} Mpx, {:.0} MB RGBA",
-                 pbr.textures.len(), tex_px as f64 / 1e6, tex_px as f64 * 4.0 / 1e6);
+        println!(
+            "textures  : {} images, {:.1} Mpx, {:.0} MB RGBA",
+            pbr.textures.len(),
+            tex_px as f64 / 1e6,
+            tex_px as f64 * 4.0 / 1e6
+        );
         println!("bounds    : {mn:?} .. {mx:?}");
-        println!("size      : {:?} m", [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]]);
+        println!(
+            "size      : {:?} m",
+            [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]]
+        );
 
-        assert!(tris > 1_500_000, "expected the full scene, got {tris} triangles");
-        assert_eq!(pbr.uvs.len(), mesh.positions.len(), "every vertex must carry a UV");
+        assert!(
+            tris > 1_500_000,
+            "expected the full scene, got {tris} triangles"
+        );
+        assert_eq!(
+            pbr.uvs.len(),
+            mesh.positions.len(),
+            "every vertex must carry a UV"
+        );
         assert_eq!(pbr.part_ids.len(), tris, "one part id per triangle");
         // Authored in metres at real-world size — the autoload depends on this.
         let longest = (mx[0] - mn[0]).max(mx[1] - mn[1]).max(mx[2] - mn[2]);
-        assert!((80.0..95.0).contains(&longest), "expected an ~86 m site, got {longest} m");
-        assert!(mx[2] - mn[2] > 8.0 && mx[2] - mn[2] < 14.0, "expected a ~10.6 m tall scene");
+        assert!(
+            (80.0..95.0).contains(&longest),
+            "expected an ~86 m site, got {longest} m"
+        );
+        assert!(
+            mx[2] - mn[2] > 8.0 && mx[2] - mn[2] < 14.0,
+            "expected a ~10.6 m tall scene"
+        );
     }
 }
 
@@ -3490,24 +4267,45 @@ mod import_scale_tests {
         // An 86 m site — the villa scene. Normalised down, so the factor must be < 1.
         let a = st.add_furniture_asset("villa".into(), box_mesh(86.0, 74.0, 10.6));
         let asset = &st.furniture_lib[a];
-        assert!(asset.import_scale < 1.0, "a big model is shrunk: {}", asset.import_scale);
+        assert!(
+            asset.import_scale < 1.0,
+            "a big model is shrunk: {}",
+            asset.import_scale
+        );
         let longest = |a: &crate::factory::FurnitureAsset| {
-            let e = [a.local_max[0] - a.local_min[0], a.local_max[1] - a.local_min[1], a.local_max[2] - a.local_min[2]];
+            let e = [
+                a.local_max[0] - a.local_min[0],
+                a.local_max[1] - a.local_min[1],
+                a.local_max[2] - a.local_min[2],
+            ];
             e[0].max(e[1]).max(e[2])
         };
-        assert!((longest(asset) - 1.5).abs() < 1e-3, "normalised to 1.5 m, got {}", longest(asset));
+        assert!(
+            (longest(asset) - 1.5).abs() < 1e-3,
+            "normalised to 1.5 m, got {}",
+            longest(asset)
+        );
         // Undoing it must restore the real 86 m.
         let world = longest(asset) / asset.import_scale;
-        assert!((world - 86.0).abs() < 0.01, "1/import_scale must restore real size, got {world}");
+        assert!(
+            (world - 86.0).abs() < 0.01,
+            "1/import_scale must restore real size, got {world}"
+        );
 
         // A normal-sized piece is left alone, and undoing is then a no-op.
         let b = st.add_furniture_asset("chair".into(), box_mesh(0.6, 0.6, 0.9));
-        assert_eq!(st.furniture_lib[b].import_scale, 1.0, "an in-range model is not rescaled");
+        assert_eq!(
+            st.furniture_lib[b].import_scale, 1.0,
+            "an in-range model is not rescaled"
+        );
         assert!((longest(&st.furniture_lib[b]) - 0.9).abs() < 1e-4);
 
         // …and a millimetre export is scaled UP, so the factor exceeds 1.
         let c = st.add_furniture_asset("tiny".into(), box_mesh(0.02, 0.01, 0.03));
-        assert!(st.furniture_lib[c].import_scale > 1.0, "a sub-50 mm model is grown");
+        assert!(
+            st.furniture_lib[c].import_scale > 1.0,
+            "a sub-50 mm model is grown"
+        );
         assert!((longest(&st.furniture_lib[c]) - 1.5).abs() < 1e-3);
     }
 }
@@ -3519,33 +4317,65 @@ mod gltf_material_dump {
     #[test]
     #[ignore = "diagnostic"]
     fn dump_gltf_materials() {
-        let p = std::env::var("GLB").unwrap_or_else(|_| r"G:\blender dev\staircase\villa scene\villa_scene.glb".into());
+        let p = std::env::var("GLB")
+            .unwrap_or_else(|_| r"G:\blender dev\staircase\villa scene\villa_scene.glb".into());
         let bytes = std::fs::read(&p).expect("read glb");
         let (json, _) = super::glb_split(&bytes).expect("glb");
         let doc: serde_json::Value = serde_json::from_str(&json).expect("json");
         let mats = doc["materials"].as_array().cloned().unwrap_or_default();
-        println!("{} materials, {} textures, {} images",
+        println!(
+            "{} materials, {} textures, {} images",
             mats.len(),
             doc["textures"].as_array().map(|a| a.len()).unwrap_or(0),
-            doc["images"].as_array().map(|a| a.len()).unwrap_or(0));
+            doc["images"].as_array().map(|a| a.len()).unwrap_or(0)
+        );
         let mut with_img = 0;
         for (i, m) in mats.iter().enumerate() {
             let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            let ti = m.pointer("/pbrMetallicRoughness/baseColorTexture/index").and_then(|v| v.as_u64());
-            let f = m.pointer("/pbrMetallicRoughness/baseColorFactor")
+            let ti = m
+                .pointer("/pbrMetallicRoughness/baseColorTexture/index")
+                .and_then(|v| v.as_u64());
+            let f = m
+                .pointer("/pbrMetallicRoughness/baseColorFactor")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_f64()).map(|x| format!("{x:.2}")).collect::<Vec<_>>().join(","))
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_f64())
+                        .map(|x| format!("{x:.2}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
                 .unwrap_or_else(|| "1,1,1,1 (default)".into());
             let nrm = m.pointer("/normalTexture/index").is_some();
-            let mr = m.pointer("/pbrMetallicRoughness/metallicRoughnessTexture/index").is_some();
-            let img = ti.and_then(|t| doc["textures"][t as usize].get("source").and_then(|v| v.as_u64()))
-                .and_then(|s| doc["images"][s as usize].get("name").and_then(|v| v.as_str()).map(|x| x.to_string()));
-            if img.is_some() { with_img += 1; }
-            println!("{i:>3}  {name:<34} base={:<28} factor=[{f}] {}{}",
+            let mr = m
+                .pointer("/pbrMetallicRoughness/metallicRoughnessTexture/index")
+                .is_some();
+            let img = ti
+                .and_then(|t| {
+                    doc["textures"][t as usize]
+                        .get("source")
+                        .and_then(|v| v.as_u64())
+                })
+                .and_then(|s| {
+                    doc["images"][s as usize]
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|x| x.to_string())
+                });
+            if img.is_some() {
+                with_img += 1;
+            }
+            println!(
+                "{i:>3}  {name:<34} base={:<28} factor=[{f}] {}{}",
                 img.unwrap_or_else(|| "— NO IMAGE —".into()),
-                if nrm { "+nrm" } else { "" }, if mr { "+mr" } else { "" });
+                if nrm { "+nrm" } else { "" },
+                if mr { "+mr" } else { "" }
+            );
         }
-        println!("\n{with_img}/{} materials carry a base-colour image", mats.len());
+        println!(
+            "\n{with_img}/{} materials carry a base-colour image",
+            mats.len()
+        );
     }
 }
 
@@ -3569,12 +4399,19 @@ mod villa_perf_tests {
         let bytes = std::fs::read(P).unwrap();
         let t = Instant::now();
         let (mesh, pbr) = super::parse_gltf_ex(&bytes, std::path::Path::new(P).parent());
-        println!("parse_gltf_ex        {:>8.0} ms   ({} tris)", t.elapsed().as_secs_f64() * 1e3, mesh.positions.len() / 3);
+        println!(
+            "parse_gltf_ex        {:>8.0} ms   ({} tris)",
+            t.elapsed().as_secs_f64() * 1e3,
+            mesh.positions.len() / 3
+        );
 
         let mut st = crate::factory::FactoryState::default();
         let t = Instant::now();
         let idx = st.add_furniture_asset("villa".into(), mesh);
-        println!("add_furniture_asset  {:>8.0} ms", t.elapsed().as_secs_f64() * 1e3);
+        println!(
+            "add_furniture_asset  {:>8.0} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
 
         // The app attaches the glTF UVs + part ids after adding the asset.
         let t = Instant::now();
@@ -3583,7 +4420,10 @@ mod villa_perf_tests {
             a.uvs = pbr.uvs.clone();
             a.part_ids = pbr.part_ids.clone();
         }
-        println!("attach uvs+parts     {:>8.0} ms", t.elapsed().as_secs_f64() * 1e3);
+        println!(
+            "attach uvs+parts     {:>8.0} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
 
         // THE suspect: a coplanar flood fill + weld over every triangle, run lazily on first draw.
         let t = Instant::now();
@@ -3595,11 +4435,17 @@ mod villa_perf_tests {
 
         let t = Instant::now();
         let _ = st.furniture_lib[idx].group_geom();
-        println!("group_geom (cached)  {:>8.3} ms", t.elapsed().as_secs_f64() * 1e3);
+        println!(
+            "group_geom (cached)  {:>8.3} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
 
         let t = Instant::now();
         let n = st.furniture_lib[idx].is_translucent();
-        println!("is_translucent       {:>8.0} ms   ({n})", t.elapsed().as_secs_f64() * 1e3);
+        println!(
+            "is_translucent       {:>8.0} ms   ({n})",
+            t.elapsed().as_secs_f64() * 1e3
+        );
     }
 }
 
@@ -3641,16 +4487,26 @@ mod heavy_group_tests {
 
         assert_eq!(g.face.len(), n, "one group id per triangle");
         let faces: std::collections::BTreeSet<u32> = g.face.iter().copied().collect();
-        assert_eq!(faces.len(), 3, "the material parts ARE the faces on a heavy mesh: {faces:?}");
+        assert_eq!(
+            faces.len(),
+            3,
+            "the material parts ARE the faces on a heavy mesh: {faces:?}"
+        );
         assert_eq!(g.body, g.face, "and the bodies match them");
         // A generous ceiling: the flood fill on this many triangles takes hundreds of ms even in
         // release, so anything near it means the shortcut stopped working.
-        assert!(ms < 200.0, "heavy grouping must be near-free, took {ms:.0} ms");
+        assert!(
+            ms < 200.0,
+            "heavy grouping must be near-free, took {ms:.0} ms"
+        );
 
         // A mesh with no part ids at all degrades to ONE group rather than to a long wait.
         let idx2 = st.add_furniture_asset("heavy_bare".into(), soup(n));
         let g2 = st.furniture_lib[idx2].group_geom();
-        assert!(g2.face.iter().all(|&f| f == 0), "no parts ⇒ a single whole-object group");
+        assert!(
+            g2.face.iter().all(|&f| f == 0),
+            "no parts ⇒ a single whole-object group"
+        );
 
         // …and a SMALL mesh still gets the real coplanar grouping, which is what makes
         // click-a-face texturing work on ordinary furniture.
@@ -3658,7 +4514,11 @@ mod heavy_group_tests {
         let small = st3.add_furniture_asset("small".into(), soup(64));
         let g3 = st3.furniture_lib[small].group_geom();
         let f3: std::collections::BTreeSet<u32> = g3.face.iter().copied().collect();
-        assert!(f3.len() > 1, "a small mesh keeps per-face grouping ({} groups)", f3.len());
+        assert!(
+            f3.len() > 1,
+            "a small mesh keeps per-face grouping ({} groups)",
+            f3.len()
+        );
     }
 }
 
@@ -3670,10 +4530,15 @@ mod gltf_texture_content {
     #[test]
     #[ignore = "diagnostic"]
     fn dump_texture_average_colours() {
-        let p = std::env::var("GLB").unwrap_or_else(|_| r"G:\blender dev\staircase\villa scene\villa_scene.glb".into());
+        let p = std::env::var("GLB")
+            .unwrap_or_else(|_| r"G:\blender dev\staircase\villa scene\villa_scene.glb".into());
         let bytes = std::fs::read(&p).expect("read glb");
         let (_m, pbr) = super::parse_gltf_ex(&bytes, std::path::Path::new(&p).parent());
-        println!("{} textures, {} parts", pbr.textures.len(), pbr.part_texture.len());
+        println!(
+            "{} textures, {} parts",
+            pbr.textures.len(),
+            pbr.part_texture.len()
+        );
         for (i, (w, h, rgba)) in pbr.textures.iter().enumerate() {
             let mut s = [0u64; 3];
             let n = (rgba.len() / 4).max(1);
@@ -3684,8 +4549,13 @@ mod gltf_texture_content {
             }
             let avg = [s[0] / n as u64, s[1] / n as u64, s[2] / n as u64];
             let white = avg.iter().all(|&c| c > 235);
-            println!("  tex {i:>2}  {w:>5}x{h:<5} avg=({:>3},{:>3},{:>3}) {}",
-                avg[0], avg[1], avg[2], if white { "<-- ESSENTIALLY WHITE" } else { "" });
+            println!(
+                "  tex {i:>2}  {w:>5}x{h:<5} avg=({:>3},{:>3},{:>3}) {}",
+                avg[0],
+                avg[1],
+                avg[2],
+                if white { "<-- ESSENTIALLY WHITE" } else { "" }
+            );
         }
     }
 }
@@ -3716,15 +4586,29 @@ mod fbx_textures {
     fn an_embedded_texture_is_read_out_of_the_fbx_itself() {
         let (mesh, pbr) = load("tex_cube_embedded.fbx");
         assert_eq!(mesh.tri_count(), 12, "a cube is 12 triangles");
-        let images: Vec<_> = pbr.textures.iter().filter(|(w, h, _)| *w > 1 || *h > 1).collect();
-        assert_eq!(images.len(), 1, "one real image, got textures {:?}",
-            pbr.textures.iter().map(|(w, h, _)| (*w, *h)).collect::<Vec<_>>());
+        let images: Vec<_> = pbr
+            .textures
+            .iter()
+            .filter(|(w, h, _)| *w > 1 || *h > 1)
+            .collect();
+        assert_eq!(
+            images.len(),
+            1,
+            "one real image, got textures {:?}",
+            pbr.textures
+                .iter()
+                .map(|(w, h, _)| (*w, *h))
+                .collect::<Vec<_>>()
+        );
         let (w, h, rgba) = images[0];
         assert_eq!((*w, *h), (64, 64));
         // The four quadrant colours must all survive — a wrong decode gives grey or one colour.
         let pal = palette(rgba);
         for want in [[0xE0, 0, 0], [0, 0xE0, 0], [0, 0, 0xE0], [0xE0, 0xE0, 0]] {
-            assert!(pal.contains(&want), "quadrant {want:?} missing from {pal:?}");
+            assert!(
+                pal.contains(&want),
+                "quadrant {want:?} missing from {pal:?}"
+            );
         }
     }
 
@@ -3734,8 +4618,16 @@ mod fbx_textures {
     fn a_texture_file_beside_the_fbx_resolves_the_same_way() {
         let (_, emb) = load("tex_cube_embedded.fbx");
         let (_, ext) = load("tex_cube_external.fbx");
-        let img = |p: &super::GltfPbr| p.textures.iter().find(|(w, h, _)| *w > 1 || *h > 1).cloned();
-        let (a, b) = (img(&emb).expect("embedded image"), img(&ext).expect("external image"));
+        let img = |p: &super::GltfPbr| {
+            p.textures
+                .iter()
+                .find(|(w, h, _)| *w > 1 || *h > 1)
+                .cloned()
+        };
+        let (a, b) = (
+            img(&emb).expect("embedded image"),
+            img(&ext).expect("external image"),
+        );
         assert_eq!((a.0, a.1), (b.0, b.1), "same image dimensions either way");
         assert_eq!(palette(&a.2), palette(&b.2), "same pixels either way");
     }
@@ -3745,9 +4637,17 @@ mod fbx_textures {
     #[test]
     fn one_mesh_with_two_materials_splits_into_two_parts() {
         let (mesh, pbr) = load("tex_cube_embedded.fbx");
-        assert_eq!(pbr.part_ids.len(), mesh.tri_count(), "one part id per triangle");
+        assert_eq!(
+            pbr.part_ids.len(),
+            mesh.tri_count(),
+            "one part id per triangle"
+        );
         let parts: std::collections::BTreeSet<u32> = pbr.part_ids.iter().copied().collect();
-        assert_eq!(parts.len(), 2, "textured sides and the red top are separate parts");
+        assert_eq!(
+            parts.len(),
+            2,
+            "textured sides and the red top are separate parts"
+        );
 
         // The red top is exactly one quad = 2 triangles; the textured sides are the other 10.
         let mut count = std::collections::BTreeMap::new();
@@ -3760,13 +4660,24 @@ mod fbx_textures {
 
         // …and they must point at DIFFERENT appearances: one image, one red swatch.
         let of = |p: u32| pbr.part_texture[p as usize].map(|s| &pbr.textures[s]);
-        let big = count.iter().max_by_key(|(_, n)| **n).map(|(p, _)| *p).unwrap();
-        let small = count.iter().min_by_key(|(_, n)| **n).map(|(p, _)| *p).unwrap();
+        let big = count
+            .iter()
+            .max_by_key(|(_, n)| **n)
+            .map(|(p, _)| *p)
+            .unwrap();
+        let small = count
+            .iter()
+            .min_by_key(|(_, n)| **n)
+            .map(|(p, _)| *p)
+            .unwrap();
         let (bw, bh, _) = of(big).expect("sides have an appearance");
         assert!(*bw > 1 && *bh > 1, "the sides wear the image");
         let (sw, sh, srgba) = of(small).expect("top has an appearance");
         assert_eq!((*sw, *sh), (1, 1), "the top has no image, just its colour");
-        assert!(srgba[0] > 150 && srgba[1] < 80 && srgba[2] < 80, "the top is red, got {srgba:?}");
+        assert!(
+            srgba[0] > 150 && srgba[1] < 80 && srgba[2] < 80,
+            "the top is red, got {srgba:?}"
+        );
     }
 
     /// Two images on one material — the quadrant colour map and a normal map. The reader must
@@ -3785,10 +4696,17 @@ mod fbx_textures {
         let (w, h, rgba) = pbr.part_texture[sides as usize]
             .map(|s| &pbr.textures[s])
             .expect("the sides have an appearance");
-        assert_eq!((*w, *h), (64, 64), "the 64² colour map, not the 32² normal map");
+        assert_eq!(
+            (*w, *h),
+            (64, 64),
+            "the 64² colour map, not the 32² normal map"
+        );
         // A normal map is flat lilac everywhere; the colour map has four saturated quadrants.
         let pal = palette(rgba);
-        assert!(pal.contains(&[0xE0, 0, 0]), "expected the colour map's red, got {pal:?}");
+        assert!(
+            pal.contains(&[0xE0, 0, 0]),
+            "expected the colour map's red, got {pal:?}"
+        );
     }
 
     /// The discriminating half of the case above: a material wearing ONLY a normal map. There is
@@ -3797,9 +4715,16 @@ mod fbx_textures {
     #[test]
     fn a_material_with_only_a_normal_map_falls_back_to_its_colour() {
         let (_, pbr) = load("tex_cube_normalonly.fbx");
-        let images: Vec<_> = pbr.textures.iter().filter(|(w, h, _)| *w > 1 || *h > 1).collect();
-        assert!(images.is_empty(), "no image should be bound, got {:?}",
-            images.iter().map(|(w, h, _)| (*w, *h)).collect::<Vec<_>>());
+        let images: Vec<_> = pbr
+            .textures
+            .iter()
+            .filter(|(w, h, _)| *w > 1 || *h > 1)
+            .collect();
+        assert!(
+            images.is_empty(),
+            "no image should be bound, got {:?}",
+            images.iter().map(|(w, h, _)| (*w, *h)).collect::<Vec<_>>()
+        );
         // The sides must carry the material's own blue, not the normal map's lilac.
         let sides = pbr
             .part_ids
@@ -3810,7 +4735,10 @@ mod fbx_textures {
         let (_, _, rgba) = pbr.part_texture[sides as usize]
             .map(|s| &pbr.textures[s])
             .expect("the sides have an appearance");
-        assert!(rgba[2] > rgba[0] + 60, "expected the material's blue, got {rgba:?}");
+        assert!(
+            rgba[2] > rgba[0] + 60,
+            "expected the material's blue, got {rgba:?}"
+        );
     }
 
     /// UVs are the other half of "textures work" — an image with no UVs is box-projected, which
@@ -3818,7 +4746,11 @@ mod fbx_textures {
     #[test]
     fn uvs_come_through_per_vertex_and_span_the_map() {
         let (mesh, pbr) = load("tex_cube_embedded.fbx");
-        assert_eq!(pbr.uvs.len(), mesh.positions.len(), "one UV per emitted vertex");
+        assert_eq!(
+            pbr.uvs.len(),
+            mesh.positions.len(),
+            "one UV per emitted vertex"
+        );
         let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
         for uv in &pbr.uvs {
             for k in 0..2 {
@@ -3826,12 +4758,25 @@ mod fbx_textures {
                 hi[k] = hi[k].max(uv[k]);
             }
         }
-        assert!(lo[0] <= 0.01 && lo[1] <= 0.01, "UVs start at the map origin, got {lo:?}");
-        assert!(hi[0] >= 0.99 && hi[1] >= 0.99, "UVs reach the far corner, got {hi:?}");
+        assert!(
+            lo[0] <= 0.01 && lo[1] <= 0.01,
+            "UVs start at the map origin, got {lo:?}"
+        );
+        assert!(
+            hi[0] >= 0.99 && hi[1] >= 0.99,
+            "UVs reach the far corner, got {hi:?}"
+        );
         // Not all one value — a collapsed UV set would pass the span test on a lucky pair.
-        let distinct: std::collections::BTreeSet<[u32; 2]> =
-            pbr.uvs.iter().map(|t| [t[0].to_bits(), t[1].to_bits()]).collect();
-        assert!(distinct.len() >= 4, "expected varied UVs, got {} distinct", distinct.len());
+        let distinct: std::collections::BTreeSet<[u32; 2]> = pbr
+            .uvs
+            .iter()
+            .map(|t| [t[0].to_bits(), t[1].to_bits()])
+            .collect();
+        assert!(
+            distinct.len() >= 4,
+            "expected varied UVs, got {} distinct",
+            distinct.len()
+        );
     }
 
     /// A geometry-only regression guard: the appearance work must not disturb the mesh. The cube
@@ -3852,7 +4797,11 @@ mod fbx_textures {
             }
         }
         for k in 0..3 {
-            assert!((hi[k] - lo[k] - 2.0).abs() < 1e-4, "axis {k} spans {} m, want 2", hi[k] - lo[k]);
+            assert!(
+                (hi[k] - lo[k] - 2.0).abs() < 1e-4,
+                "axis {k} spans {} m, want 2",
+                hi[k] - lo[k]
+            );
             assert!((hi[k] + lo[k]).abs() < 1e-4, "axis {k} is off centre");
         }
     }
@@ -3867,25 +4816,38 @@ mod fbx_survey {
     fn dump_binary_fbx_tree() {
         // Override with SIMLUX_FBX=<path> to dump any other file.
         let path = std::env::var("SIMLUX_FBX").unwrap_or_else(|_| {
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/test/fbx/tex_cube_embedded.fbx").into()
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../assets/test/fbx/tex_cube_embedded.fbx"
+            )
+            .into()
         });
         let data = std::fs::read(&path).expect("fixture");
         let v75 = u32::from_le_bytes([data[23], data[24], data[25], data[26]]) >= 7500;
-        let mut cur = super::FbxCursor { buf: &data, pos: 27 };
+        let mut cur = super::FbxCursor {
+            buf: &data,
+            pos: 27,
+        };
         let root = super::fbx_parse_siblings(&mut cur, v75, data.len());
         fn walk(ns: &[super::FbxNode], d: usize) {
             for n in ns {
-                let p: Vec<String> = n.props.iter().map(|v| match v {
-                    super::FbxVal::I(x) => format!("I({x})"),
-                    super::FbxVal::F(x) => format!("F({x:.3})"),
-                    super::FbxVal::S(s) => format!("S({:?})", &s[..s.len().min(60)]),
-                    super::FbxVal::Fa(a) => format!("d[{}]", a.len()),
-                    super::FbxVal::Ia(a) => format!("i[{}]", a.len()),
-                    super::FbxVal::Raw(b) => format!("raw[{}]", b.len()),
-                    super::FbxVal::Skip => "SKIP".into(),
-                }).collect();
+                let p: Vec<String> = n
+                    .props
+                    .iter()
+                    .map(|v| match v {
+                        super::FbxVal::I(x) => format!("I({x})"),
+                        super::FbxVal::F(x) => format!("F({x:.3})"),
+                        super::FbxVal::S(s) => format!("S({:?})", &s[..s.len().min(60)]),
+                        super::FbxVal::Fa(a) => format!("d[{}]", a.len()),
+                        super::FbxVal::Ia(a) => format!("i[{}]", a.len()),
+                        super::FbxVal::Raw(b) => format!("raw[{}]", b.len()),
+                        super::FbxVal::Skip => "SKIP".into(),
+                    })
+                    .collect();
                 println!("{:indent$}{} {}", "", n.name, p.join(" "), indent = d * 2);
-                if d < 5 { walk(&n.children, d + 1); }
+                if d < 5 {
+                    walk(&n.children, d + 1);
+                }
             }
         }
         walk(&root, 0);
@@ -3911,15 +4873,30 @@ mod fbx_survey {
         let t = std::time::Instant::now();
         let (mesh, pbr) = super::parse_fbx_pbr_at(&bytes, p.parent());
         let ms = t.elapsed().as_millis();
-        println!("{}  {:.1} MB, parsed in {ms} ms", p.display(), bytes.len() as f64 / 1e6);
-        println!("  triangles {}   parts {}   uvs {}",
-            mesh.tri_count(), pbr.part_texture.len(), pbr.uvs.len());
+        println!(
+            "{}  {:.1} MB, parsed in {ms} ms",
+            p.display(),
+            bytes.len() as f64 / 1e6
+        );
+        println!(
+            "  triangles {}   parts {}   uvs {}",
+            mesh.tri_count(),
+            pbr.part_texture.len(),
+            pbr.uvs.len()
+        );
         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
         for p in &mesh.positions {
-            for k in 0..3 { lo[k] = lo[k].min(p[k]); hi[k] = hi[k].max(p[k]); }
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
         }
-        println!("  bounds    {:?} .. {:?}  size {:?}", lo, hi,
-            [hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]]);
+        println!(
+            "  bounds    {:?} .. {:?}  size {:?}",
+            lo,
+            hi,
+            [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]]
+        );
         let mut images = 0;
         for (i, (w, h, rgba)) in pbr.textures.iter().enumerate() {
             let n = (rgba.len() / 4).max(1) as u64;
@@ -3932,9 +4909,17 @@ mod fbx_survey {
             let avg = [s[0] / n, s[1] / n, s[2] / n];
             if *w > 1 || *h > 1 {
                 images += 1;
-                println!("  tex {i:>3}  {w:>5}x{h:<5} avg=({:>3},{:>3},{:>3}){}",
-                    avg[0], avg[1], avg[2],
-                    if avg.iter().all(|&c| c > 235) { "   <-- ESSENTIALLY WHITE" } else { "" });
+                println!(
+                    "  tex {i:>3}  {w:>5}x{h:<5} avg=({:>3},{:>3},{:>3}){}",
+                    avg[0],
+                    avg[1],
+                    avg[2],
+                    if avg.iter().all(|&c| c > 235) {
+                        "   <-- ESSENTIALLY WHITE"
+                    } else {
+                        ""
+                    }
+                );
             }
         }
         println!("  images {images} of {} appearances", pbr.textures.len());
@@ -3950,32 +4935,46 @@ mod fbx_survey {
         for d in ["assets/cc0/furniture", "assets/apertures"] {
             if let Ok(rd) = std::fs::read_dir(d) {
                 paths.extend(rd.flatten().map(|e| e.path()).filter(|p| {
-                    p.extension().map(|e| e.eq_ignore_ascii_case("fbx")).unwrap_or(false)
+                    p.extension()
+                        .map(|e| e.eq_ignore_ascii_case("fbx"))
+                        .unwrap_or(false)
                 }));
             }
         }
-        for extra in [r"G:\blender dev\staircase\villa model\build\villa_v1.fbx",
-                      r"G:\blender dev\staircase\cabinet\build\kitchen_v1.fbx"] {
+        for extra in [
+            r"G:\blender dev\staircase\villa model\build\villa_v1.fbx",
+            r"G:\blender dev\staircase\cabinet\build\kitchen_v1.fbx",
+        ] {
             let p = std::path::PathBuf::from(extra);
-            if p.exists() { paths.push(p); }
+            if p.exists() {
+                paths.push(p);
+            }
         }
         for p in paths {
-            let Ok(bytes) = std::fs::read(&p) else { continue };
+            let Ok(bytes) = std::fs::read(&p) else {
+                continue;
+            };
             let ascii = super::is_ascii_fbx(&bytes);
             let (mesh, pbr) = if ascii {
                 super::parse_fbx_ascii(&bytes, p.parent())
             } else {
                 super::parse_fbx_pbr_at(&bytes, p.parent())
             };
-            let real_imgs = pbr.textures.iter().filter(|(w, h, _)| *w > 1 || *h > 1).count();
-            println!("{:<44} {:<7} {:>8} tris  uv={:<5} parts={:<4} tex={} (real images {})",
+            let real_imgs = pbr
+                .textures
+                .iter()
+                .filter(|(w, h, _)| *w > 1 || *h > 1)
+                .count();
+            println!(
+                "{:<44} {:<7} {:>8} tris  uv={:<5} parts={:<4} tex={} (real images {})",
                 p.file_name().unwrap().to_string_lossy(),
                 if ascii { "ascii" } else { "binary" },
                 mesh.positions.len() / 3,
                 !pbr.uvs.is_empty(),
                 pbr.part_texture.len(),
                 pbr.textures.len(),
-                real_imgs);
+                real_imgs
+            );
         }
     }
 }

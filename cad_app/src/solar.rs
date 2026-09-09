@@ -121,7 +121,14 @@ pub struct SunPos {
 /// Compute the sun's direction. Inputs are the friendly convention: `lat_deg` +north, `lon_deg`
 /// +east, `utc_offset_hours` +east (e.g. British Summer Time = +1, PST = −8). `north_offset_deg`
 /// rotates the result about Z so world +Y need not be true north (0 = +Y is north).
-pub fn sun_position(lat_deg: f32, lon_deg: f32, utc_offset_hours: f32, doy: u32, hour: f32, north_offset_deg: f32) -> SunPos {
+pub fn sun_position(
+    lat_deg: f32,
+    lon_deg: f32,
+    utc_offset_hours: f32,
+    doy: u32,
+    hour: f32,
+    north_offset_deg: f32,
+) -> SunPos {
     let lat = lat_deg.to_radians();
     // Radiance is west-positive: flip the +east inputs.
     let s_long = (-lon_deg).to_radians();
@@ -147,7 +154,12 @@ pub fn sun_position(lat_deg: f32, lon_deg: f32, utc_offset_hours: f32, doy: u32,
     let (c, s) = (no.cos(), no.sin());
     let dir = Vec3::new(east * c - north * s, east * s + north * c, up);
 
-    SunPos { altitude_deg: alt.to_degrees(), bearing_deg: bearing, dir, up: alt > 0.0 }
+    SunPos {
+        altitude_deg: alt.to_degrees(),
+        bearing_deg: bearing,
+        dir,
+        up: alt > 0.0,
+    }
 }
 
 #[cfg(test)]
@@ -169,8 +181,14 @@ mod tests {
     #[test]
     fn declination_matches_the_seasons() {
         assert!(declination(81.0).abs() < 0.02, "≈0 at equinox");
-        assert!((declination(172.0).to_degrees() - 23.4).abs() < 1.0, "+23.4° June");
-        assert!((declination(355.0).to_degrees() + 23.4).abs() < 1.0, "−23.4° December");
+        assert!(
+            (declination(172.0).to_degrees() - 23.4).abs() < 1.0,
+            "+23.4° June"
+        );
+        assert!(
+            (declination(355.0).to_degrees() + 23.4).abs() < 1.0,
+            "−23.4° December"
+        );
     }
 
     /// Radiance `salt` at the equinox, solar noon (st = 12), latitude φ gives altitude 90°−φ — the
@@ -179,7 +197,10 @@ mod tests {
     fn equinox_noon_altitude_is_90_minus_latitude() {
         let sd = declination(81.0);
         let alt = altitude(40.0f32.to_radians(), sd, 12.0).to_degrees();
-        assert!((alt - 50.0).abs() < 0.3, "alt {alt} ≈ 50° at 40°N equinox noon");
+        assert!(
+            (alt - 50.0).abs() < 0.3,
+            "alt {alt} ≈ 50° at 40°N equinox noon"
+        );
         let alt0 = altitude(0.0, sd, 12.0).to_degrees();
         assert!((alt0 - 90.0).abs() < 0.3, "overhead at the equator");
     }
@@ -189,9 +210,17 @@ mod tests {
     fn summer_noon_is_high_and_south() {
         // Choose an hour near local solar noon for a place ON its standard meridian.
         let p = sun_position(40.0, -75.0, -5.0, day_of_year(6, 21), 12.0, 0.0);
-        assert!(p.up && p.altitude_deg > 68.0 && p.altitude_deg < 75.0, "high summer sun {}", p.altitude_deg);
+        assert!(
+            p.up && p.altitude_deg > 68.0 && p.altitude_deg < 75.0,
+            "high summer sun {}",
+            p.altitude_deg
+        );
         // Near south: bearing within ±20° of 180.
-        assert!((p.bearing_deg - 180.0).abs() < 25.0, "≈ south, bearing {}", p.bearing_deg);
+        assert!(
+            (p.bearing_deg - 180.0).abs() < 25.0,
+            "≈ south, bearing {}",
+            p.bearing_deg
+        );
         // Direction points up and is a unit vector.
         assert!(p.dir.z > 0.9, "sun is high, dir.z {}", p.dir.z);
         assert!((p.dir.length() - 1.0).abs() < 1e-3, "unit vector");
@@ -204,7 +233,10 @@ mod tests {
         let doy = day_of_year(3, 21);
         let midnight = sun_position(51.5, -0.13, 0.0, doy, 0.0, 0.0);
         let noon = sun_position(51.5, -0.13, 0.0, doy, 12.0, 0.0);
-        assert!(!midnight.up && midnight.altitude_deg < 0.0, "down at midnight");
+        assert!(
+            !midnight.up && midnight.altitude_deg < 0.0,
+            "down at midnight"
+        );
         assert!(noon.up && noon.altitude_deg > 0.0, "up at noon");
     }
 
@@ -214,11 +246,17 @@ mod tests {
     fn north_offset_rotates_the_direction() {
         let a = sun_position(45.0, 0.0, 0.0, day_of_year(9, 21), 9.0, 0.0);
         let b = sun_position(45.0, 0.0, 0.0, day_of_year(9, 21), 9.0, 90.0);
-        assert!((a.dir.z - b.dir.z).abs() < 1e-4, "altitude unchanged by north offset");
+        assert!(
+            (a.dir.z - b.dir.z).abs() < 1e-4,
+            "altitude unchanged by north offset"
+        );
         // Horizontal component rotates 90°: a.(x,y) ≈ b rotated back.
         let ah = glam::Vec2::new(a.dir.x, a.dir.y);
         let bh = glam::Vec2::new(b.dir.x, b.dir.y);
-        assert!((ah.length() - bh.length()).abs() < 1e-4, "same horizontal magnitude");
+        assert!(
+            (ah.length() - bh.length()).abs() < 1e-4,
+            "same horizontal magnitude"
+        );
         let dot = ah.normalize().dot(bh.normalize()).clamp(-1.0, 1.0);
         assert!((dot.acos().to_degrees() - 90.0).abs() < 1.0, "rotated 90°");
     }

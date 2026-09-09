@@ -8,34 +8,34 @@
 // AutoCAD's reserved layer.
 
 use crate::color::Color;
-use crate::lineweight::Lineweight;
 use crate::linetype::LinetypeTable;
+use crate::lineweight::Lineweight;
 
 pub type LayerId = u32;
 
 #[derive(Clone, Debug)]
 pub struct Layer {
-    pub name:       String,
-    pub color:      Color,
-    pub linetype:   u32,           // LinetypeId into LinetypeTable
+    pub name: String,
+    pub color: Color,
+    pub linetype: u32, // LinetypeId into LinetypeTable
     pub lineweight: Lineweight,
     /// Visibility — false hides every Dobject on this layer from rendering
     /// AND from selection/snap.
-    pub visible:    bool,
+    pub visible: bool,
     /// Locked — Dobjects render and pick-highlight, but cannot be modified
     /// or selected for editing operations.
-    pub locked:     bool,
+    pub locked: bool,
     /// Frozen — like `!visible` but stronger: AutoCAD also skips layer-frozen
     /// entities during regen. Modelled here so plotting and panel UI can
     /// distinguish; functionally `visible` is what the renderer reads.
-    pub frozen:     bool,
+    pub frozen: bool,
     /// Plottable — false skips this layer on plot/export.
-    pub plottable:  bool,
+    pub plottable: bool,
     /// Draw-order priority (issue #35) — layers render in ascending
     /// `order` (lower = further back); ties fall back to dobject index.
     /// Defaults to the table index; the Layer Manager's Up/Down buttons
     /// swap orders to re-stack the drawing. Persisted in RSM v20+.
-    pub order:      u32,
+    pub order: u32,
 }
 
 impl Layer {
@@ -49,22 +49,22 @@ impl Layer {
     /// imported file used at id 0.
     pub fn layer_zero() -> Self {
         Self {
-            name:       "LAYER B".into(),     // Base
-            color:      Color::Aci(7),         // white (ACI 7)
-            linetype:   LinetypeTable::CONTINUOUS,
+            name: "LAYER B".into(), // Base
+            color: Color::Aci(7),   // white (ACI 7)
+            linetype: LinetypeTable::CONTINUOUS,
             lineweight: Lineweight::Default,
-            visible:    true,
-            locked:     false,
-            frozen:     false,
-            plottable:  true,
-            order:      0,
+            visible: true,
+            locked: false,
+            frozen: false,
+            plottable: true,
+            order: 0,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct LayerTable {
-    pub layers: Vec<Layer>,            // index = LayerId
+    pub layers: Vec<Layer>, // index = LayerId
     /// The layer new Dobjects get assigned to. Index into `layers`.
     pub active: LayerId,
 }
@@ -106,7 +106,9 @@ impl LayerTable {
     }
 
     pub fn find(&self, name: &str) -> Option<LayerId> {
-        self.layers.iter().position(|l| l.name.eq_ignore_ascii_case(name))
+        self.layers
+            .iter()
+            .position(|l| l.name.eq_ignore_ascii_case(name))
             .map(|i| i as LayerId)
     }
 
@@ -127,26 +129,40 @@ impl LayerTable {
     }
 
     pub fn rename(&mut self, id: LayerId, new_name: &str) -> bool {
-        if id == Self::LAYER_ZERO { return false; }   // "0" is reserved
-        if self.find(new_name).is_some() { return false; }
+        if id == Self::LAYER_ZERO {
+            return false;
+        } // "0" is reserved
+        if self.find(new_name).is_some() {
+            return false;
+        }
         if let Some(l) = self.layers.get_mut(id as usize) {
             l.name = new_name.into();
             true
-        } else { false }
+        } else {
+            false
+        }
     }
 
-    pub fn len(&self) -> usize { self.layers.len() }
-    pub fn is_empty(&self) -> bool { self.layers.is_empty() }
+    pub fn len(&self) -> usize {
+        self.layers.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty()
+    }
 
     /// True iff a Dobject on this layer is allowed to render. Combines
     /// visible AND not-frozen.
     pub fn renders(&self, id: LayerId) -> bool {
-        self.get(id).map(|l| l.visible && !l.frozen).unwrap_or(false)
+        self.get(id)
+            .map(|l| l.visible && !l.frozen)
+            .unwrap_or(false)
     }
 
     /// True iff the layer permits selection / editing.
     pub fn selectable(&self, id: LayerId) -> bool {
-        self.get(id).map(|l| !l.locked && self.renders(id)).unwrap_or(false)
+        self.get(id)
+            .map(|l| !l.locked && self.renders(id))
+            .unwrap_or(false)
     }
 }
 
@@ -172,8 +188,14 @@ mod tests {
     #[test]
     fn add_and_remove_shift_active() {
         let mut t = LayerTable::with_defaults();
-        let a = t.add(Layer { name: "A".into(), ..Layer::layer_zero() });
-        let _b = t.add(Layer { name: "B".into(), ..Layer::layer_zero() });
+        let a = t.add(Layer {
+            name: "A".into(),
+            ..Layer::layer_zero()
+        });
+        let _b = t.add(Layer {
+            name: "B".into(),
+            ..Layer::layer_zero()
+        });
         t.active = a;
         assert!(t.remove(a));
         // Active fell back to layer "0".
@@ -183,15 +205,24 @@ mod tests {
     #[test]
     fn find_is_case_insensitive() {
         let mut t = LayerTable::with_defaults();
-        t.add(Layer { name: "Walls".into(), ..Layer::layer_zero() });
+        t.add(Layer {
+            name: "Walls".into(),
+            ..Layer::layer_zero()
+        });
         assert_eq!(t.find("WALLS"), Some(1));
     }
 
     #[test]
     fn rename_rejects_duplicates() {
         let mut t = LayerTable::with_defaults();
-        let a = t.add(Layer { name: "A".into(), ..Layer::layer_zero() });
-        t.add(Layer { name: "B".into(), ..Layer::layer_zero() });
+        let a = t.add(Layer {
+            name: "A".into(),
+            ..Layer::layer_zero()
+        });
+        t.add(Layer {
+            name: "B".into(),
+            ..Layer::layer_zero()
+        });
         assert!(!t.rename(a, "B"));
         assert!(t.rename(a, "Alpha"));
     }

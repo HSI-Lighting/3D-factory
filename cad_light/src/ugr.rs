@@ -55,7 +55,10 @@ impl Observer {
     pub const STANDING_EYE_M: f32 = 1.6;
 
     pub fn looking(position: Vertex, direction: Vec3) -> Self {
-        Self { position, direction }
+        Self {
+            position,
+            direction,
+        }
     }
 }
 
@@ -127,7 +130,9 @@ pub fn ugr_at(
     profiles: &HashMap<String, IesProfile>,
     background: f64,
 ) -> Option<UgrResult> {
-    ugr_at_ex(observer, luminaires, profiles, background, 1.0, &|_, _| true)
+    ugr_at_ex(observer, luminaires, profiles, background, 1.0, &|_, _| {
+        true
+    })
 }
 
 /// UGR at one observer, WITH OCCLUSION AND MAINTENANCE — the form a real room wants.
@@ -176,7 +181,9 @@ pub fn ugr_at_ex(
     let mut skipped_no_area = 0usize;
 
     for l in luminaires {
-        let Some(prof) = profiles.get(&l.profile) else { continue };
+        let Some(prof) = profiles.get(&l.profile) else {
+            continue;
+        };
         let to = l.position.to_vec3() - eye;
         let d2 = to.length_squared();
         if d2 < 1e-6 {
@@ -267,9 +274,18 @@ pub fn ugr_at_ex(
     if sum <= 0.0 {
         return None;
     }
-    sources.sort_by(|a, b| b.term.partial_cmp(&a.term).unwrap_or(std::cmp::Ordering::Equal));
+    sources.sort_by(|a, b| {
+        b.term
+            .partial_cmp(&a.term)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let ugr = 8.0 * (0.25 / background * sum).log10();
-    Some(UgrResult { ugr, background, sources, skipped_no_area })
+    Some(UgrResult {
+        ugr,
+        background,
+        sources,
+        skipped_no_area,
+    })
 }
 
 /// Background luminance from an indirect vertical illuminance: `L_b = E_ind / π`.
@@ -335,7 +351,10 @@ mod tests {
         let mut last = 1.0;
         for s in [5.0, 10.0, 20.0, 40.0, 60.0, 80.0] {
             let p = position_index(s, 0.0);
-            assert!(p > last, "p should rise with sigma: {s}° gave {p}, previous {last}");
+            assert!(
+                p > last,
+                "p should rise with sigma: {s}° gave {p}, previous {last}"
+            );
             last = p;
         }
         // A source the same angle OVERHEAD is less annoying than one out to the side, so its
@@ -353,7 +372,13 @@ mod tests {
     /// sum by zero.
     #[test]
     fn position_index_survives_extremes() {
-        for (s, a) in [(-10.0, 0.0), (200.0, 0.0), (30.0, -50.0), (30.0, 400.0), (0.0, 0.0)] {
+        for (s, a) in [
+            (-10.0, 0.0),
+            (200.0, 0.0),
+            (30.0, -50.0),
+            (30.0, 400.0),
+            (0.0, 0.0),
+        ] {
             let p = position_index(s, a);
             assert!(p.is_finite() && p >= 1.0, "sigma {s}, alpha {a} gave {p}");
         }
@@ -379,8 +404,16 @@ mod tests {
         let s = r.sources[0];
         assert!((s.sigma_deg - 45.0).abs() < 1e-3, "sigma {}", s.sigma_deg);
         assert!((s.omega - 0.0220971).abs() < 1e-6, "omega {}", s.omega);
-        assert!((s.luminance - 5656.85).abs() < 1.0, "luminance {}", s.luminance);
-        assert!((s.position_index - 7.0596).abs() < 1e-3, "p {}", s.position_index);
+        assert!(
+            (s.luminance - 5656.85).abs() < 1.0,
+            "luminance {}",
+            s.luminance
+        );
+        assert!(
+            (s.position_index - 7.0596).abs() < 1e-3,
+            "p {}",
+            s.position_index
+        );
         assert!((r.ugr - 14.81).abs() < 0.05, "UGR {}", r.ugr);
     }
 
@@ -402,11 +435,21 @@ mod tests {
     fn a_brighter_background_lowers_the_rating() {
         let p = profiles(flat_source(1000.0, 0.5));
         let obs = Observer::looking(Vertex::new(0.0, 0.0, 1.2), Vec3::Y);
-        let dark = ugr_at(&obs, &one_lamp(0.0, 2.0, 3.2), &p, 20.0).unwrap().ugr;
-        let bright = ugr_at(&obs, &one_lamp(0.0, 2.0, 3.2), &p, 200.0).unwrap().ugr;
-        assert!(bright < dark, "bright {bright:.1} should rate below dark {dark:.1}");
+        let dark = ugr_at(&obs, &one_lamp(0.0, 2.0, 3.2), &p, 20.0)
+            .unwrap()
+            .ugr;
+        let bright = ugr_at(&obs, &one_lamp(0.0, 2.0, 3.2), &p, 200.0)
+            .unwrap()
+            .ugr;
+        assert!(
+            bright < dark,
+            "bright {bright:.1} should rate below dark {dark:.1}"
+        );
         // A tenfold background is exactly 8 dB of log — 8·log₁₀(10) = 8.
-        assert!((dark - bright - 8.0).abs() < 0.01, "{dark:.2} - {bright:.2}");
+        assert!(
+            (dark - bright - 8.0).abs() < 0.01,
+            "{dark:.2} - {bright:.2}"
+        );
     }
 
     /// A SMALLER APERTURE at the same output glares MORE — L² ω = I²/(A·d²), so halving the area
@@ -415,14 +458,26 @@ mod tests {
     #[test]
     fn a_smaller_aperture_at_the_same_output_glares_more() {
         let obs = Observer::looking(Vertex::new(0.0, 0.0, 1.2), Vec3::Y);
-        let big = ugr_at(&obs, &one_lamp(0.0, 2.0, 3.2), &profiles(flat_source(1000.0, 0.6)), 50.0)
-            .unwrap()
-            .ugr;
-        let small =
-            ugr_at(&obs, &one_lamp(0.0, 2.0, 3.2), &profiles(flat_source(1000.0, 0.3)), 50.0)
-                .unwrap()
-                .ugr;
-        assert!(small > big, "small aperture {small:.1} should out-glare big {big:.1}");
+        let big = ugr_at(
+            &obs,
+            &one_lamp(0.0, 2.0, 3.2),
+            &profiles(flat_source(1000.0, 0.6)),
+            50.0,
+        )
+        .unwrap()
+        .ugr;
+        let small = ugr_at(
+            &obs,
+            &one_lamp(0.0, 2.0, 3.2),
+            &profiles(flat_source(1000.0, 0.3)),
+            50.0,
+        )
+        .unwrap()
+        .ugr;
+        assert!(
+            small > big,
+            "small aperture {small:.1} should out-glare big {big:.1}"
+        );
         // L²ω = I²/(A_p·d²), so the term goes as 1/A. Halving the SIDE quarters the area and
         // quadruples the term: 8·log₁₀(4) = 4.82.
         assert!((small - big - 4.82).abs() < 0.05, "{small:.2} - {big:.2}");
@@ -444,7 +499,7 @@ mod tests {
                     dimming: 1.0,
                     watts_override: None,
                     flux_override: None,
-            from_block: None,
+                    from_block: None,
                 })
                 .collect()
         };
@@ -531,7 +586,10 @@ mod tests {
         let level = ugr_at(&obs, &[lamp_at(0.0, 2.0, 3.2)], &p, 50.0).expect("floor-aimed");
 
         let mut aimed = lamp_at(0.0, 2.0, 3.2);
-        assert!(aimed.aim_at(obs.position.to_vec3()), "the fitting must accept the aim");
+        assert!(
+            aimed.aim_at(obs.position.to_vec3()),
+            "the fitting must accept the aim"
+        );
         let aimed = ugr_at(&obs, &[aimed], &p, 50.0).expect("eye-aimed");
 
         // γ goes 45° → 0°, so the beam swings from 75 cd onto the eye at its full 3000 cd. The term
@@ -558,8 +616,13 @@ mod tests {
     #[test]
     fn an_untilted_fitting_reads_exactly_as_it_did_before_the_frame_fix() {
         let obs = Observer::looking(Vertex::new(0.0, 0.0, 1.2), Vec3::Y);
-        let r = ugr_at(&obs, &one_lamp(0.0, 2.0, 3.2), &profiles(flat_source(1000.0, 0.5)), 50.0)
-            .expect("a result");
+        let r = ugr_at(
+            &obs,
+            &one_lamp(0.0, 2.0, 3.2),
+            &profiles(flat_source(1000.0, 0.5)),
+            50.0,
+        )
+        .expect("a result");
         assert!((r.sources[0].sigma_deg - 45.0).abs() < 1e-3);
         assert!((r.ugr - 14.81).abs() < 0.05, "UGR {}", r.ugr);
     }
@@ -596,13 +659,19 @@ mod tests {
     #[test]
     fn the_candela_multiplier_is_applied_once_and_not_twice() {
         let obs = Observer::looking(Vertex::new(0.0, 0.0, 1.2), Vec3::Y);
-        let plain = ugr_at(&obs, &one_lamp(0.0, 2.0, 3.2), &profiles(flat_source(1000.0, 0.5)), 50.0)
-            .unwrap()
-            .ugr;
+        let plain = ugr_at(
+            &obs,
+            &one_lamp(0.0, 2.0, 3.2),
+            &profiles(flat_source(1000.0, 0.5)),
+            50.0,
+        )
+        .unwrap()
+        .ugr;
         let mut doubled = flat_source(1000.0, 0.5);
         doubled.multiplier = 2.0;
-        let doubled =
-            ugr_at(&obs, &one_lamp(0.0, 2.0, 3.2), &profiles(doubled), 50.0).unwrap().ugr;
+        let doubled = ugr_at(&obs, &one_lamp(0.0, 2.0, 3.2), &profiles(doubled), 50.0)
+            .unwrap()
+            .ugr;
 
         // Twice the output is twice the luminance and four times the term: 8·log₁₀(4) = 4.82.
         // Counted twice it would be four times the output and 8·log₁₀(16) = 9.64.
@@ -618,7 +687,9 @@ mod tests {
     fn re_rating_a_fitting_moves_its_glare_as_well_as_its_light() {
         let obs = Observer::looking(Vertex::new(0.0, 0.0, 1.2), Vec3::Y);
         let p = profiles(flat_source(1000.0, 0.5)); // the profile declares 1000 lm
-        let full = ugr_at(&obs, &one_lamp(0.0, 2.0, 3.2), &p, 50.0).unwrap().ugr;
+        let full = ugr_at(&obs, &one_lamp(0.0, 2.0, 3.2), &p, 50.0)
+            .unwrap()
+            .ugr;
 
         let mut halved = lamp_at(0.0, 2.0, 3.2);
         halved.flux_override = Some(500.0);
@@ -643,7 +714,10 @@ mod tests {
         let seen = ugr_at_ex(&obs, &lums, &p, 50.0, 1.0, &|_, _| true);
         let hidden = ugr_at_ex(&obs, &lums, &p, 50.0, 1.0, &|_, _| false);
         assert!(seen.is_some(), "the plain scene must still rate");
-        assert!(hidden.is_none(), "a wall in the way leaves nothing to rate, not a rating of zero");
+        assert!(
+            hidden.is_none(),
+            "a wall in the way leaves nothing to rate, not a rating of zero"
+        );
 
         // And with two fittings, hiding ONE leaves the other — it removes a source rather than
         // abandoning the calculation.
@@ -652,10 +726,13 @@ mod tests {
         second.id = 2;
         two.push(second);
         let both = ugr_at_ex(&obs, &two, &p, 50.0, 1.0, &|_, _| true).unwrap();
-        let one_hidden =
-            ugr_at_ex(&obs, &two, &p, 50.0, 1.0, &|_, to| to.x < 0.3).unwrap();
+        let one_hidden = ugr_at_ex(&obs, &two, &p, 50.0, 1.0, &|_, to| to.x < 0.3).unwrap();
         assert_eq!(both.sources.len(), 2);
-        assert_eq!(one_hidden.sources.len(), 1, "exactly the unobstructed fitting survives");
+        assert_eq!(
+            one_hidden.sources.len(),
+            1,
+            "exactly the unobstructed fitting survives"
+        );
         assert!(one_hidden.ugr < both.ugr);
     }
 
@@ -671,8 +748,12 @@ mod tests {
         let obs = Observer::looking(Vertex::new(0.0, 0.0, 1.2), Vec3::Y);
         let p = profiles(flat_source(1000.0, 0.5));
         let lums = one_lamp(0.0, 2.0, 3.2);
-        let initial = ugr_at_ex(&obs, &lums, &p, 50.0, 1.0, &|_, _| true).unwrap().ugr;
-        let kept = ugr_at_ex(&obs, &lums, &p, 50.0, 0.8, &|_, _| true).unwrap().ugr;
+        let initial = ugr_at_ex(&obs, &lums, &p, 50.0, 1.0, &|_, _| true)
+            .unwrap()
+            .ugr;
+        let kept = ugr_at_ex(&obs, &lums, &p, 50.0, 0.8, &|_, _| true)
+            .unwrap()
+            .ugr;
 
         let expect = 16.0 * 0.8f64.log10(); // −1.55
         assert!(
@@ -693,6 +774,12 @@ mod tests {
         let lums = one_lamp(0.0, 2.0, 3.2);
         let plain = ugr_at(&obs, &lums, &p, 50.0).unwrap();
         let ex = ugr_at_ex(&obs, &lums, &p, 50.0, 1.0, &|_, _| true).unwrap();
-        assert_eq!(plain.ugr.to_bits(), ex.ugr.to_bits(), "{} vs {}", plain.ugr, ex.ugr);
+        assert_eq!(
+            plain.ugr.to_bits(),
+            ex.ugr.to_bits(),
+            "{} vs {}",
+            plain.ugr,
+            ex.ugr
+        );
     }
 }

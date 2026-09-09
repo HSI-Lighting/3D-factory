@@ -55,7 +55,15 @@ pub fn scene_to_svg(scene: &Scene, title: &str) -> String {
     for prim in &scene.prims {
         match prim {
             Prim::Stroke {
-                pts, closed, width_mm, rgb, dash_mm, dash_offset_mm, cap, join, ..
+                pts,
+                closed,
+                width_mm,
+                rgb,
+                dash_mm,
+                dash_offset_mm,
+                cap,
+                join,
+                ..
             } => {
                 if pts.len() < 2 {
                     continue;
@@ -70,9 +78,7 @@ pub fn scene_to_svg(scene: &Scene, title: &str) -> String {
                     join_keyword(*join),
                 ));
                 if !dash_mm.is_empty() {
-                    let dashes: Vec<String> = dash_mm.iter()
-                        .map(|v| format!("{:.3}", v))
-                        .collect();
+                    let dashes: Vec<String> = dash_mm.iter().map(|v| format!("{:.3}", v)).collect();
                     s.push_str(&format!(" stroke-dasharray=\"{}\"", dashes.join(", ")));
                 }
                 if dash_offset_mm.abs() > 1e-6 {
@@ -134,10 +140,10 @@ fn svg_path_d(pts: &[(f64, f64)], closed: bool, page_h_mm: f64) -> String {
 
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
-     .replace('<', "&lt;")
-     .replace('>', "&gt;")
-     .replace('"', "&quot;")
-     .replace('\'', "&apos;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 #[cfg(test)]
@@ -146,9 +152,19 @@ mod tests {
     use crate::scene::Scene;
     use cad_kernel::plotstyle::{EndStyle, JoinStyle};
 
-    fn stroke(pts: Vec<(f64, f64)>, closed: bool, width_mm: f32, rgb: (u8, u8, u8), dash_mm: Vec<f32>) -> Prim {
+    fn stroke(
+        pts: Vec<(f64, f64)>,
+        closed: bool,
+        width_mm: f32,
+        rgb: (u8, u8, u8),
+        dash_mm: Vec<f32>,
+    ) -> Prim {
         Prim::Stroke {
-            pts, closed, width_mm, rgb, dash_mm,
+            pts,
+            closed,
+            width_mm,
+            rgb,
+            dash_mm,
             dash_offset_mm: 0.0,
             cap: EndStyle::Round,
             join: JoinStyle::Round,
@@ -160,8 +176,10 @@ mod tests {
     #[test]
     fn empty_scene_produces_valid_svg() {
         let scene = Scene {
-            page_w_mm: 297.0, page_h_mm: 210.0,
-            prims: Vec::new(), skipped_dims: 0,
+            page_w_mm: 297.0,
+            page_h_mm: 210.0,
+            prims: Vec::new(),
+            skipped_dims: 0,
         };
         let svg = scene_to_svg(&scene, "test");
         assert!(svg.starts_with("<svg"));
@@ -172,8 +190,15 @@ mod tests {
     #[test]
     fn stroke_becomes_path() {
         let scene = Scene {
-            page_w_mm: 100.0, page_h_mm: 100.0,
-            prims: vec![stroke(vec![(10.0, 10.0), (90.0, 50.0)], false, 0.25, (255, 0, 0), Vec::new())],
+            page_w_mm: 100.0,
+            page_h_mm: 100.0,
+            prims: vec![stroke(
+                vec![(10.0, 10.0), (90.0, 50.0)],
+                false,
+                0.25,
+                (255, 0, 0),
+                Vec::new(),
+            )],
             skipped_dims: 0,
         };
         let svg = scene_to_svg(&scene, "test");
@@ -186,8 +211,15 @@ mod tests {
     #[test]
     fn closed_path_has_z() {
         let scene = Scene {
-            page_w_mm: 100.0, page_h_mm: 100.0,
-            prims: vec![stroke(vec![(10.0, 10.0), (90.0, 10.0), (90.0, 90.0)], true, 0.5, (0, 0, 255), vec![5.0, 2.0])],
+            page_w_mm: 100.0,
+            page_h_mm: 100.0,
+            prims: vec![stroke(
+                vec![(10.0, 10.0), (90.0, 10.0), (90.0, 90.0)],
+                true,
+                0.5,
+                (0, 0, 255),
+                vec![5.0, 2.0],
+            )],
             skipped_dims: 0,
         };
         let svg = scene_to_svg(&scene, "test");
@@ -200,8 +232,15 @@ mod tests {
         // In Scene (bottom-left), a point at y=10 is near the bottom.
         // In SVG (top-left), it should be near the bottom: y_svg = page_h - 10.
         let scene = Scene {
-            page_w_mm: 100.0, page_h_mm: 100.0,
-            prims: vec![stroke(vec![(50.0, 10.0), (50.0, 90.0)], false, 0.1, (0, 0, 0), Vec::new())],
+            page_w_mm: 100.0,
+            page_h_mm: 100.0,
+            prims: vec![stroke(
+                vec![(50.0, 10.0), (50.0, 90.0)],
+                false,
+                0.1,
+                (0, 0, 0),
+                Vec::new(),
+            )],
             skipped_dims: 0,
         };
         let svg = scene_to_svg(&scene, "test");
@@ -211,28 +250,44 @@ mod tests {
 
     #[test]
     fn cap_join_attributes_follow_the_pen() {
-        let mut s = stroke(vec![(10.0, 10.0), (90.0, 50.0)], false, 0.25, (0, 0, 0), Vec::new());
+        let mut s = stroke(
+            vec![(10.0, 10.0), (90.0, 50.0)],
+            false,
+            0.25,
+            (0, 0, 0),
+            Vec::new(),
+        );
         if let Prim::Stroke { cap, join, .. } = &mut s {
             *cap = EndStyle::Square;
             *join = JoinStyle::Bevel;
         }
         let scene = Scene {
-            page_w_mm: 100.0, page_h_mm: 100.0,
-            prims: vec![s], skipped_dims: 0,
+            page_w_mm: 100.0,
+            page_h_mm: 100.0,
+            prims: vec![s],
+            skipped_dims: 0,
         };
         let svg = scene_to_svg(&scene, "test");
         assert!(svg.contains("stroke-linecap=\"square\""), "svg: {svg}");
         assert!(svg.contains("stroke-linejoin=\"bevel\""), "svg: {svg}");
 
         // Diamond maps to round (not expressible natively).
-        let mut d = stroke(vec![(10.0, 10.0), (90.0, 50.0)], false, 0.25, (0, 0, 0), Vec::new());
+        let mut d = stroke(
+            vec![(10.0, 10.0), (90.0, 50.0)],
+            false,
+            0.25,
+            (0, 0, 0),
+            Vec::new(),
+        );
         if let Prim::Stroke { cap, join, .. } = &mut d {
             *cap = EndStyle::Diamond;
             *join = JoinStyle::Diamond;
         }
         let scene = Scene {
-            page_w_mm: 100.0, page_h_mm: 100.0,
-            prims: vec![d], skipped_dims: 0,
+            page_w_mm: 100.0,
+            page_h_mm: 100.0,
+            prims: vec![d],
+            skipped_dims: 0,
         };
         let svg = scene_to_svg(&scene, "test");
         assert!(svg.contains("stroke-linecap=\"round\""));
@@ -241,11 +296,21 @@ mod tests {
 
     #[test]
     fn dash_offset_emits_stroke_dashoffset() {
-        let mut s = stroke(vec![(10.0, 50.0), (90.0, 50.0)], false, 0.25, (0, 0, 0), vec![4.0, 2.0]);
-        if let Prim::Stroke { dash_offset_mm, .. } = &mut s { *dash_offset_mm = 2.5; }
+        let mut s = stroke(
+            vec![(10.0, 50.0), (90.0, 50.0)],
+            false,
+            0.25,
+            (0, 0, 0),
+            vec![4.0, 2.0],
+        );
+        if let Prim::Stroke { dash_offset_mm, .. } = &mut s {
+            *dash_offset_mm = 2.5;
+        }
         let scene = Scene {
-            page_w_mm: 100.0, page_h_mm: 100.0,
-            prims: vec![s], skipped_dims: 0,
+            page_w_mm: 100.0,
+            page_h_mm: 100.0,
+            prims: vec![s],
+            skipped_dims: 0,
         };
         let svg = scene_to_svg(&scene, "test");
         assert!(svg.contains("stroke-dashoffset=\"2.500\""), "svg: {svg}");
@@ -256,7 +321,8 @@ mod tests {
         // A non-Solid pen fill style is expanded to pattern geometry at scene
         // build; the Fill itself still emits a solid region.
         let scene = Scene {
-            page_w_mm: 100.0, page_h_mm: 100.0,
+            page_w_mm: 100.0,
+            page_h_mm: 100.0,
             prims: vec![Prim::Fill {
                 loops: vec![vec![(10.0, 10.0), (90.0, 10.0), (90.0, 90.0), (10.0, 90.0)]],
                 rgb: (0, 128, 0),

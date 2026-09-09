@@ -43,13 +43,17 @@ pub fn parse_runs(text: &str) -> Vec<MtextRun> {
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0usize;
     let mut buf = String::new();
-    let flush = |buf: &mut String, runs: &mut Vec<MtextRun>,
-                 color: Option<MtextColor>, font: Option<String>, h: f64| {
-        if buf.is_empty() { return; }
+    let flush = |buf: &mut String,
+                 runs: &mut Vec<MtextRun>,
+                 color: Option<MtextColor>,
+                 font: Option<String>,
+                 h: f64| {
+        if buf.is_empty() {
+            return;
+        }
         if !runs.is_empty() {
             let last = runs.last_mut().unwrap();
-            if last.color == color && last.font == font
-                && (last.height_mult - h).abs() < 1e-12 {
+            if last.color == color && last.font == font && (last.height_mult - h).abs() < 1e-12 {
                 last.text.push_str(buf);
                 buf.clear();
                 return;
@@ -61,11 +65,15 @@ pub fn parse_runs(text: &str) -> Vec<MtextRun> {
             font,
             height_mult: h,
         };
-        if nr.text.is_empty() { return; }
+        if nr.text.is_empty() {
+            return;
+        }
         // Merge with the previous run when formats match.
         if let Some(last) = runs.last_mut() {
-            if last.color == nr.color && last.font == nr.font
-                && (last.height_mult - nr.height_mult).abs() < 1e-12 {
+            if last.color == nr.color
+                && last.font == nr.font
+                && (last.height_mult - nr.height_mult).abs() < 1e-12
+            {
                 last.text.push_str(&nr.text);
                 return;
             }
@@ -107,7 +115,13 @@ pub fn parse_runs(text: &str) -> Vec<MtextRun> {
                         parts[2].trim().parse::<u8>(),
                     ) {
                         let consumed = parts[0].len() + parts[1].len() + parts[2].len() + 3;
-                        flush(&mut buf, &mut runs, pending_color, pending_font.clone(), pending_h);
+                        flush(
+                            &mut buf,
+                            &mut runs,
+                            pending_color,
+                            pending_font.clone(),
+                            pending_h,
+                        );
                         let rgb = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
                         pending_color = Some(MtextColor::True(rgb));
                         // Consume r;g;b; plus the leading \c
@@ -120,8 +134,18 @@ pub fn parse_runs(text: &str) -> Vec<MtextRun> {
             let rest: String = chars[i + 2..].iter().take(16).collect();
             if let Some(idx) = rest.find(';') {
                 if let Ok(n) = rest[..idx].trim().parse::<u8>() {
-                    flush(&mut buf, &mut runs, pending_color, pending_font.clone(), pending_h);
-                    pending_color = if n == 0 { None } else { Some(MtextColor::Aci(n)) };
+                    flush(
+                        &mut buf,
+                        &mut runs,
+                        pending_color,
+                        pending_font.clone(),
+                        pending_h,
+                    );
+                    pending_color = if n == 0 {
+                        None
+                    } else {
+                        Some(MtextColor::Aci(n))
+                    };
                     i += 2 + idx + 1;
                     continue;
                 }
@@ -138,7 +162,13 @@ pub fn parse_runs(text: &str) -> Vec<MtextRun> {
                 let num = rest[..idx].trim_end_matches('x').trim();
                 if let Ok(m) = num.parse::<f64>() {
                     if m > 0.0 && m < 1e6 {
-                        flush(&mut buf, &mut runs, pending_color, pending_font.clone(), pending_h);
+                        flush(
+                            &mut buf,
+                            &mut runs,
+                            pending_color,
+                            pending_font.clone(),
+                            pending_h,
+                        );
                         pending_h = m;
                         i += 2 + idx + 1;
                         continue;
@@ -155,7 +185,13 @@ pub fn parse_runs(text: &str) -> Vec<MtextRun> {
             if let Some(idx) = rest.find(';') {
                 let name = rest[..idx].trim().to_string();
                 if !name.is_empty() {
-                    flush(&mut buf, &mut runs, pending_color, pending_font.clone(), pending_h);
+                    flush(
+                        &mut buf,
+                        &mut runs,
+                        pending_color,
+                        pending_font.clone(),
+                        pending_h,
+                    );
                     pending_font = Some(name);
                     i += 2 + idx + 1;
                     continue;
@@ -195,19 +231,36 @@ pub fn strip_codes(text: &str) -> String {
         }
         let code = chars[i + 1].to_ascii_lowercase();
         match code {
-            '\\' => { out.push('\\'); i += 2; }
-            'p' => { out.push('\n'); i += 2; }
+            '\\' => {
+                out.push('\\');
+                i += 2;
+            }
+            'p' => {
+                out.push('\n');
+                i += 2;
+            }
             'c' | 'h' | 'f' => {
                 // Skip to the terminating ';'.
                 let mut j = i + 2;
                 let mut found = false;
                 while j < chars.len() {
-                    if chars[j] == ';' { found = true; break; }
+                    if chars[j] == ';' {
+                        found = true;
+                        break;
+                    }
                     j += 1;
                 }
-                if found { i = j + 1; } else { out.push(c); i += 1; }
+                if found {
+                    i = j + 1;
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
             }
-            _ => { out.push(c); i += 1; }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
         }
     }
     out
@@ -271,7 +324,11 @@ mod tests {
     #[test]
     fn consecutive_same_format_merges() {
         let runs = parse_runs("\\C1;a\\C1;b\\C1;c");
-        assert_eq!(runs.len(), 1, "leading empty run dropped, same-format runs merge");
+        assert_eq!(
+            runs.len(),
+            1,
+            "leading empty run dropped, same-format runs merge"
+        );
         assert_eq!(runs[0].text, "abc");
         assert_eq!(runs[0].color, Some(MtextColor::Aci(1)));
     }

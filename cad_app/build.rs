@@ -38,7 +38,10 @@ fn main() {
                 .any(|l| !l.ends_with("packaging/build-number.txt"))
         });
 
-    println!("cargo:rustc-env=SIMLUX_BUILD={short}{}", if dirty { "+dirty" } else { "" });
+    println!(
+        "cargo:rustc-env=SIMLUX_BUILD={short}{}",
+        if dirty { "+dirty" } else { "" }
+    );
 
     // The RELEASE NUMBER people actually say out loud — "build 3" — kept beside the commit rather
     // than instead of it. A short hash is precise and unmemorable; a sequence is memorable and

@@ -35,8 +35,13 @@ pub enum ModifyOp {
 }
 
 impl ModifyOp {
-    pub const ALL: [ModifyOp; 5] =
-        [ModifyOp::Move, ModifyOp::Copy, ModifyOp::Rotate, ModifyOp::Scale, ModifyOp::Mirror];
+    pub const ALL: [ModifyOp; 5] = [
+        ModifyOp::Move,
+        ModifyOp::Copy,
+        ModifyOp::Rotate,
+        ModifyOp::Scale,
+        ModifyOp::Mirror,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -66,12 +71,12 @@ pub enum Feed {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Ref {
     None,
-    RotSrc1,        // rotate-R: waiting SOURCE 1
-    RotSrc2(Vec2),  // rotate-R: waiting SOURCE 2 (holds src1)
-    RotTgt(f32),    // rotate-R: waiting NEW direction (holds source angle, rad)
-    ScaStart,       // scale-R: waiting REFERENCE start
-    ScaEnd(Vec2),   // scale-R: waiting REFERENCE end (holds start)
-    ScaNew(f32),    // scale-R: waiting NEW length (holds reference distance)
+    RotSrc1,       // rotate-R: waiting SOURCE 1
+    RotSrc2(Vec2), // rotate-R: waiting SOURCE 2 (holds src1)
+    RotTgt(f32),   // rotate-R: waiting NEW direction (holds source angle, rad)
+    ScaStart,      // scale-R: waiting REFERENCE start
+    ScaEnd(Vec2),  // scale-R: waiting REFERENCE end (holds start)
+    ScaNew(f32),   // scale-R: waiting NEW length (holds reference distance)
 }
 
 /// An in-flight modify command over a set of selected features, echoing the 2D
@@ -94,7 +99,14 @@ pub struct Modify {
 
 impl Modify {
     pub fn new(op: ModifyOp, targets: Vec<u32>) -> Self {
-        Self { op, targets, copy: false, last_summary: None, first: None, refm: Ref::None }
+        Self {
+            op,
+            targets,
+            copy: false,
+            last_summary: None,
+            first: None,
+            refm: Ref::None,
+        }
     }
 
     /// Whether the base/pivot/axis-A has been picked yet.
@@ -131,7 +143,11 @@ impl Modify {
     /// The current prompt (which point / option we're waiting for).
     pub fn prompt(&self) -> String {
         if self.first.is_none() {
-            return format!("{}: pick {}", self.op.label().to_lowercase(), self.pick_name());
+            return format!(
+                "{}: pick {}",
+                self.op.label().to_lowercase(),
+                self.pick_name()
+            );
         }
         let cp = if self.copy { "ON" } else { "off" };
         match (self.op, self.refm) {
@@ -141,15 +157,23 @@ impl Modify {
             (ModifyOp::Rotate, Ref::None) => {
                 format!("rotate: pick ANGLE, or type degrees (CCW+) · R=reference · C=copy {cp}")
             }
-            (ModifyOp::Rotate, Ref::RotSrc1) => "rotate-R: pick SOURCE point 1 (current direction)".into(),
-            (ModifyOp::Rotate, Ref::RotSrc2(_)) => "rotate-R: pick SOURCE point 2 (current direction)".into(),
-            (ModifyOp::Rotate, Ref::RotTgt(_)) => "rotate-R: pick NEW direction (anchored at pivot) or type angle".into(),
+            (ModifyOp::Rotate, Ref::RotSrc1) => {
+                "rotate-R: pick SOURCE point 1 (current direction)".into()
+            }
+            (ModifyOp::Rotate, Ref::RotSrc2(_)) => {
+                "rotate-R: pick SOURCE point 2 (current direction)".into()
+            }
+            (ModifyOp::Rotate, Ref::RotTgt(_)) => {
+                "rotate-R: pick NEW direction (anchored at pivot) or type angle".into()
+            }
             (ModifyOp::Scale, Ref::None) => {
                 format!("scale: pick FACTOR (dist from pivot), or type factor · R=reference · C=copy {cp}")
             }
             (ModifyOp::Scale, Ref::ScaStart) => "scale-R: pick REFERENCE start (old length)".into(),
             (ModifyOp::Scale, Ref::ScaEnd(_)) => "scale-R: pick REFERENCE end (old length)".into(),
-            (ModifyOp::Scale, Ref::ScaNew(_)) => "scale-R: pick NEW length (dist from pivot) or type number".into(),
+            (ModifyOp::Scale, Ref::ScaNew(_)) => {
+                "scale-R: pick NEW length (dist from pivot) or type number".into()
+            }
             _ => self.op.label().to_lowercase(),
         }
     }
@@ -265,7 +289,11 @@ impl Modify {
                 _ => Feed::NeedMore,
             },
             ModifyOp::Mirror => {
-                let b_uv = if card { first_uv + card_lock(uv - first_uv, true) } else { uv };
+                let b_uv = if card {
+                    first_uv + card_lock(uv - first_uv, true)
+                } else {
+                    uv
+                };
                 let a_w = plane.from_uv(first_uv);
                 let b_w = plane.from_uv(b_uv);
                 let line = (b_w - a_w).normalize_or_zero();
@@ -275,7 +303,10 @@ impl Modify {
                         *f = f.mirrored(a_w, mirror_n);
                     }
                 }
-                self.last_summary = Some(format!("mirror across ({:.2},{:.2})–({:.2},{:.2})", a_w.x, a_w.y, b_w.x, b_w.y));
+                self.last_summary = Some(format!(
+                    "mirror across ({:.2},{:.2})–({:.2},{:.2})",
+                    a_w.x, a_w.y, b_w.x, b_w.y
+                ));
                 Feed::Applied
             }
         }
@@ -362,16 +393,24 @@ impl Modify {
             for d in dupes {
                 model.push_feature(d);
             }
-            self.last_summary =
-                Some(format!("rotate-copy {:.1}° about ({:.2},{:.2})", ang.to_degrees(), pivot.x, pivot.y));
+            self.last_summary = Some(format!(
+                "rotate-copy {:.1}° about ({:.2},{:.2})",
+                ang.to_degrees(),
+                pivot.x,
+                pivot.y
+            ));
         } else {
             for id in &self.targets {
                 if let Some(f) = model.get_mut(*id) {
                     *f = f.rotated(pivot, axis, ang);
                 }
             }
-            self.last_summary =
-                Some(format!("rotate {:.1}° about ({:.2},{:.2})", ang.to_degrees(), pivot.x, pivot.y));
+            self.last_summary = Some(format!(
+                "rotate {:.1}° about ({:.2},{:.2})",
+                ang.to_degrees(),
+                pivot.x,
+                pivot.y
+            ));
         }
     }
 
@@ -386,14 +425,20 @@ impl Modify {
             for d in dupes {
                 model.push_feature(d);
             }
-            self.last_summary = Some(format!("scale-copy ×{:.3} about ({:.2},{:.2})", k, pivot.x, pivot.y));
+            self.last_summary = Some(format!(
+                "scale-copy ×{:.3} about ({:.2},{:.2})",
+                k, pivot.x, pivot.y
+            ));
         } else {
             for id in &self.targets {
                 if let Some(f) = model.get_mut(*id) {
                     *f = f.scaled(pivot, k);
                 }
             }
-            self.last_summary = Some(format!("scale ×{:.3} about ({:.2},{:.2})", k, pivot.x, pivot.y));
+            self.last_summary = Some(format!(
+                "scale ×{:.3} about ({:.2},{:.2})",
+                k, pivot.x, pivot.y
+            ));
         }
     }
 }
@@ -475,8 +520,19 @@ mod tests {
         let id = m.push(
             BoolOp::Union,
             Plane::default(),
-            Placement { u, v, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
-            Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+            Placement {
+                u,
+                v,
+                lift: 0.0,
+                spin_deg: 0.0,
+                pitch_deg: 0.0,
+                roll_deg: 0.0,
+            },
+            Primitive::Box {
+                w: 1.0,
+                d: 1.0,
+                h: 1.0,
+            },
         );
         (m, id)
     }
@@ -487,7 +543,10 @@ mod tests {
         let mut op = Modify::new(ModifyOp::Move, vec![id]);
         let plane = Plane::default();
         assert_eq!(op.feed(Vec3::ZERO, &plane, &mut m, false), Feed::NeedMore);
-        assert_eq!(op.feed(Vec3::new(2.0, 1.0, 0.0), &plane, &mut m, false), Feed::Applied);
+        assert_eq!(
+            op.feed(Vec3::new(2.0, 1.0, 0.0), &plane, &mut m, false),
+            Feed::Applied
+        );
         let o = m.get_mut(id).unwrap().world_origin();
         assert!((o - Vec3::new(2.0, 1.0, 0.0)).length() < 1e-4);
     }
@@ -500,7 +559,10 @@ mod tests {
         op.feed(Vec3::ZERO, &plane, &mut m, true);
         op.feed(Vec3::new(3.0, 0.4, 0.0), &plane, &mut m, true);
         let o = m.get_mut(id).unwrap().world_origin();
-        assert!((o - Vec3::new(3.0, 0.0, 0.0)).length() < 1e-4, "y locked out, got {o:?}");
+        assert!(
+            (o - Vec3::new(3.0, 0.0, 0.0)).length() < 1e-4,
+            "y locked out, got {o:?}"
+        );
     }
 
     #[test]
@@ -516,7 +578,10 @@ mod tests {
         assert_eq!(m.features.len(), 2);
         let orig = m.features[0].world_origin();
         let dup = m.features[1].world_origin();
-        assert!((dup - (orig + Vec3::new(0.0, 0.0, -1.0))).length() < 1e-4, "copy carried Δz, got {dup:?}");
+        assert!(
+            (dup - (orig + Vec3::new(0.0, 0.0, -1.0))).length() < 1e-4,
+            "copy carried Δz, got {dup:?}"
+        );
     }
 
     #[test]
@@ -528,7 +593,10 @@ mod tests {
         // in-plane mostly +x (locks out the small +y) but +2 in Z must survive.
         op.feed(Vec3::new(3.0, 0.4, 2.0), &plane, &mut m, true);
         let o = m.get_mut(id).unwrap().world_origin();
-        assert!((o - Vec3::new(3.0, 0.0, 2.0)).length() < 1e-4, "x locked, y dropped, z kept, got {o:?}");
+        assert!(
+            (o - Vec3::new(3.0, 0.0, 2.0)).length() < 1e-4,
+            "x locked, y dropped, z kept, got {o:?}"
+        );
     }
 
     #[test]
@@ -552,7 +620,10 @@ mod tests {
         op.feed(Vec3::ZERO, &plane, &mut m, false); // pivot at origin
         op.feed(Vec3::new(0.0, 1.0, 0.0), &plane, &mut m, false); // angle point on +v → +90°
         let o = m.get_mut(id).unwrap().world_origin();
-        assert!((o - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-4, "rotated (1,0)→(0,1), got {o:?}");
+        assert!(
+            (o - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-4,
+            "rotated (1,0)→(0,1), got {o:?}"
+        );
     }
 
     #[test]
@@ -561,10 +632,15 @@ mod tests {
         let mut op = Modify::new(ModifyOp::Rotate, vec![id]);
         let plane = Plane::default();
         op.feed(Vec3::ZERO, &plane, &mut m, false); // pivot
-        let r = op.type_value("90", &plane, &mut m).expect("typed degrees consumed");
+        let r = op
+            .type_value("90", &plane, &mut m)
+            .expect("typed degrees consumed");
         assert_eq!(r, Feed::Applied);
         let o = m.get_mut(id).unwrap().world_origin();
-        assert!((o - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-4, "90° CCW (1,0)→(0,1), got {o:?}");
+        assert!(
+            (o - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-4,
+            "90° CCW (1,0)→(0,1), got {o:?}"
+        );
         assert!(op.last_summary.as_deref().unwrap().contains("90"));
     }
 
@@ -577,8 +653,15 @@ mod tests {
         assert_eq!(op.type_value("c", &plane, &mut m), Some(Feed::NeedMore)); // copy ON
         assert!(op.copy);
         op.type_value("90", &plane, &mut m);
-        assert_eq!(m.features.len(), 2, "copy adds a rotated feature, original kept");
-        assert!((m.features[0].world_origin() - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-4, "original unmoved");
+        assert_eq!(
+            m.features.len(),
+            2,
+            "copy adds a rotated feature, original kept"
+        );
+        assert!(
+            (m.features[0].world_origin() - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-4,
+            "original unmoved"
+        );
     }
 
     #[test]
@@ -588,13 +671,25 @@ mod tests {
         let plane = Plane::default();
         op.feed(Vec3::ZERO, &plane, &mut m, false); // pivot
         assert_eq!(op.type_value("r", &plane, &mut m), Some(Feed::NeedMore)); // reference mode
-        // current direction = +X (src1→src2 along +x)
-        assert_eq!(op.feed(Vec3::new(0.0, 0.0, 0.0), &plane, &mut m, false), Feed::NeedMore);
-        assert_eq!(op.feed(Vec3::new(1.0, 0.0, 0.0), &plane, &mut m, false), Feed::NeedMore);
+                                                                              // current direction = +X (src1→src2 along +x)
+        assert_eq!(
+            op.feed(Vec3::new(0.0, 0.0, 0.0), &plane, &mut m, false),
+            Feed::NeedMore
+        );
+        assert_eq!(
+            op.feed(Vec3::new(1.0, 0.0, 0.0), &plane, &mut m, false),
+            Feed::NeedMore
+        );
         // new direction = +Y → rotate +90°
-        assert_eq!(op.feed(Vec3::new(0.0, 1.0, 0.0), &plane, &mut m, false), Feed::Applied);
+        assert_eq!(
+            op.feed(Vec3::new(0.0, 1.0, 0.0), &plane, &mut m, false),
+            Feed::Applied
+        );
         let o = m.get_mut(id).unwrap().world_origin();
-        assert!((o - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-4, "ref rotate +90°, got {o:?}");
+        assert!(
+            (o - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-4,
+            "ref rotate +90°, got {o:?}"
+        );
     }
 
     #[test]
@@ -606,10 +701,16 @@ mod tests {
         assert_eq!(op.type_value("r", &plane, &mut m), Some(Feed::NeedMore));
         op.feed(Vec3::new(0.0, 0.0, 0.0), &plane, &mut m, false); // ref start
         op.feed(Vec3::new(2.0, 0.0, 0.0), &plane, &mut m, false); // ref end → old length 2
-        // new length 4 → factor 2 → the box centre at (2,0) goes to (4,0)
-        assert_eq!(op.feed(Vec3::new(4.0, 0.0, 0.0), &plane, &mut m, false), Feed::Applied);
+                                                                  // new length 4 → factor 2 → the box centre at (2,0) goes to (4,0)
+        assert_eq!(
+            op.feed(Vec3::new(4.0, 0.0, 0.0), &plane, &mut m, false),
+            Feed::Applied
+        );
         let o = m.get_mut(id).unwrap().world_origin();
-        assert!((o - Vec3::new(4.0, 0.0, 0.0)).length() < 1e-4, "scale ×2 about origin, got {o:?}");
+        assert!(
+            (o - Vec3::new(4.0, 0.0, 0.0)).length() < 1e-4,
+            "scale ×2 about origin, got {o:?}"
+        );
     }
 
     #[test]

@@ -152,8 +152,13 @@ impl Default for CupboardInput {
 
 /// The cornice profile: (fraction of `cornice_proj`, fraction of `cornice_h`) for each stacked
 /// step, bottom → top (spec §B1.5 default 5-step moulding).
-const CORNICE_STEPS: [(f32, f32); 5] =
-    [(1.00, 0.22), (0.86, 0.16), (0.60, 0.30), (0.30, 0.20), (0.12, 0.12)];
+const CORNICE_STEPS: [(f32, f32); 5] = [
+    (1.00, 0.22),
+    (0.86, 0.16),
+    (0.60, 0.30),
+    (0.30, 0.20),
+    (0.12, 0.12),
+];
 
 /// Parts OVERLAP by this rather than abut, so no coplanar faces z-fight (spec §B6.4).
 const OVERLAP: f32 = 0.0004;
@@ -234,7 +239,9 @@ pub fn plan(inp: &CupboardInput) -> Result<(CupboardMetrics, Vec<String>), ArchE
     let n_cols = inp.cols.len();
     let n_rows = inp.rows.len();
     if n_cols == 0 || n_rows == 0 {
-        return Err(ArchError::Invalid("cupboard needs at least one bay and one tier"));
+        return Err(ArchError::Invalid(
+            "cupboard needs at least one bay and one tier",
+        ));
     }
     if inp.layout.len() != n_rows || inp.layout.iter().any(|r| r.len() != n_cols) {
         return Err(ArchError::Invalid("layout shape must be rows × cols"));
@@ -243,13 +250,17 @@ pub fn plan(inp: &CupboardInput) -> Result<(CupboardMetrics, Vec<String>), ArchE
         return Err(ArchError::NonPositive("cupboard size"));
     }
     if inp.depth <= 2.0 * inp.panel_t {
-        return Err(ArchError::NonPositive("depth (must exceed twice the board thickness)"));
+        return Err(ArchError::NonPositive(
+            "depth (must exceed twice the board thickness)",
+        ));
     }
     for row in &inp.layout {
         for cell in row {
             if let Cell::Drawers(n) = cell {
                 if *n < 1 {
-                    return Err(ArchError::Invalid("a drawer cell needs at least one drawer"));
+                    return Err(ArchError::Invalid(
+                        "a drawer cell needs at least one drawer",
+                    ));
                 }
             }
         }
@@ -271,8 +282,12 @@ pub fn plan(inp: &CupboardInput) -> Result<(CupboardMetrics, Vec<String>), ArchE
             }
         }
     }
-    let bay_widths: Vec<f32> = (0..n_cols).map(|c| grid.col_x[c + 1] - grid.col_x[c]).collect();
-    let tier_heights: Vec<f32> = (0..n_rows).map(|r| grid.row_z[r] - grid.row_z[r + 1]).collect();
+    let bay_widths: Vec<f32> = (0..n_cols)
+        .map(|c| grid.col_x[c + 1] - grid.col_x[c])
+        .collect();
+    let tier_heights: Vec<f32> = (0..n_rows)
+        .map(|r| grid.row_z[r] - grid.row_z[r + 1])
+        .collect();
 
     let m = CupboardMetrics {
         total_w,
@@ -289,7 +304,11 @@ pub fn plan(inp: &CupboardInput) -> Result<(CupboardMetrics, Vec<String>), ArchE
         niches,
         panels,
         total_fronts: doors + glazed + drawers + panels,
-        handles: if inp.handles { doors + glazed + drawers } else { 0 },
+        handles: if inp.handles {
+            doors + glazed + drawers
+        } else {
+            0
+        },
     };
 
     // ── warnings (§B7) — build anyway, but report ──
@@ -308,7 +327,10 @@ pub fn plan(inp: &CupboardInput) -> Result<(CupboardMetrics, Vec<String>), ArchE
                     if cw.min(ch) < 2.2 * inp.stile_w {
                         warn.push(format!(
                             "cell R{}C{} is too small for a {:.0} mm stile — the frame closes up",
-                            r + 1, c + 1, inp.stile_w * 1000.0));
+                            r + 1,
+                            c + 1,
+                            inp.stile_w * 1000.0
+                        ));
                     }
                 }
                 Cell::Drawers(n) => {
@@ -328,7 +350,10 @@ pub fn plan(inp: &CupboardInput) -> Result<(CupboardMetrics, Vec<String>), ArchE
             inp.carcass_height * 1000.0));
     }
     if inp.depth < 0.300 {
-        warn.push(format!("depth {:.0} mm is under 300 mm — too shallow for plates or hanging", inp.depth * 1000.0));
+        warn.push(format!(
+            "depth {:.0} mm is under 300 mm — too shallow for plates or hanging",
+            inp.depth * 1000.0
+        ));
     }
     Ok((m, warn))
 }
@@ -349,7 +374,16 @@ fn push_box(mesh: &mut SolidMesh, part: u32, x: [f32; 2], y: [f32; 2], z: [f32; 
     if (x1 - x0) < 1e-6 || (y1 - y0) < 1e-6 || (z1 - z0) < 1e-6 {
         return;
     }
-    let c = [[x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0], [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]];
+    let c = [
+        [x0, y0, z0],
+        [x1, y0, z0],
+        [x1, y1, z0],
+        [x0, y1, z0],
+        [x0, y0, z1],
+        [x1, y0, z1],
+        [x1, y1, z1],
+        [x0, y1, z1],
+    ];
     let quads: [([usize; 4], [f32; 3]); 6] = [
         ([0, 3, 2, 1], [0.0, 0.0, -1.0]),
         ([4, 5, 6, 7], [0.0, 0.0, 1.0]),
@@ -387,13 +421,25 @@ fn push_prism_y(mesh: &mut SolidMesh, part: u32, poly: &[[f32; 2]], y0: f32, y1:
     let mut tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
         let sub = |p: [f32; 3], q: [f32; 3]| [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
         let cross = |u: [f32; 3], w: [f32; 3]| {
-            [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]]
+            [
+                u[1] * w[2] - u[2] * w[1],
+                u[2] * w[0] - u[0] * w[2],
+                u[0] * w[1] - u[1] * w[0],
+            ]
         };
         let dot = |u: [f32; 3], w: [f32; 3]| u[0] * w[0] + u[1] * w[1] + u[2] * w[2];
-        let tc = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0];
+        let tc = [
+            (a[0] + b[0] + c[0]) / 3.0,
+            (a[1] + b[1] + c[1]) / 3.0,
+            (a[2] + b[2] + c[2]) / 3.0,
+        ];
         let out = sub(tc, centroid);
         // Flip winding so the geometric normal points away from the prism centre.
-        let (p, q, r) = if dot(cross(sub(b, a), sub(c, a)), out) < 0.0 { (a, c, b) } else { (a, b, c) };
+        let (p, q, r) = if dot(cross(sub(b, a), sub(c, a)), out) < 0.0 {
+            (a, c, b)
+        } else {
+            (a, b, c)
+        };
         let mut nrm = cross(sub(q, p), sub(r, p));
         let len = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt();
         if len > 1e-9 {
@@ -419,16 +465,46 @@ fn push_prism_y(mesh: &mut SolidMesh, part: u32, poly: &[[f32; 2]], y0: f32, y1:
 
 /// A frame-and-panel FRONT face as four overlapping bars (stiles + rails), no picture-frame profile
 /// (§B4 done as boxes). Returns the inner opening `(x0, x1, z0, z1)` the panel/glass fills.
-fn frame_bars(mesh: &mut SolidMesh, part: u32, x0: f32, x1: f32, z0: f32, z1: f32, sw: f32, y: [f32; 2]) -> (f32, f32, f32, f32) {
+fn frame_bars(
+    mesh: &mut SolidMesh,
+    part: u32,
+    x0: f32,
+    x1: f32,
+    z0: f32,
+    z1: f32,
+    sw: f32,
+    y: [f32; 2],
+) -> (f32, f32, f32, f32) {
     push_box(mesh, part, [x0, x0 + sw], y, [z0, z1]); // left stile
     push_box(mesh, part, [x1 - sw, x1], y, [z0, z1]); // right stile
-    push_box(mesh, part, [x0 + sw - OVERLAP, x1 - sw + OVERLAP], y, [z0, z0 + sw]); // bottom rail
-    push_box(mesh, part, [x0 + sw - OVERLAP, x1 - sw + OVERLAP], y, [z1 - sw, z1]); // top rail
+    push_box(
+        mesh,
+        part,
+        [x0 + sw - OVERLAP, x1 - sw + OVERLAP],
+        y,
+        [z0, z0 + sw],
+    ); // bottom rail
+    push_box(
+        mesh,
+        part,
+        [x0 + sw - OVERLAP, x1 - sw + OVERLAP],
+        y,
+        [z1 - sw, z1],
+    ); // top rail
     (x0 + sw, x1 - sw, z0 + sw, z1 - sw)
 }
 
 /// Liang–Barsky: clip the infinite line through `(px,pz)` with direction `(dx,dz)` to the rectangle.
-fn clip_segment(px: f32, pz: f32, dx: f32, dz: f32, x0: f32, x1: f32, z0: f32, z1: f32) -> Option<((f32, f32), (f32, f32))> {
+fn clip_segment(
+    px: f32,
+    pz: f32,
+    dx: f32,
+    dz: f32,
+    x0: f32,
+    x1: f32,
+    z0: f32,
+    z1: f32,
+) -> Option<((f32, f32), (f32, f32))> {
     let (mut t0, mut t1) = (-1e9_f32, 1e9_f32);
     for (p, q) in [(-dx, px - x0), (dx, x1 - px), (-dz, pz - z0), (dz, z1 - pz)] {
         if p.abs() < 1e-12 {
@@ -458,27 +534,77 @@ fn clamp_stile(inp: &CupboardInput, w: f32, h: f32) -> f32 {
 
 /// A solid raised-panel front: a frame of bars + a raised field with a moulded border (§B3 #6-8),
 /// all wood.
-fn build_solid_front(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &CupboardInput, x0: f32, x1: f32, z0: f32, z1: f32) {
+fn build_solid_front(
+    mesh: &mut SolidMesh,
+    mats: &mut Vec<Material>,
+    inp: &CupboardInput,
+    x0: f32,
+    x1: f32,
+    z0: f32,
+    z1: f32,
+) {
     let frame = alloc(mats, Material::Wood);
     let sw = clamp_stile(inp, x1 - x0, z1 - z0);
     let (px0, px1, pz0, pz1) = frame_bars(mesh, frame, x0, x1, z0, z1, sw, [0.0, inp.door_t]);
 
     // Raised field standing slightly proud of the leaf face, with a four-bar moulded border.
     let panel = alloc(mats, Material::Wood);
-    let pm = inp.panel_mould().min((px1 - px0) / 2.0 - 0.001).min((pz1 - pz0) / 2.0 - 0.001).max(0.0);
-    push_box(mesh, panel, [px0, px1], [inp.door_t - 0.006, inp.door_t + 0.0012], [pz0, pz1]); // field
+    let pm = inp
+        .panel_mould()
+        .min((px1 - px0) / 2.0 - 0.001)
+        .min((pz1 - pz0) / 2.0 - 0.001)
+        .max(0.0);
+    push_box(
+        mesh,
+        panel,
+        [px0, px1],
+        [inp.door_t - 0.006, inp.door_t + 0.0012],
+        [pz0, pz1],
+    ); // field
     if pm > 0.0 {
         let my = [inp.door_t - 0.001, inp.door_t + 0.004];
-        push_box(mesh, panel, [px0 - OVERLAP, px0 + pm], my, [pz0 - OVERLAP, pz1 + OVERLAP]); // left
-        push_box(mesh, panel, [px1 - pm, px1 + OVERLAP], my, [pz0 - OVERLAP, pz1 + OVERLAP]); // right
-        push_box(mesh, panel, [px0 - OVERLAP, px1 + OVERLAP], my, [pz0 - OVERLAP, pz0 + pm]); // bottom
-        push_box(mesh, panel, [px0 - OVERLAP, px1 + OVERLAP], my, [pz1 - pm, pz1 + OVERLAP]); // top
+        push_box(
+            mesh,
+            panel,
+            [px0 - OVERLAP, px0 + pm],
+            my,
+            [pz0 - OVERLAP, pz1 + OVERLAP],
+        ); // left
+        push_box(
+            mesh,
+            panel,
+            [px1 - pm, px1 + OVERLAP],
+            my,
+            [pz0 - OVERLAP, pz1 + OVERLAP],
+        ); // right
+        push_box(
+            mesh,
+            panel,
+            [px0 - OVERLAP, px1 + OVERLAP],
+            my,
+            [pz0 - OVERLAP, pz0 + pm],
+        ); // bottom
+        push_box(
+            mesh,
+            panel,
+            [px0 - OVERLAP, px1 + OVERLAP],
+            my,
+            [pz1 - pm, pz1 + OVERLAP],
+        ); // top
     }
 }
 
 /// A glazed front: a wood frame + a glass pane + a diamond lattice of wood muntins at ±45° (§B3
 /// #6,9,10), each lattice line clipped to the glass by Liang–Barsky (§A4 — no boolean).
-fn build_glazed_front(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &CupboardInput, x0: f32, x1: f32, z0: f32, z1: f32) {
+fn build_glazed_front(
+    mesh: &mut SolidMesh,
+    mats: &mut Vec<Material>,
+    inp: &CupboardInput,
+    x0: f32,
+    x1: f32,
+    z0: f32,
+    z1: f32,
+) {
     let frame = alloc(mats, Material::Wood);
     let sw = clamp_stile(inp, x1 - x0, z1 - z0);
     let (fx0, fx1, fz0, fz1) = frame_bars(mesh, frame, x0, x1, z0, z1, sw, [0.0, inp.door_t]);
@@ -509,7 +635,12 @@ fn build_glazed_front(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &Cupb
                 let (ddx, ddz) = (bx - ax, bz - az);
                 let l = ddx.hypot(ddz);
                 let (nx, nz) = (-ddz / l * inp.muntin_w / 2.0, ddx / l * inp.muntin_w / 2.0);
-                let poly = [[ax + nx, az + nz], [bx + nx, bz + nz], [bx - nx, bz - nz], [ax - nx, az - nz]];
+                let poly = [
+                    [ax + nx, az + nz],
+                    [bx + nx, bz + nz],
+                    [bx - nx, bz - nz],
+                    [ax - nx, az - nz],
+                ];
                 push_prism_y(mesh, muntins, &poly, my0, my1);
             }
         }
@@ -518,25 +649,70 @@ fn build_glazed_front(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &Cupb
 
 /// A shallow bar pull on two standoffs — chrome. `axis` V runs along Z (doors), H along X (drawers):
 /// a drawer pull is horizontal and a door pull vertical (§B6.2).
-fn build_handle(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &CupboardInput, cx: f32, cz: f32, vertical: bool) {
+fn build_handle(
+    mesh: &mut SolidMesh,
+    mats: &mut Vec<Material>,
+    inp: &CupboardInput,
+    cx: f32,
+    cz: f32,
+    vertical: bool,
+) {
     let h = alloc(mats, Material::Chrome);
     let (d, l, proj) = (inp.handle_d, inp.handle_l, inp.handle_proj);
     let y_bar = [inp.door_t + proj - d, inp.door_t + proj];
     let y_post = [inp.door_t - OVERLAP, inp.door_t + proj];
     if vertical {
-        push_box(mesh, h, [cx - d / 2.0, cx + d / 2.0], y_bar, [cz - l / 2.0, cz + l / 2.0]); // bar
-        push_box(mesh, h, [cx - d / 2.0, cx + d / 2.0], y_post, [cz - l / 2.0, cz - l / 2.0 + d]); // lower post
-        push_box(mesh, h, [cx - d / 2.0, cx + d / 2.0], y_post, [cz + l / 2.0 - d, cz + l / 2.0]); // upper post
+        push_box(
+            mesh,
+            h,
+            [cx - d / 2.0, cx + d / 2.0],
+            y_bar,
+            [cz - l / 2.0, cz + l / 2.0],
+        ); // bar
+        push_box(
+            mesh,
+            h,
+            [cx - d / 2.0, cx + d / 2.0],
+            y_post,
+            [cz - l / 2.0, cz - l / 2.0 + d],
+        ); // lower post
+        push_box(
+            mesh,
+            h,
+            [cx - d / 2.0, cx + d / 2.0],
+            y_post,
+            [cz + l / 2.0 - d, cz + l / 2.0],
+        ); // upper post
     } else {
-        push_box(mesh, h, [cx - l / 2.0, cx + l / 2.0], y_bar, [cz - d / 2.0, cz + d / 2.0]);
-        push_box(mesh, h, [cx - l / 2.0, cx - l / 2.0 + d], y_post, [cz - d / 2.0, cz + d / 2.0]);
-        push_box(mesh, h, [cx + l / 2.0 - d, cx + l / 2.0], y_post, [cz - d / 2.0, cz + d / 2.0]);
+        push_box(
+            mesh,
+            h,
+            [cx - l / 2.0, cx + l / 2.0],
+            y_bar,
+            [cz - d / 2.0, cz + d / 2.0],
+        );
+        push_box(
+            mesh,
+            h,
+            [cx - l / 2.0, cx - l / 2.0 + d],
+            y_post,
+            [cz - d / 2.0, cz + d / 2.0],
+        );
+        push_box(
+            mesh,
+            h,
+            [cx + l / 2.0 - d, cx + l / 2.0],
+            y_post,
+            [cz - d / 2.0, cz + d / 2.0],
+        );
     }
 }
 
 /// Build the whole cabinet: carcass, cornice, plinth, fronts and handles (spec §B3), as a triangle
 /// soup whose `face_ids` tag each selectable piece, plus the [`Material`] per part id.
-pub fn build(inp: &CupboardInput) -> Result<(CupboardMetrics, SolidMesh, Vec<Material>), ArchError> {
+pub fn build(
+    inp: &CupboardInput,
+) -> Result<(CupboardMetrics, SolidMesh, Vec<Material>), ArchError> {
     let (m, _w) = plan(inp)?;
     let grid = derive_grid(inp);
     let mut mesh = SolidMesh::default();
@@ -553,14 +729,32 @@ pub fn build(inp: &CupboardInput) -> Result<(CupboardMetrics, SolidMesh, Vec<Mat
     push_box(&mut mesh, carcass, [hw - pt, hw], [-d, 0.0], [z0, z1]); // right
     push_box(&mut mesh, carcass, [-hw, hw], [-d, 0.0], [z1 - pt, z1]); // top
     push_box(&mut mesh, carcass, [-hw, hw], [-d, 0.0], [z0, z0 + pt]); // bottom
-    push_box(&mut mesh, carcass, [-hw, hw], [-d, -d + inp.back_t], [z0, z1]); // back
+    push_box(
+        &mut mesh,
+        carcass,
+        [-hw, hw],
+        [-d, -d + inp.back_t],
+        [z0, z1],
+    ); // back
     for c in 1..grid.col_x.len() - 1 {
         let x = grid.col_x[c];
-        push_box(&mut mesh, carcass, [x - inp.divider_t / 2.0, x + inp.divider_t / 2.0], [-d + inp.back_t, 0.0], [z0 + pt, z1 - pt]);
+        push_box(
+            &mut mesh,
+            carcass,
+            [x - inp.divider_t / 2.0, x + inp.divider_t / 2.0],
+            [-d + inp.back_t, 0.0],
+            [z0 + pt, z1 - pt],
+        );
     }
     for r in 1..grid.row_z.len() - 1 {
         let z = grid.row_z[r];
-        push_box(&mut mesh, carcass, [-hw + pt, hw - pt], [-d + inp.back_t, 0.0], [z - inp.shelf_t / 2.0, z + inp.shelf_t / 2.0]);
+        push_box(
+            &mut mesh,
+            carcass,
+            [-hw + pt, hw - pt],
+            [-d + inp.back_t, 0.0],
+            [z - inp.shelf_t / 2.0, z + inp.shelf_t / 2.0],
+        );
     }
 
     // ── Cornice: stacked steps, projecting front + both sides, back flush against the wall. ──
@@ -569,14 +763,26 @@ pub fn build(inp: &CupboardInput) -> Result<(CupboardMetrics, SolidMesh, Vec<Mat
     for (pf, hf) in CORNICE_STEPS {
         let p = inp.cornice_proj * pf;
         let hgt = inp.cornice_h * hf;
-        push_box(&mut mesh, cornice, [-hw - p, hw + p], [-d, p], [cz, cz + hgt + OVERLAP]);
+        push_box(
+            &mut mesh,
+            cornice,
+            [-hw - p, hw + p],
+            [-d, p],
+            [cz, cz + hgt + OVERLAP],
+        );
         cz += hgt;
     }
 
     // ── Plinth: set back from the carcass face. ──
     let plinth = alloc(&mut mats, Material::Wood);
     let phw = hw - inp.plinth_setback;
-    push_box(&mut mesh, plinth, [-phw, phw], [-d, -inp.plinth_setback], [0.0, inp.plinth_h + OVERLAP]);
+    push_box(
+        &mut mesh,
+        plinth,
+        [-phw, phw],
+        [-d, -inp.plinth_setback],
+        [0.0, inp.plinth_h + OVERLAP],
+    );
 
     // ── Fronts: tile the front FACE by cell boundary (overlay, covering the dividers — §B2). ──
     for r in 0..grid.row_z.len() - 1 {
@@ -595,7 +801,14 @@ pub fn build(inp: &CupboardInput) -> Result<(CupboardMetrics, SolidMesh, Vec<Mat
                         let dz0 = cz0 + i as f32 * (h + inp.door_gap);
                         build_solid_front(&mut mesh, &mut mats, inp, x0, x1, dz0, dz0 + h);
                         if inp.handles {
-                            build_handle(&mut mesh, &mut mats, inp, (x0 + x1) / 2.0, dz0 + h / 2.0, false);
+                            build_handle(
+                                &mut mesh,
+                                &mut mats,
+                                inp,
+                                (x0 + x1) / 2.0,
+                                dz0 + h / 2.0,
+                                false,
+                            );
                         }
                     }
                 }
@@ -608,7 +821,11 @@ pub fn build(inp: &CupboardInput) -> Result<(CupboardMetrics, SolidMesh, Vec<Mat
                     if inp.handles {
                         // Handle on the OPENING edge, opposite the auto hinge (§B1.3).
                         let hinge_left = (c as f32 + 0.5) < inp.cols.len() as f32 / 2.0;
-                        let hx = if hinge_left { x1 - inp.handle_inset } else { x0 + inp.handle_inset };
+                        let hx = if hinge_left {
+                            x1 - inp.handle_inset
+                        } else {
+                            x0 + inp.handle_inset
+                        };
                         build_handle(&mut mesh, &mut mats, inp, hx, (cz0 + cz1) / 2.0, true);
                     }
                 }
@@ -636,10 +853,22 @@ mod tests {
     fn reference_matches_spec() {
         let (m, _w) = plan(&CupboardInput::default()).unwrap();
         let mm = |v: f32| v * 1000.0;
-        assert!((mm(m.total_w) - 1430.0).abs() < 1.0, "total W {}", mm(m.total_w));
-        assert!((mm(m.total_h) - 2100.0).abs() < 1.0, "total H {}", mm(m.total_h));
+        assert!(
+            (mm(m.total_w) - 1430.0).abs() < 1.0,
+            "total W {}",
+            mm(m.total_w)
+        );
+        assert!(
+            (mm(m.total_h) - 2100.0).abs() < 1.0,
+            "total H {}",
+            mm(m.total_h)
+        );
         assert!((m.aspect - 1.4685).abs() < 0.001, "aspect {}", m.aspect);
-        assert!((m.overhang_ratio - 0.0720).abs() < 0.001, "overhang ratio {}", m.overhang_ratio);
+        assert!(
+            (m.overhang_ratio - 0.0720).abs() < 0.001,
+            "overhang ratio {}",
+            m.overhang_ratio
+        );
         for w in &m.bay_widths {
             assert!((mm(*w) - 413.0).abs() < 1.0, "bay width {}", mm(*w));
         }
@@ -682,8 +911,14 @@ mod tests {
             assert_eq!((m.doors, m.glazed, m.drawers, m.niches), (d, g, dr, ni));
             let field_w = inp.width - 2.0 * inp.edge_reveal;
             let field_h = inp.carcass_height - 2.0 * inp.edge_reveal;
-            assert!((m.bay_widths.iter().sum::<f32>() - field_w).abs() < 1e-4, "bays fill width");
-            assert!((m.tier_heights.iter().sum::<f32>() - field_h).abs() < 1e-4, "tiers fill height");
+            assert!(
+                (m.bay_widths.iter().sum::<f32>() - field_w).abs() < 1e-4,
+                "bays fill width"
+            );
+            assert!(
+                (m.tier_heights.iter().sum::<f32>() - field_h).abs() < 1e-4,
+                "tiers fill height"
+            );
         }
     }
 
@@ -693,7 +928,11 @@ mod tests {
     fn build_yields_a_tagged_mesh() {
         let (_m, mesh, mats) = build(&CupboardInput::default()).unwrap();
         assert!(mesh.tri_count() > 0);
-        assert_eq!(mesh.face_ids.len(), mesh.tri_count(), "one part id per triangle");
+        assert_eq!(
+            mesh.face_ids.len(),
+            mesh.tri_count(),
+            "one part id per triangle"
+        );
         let max_part = *mesh.face_ids.iter().max().unwrap() as usize;
         assert!(max_part < mats.len(), "every part id has a material");
         for p in &mesh.positions {
@@ -733,9 +972,30 @@ mod tests {
     #[test]
     fn rejects_bad_inputs() {
         use Cell::*;
-        assert!(plan(&CupboardInput { layout: vec![vec![Door, Door]], ..Default::default() }).is_err(), "layout shape");
-        assert!(plan(&CupboardInput { width: 0.0, ..Default::default() }).is_err(), "zero width");
-        assert!(plan(&CupboardInput { depth: 0.01, ..Default::default() }).is_err(), "depth ≤ 2·panel_t");
+        assert!(
+            plan(&CupboardInput {
+                layout: vec![vec![Door, Door]],
+                ..Default::default()
+            })
+            .is_err(),
+            "layout shape"
+        );
+        assert!(
+            plan(&CupboardInput {
+                width: 0.0,
+                ..Default::default()
+            })
+            .is_err(),
+            "zero width"
+        );
+        assert!(
+            plan(&CupboardInput {
+                depth: 0.01,
+                ..Default::default()
+            })
+            .is_err(),
+            "depth ≤ 2·panel_t"
+        );
         assert!(
             plan(&CupboardInput {
                 cols: vec![1.0],

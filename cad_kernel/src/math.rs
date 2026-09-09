@@ -1,7 +1,7 @@
 // 2D vector math with epsilon-aware comparisons.
 // All geometry is f64; the UI converts to f32 only for screen pixels.
 
-use std::ops::{Add, Sub, Mul, Div, Neg};
+use std::ops::{Add, Div, Mul, Neg, Sub};
 
 pub const EPS: f64 = 1e-9;
 
@@ -14,31 +14,80 @@ pub struct Vec2 {
 impl Vec2 {
     pub const ZERO: Vec2 = Vec2 { x: 0.0, y: 0.0 };
 
-    pub fn new(x: f64, y: f64) -> Self { Self { x, y } }
+    pub fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
+    }
 
-    pub fn dot(self, o: Vec2) -> f64    { self.x * o.x + self.y * o.y }
-    pub fn cross(self, o: Vec2) -> f64  { self.x * o.y - self.y * o.x }
-    pub fn len_sq(self) -> f64          { self.dot(self) }
-    pub fn len(self) -> f64             { self.len_sq().sqrt() }
-    pub fn dist(self, o: Vec2) -> f64   { (self - o).len() }
-    pub fn angle(self) -> f64           { self.y.atan2(self.x) }
+    pub fn dot(self, o: Vec2) -> f64 {
+        self.x * o.x + self.y * o.y
+    }
+    pub fn cross(self, o: Vec2) -> f64 {
+        self.x * o.y - self.y * o.x
+    }
+    pub fn len_sq(self) -> f64 {
+        self.dot(self)
+    }
+    pub fn len(self) -> f64 {
+        self.len_sq().sqrt()
+    }
+    pub fn dist(self, o: Vec2) -> f64 {
+        (self - o).len()
+    }
+    pub fn angle(self) -> f64 {
+        self.y.atan2(self.x)
+    }
 
-    pub fn perp(self) -> Vec2           { Vec2::new(-self.y, self.x) }
+    pub fn perp(self) -> Vec2 {
+        Vec2::new(-self.y, self.x)
+    }
 
     pub fn normalized(self) -> Vec2 {
         let l = self.len();
-        if l < EPS { self } else { self / l }
+        if l < EPS {
+            self
+        } else {
+            self / l
+        }
     }
 }
 
-impl Add for Vec2     { type Output = Vec2; fn add(self, o: Vec2) -> Vec2 { Vec2::new(self.x + o.x, self.y + o.y) } }
-impl Sub for Vec2     { type Output = Vec2; fn sub(self, o: Vec2) -> Vec2 { Vec2::new(self.x - o.x, self.y - o.y) } }
-impl Neg for Vec2     { type Output = Vec2; fn neg(self) -> Vec2 { Vec2::new(-self.x, -self.y) } }
-impl Mul<f64> for Vec2 { type Output = Vec2; fn mul(self, s: f64) -> Vec2 { Vec2::new(self.x * s, self.y * s) } }
-impl Div<f64> for Vec2 { type Output = Vec2; fn div(self, s: f64) -> Vec2 { Vec2::new(self.x / s, self.y / s) } }
+impl Add for Vec2 {
+    type Output = Vec2;
+    fn add(self, o: Vec2) -> Vec2 {
+        Vec2::new(self.x + o.x, self.y + o.y)
+    }
+}
+impl Sub for Vec2 {
+    type Output = Vec2;
+    fn sub(self, o: Vec2) -> Vec2 {
+        Vec2::new(self.x - o.x, self.y - o.y)
+    }
+}
+impl Neg for Vec2 {
+    type Output = Vec2;
+    fn neg(self) -> Vec2 {
+        Vec2::new(-self.x, -self.y)
+    }
+}
+impl Mul<f64> for Vec2 {
+    type Output = Vec2;
+    fn mul(self, s: f64) -> Vec2 {
+        Vec2::new(self.x * s, self.y * s)
+    }
+}
+impl Div<f64> for Vec2 {
+    type Output = Vec2;
+    fn div(self, s: f64) -> Vec2 {
+        Vec2::new(self.x / s, self.y / s)
+    }
+}
 
-pub fn approx_eq(a: f64, b: f64) -> bool { (a - b).abs() < EPS }
-pub fn approx_zero(a: f64) -> bool       { a.abs() < EPS }
+pub fn approx_eq(a: f64, b: f64) -> bool {
+    (a - b).abs() < EPS
+}
+pub fn approx_zero(a: f64) -> bool {
+    a.abs() < EPS
+}
 
 /// The standard miter limit for stroked line joins (the PDF/SVG default): a
 /// miter apex further than 4× the half stroke width from the corner falls
@@ -54,8 +103,8 @@ pub const JOIN_MITER_LIMIT: f64 = 4.0;
 /// and `apex` is the miter point (edge intersection) when it stays within the
 /// miter limit. `None` for degenerate corners (collinear or reversed).
 pub struct JoinWedge {
-    pub a:    Vec2,
-    pub b:    Vec2,
+    pub a: Vec2,
+    pub b: Vec2,
     pub apex: Option<Vec2>,
 }
 
@@ -114,7 +163,11 @@ pub const PARALLEL_SIN_EPS: f64 = 1e-9;
 pub fn norm_angle(a: f64) -> f64 {
     let tau = std::f64::consts::TAU;
     let r = a.rem_euclid(tau);
-    if r >= tau - 1e-12 { 0.0 } else { r }
+    if r >= tau - 1e-12 {
+        0.0
+    } else {
+        r
+    }
 }
 
 /// Union of param intervals `(start, LENGTH)` on a CLOSED curve (period TAU).
@@ -136,11 +189,15 @@ pub fn norm_angle(a: f64) -> f64 {
 pub(crate) fn circular_union(intervals: &[(f64, f64)]) -> (Vec<(f64, f64)>, bool) {
     let tau = std::f64::consts::TAU;
     let eps = 1e-6;
-    if intervals.is_empty() { return (Vec::new(), false); }
+    if intervals.is_empty() {
+        return (Vec::new(), false);
+    }
     // Normalise starts into [0, TAU); find a point inside a GAP to use as origin
     // so nothing wraps in the rotated domain.
-    let mut a: Vec<(f64, f64)> = intervals.iter()
-        .map(|&(s, l)| (s.rem_euclid(tau), l)).collect();
+    let mut a: Vec<(f64, f64)> = intervals
+        .iter()
+        .map(|&(s, l)| (s.rem_euclid(tau), l))
+        .collect();
     a.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap());
     let n = a.len();
     let mut origin = 0.0_f64;
@@ -162,9 +219,13 @@ pub(crate) fn circular_union(intervals: &[(f64, f64)]) -> (Vec<(f64, f64)>, bool
             break;
         }
     }
-    if !found { return (Vec::new(), true); }   // no gap anywhere ⇒ full curve
-    let mut rel: Vec<(f64, f64)> = a.iter()
-        .map(|&(s, l)| ((s - origin).rem_euclid(tau), l)).collect();
+    if !found {
+        return (Vec::new(), true);
+    } // no gap anywhere ⇒ full curve
+    let mut rel: Vec<(f64, f64)> = a
+        .iter()
+        .map(|&(s, l)| ((s - origin).rem_euclid(tau), l))
+        .collect();
     rel.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap());
     let mut merged: Vec<(f64, f64)> = Vec::new();
     for (s, l) in rel {
@@ -177,8 +238,10 @@ pub(crate) fn circular_union(intervals: &[(f64, f64)]) -> (Vec<(f64, f64)>, bool
         }
         merged.push((s, l));
     }
-    let abs: Vec<(f64, f64)> = merged.into_iter()
-        .map(|(rs, l)| ((origin + rs).rem_euclid(tau), l)).collect();
+    let abs: Vec<(f64, f64)> = merged
+        .into_iter()
+        .map(|(rs, l)| ((origin + rs).rem_euclid(tau), l))
+        .collect();
     (abs, false)
 }
 
@@ -214,10 +277,14 @@ pub(crate) fn circular_union(intervals: &[(f64, f64)]) -> (Vec<(f64, f64)>, bool
 /// precision-level dedup would emit both — a duplicate-root bug traded for a
 /// merge bug. It must track world scale, not shrink.
 pub fn newton_roots_periodic<F, FD>(
-    f: F, fd: FD, n_seeds: usize, residual_tol: f64, dedup_tol: f64,
+    f: F,
+    fd: FD,
+    n_seeds: usize,
+    residual_tol: f64,
+    dedup_tol: f64,
 ) -> Vec<f64>
 where
-    F:  Fn(f64) -> f64,
+    F: Fn(f64) -> f64,
     FD: Fn(f64) -> f64,
 {
     let mut roots: Vec<f64> = Vec::new();
@@ -233,7 +300,9 @@ where
         for _ in 0..30 {
             let val = f(t);
             let deriv = fd(t);
-            if deriv.abs() < EPS { break; }
+            if deriv.abs() < EPS {
+                break;
+            }
             let step = val / deriv;
             t -= step;
             if step.abs() < 1e-12 {
@@ -246,7 +315,9 @@ where
         // threshold is scale-relative (caller-supplied) so a squared-distance
         // residual isn't rejected at large coordinates. The parameter-space
         // step test above (1e-12) stays absolute.
-        if !converged || f(t).abs() > residual_tol { continue; }
+        if !converged || f(t).abs() > residual_tol {
+            continue;
+        }
         let t = t.rem_euclid(tau);
         // Dedup in param space with the caller's scale-aware tolerance (see the
         // `dedup_tol` doc above), handling wrap-around at τ.
@@ -270,12 +341,20 @@ mod newton_dedup_tests {
     #[test]
     fn dedup_tol_controls_root_merging() {
         // f = sin t: simple roots at 0 and π, both reliably found from 16 seeds.
-        let f  = |t: f64| t.sin();
+        let f = |t: f64| t.sin();
         let fd = |t: f64| t.cos();
         let two = newton_roots_periodic(f, fd, 16, 1e-6, 0.1);
-        assert_eq!(two.len(), 2, "roots π apart must survive a 0.1 dedup: {two:?}");
+        assert_eq!(
+            two.len(),
+            2,
+            "roots π apart must survive a 0.1 dedup: {two:?}"
+        );
         let one = newton_roots_periodic(f, fd, 16, 1e-6, 4.0);
-        assert_eq!(one.len(), 1, "roots π apart must merge under a 4.0 dedup: {one:?}");
+        assert_eq!(
+            one.len(),
+            1,
+            "roots π apart must merge under a 4.0 dedup: {one:?}"
+        );
     }
 
     // The duplicate-root guard the task warns about: many seeds converge onto the
@@ -284,10 +363,14 @@ mod newton_dedup_tests {
     // (seeds land ~1e-9 apart on one root); the scale-aware tol must still merge.
     #[test]
     fn many_seeds_dedup_to_the_distinct_roots() {
-        let f  = |t: f64| t.sin();
+        let f = |t: f64| t.sin();
         let fd = |t: f64| t.cos();
         let roots = newton_roots_periodic(f, fd, 64, 1e-6, 1e-6);
-        assert_eq!(roots.len(), 2, "64 seeds, 2 real roots → exactly 2, got {roots:?}");
+        assert_eq!(
+            roots.len(),
+            2,
+            "64 seeds, 2 real roots → exactly 2, got {roots:?}"
+        );
     }
 }
 
@@ -306,7 +389,10 @@ mod join_wedge_tests {
         assert!((w.a - Vec2::new(0.0, -1.0)).len() < 1e-9, "a = {:?}", w.a);
         assert!((w.b - Vec2::new(1.0, 0.0)).len() < 1e-9, "b = {:?}", w.b);
         let apex = w.apex.expect("90° miter stays within the limit");
-        assert!((apex - Vec2::new(1.0, -1.0)).len() < 1e-9, "apex = {apex:?}");
+        assert!(
+            (apex - Vec2::new(1.0, -1.0)).len() < 1e-9,
+            "apex = {apex:?}"
+        );
     }
 
     // The mirror-image RIGHT turn: the notch is above +x / left of -y.
@@ -325,10 +411,17 @@ mod join_wedge_tests {
     // is None (bevel fallback).
     #[test]
     fn sharp_corner_falls_back_to_bevel() {
-        let d = Vec2::new((175.0_f64).to_radians().cos(), (175.0_f64).to_radians().sin());
+        let d = Vec2::new(
+            (175.0_f64).to_radians().cos(),
+            (175.0_f64).to_radians().sin(),
+        );
         let w = join_wedge(Vec2::ZERO, Vec2::new(1.0, 0.0), d, 1.0)
             .expect("a 175° reflex corner must still produce a wedge");
-        assert!(w.apex.is_none(), "nearly-reversing corners must bevel, got {:?}", w.apex);
+        assert!(
+            w.apex.is_none(),
+            "nearly-reversing corners must bevel, got {:?}",
+            w.apex
+        );
     }
 
     // Collinear segments have no notch.

@@ -27,7 +27,6 @@
 // default (mm, 1 scene unit = 1 mm) makes `metres_per_unit = 0.001` — a drawing
 // in millimetres builds at true size in the 3D world without declaring anything.
 
-
 /// How a document's unit was arrived at. The distinction matters more than the number:
 /// an ASSUMED unit is a fallback nobody chose, and the app must never write it out as a
 /// positive assertion (e.g. into a DXF `$INSUNITS`) or act on it destructively.
@@ -44,16 +43,31 @@ pub enum UnitSource {
 
 /// Length display format (AcadDDUNITS "Length › Type").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LengthFormat { Scientific, Decimal, Engineering, Architectural, Fractional }
+pub enum LengthFormat {
+    Scientific,
+    Decimal,
+    Engineering,
+    Architectural,
+    Fractional,
+}
 
 /// Angle display format (AcadDDUNITS "Angle › Type").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AngleFormat { DecimalDegrees, DegMinSec, Grads, Radians, Surveyor }
+pub enum AngleFormat {
+    DecimalDegrees,
+    DegMinSec,
+    Grads,
+    Radians,
+    Surveyor,
+}
 
 impl LengthFormat {
     pub const ALL: [LengthFormat; 5] = [
-        LengthFormat::Scientific, LengthFormat::Decimal, LengthFormat::Engineering,
-        LengthFormat::Architectural, LengthFormat::Fractional,
+        LengthFormat::Scientific,
+        LengthFormat::Decimal,
+        LengthFormat::Engineering,
+        LengthFormat::Architectural,
+        LengthFormat::Fractional,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -67,8 +81,11 @@ impl LengthFormat {
 }
 impl AngleFormat {
     pub const ALL: [AngleFormat; 5] = [
-        AngleFormat::DecimalDegrees, AngleFormat::DegMinSec, AngleFormat::Grads,
-        AngleFormat::Radians, AngleFormat::Surveyor,
+        AngleFormat::DecimalDegrees,
+        AngleFormat::DegMinSec,
+        AngleFormat::Grads,
+        AngleFormat::Radians,
+        AngleFormat::Surveyor,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -178,7 +195,12 @@ impl Units {
     pub fn new(name: impl Into<String>, scene_per_unit: f64) -> Self {
         let name = name.into();
         let mpu = Self::mm_per_named(&name) / 1000.0 / scene_per_unit.max(1e-15);
-        Self { name, scene_per_unit, metres_per_unit: mpu, ..Self::default() }
+        Self {
+            name,
+            scene_per_unit,
+            metres_per_unit: mpu,
+            ..Self::default()
+        }
     }
 
     /// Build from a direct metre factor (the 3D-side form): derives the nearest
@@ -188,12 +210,19 @@ impl Units {
     pub fn from_metres_per_unit(metres_per_unit: f64, source: UnitSource) -> Self {
         // Nearest standard name by comparing mm_per_named/1000 to the factor.
         let standards: [(f64, &str); 5] = [
-            (0.001, "mm"), (0.01, "cm"), (1.0, "m"),
-            (0.0254, "in"), (0.3048, "ft"),
+            (0.001, "mm"),
+            (0.01, "cm"),
+            (1.0, "m"),
+            (0.0254, "in"),
+            (0.3048, "ft"),
         ];
-        let name = standards.iter()
+        let name = standards
+            .iter()
             .min_by(|a, b| {
-                (a.0 - metres_per_unit).abs().partial_cmp(&(b.0 - metres_per_unit).abs()).unwrap()
+                (a.0 - metres_per_unit)
+                    .abs()
+                    .partial_cmp(&(b.0 - metres_per_unit).abs())
+                    .unwrap()
             })
             .map(|(_, n)| n.to_string())
             .unwrap_or_else(|| "mm".into());
@@ -201,7 +230,10 @@ impl Units {
         // scene_per_unit that makes mm_per_named(name)/1000/scene_per_unit == mpu.
         let scene_per_unit = Self::mm_per_named(&name) / 1000.0 / mpu;
         Self {
-            name, scene_per_unit, metres_per_unit: mpu, source,
+            name,
+            scene_per_unit,
+            metres_per_unit: mpu,
+            source,
             ..Self::default()
         }
     }
@@ -216,7 +248,11 @@ impl Units {
     /// keeps a metre-shaped default honest when it is stored as a document-unit length.
     #[inline]
     pub fn from_metres(&self, v: f64) -> f64 {
-        if self.metres_per_unit.abs() > 1e-12 { v / self.metres_per_unit } else { v }
+        if self.metres_per_unit.abs() > 1e-12 {
+            v / self.metres_per_unit
+        } else {
+            v
+        }
     }
 
     /// A short label for the UI ("mm", "m", …), or a bare ratio when it is not a standard unit.
@@ -235,7 +271,8 @@ impl Units {
     /// name for a custom label).
     pub fn insert_label(&self) -> String {
         let key = self.name.trim().to_ascii_lowercase();
-        INSERT_UNITS.iter()
+        INSERT_UNITS
+            .iter()
             .find(|(_, sym)| *sym == key)
             .map(|(disp, _)| disp.to_string())
             .unwrap_or_else(|| self.name.clone())
@@ -248,27 +285,27 @@ impl Units {
             // Metric
             "mm" | "millimeter" | "millimeters" | "millimetre" => 1.0,
             "cm" | "centimeter" | "centimeters" | "centimetre" => 10.0,
-            "dm" | "decimeter" | "decimeters"                  => 100.0,
-            "m"  | "meter" | "meters" | "metre"                => 1000.0,
-            "dam" | "dekameter" | "dekameters"                 => 10_000.0,
-            "hm" | "hectometer" | "hectometers"                => 100_000.0,
-            "km" | "kilometer" | "kilometers"                  => 1_000_000.0,
-            "um" | "micron" | "microns" | "micrometer"         => 0.001,
-            "nm" | "nanometer" | "nanometers"                  => 1e-6,
-            "ang" | "angstrom" | "angstroms"                   => 1e-7,
-            "gm" | "gigameter" | "gigameters"                  => 1e12,
+            "dm" | "decimeter" | "decimeters" => 100.0,
+            "m" | "meter" | "meters" | "metre" => 1000.0,
+            "dam" | "dekameter" | "dekameters" => 10_000.0,
+            "hm" | "hectometer" | "hectometers" => 100_000.0,
+            "km" | "kilometer" | "kilometers" => 1_000_000.0,
+            "um" | "micron" | "microns" | "micrometer" => 0.001,
+            "nm" | "nanometer" | "nanometers" => 1e-6,
+            "ang" | "angstrom" | "angstroms" => 1e-7,
+            "gm" | "gigameter" | "gigameters" => 1e12,
             // Imperial
-            "in" | "inch" | "inches" | "\""                    => 25.4,
-            "ft" | "foot" | "feet" | "'"                       => 304.8,
-            "usft" | "us survey feet"                          => 304.800_6096,
-            "yd" | "yard" | "yards"                            => 914.4,
-            "mi" | "mile" | "miles"                            => 1_609_344.0,
-            "mil" | "mils"                                     => 0.0254,
-            "uin" | "microinch" | "microinches"                => 2.54e-5,
+            "in" | "inch" | "inches" | "\"" => 25.4,
+            "ft" | "foot" | "feet" | "'" => 304.8,
+            "usft" | "us survey feet" => 304.800_6096,
+            "yd" | "yard" | "yards" => 914.4,
+            "mi" | "mile" | "miles" => 1_609_344.0,
+            "mil" | "mils" => 0.0254,
+            "uin" | "microinch" | "microinches" => 2.54e-5,
             // Astronomical
-            "au" | "astronomical"                              => 1.495_978_707e14,
-            "ly" | "light year" | "light years"               => 9.460_730_472e18,
-            "pc" | "parsec" | "parsecs"                        => 3.085_677_581e19,
+            "au" | "astronomical" => 1.495_978_707e14,
+            "ly" | "light year" | "light years" => 9.460_730_472e18,
+            "pc" | "parsec" | "parsecs" => 3.085_677_581e19,
             // Unitless / unknown → mm-equivalent (never panics).
             _ => 1.0,
         }
@@ -289,13 +326,21 @@ impl Units {
     /// 0.001`) so physical-mm pen widths convert to scene units correctly.
     pub fn scene_per_meter(&self) -> f64 {
         let mpu = Self::meters_per_unit(&self.name);
-        if mpu.abs() < 1e-15 { self.scene_per_unit } else { self.scene_per_unit / mpu }
+        if mpu.abs() < 1e-15 {
+            self.scene_per_unit
+        } else {
+            self.scene_per_unit / mpu
+        }
     }
 
     /// Scene units per physical millimetre.
     pub fn scene_per_mm(&self) -> f64 {
         let mm = self.mm_per_unit();
-        if mm.abs() < 1e-15 { self.scene_per_unit } else { self.scene_per_unit / mm }
+        if mm.abs() < 1e-15 {
+            self.scene_per_unit
+        } else {
+            self.scene_per_unit / mm
+        }
     }
 
     /// The units-derived factor for a viewport at nominal ratio `desired_scale`
@@ -318,7 +363,11 @@ impl Units {
     /// Properties dialog can display "1:N" independent of the document unit.
     pub fn viewport_nominal_scale(&self, paper_mm_per_scene: f64) -> f64 {
         let mm = self.mm_per_unit();
-        if mm.abs() < 1e-15 { paper_mm_per_scene } else { paper_mm_per_scene * self.scene_per_unit / mm }
+        if mm.abs() < 1e-15 {
+            paper_mm_per_scene
+        } else {
+            paper_mm_per_scene * self.scene_per_unit / mm
+        }
     }
 
     /// Parse a distance string into SCENE units. A bare number is in the
@@ -330,7 +379,9 @@ impl Units {
     /// without a space: "25", "25mm", "25 cm", "-3.5in", `12"`, `6'`.
     pub fn parse_distance(&self, s: &str) -> Option<f64> {
         let t = s.trim().to_ascii_lowercase();
-        if t.is_empty() { return None; }
+        if t.is_empty() {
+            return None;
+        }
         // Find where the numeric head ends and an alphabetic / quote suffix begins.
         let split = t.find(|c: char| c.is_ascii_alphabetic() || c == '"' || c == '\'');
         let (num_part, suffix) = match split {
@@ -338,7 +389,9 @@ impl Units {
             None => (t.as_str(), ""),
         };
         let value: f64 = num_part.parse().ok()?;
-        if !value.is_finite() { return None; }
+        if !value.is_finite() {
+            return None;
+        }
         if suffix.is_empty() {
             // Display units → scene units.
             Some(value * self.scene_per_unit)
@@ -352,7 +405,11 @@ impl Units {
     /// Convert a scene-units distance back into the display unit (no suffix) —
     /// the inverse of a bare `parse_distance`. For readouts / dimension text.
     pub fn to_display(&self, scene: f64) -> f64 {
-        if self.scene_per_unit.abs() < 1e-15 { scene } else { scene / self.scene_per_unit }
+        if self.scene_per_unit.abs() < 1e-15 {
+            scene
+        } else {
+            scene / self.scene_per_unit
+        }
     }
 
     // -- Display formatting (AcadDDUNITS Length / Angle) ---------------------
@@ -369,15 +426,21 @@ impl Units {
             LengthFormat::Scientific => format!("{:.*E}", p, v),
             LengthFormat::Engineering => {
                 // value in inches → F'-I.d"
-                let neg = v < 0.0; let a = v.abs();
+                let neg = v < 0.0;
+                let a = v.abs();
                 let feet = (a / 12.0).floor();
                 let inch = a - feet * 12.0;
                 let s = format!("{}'-{:.*}\"", feet as i64, p, inch);
-                if neg { format!("-{s}") } else { s }
+                if neg {
+                    format!("-{s}")
+                } else {
+                    s
+                }
             }
             LengthFormat::Architectural => {
                 // value in inches → F'-I n/d" (fractional inch, denom = 2^prec)
-                let neg = v < 0.0; let a = v.abs();
+                let neg = v < 0.0;
+                let a = v.abs();
                 let feet = (a / 12.0).floor();
                 let inch_total = a - feet * 12.0;
                 let (whole, frac) = fmt_fraction(inch_total, self.length_precision);
@@ -386,13 +449,26 @@ impl Units {
                 } else {
                     format!("{}'-{} {}\"", feet as i64, whole, frac)
                 };
-                if neg { format!("-{s}") } else { s }
+                if neg {
+                    format!("-{s}")
+                } else {
+                    s
+                }
             }
             LengthFormat::Fractional => {
-                let neg = v < 0.0; let a = v.abs();
+                let neg = v < 0.0;
+                let a = v.abs();
                 let (whole, frac) = fmt_fraction(a, self.length_precision);
-                let s = if frac.is_empty() { whole.to_string() } else { format!("{whole} {frac}") };
-                if neg { format!("-{s}") } else { s }
+                let s = if frac.is_empty() {
+                    whole.to_string()
+                } else {
+                    format!("{whole} {frac}")
+                };
+                if neg {
+                    format!("-{s}")
+                } else {
+                    s
+                }
             }
         }
     }
@@ -417,10 +493,15 @@ impl Units {
             AngleFormat::Surveyor => {
                 // Bearing from North/South toward East/West.
                 let a = deg.rem_euclid(360.0);
-                let (ns, ew, bearing) = if a <= 90.0 { ("N", "E", a) }
-                    else if a <= 180.0 { ("N", "W", 180.0 - a) }
-                    else if a <= 270.0 { ("S", "W", a - 180.0) }
-                    else { ("S", "E", 360.0 - a) };
+                let (ns, ew, bearing) = if a <= 90.0 {
+                    ("N", "E", a)
+                } else if a <= 180.0 {
+                    ("N", "W", 180.0 - a)
+                } else if a <= 270.0 {
+                    ("S", "W", a - 180.0)
+                } else {
+                    ("S", "E", 360.0 - a)
+                };
                 format!("{ns}{:.*}\u{00B0}{ew}", p, bearing)
             }
         }
@@ -432,8 +513,11 @@ impl Units {
         let x = 1.5 * self.scene_per_unit;
         let y = 2.003_906_25 * self.scene_per_unit;
         let line1 = format!("{}, {}, 0", self.format_length(x), self.format_length(y));
-        let line2 = format!("{} < {}", self.format_length(x),
-            self.format_angle(45.0_f64.to_radians()));
+        let line2 = format!(
+            "{} < {}",
+            self.format_length(x),
+            self.format_angle(45.0_f64.to_radians())
+        );
         (line1, line2)
     }
 }
@@ -446,15 +530,26 @@ fn fmt_fraction(v: f64, prec: u8) -> (i64, String) {
     let frac = v - whole as f64;
     let mut num = (frac * denom as f64).round() as i64;
     let mut den = denom;
-    if num == 0 { return (whole, String::new()); }
-    if num >= den { return (whole + 1, String::new()); }
+    if num == 0 {
+        return (whole, String::new());
+    }
+    if num >= den {
+        return (whole + 1, String::new());
+    }
     // reduce
     let g = gcd(num, den);
-    num /= g; den /= g;
+    num /= g;
+    den /= g;
     (whole, format!("{num}/{den}"))
 }
 
-fn gcd(a: i64, b: i64) -> i64 { if b == 0 { a } else { gcd(b, a % b) } }
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -475,16 +570,16 @@ mod tests {
     fn suffix_converts_through_physical_table() {
         let u = Units::default(); // mm, 1 scene = 1 mm
         assert_eq!(u.parse_distance("25cm"), Some(250.0)); // 25 cm = 250 mm = 250 scene
-        assert_eq!(u.parse_distance("1m"), Some(1000.0));  // 1 m = 1000 mm
+        assert_eq!(u.parse_distance("1m"), Some(1000.0)); // 1 m = 1000 mm
         assert_eq!(u.parse_distance("1in").unwrap(), 25.4);
-        assert_eq!(u.parse_distance("2 cm"), Some(20.0));  // space allowed
+        assert_eq!(u.parse_distance("2 cm"), Some(20.0)); // space allowed
         assert_eq!(u.parse_distance("12\"").unwrap(), 12.0 * 25.4);
     }
 
     #[test]
     fn bare_number_is_display_unit() {
         let cm = Units::new("cm", 1.0); // 1 scene unit = 1 cm
-        assert_eq!(cm.parse_distance("25"), Some(25.0));   // 25 cm = 25 scene
+        assert_eq!(cm.parse_distance("25"), Some(25.0)); // 25 cm = 25 scene
         assert_eq!(cm.parse_distance("25cm"), Some(25.0)); // same, explicit
         assert_eq!(cm.parse_distance("250mm"), Some(25.0)); // 250 mm = 25 cm = 25 scene
     }
@@ -503,9 +598,8 @@ mod tests {
     fn viewport_zoom_is_unit_independent() {
         // The single most important property: a 1 m line in a 1:100 viewport must
         // print at 10 mm on paper, regardless of the document's unit system.
-        let one_m_paper_mm = |u: &Units, one_m_scene: f64| {
-            u.viewport_paper_mm_per_scene(0.01) * one_m_scene
-        };
+        let one_m_paper_mm =
+            |u: &Units, one_m_scene: f64| u.viewport_paper_mm_per_scene(0.01) * one_m_scene;
         // mm-doc, 1 unit = 1 mm → 1 m = 1000 scene.
         let mm = Units::new("mm", 1.0);
         assert!((one_m_paper_mm(&mm, 1000.0) - 10.0).abs() < 1e-9);
@@ -524,12 +618,21 @@ mod tests {
     fn nominal_scale_round_trips_in_any_unit() {
         // Create a 1:100 viewport (store paper-mm-per-scene), then read it back:
         // the Properties dialog must show "1:100" regardless of the doc unit.
-        for u in [Units::new("mm", 1.0), Units::new("cm", 1.0),
-                  Units::new("m", 1.0), Units::new("mm", 100.0)] {
-            let stored = u.viewport_paper_mm_per_scene(0.01);      // create at 1:100
-            let nominal = u.viewport_nominal_scale(stored);        // readout
-            assert!((nominal - 0.01).abs() < 1e-12,
-                "unit {:?}/{}: nominal {} != 0.01", u.name, u.scene_per_unit, nominal);
+        for u in [
+            Units::new("mm", 1.0),
+            Units::new("cm", 1.0),
+            Units::new("m", 1.0),
+            Units::new("mm", 100.0),
+        ] {
+            let stored = u.viewport_paper_mm_per_scene(0.01); // create at 1:100
+            let nominal = u.viewport_nominal_scale(stored); // readout
+            assert!(
+                (nominal - 0.01).abs() < 1e-12,
+                "unit {:?}/{}: nominal {} != 0.01",
+                u.name,
+                u.scene_per_unit,
+                nominal
+            );
         }
         // Default doc: the stored factor is literally 1/N (old behaviour).
         assert!((Units::default().viewport_paper_mm_per_scene(0.01) - 0.01).abs() < 1e-15);
@@ -590,6 +693,9 @@ mod tests {
     fn label_matches_metre_factor() {
         assert_eq!(Units::default().label(), "mm");
         assert_eq!(Units::new("m", 1.0).label(), "m");
-        assert_eq!(Units::from_metres_per_unit(0.0254, UnitSource::Assumed).label(), "in");
+        assert_eq!(
+            Units::from_metres_per_unit(0.0254, UnitSource::Assumed).label(),
+            "in"
+        );
     }
 }

@@ -23,7 +23,6 @@
 //! the real fitting instead of a marker — "the stp file wiring is plan for next development, just
 //! keep it in mind". The field exists now so a library written today loads unchanged when it does.
 
-
 use cad_kernel::{Block, DObject, Document, Geom, Vec2};
 
 /// One library entry: a symbol, a photometric file, and room for a 3D model.
@@ -94,7 +93,6 @@ pub struct Library {
     #[serde(default)]
     pub next_id: u32,
 }
-
 
 /// The metadata half of the library, in the user's config directory.
 const META_FILE: &str = "illuminaire.json";
@@ -290,7 +288,11 @@ pub fn symbols_from(doc: &Document) -> Vec<BlockRow> {
         .enumerate()
         .map(|(i, b)| {
             let symbol = flatten_block(doc, i as u32, 0);
-            BlockRow { name: b.name.clone(), size: symbol_extent(&symbol), symbol }
+            BlockRow {
+                name: b.name.clone(),
+                size: symbol_extent(&symbol),
+                symbol,
+            }
         })
         .collect()
 }
@@ -376,7 +378,9 @@ fn flatten_block(doc: &Document, block: u32, depth: u32) -> Vec<SymbolGeom> {
     if depth >= MAX_DEPTH {
         return Vec::new();
     }
-    let Some(b) = doc.blocks.get(block) else { return Vec::new() };
+    let Some(b) = doc.blocks.get(block) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for d in &b.dobjects {
         let aci = match d.style.color {
@@ -387,7 +391,9 @@ fn flatten_block(doc: &Document, block: u32, depth: u32) -> Vec<SymbolGeom> {
             // A nested reference is expanded through its own transform, so what lands in the
             // library is the shape a person would see rather than a name that resolves to nothing.
             Geom::BlockRef(br) => {
-                let Some(inner) = doc.blocks.get(br.block) else { continue };
+                let Some(inner) = doc.blocks.get(br.block) else {
+                    continue;
+                };
                 let base = inner.base;
                 for g in flatten_block(doc, br.block, depth + 1) {
                     out.push(SymbolGeom {
@@ -396,7 +402,10 @@ fn flatten_block(doc: &Document, block: u32, depth: u32) -> Vec<SymbolGeom> {
                     });
                 }
             }
-            g => out.push(SymbolGeom { geom: g.clone(), aci }),
+            g => out.push(SymbolGeom {
+                geom: g.clone(),
+                aci,
+            }),
         }
     }
     out
@@ -508,7 +517,6 @@ pub fn insert(doc: &mut Document, fitting: &Fitting, at: Vec2, doc_unit_m: f64) 
     block
 }
 
-
 /// How close a block instance has to be to a fixture to be the one it was placed as, in metres.
 ///
 /// Positions make the round trip world-metres `f32` → drawing-units `f64` → back, so an exact
@@ -538,21 +546,28 @@ pub fn instances_for<'a>(
     fixtures: impl Iterator<Item = &'a cad_light::Luminaire>,
     doc_unit_m: f64,
 ) -> Vec<usize> {
-    let k = if doc_unit_m.is_finite() && doc_unit_m > 0.0 { doc_unit_m } else { 1.0 };
+    let k = if doc_unit_m.is_finite() && doc_unit_m > 0.0 {
+        doc_unit_m
+    } else {
+        1.0
+    };
     let tol = INSTANCE_TOL_M / k; // the tolerance, in drawing units
     let want: Vec<(u32, f64, f64)> = fixtures
-        .filter_map(|l| l.from_block.map(|b| (b, l.position.x as f64 / k, l.position.y as f64 / k)))
+        .filter_map(|l| {
+            l.from_block
+                .map(|b| (b, l.position.x as f64 / k, l.position.y as f64 / k))
+        })
         .collect();
     if want.is_empty() {
         return Vec::new();
     }
     let mut out: Vec<usize> = Vec::new();
     for (i, d) in doc.dobjects.iter().enumerate() {
-        let Geom::BlockRef(br) = &d.geom else { continue };
+        let Geom::BlockRef(br) = &d.geom else {
+            continue;
+        };
         let hit = want.iter().any(|(b, x, y)| {
-            *b == br.block
-                && (br.insert.x - x).abs() <= tol
-                && (br.insert.y - y).abs() <= tol
+            *b == br.block && (br.insert.x - x).abs() <= tol && (br.insert.y - y).abs() <= tol
         });
         if hit {
             out.push(i);
@@ -578,7 +593,11 @@ pub fn claim_instances<'a>(
     fixtures: impl Iterator<Item = &'a cad_light::Luminaire>,
     doc_unit_m: f64,
 ) -> Vec<(u32, usize)> {
-    let k = if doc_unit_m.is_finite() && doc_unit_m > 0.0 { doc_unit_m } else { 1.0 };
+    let k = if doc_unit_m.is_finite() && doc_unit_m > 0.0 {
+        doc_unit_m
+    } else {
+        1.0
+    };
     let tol = INSTANCE_TOL_M / k; // the tolerance, in drawing units
     let mut taken: std::collections::HashSet<usize> = Default::default();
     let mut out = Vec::new();
@@ -623,7 +642,9 @@ pub fn move_instance(doc: &mut Document, index: usize, at: Vec2) -> bool {
 /// a window whose other half still works.
 pub fn scan_folder(dir: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir.trim().trim_matches('"')) else { return out };
+    let Ok(rd) = std::fs::read_dir(dir.trim().trim_matches('"')) else {
+        return out;
+    };
     for e in rd.flatten() {
         let p = e.path();
         let is_photometry = p
@@ -633,14 +654,14 @@ pub fn scan_folder(dir: &str) -> Vec<(String, String)> {
         if !is_photometry {
             continue;
         }
-        let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+        let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
         out.push((stem.to_string(), p.to_string_lossy().into_owned()));
     }
     out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
     out
 }
-
-
 
 // ── PREVIEWS ───────────────────────────────────────────────────────────────────────────────
 //
@@ -695,7 +716,11 @@ pub fn symbol_preview_paths(sym: &[SymbolGeom]) -> Vec<Vec<[f32; 2]>> {
     let k = 1.0 / span;
     let (ox, oy) = (0.5 - 0.5 * w * k, 0.5 - 0.5 * h * k);
     raw.iter()
-        .map(|p| p.iter().map(|q| [ox + (q[0] - mnx) * k, oy + (q[1] - mny) * k]).collect())
+        .map(|p| {
+            p.iter()
+                .map(|q| [ox + (q[0] - mnx) * k, oy + (q[1] - mny) * k])
+                .collect()
+        })
         .collect()
 }
 
@@ -724,7 +749,11 @@ pub fn polar_points(prof: &cad_light::IesProfile, plane_deg: f64) -> Vec<[f32; 2
         let n = steps;
         for i in 0..=n {
             let t = i as f64 / n as f64;
-            let g = if sign < 0.0 { last * (1.0 - t) } else { last * t };
+            let g = if sign < 0.0 {
+                last * (1.0 - t)
+            } else {
+                last * t
+            };
             let r = prof.intensity(g, c) / peak;
             let a = g.to_radians();
             out.push([(sign * r * a.sin()) as f32, -(r * a.cos()) as f32]);
@@ -803,7 +832,6 @@ fn beam_angle(prof: &cad_light::IesProfile) -> Option<f64> {
     }
     None
 }
-
 
 // ── THE WINDOW ─────────────────────────────────────────────────────────────────────────────
 //
@@ -914,7 +942,10 @@ fn paint_polar(painter: &egui::Painter, rect: egui::Rect, prof: &cad_light::IesP
     for f in [0.5_f32, 1.0] {
         painter.circle_stroke(org, r * f, egui::Stroke::new(0.7, faint));
     }
-    painter.line_segment([org, egui::pos2(org.x, org.y + r)], egui::Stroke::new(0.7, faint));
+    painter.line_segment(
+        [org, egui::pos2(org.x, org.y + r)],
+        egui::Stroke::new(0.7, faint),
+    );
     painter.line_segment(
         [egui::pos2(org.x - r, org.y), egui::pos2(org.x + r, org.y)],
         egui::Stroke::new(0.7, faint),
@@ -960,7 +991,6 @@ fn figures_ui(ui: &mut egui::Ui, prof: &cad_light::IesProfile) {
     row(ui, "Peak", format!("{:.0} cd", f.peak_candela));
     row(ui, "Beam", or_dash(f.beam_deg, "°", 0));
 }
-
 
 /// What `place_fitting` becomes when a tile is clicked: `Some(id)` to re-arm, `None` to leave it.
 ///
@@ -1010,14 +1040,21 @@ fn tile(
     };
     let p = ui.painter();
     p.rect_filled(rect, 3.0, bg);
-    p.rect_stroke(rect, 3.0, egui::Stroke::new(if selected { 2.0 } else { 1.0 }, border));
+    p.rect_stroke(
+        rect,
+        3.0,
+        egui::Stroke::new(if selected { 2.0 } else { 1.0 }, border),
+    );
 
     // Split down the middle: block on the left, photometry on the right.
     let mid = rect.center().x;
     let left = egui::Rect::from_min_max(rect.min, egui::pos2(mid, rect.max.y));
     let right = egui::Rect::from_min_max(egui::pos2(mid, rect.min.y), rect.max);
     p.line_segment(
-        [egui::pos2(mid, rect.top() + 4.0), egui::pos2(mid, rect.bottom() - 4.0)],
+        [
+            egui::pos2(mid, rect.top() + 4.0),
+            egui::pos2(mid, rect.bottom() - 4.0),
+        ],
         egui::Stroke::new(0.6, egui::Color32::from_gray(60)),
     );
     paint_symbol(p, left, paths, egui::Color32::from_rgb(200, 215, 235));
@@ -1412,7 +1449,10 @@ mod tests {
 
     fn sym(x: f64) -> Vec<SymbolGeom> {
         vec![SymbolGeom {
-            geom: Geom::Line(Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(x, 0.0) }),
+            geom: Geom::Line(Line {
+                a: Vec2::new(0.0, 0.0),
+                b: Vec2::new(x, 0.0),
+            }),
             aci: Some(2),
         }]
     }
@@ -1464,8 +1504,15 @@ mod tests {
             f.ldt_path = "C:/ldt/PULSE-14.ldt".into();
             f.profile = "PULSE MG - 14°".into();
         }
-        assert_eq!(lib.fittings.len(), 1, "relinking must not add a second entry");
-        assert_eq!(lib.get(id).map(|f| f.profile.as_str()), Some("PULSE MG - 14°"));
+        assert_eq!(
+            lib.fittings.len(),
+            1,
+            "relinking must not add a second entry"
+        );
+        assert_eq!(
+            lib.get(id).map(|f| f.profile.as_str()),
+            Some("PULSE MG - 14°")
+        );
     }
 
     /// A SYMBOL DRAWN IN MILLIMETRES LANDS THE RIGHT SIZE IN A METRE DRAWING.
@@ -1495,7 +1542,7 @@ mod tests {
         let id = ensure_block(&mut mm, &f, 0.001);
         let blk = mm.blocks.get(id).expect("added");
         let (mn, mx) = blk.dobjects[0].bbox();
-        assert!((( mx.x - mn.x) - 100.0).abs() < 1e-9, "got {}", mx.x - mn.x);
+        assert!(((mx.x - mn.x) - 100.0).abs() < 1e-9, "got {}", mx.x - mn.x);
     }
 
     /// PLACING THE SAME FITTING TWICE MAKES ONE DEFINITION. Fifty downlights are fifty references
@@ -1542,13 +1589,24 @@ mod tests {
             cut_edges: Vec::new(),
         });
         let syms = symbols_from(&doc);
-        let d = syms.iter().find(|b| b.name == "DOWNLIGHT").expect("the block");
+        let d = syms
+            .iter()
+            .find(|b| b.name == "DOWNLIGHT")
+            .expect("the block");
         assert_eq!(d.symbol.len(), 1, "the symbol lost its geometry");
         // AND ITS MEASURED SIZE, which is what lets a wrong unit declaration be seen. A 50-unit
         // radius circle is 100 across; reporting the radius, or the extent of its centre point,
         // would put every round fitting at half size or at nothing.
-        assert!((d.size[0] - 100.0).abs() < 0.5, "the block measured {} across", d.size[0]);
-        assert!((d.size[1] - 100.0).abs() < 0.5, "the block measured {} tall", d.size[1]);
+        assert!(
+            (d.size[0] - 100.0).abs() < 0.5,
+            "the block measured {} across",
+            d.size[0]
+        );
+        assert!(
+            (d.size[1] - 100.0).abs() < 0.5,
+            "the block measured {} tall",
+            d.size[1]
+        );
     }
 
     /// A BLOCK FILE'S DECLARED UNIT IS OFTEN WRONG, and the panel has to make that visible.
@@ -1576,11 +1634,22 @@ mod tests {
             cut_edges: Vec::new(),
         });
         let rows = symbols_from(&doc);
-        let b = rows.iter().find(|b| b.name.starts_with("LINEA")).expect("the batten");
+        let b = rows
+            .iter()
+            .find(|b| b.name.starts_with("LINEA"))
+            .expect("the batten");
         // The FIGURE is the drawn one — unconverted. Converting it here would fold the wrong
         // declaration into the very number that exists to expose it.
-        assert!((b.size[0] - 2000.0).abs() < 1e-6, "the batten measured {}", b.size[0]);
-        assert!(b.size[1].abs() < 1e-6, "a single line has no height: {}", b.size[1]);
+        assert!(
+            (b.size[0] - 2000.0).abs() < 1e-6,
+            "the batten measured {}",
+            b.size[0]
+        );
+        assert!(
+            b.size[1].abs() < 1e-6,
+            "a single line has no height: {}",
+            b.size[1]
+        );
     }
 
     /// AN EMPTY BLOCK MEASURES NOTHING rather than a bounding box between two infinities.
@@ -1596,7 +1665,12 @@ mod tests {
             cut_edges: Vec::new(),
         });
         let rows = symbols_from(&doc);
-        assert_eq!(rows[0].size, [0.0, 0.0], "an empty block measured {:?}", rows[0].size);
+        assert_eq!(
+            rows[0].size,
+            [0.0, 0.0],
+            "an empty block measured {:?}",
+            rows[0].size
+        );
     }
 
     /// THE UNIT CHOICES NAME REAL UNITS, and the label round-trips the value the file states.
@@ -1617,7 +1691,10 @@ mod tests {
         // opens with nothing selected and the user cannot tell what it defaulted to.
         assert_eq!(unit_label(0.0254), "inch");
         // Anything else says so rather than silently reading as one of them.
-        assert!(unit_label(0.3048).contains("0.3048"), "a foot must not be labelled as an offer");
+        assert!(
+            unit_label(0.3048).contains("0.3048"),
+            "a foot must not be labelled as an offer"
+        );
     }
 
     /// A NESTED BLOCK IS EXPANDED, not dropped. A fixture drawn as a housing block plus a lamp
@@ -1640,7 +1717,10 @@ mod tests {
             name: "FIXTURE".into(),
             base: Vec2::new(0.0, 0.0),
             dobjects: vec![
-                DObject::new(Geom::Line(Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(100.0, 0.0) })),
+                DObject::new(Geom::Line(Line {
+                    a: Vec2::new(0.0, 0.0),
+                    b: Vec2::new(100.0, 0.0),
+                })),
                 DObject::new(Geom::BlockRef(cad_kernel::BlockRef {
                     block: lamp,
                     insert: Vec2::new(50.0, 0.0),
@@ -1649,7 +1729,7 @@ mod tests {
                     rotation: 0.0,
                     mirror_x: false,
                     param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
-                attr_values: Vec::new(),
+                    attr_values: Vec::new(),
                 })),
             ],
             smart: false,
@@ -1657,8 +1737,16 @@ mod tests {
             cut_edges: Vec::new(),
         });
         let syms = symbols_from(&doc);
-        let f = syms.iter().find(|b| b.name == "FIXTURE").expect("the fixture");
-        assert_eq!(f.symbol.len(), 2, "the nested lamp was dropped: {:?}", f.symbol.len());
+        let f = syms
+            .iter()
+            .find(|b| b.name == "FIXTURE")
+            .expect("the fixture");
+        assert_eq!(
+            f.symbol.len(),
+            2,
+            "the nested lamp was dropped: {:?}",
+            f.symbol.len()
+        );
         assert!(
             f.symbol.iter().any(|g| matches!(g.geom, Geom::Circle(_))),
             "the nested block came through as something other than its own geometry",
@@ -1677,7 +1765,10 @@ mod tests {
         } ], "next_id": 4 }"#;
         let lib: Library = serde_json::from_str(json).expect("an older library must load");
         assert_eq!(lib.fittings.len(), 1);
-        assert!(lib.fittings[0].model_path.is_empty(), "the reserved field must default to empty");
+        assert!(
+            lib.fittings[0].model_path.is_empty(),
+            "the reserved field must default to empty"
+        );
     }
 
     /// A LIBRARY LOADED FROM A FILE WITH NO COUNTER DOES NOT HAND OUT A LIVE ID.
@@ -1688,7 +1779,10 @@ mod tests {
         let mut lib: Library = serde_json::from_str(json).expect("loads");
         lib.reserve_ids();
         let fresh = lib.add(fitting("B", 0.001, 1.0));
-        assert!(fresh > 7, "a fresh fitting took the id {fresh}, colliding with the stored 7");
+        assert!(
+            fresh > 7,
+            "a fresh fitting took the id {fresh}, colliding with the stored 7"
+        );
     }
 
     /// A scratch directory of this test's own, so a round trip never touches the real library.
@@ -1716,11 +1810,17 @@ mod tests {
             id: 0,
             symbol: vec![
                 SymbolGeom {
-                    geom: Geom::Circle(Circle { center: Vec2::new(5.0, 5.0), radius: 40.0 }),
+                    geom: Geom::Circle(Circle {
+                        center: Vec2::new(5.0, 5.0),
+                        radius: 40.0,
+                    }),
                     aci: Some(7),
                 },
                 SymbolGeom {
-                    geom: Geom::Line(Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(1500.0, 0.0) }),
+                    geom: Geom::Line(Line {
+                        a: Vec2::new(0.0, 0.0),
+                        b: Vec2::new(1500.0, 0.0),
+                    }),
                     aci: None,
                 },
             ],
@@ -1736,13 +1836,27 @@ mod tests {
 
         let fa = back.get(a).expect("the first fitting kept its id");
         assert_eq!(fa.name, "OCULUS GRANDE");
-        assert_eq!(fa.ldt_path, "C:/ldt/OCULUS.ldt", "the photometry link must survive");
+        assert_eq!(
+            fa.ldt_path, "C:/ldt/OCULUS.ldt",
+            "the photometry link must survive"
+        );
         assert_eq!(fa.profile, "OCULUS GRANDE 2.0 - 36°");
-        assert_eq!(fa.symbol.len(), 1, "the symbol came back empty — the combo is half a combo");
-        assert!((fa.symbol_unit_m - 0.001).abs() < 1e-12, "the unit must survive");
+        assert_eq!(
+            fa.symbol.len(),
+            1,
+            "the symbol came back empty — the combo is half a combo"
+        );
+        assert!(
+            (fa.symbol_unit_m - 0.001).abs() < 1e-12,
+            "the unit must survive"
+        );
 
         let fb = back.get(b).expect("the second fitting kept its id");
-        assert_eq!(fb.symbol.len(), 2, "a two-piece symbol must come back whole");
+        assert_eq!(
+            fb.symbol.len(),
+            2,
+            "a two-piece symbol must come back whole"
+        );
         // The SHAPES, not just the count: an rsm that round-tripped every circle as a line would
         // satisfy a length check and preview every downlight as a stick.
         let circles = fb
@@ -1751,12 +1865,19 @@ mod tests {
             .filter(|s| matches!(s.geom, Geom::Circle(_)))
             .count();
         assert_eq!(circles, 1, "the circle came back as something else");
-        assert_eq!(fb.symbol.iter().filter(|s| s.aci == Some(7)).count(), 1, "colour must survive");
+        assert_eq!(
+            fb.symbol.iter().filter(|s| s.aci == Some(7)).count(),
+            1,
+            "colour must survive"
+        );
 
         // And the counter, so a fitting added after a restart cannot collide with a stored one.
         let mut back = back;
         let c = back.add(fitting("C", 1.0, 1.0));
-        assert!(c > a && c > b, "a fresh id ({c}) collided with a stored one");
+        assert!(
+            c > a && c > b,
+            "a fresh id ({c}) collided with a stored one"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1767,14 +1888,20 @@ mod tests {
     fn a_malformed_library_is_not_silently_empty() {
         let dir = scratch("malformed");
         std::fs::write(dir.join(META_FILE), "{ not json at all").expect("write");
-        assert!(Library::load_from(&dir).is_err(), "a broken metadata file must be reported");
+        assert!(
+            Library::load_from(&dir).is_err(),
+            "a broken metadata file must be reported"
+        );
 
         // …and so is a broken SYMBOL file, for the same reason: loading past it would show every
         // fitting with an empty preview and then save that emptiness back.
         let dir = scratch("malformed_sym");
         Library::default().save_to(&dir).expect("save");
         std::fs::write(dir.join(SYM_FILE), b"not an rsm file").expect("write");
-        assert!(Library::load_from(&dir).is_err(), "a broken symbol file must be reported");
+        assert!(
+            Library::load_from(&dir).is_err(),
+            "a broken symbol file must be reported"
+        );
 
         // A library that has simply never been saved is NOT an error.
         let dir = scratch("absent");
@@ -1788,7 +1915,11 @@ mod tests {
         lib.save_to(&dir).expect("save");
         std::fs::remove_file(dir.join(SYM_FILE)).expect("remove");
         let back = Library::load_from(&dir).expect("a missing symbol file is not an error");
-        assert_eq!(back.fittings.len(), 1, "the fitting must survive its symbol going missing");
+        assert_eq!(
+            back.fittings.len(),
+            1,
+            "the fitting must survive its symbol going missing"
+        );
     }
 
     /// THE NAME IS NOT THE IDENTITY, and the symbol store must not treat it as one.
@@ -1805,14 +1936,20 @@ mod tests {
         let mut lib = Library::default();
         let round = lib.add(Fitting {
             symbol: vec![SymbolGeom {
-                geom: Geom::Circle(Circle { center: Vec2::new(0.0, 0.0), radius: 75.0 }),
+                geom: Geom::Circle(Circle {
+                    center: Vec2::new(0.0, 0.0),
+                    radius: 75.0,
+                }),
                 aci: None,
             }],
             ..fitting("DOWNLIGHT 20W", 0.001, 1.0)
         });
         let square = lib.add(Fitting {
             symbol: vec![SymbolGeom {
-                geom: Geom::Line(Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(150.0, 0.0) }),
+                geom: Geom::Line(Line {
+                    a: Vec2::new(0.0, 0.0),
+                    b: Vec2::new(150.0, 0.0),
+                }),
                 aci: None,
             }],
             ..fitting("DOWNLIGHT 20W", 0.001, 1.0)
@@ -1836,10 +1973,13 @@ mod tests {
         back.get_mut(round).expect("there").name = "DOWNLIGHT 20W ROUND".into();
         back.save_to(&dir).expect("save again");
         let again = Library::load_from(&dir).expect("load again");
-        assert_eq!(again.get(round).expect("there").symbol.len(), 1, "the rename lost the symbol");
+        assert_eq!(
+            again.get(round).expect("there").symbol.len(),
+            1,
+            "the rename lost the symbol"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 
     /// PICKING ANOTHER FITTING WHILE PLACING SWITCHES TO IT.
     ///
@@ -1848,7 +1988,11 @@ mod tests {
     /// one alone — so the plan filled with the first fitting's symbol and nothing said so.
     #[test]
     fn selecting_another_fitting_while_placing_switches_to_it() {
-        assert_eq!(rearm_on_select(Some(3), 7), Some(7), "the new pick was not armed");
+        assert_eq!(
+            rearm_on_select(Some(3), 7),
+            Some(7),
+            "the new pick was not armed"
+        );
     }
 
     /// CLICKING THE ONE ALREADY BEING PLACED IS NOT A TOGGLE. Clicking the highlighted tile to
@@ -1862,9 +2006,12 @@ mod tests {
     /// each fitting's distribution must not start dropping them on the drawing.
     #[test]
     fn selecting_a_fitting_when_idle_does_not_start_placing() {
-        assert_eq!(rearm_on_select(None, 7), None, "browsing the library armed a placement");
+        assert_eq!(
+            rearm_on_select(None, 7),
+            None,
+            "browsing the library armed a placement"
+        );
     }
-
 
     /// REBUILDING A DEFINITION THIS DRAWING DOES NOT HAVE IS A NO-OP, not an edit to whatever sits
     /// at index zero.
@@ -1887,12 +2034,18 @@ mod tests {
             cut_edges: Vec::new(),
         });
         let f = fitting("NEVER PLACED", 0.001, 5000.0);
-        assert!(rebuild_block(&mut doc, &f, 1.0).is_none(), "it claimed to rebuild something");
+        assert!(
+            rebuild_block(&mut doc, &f, 1.0).is_none(),
+            "it claimed to rebuild something"
+        );
         let len = match &doc.blocks.get(0).expect("still there").dobjects[0].geom {
             Geom::Line(l) => (l.b - l.a).len(),
             g => panic!("the definition holds {g:?}"),
         };
-        assert!((len - 1.0).abs() < 1e-12, "another block's geometry was rewritten: {len}");
+        assert!(
+            (len - 1.0).abs() < 1e-12,
+            "another block's geometry was rewritten: {len}"
+        );
     }
 
     /// AND REBUILDING ONE IT DOES HAVE REPLACES ITS GEOMETRY at the corrected scale, leaving the
@@ -1909,10 +2062,26 @@ mod tests {
         assert!((len(&doc) - 50.8).abs() < 1e-9, "fixture: {}", len(&doc));
 
         f.symbol_unit_m = 0.001;
-        assert_eq!(rebuild_block(&mut doc, &f, 1.0), Some(id), "it did not find the definition");
-        assert!((len(&doc) - 2.0).abs() < 1e-9, "still {} m after the correction", len(&doc));
-        assert_eq!(doc.blocks.blocks.len(), 1, "a second definition was created instead");
-        assert_eq!(doc.blocks.get(id).expect("there").name, "LINEA", "the name changed");
+        assert_eq!(
+            rebuild_block(&mut doc, &f, 1.0),
+            Some(id),
+            "it did not find the definition"
+        );
+        assert!(
+            (len(&doc) - 2.0).abs() < 1e-9,
+            "still {} m after the correction",
+            len(&doc)
+        );
+        assert_eq!(
+            doc.blocks.blocks.len(),
+            1,
+            "a second definition was created instead"
+        );
+        assert_eq!(
+            doc.blocks.get(id).expect("there").name,
+            "LINEA",
+            "the name changed"
+        );
     }
     /// TWO DIFFERENT FITTINGS GET TWO DIFFERENT DEFINITIONS.
     ///
@@ -1924,7 +2093,13 @@ mod tests {
     #[test]
     fn different_fittings_do_not_share_a_definition() {
         let mut doc = Document::default();
-        let names = ["NUCLEO", "LINEA W48X80 - (2M)", "VEGA", "OCULUS GRANDE 2.0", "PULSE MG"];
+        let names = [
+            "NUCLEO",
+            "LINEA W48X80 - (2M)",
+            "VEGA",
+            "OCULUS GRANDE 2.0",
+            "PULSE MG",
+        ];
         let ids: Vec<u32> = names
             .iter()
             .enumerate()
@@ -1937,13 +2112,22 @@ mod tests {
         let mut uniq = ids.clone();
         uniq.sort_unstable();
         uniq.dedup();
-        assert_eq!(uniq.len(), names.len(), "fittings shared a definition: {ids:?}");
-        assert_eq!(doc.blocks.blocks.len(), names.len(), "the block table is the wrong size");
+        assert_eq!(
+            uniq.len(),
+            names.len(),
+            "fittings shared a definition: {ids:?}"
+        );
+        assert_eq!(
+            doc.blocks.blocks.len(),
+            names.len(),
+            "the block table is the wrong size"
+        );
         for (i, n) in names.iter().enumerate() {
             assert_eq!(
                 doc.blocks.get(ids[i]).expect("the definition").name,
                 *n,
-                "definition {} is not {n}", ids[i],
+                "definition {} is not {n}",
+                ids[i],
             );
         }
         // …and every instance points at its OWN definition, which is what the dump showed it did
@@ -1956,7 +2140,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(refs, ids, "the instances do not match the definitions they were made from");
+        assert_eq!(
+            refs, ids,
+            "the instances do not match the definitions they were made from"
+        );
     }
 
     /// A SYMBOL LANDS ON THE POINT THAT WAS CLICKED.
@@ -2000,8 +2187,14 @@ mod tests {
         let id = insert(&mut doc, &f, Vec2::new(7.0, 3.0), 1.0); // a metre plan
 
         let def = doc.blocks.get(id).expect("the definition");
-        let sym: Vec<SymbolGeom> =
-            def.dobjects.iter().map(|d| SymbolGeom { geom: d.geom.clone(), aci: None }).collect();
+        let sym: Vec<SymbolGeom> = def
+            .dobjects
+            .iter()
+            .map(|d| SymbolGeom {
+                geom: d.geom.clone(),
+                aci: None,
+            })
+            .collect();
         let [mnx, mny, mxx, mxy] = symbol_bounds(&sym).expect("it draws something");
 
         // The DEFINITION straddles its own origin, so the reference's insertion point is the
@@ -2021,11 +2214,17 @@ mod tests {
     #[test]
     fn a_centred_symbol_is_not_moved() {
         let sym = vec![SymbolGeom {
-            geom: Geom::Circle(Circle { center: Vec2::new(0.0, 0.0), radius: 50.0 }),
+            geom: Geom::Circle(Circle {
+                center: Vec2::new(0.0, 0.0),
+                radius: 50.0,
+            }),
             aci: None,
         }];
         let a = symbol_anchor(&sym);
-        assert!(a.x.abs() < 1e-9 && a.y.abs() < 1e-9, "a centred symbol anchored at {a:?}");
+        assert!(
+            a.x.abs() < 1e-9 && a.y.abs() < 1e-9,
+            "a centred symbol anchored at {a:?}"
+        );
     }
 
     /// A SYMBOL WITH NOTHING DRAWABLE anchors at the origin rather than at a bounding box between
@@ -2033,7 +2232,10 @@ mod tests {
     #[test]
     fn an_empty_symbol_anchors_at_the_origin() {
         let a = symbol_anchor(&[]);
-        assert!(a.x == 0.0 && a.y == 0.0, "an empty symbol anchored at {a:?}");
+        assert!(
+            a.x == 0.0 && a.y == 0.0,
+            "an empty symbol anchored at {a:?}"
+        );
         assert!(symbol_bounds(&[]).is_none());
     }
 
@@ -2044,7 +2246,10 @@ mod tests {
     #[test]
     fn the_anchor_is_the_middle_of_the_extents() {
         let mut sym = vec![SymbolGeom {
-            geom: Geom::Line(Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(100.0, 0.0) }),
+            geom: Geom::Line(Line {
+                a: Vec2::new(0.0, 0.0),
+                b: Vec2::new(100.0, 0.0),
+            }),
             aci: None,
         }];
         for i in 0..20 {
@@ -2057,7 +2262,11 @@ mod tests {
             });
         }
         let a = symbol_anchor(&sym);
-        assert!((a.x - 50.0).abs() < 0.2, "the anchor was dragged to {} by the small parts", a.x);
+        assert!(
+            (a.x - 50.0).abs() < 0.2,
+            "the anchor was dragged to {} by the small parts",
+            a.x
+        );
     }
 
     /// PLACING PUTS AN ORDINARY BLOCK REFERENCE ON THE DRAWING, at the point asked for.
@@ -2071,8 +2280,15 @@ mod tests {
         let f = fitting("OCULUS", 0.001, 100.0);
         let b1 = insert(&mut doc, &f, Vec2::new(3000.0, 1500.0), 0.001);
         let b2 = insert(&mut doc, &f, Vec2::new(9000.0, 1500.0), 0.001);
-        assert_eq!(b1, b2, "the second instance must reuse the first definition");
-        assert_eq!(doc.blocks.blocks.len(), 1, "one definition, not one per instance");
+        assert_eq!(
+            b1, b2,
+            "the second instance must reuse the first definition"
+        );
+        assert_eq!(
+            doc.blocks.blocks.len(),
+            1,
+            "one definition, not one per instance"
+        );
 
         let refs: Vec<cad_kernel::BlockRef> = doc
             .dobjects
@@ -2083,8 +2299,14 @@ mod tests {
             })
             .collect();
         assert_eq!(refs.len(), 2, "two instances must be on the drawing");
-        assert!((refs[0].insert.x - 3000.0).abs() < 1e-9, "placed at the wrong point");
-        assert!((refs[1].insert.x - 9000.0).abs() < 1e-9, "placed at the wrong point");
+        assert!(
+            (refs[0].insert.x - 3000.0).abs() < 1e-9,
+            "placed at the wrong point"
+        );
+        assert!(
+            (refs[1].insert.x - 9000.0).abs() < 1e-9,
+            "placed at the wrong point"
+        );
         for r in &refs {
             assert_eq!(r.block, b1, "an instance points at some other definition");
             assert!(!r.mirror_x);
@@ -2104,8 +2326,16 @@ mod tests {
                 _ => None,
             })
             .expect("an instance must be on the drawing");
-        assert!((br.scale - 1.0).abs() < 1e-12, "the reference is scaled: {}", br.scale);
-        assert!((br.scale_y - 1.0).abs() < 1e-12, "the reference is scaled in y: {}", br.scale_y);
+        assert!(
+            (br.scale - 1.0).abs() < 1e-12,
+            "the reference is scaled: {}",
+            br.scale
+        );
+        assert!(
+            (br.scale_y - 1.0).abs() < 1e-12,
+            "the reference is scaled in y: {}",
+            br.scale_y
+        );
 
         // The symbol is 100 units at 0.001 m/unit = 0.1 m, and the drawing measures in metres.
         let def = metres.blocks.get(br.block).expect("the definition");
@@ -2113,7 +2343,10 @@ mod tests {
             Geom::Line(l) => (l.b - l.a).len(),
             g => panic!("the definition holds {g:?}"),
         };
-        assert!((len - 0.1).abs() < 1e-9, "the symbol arrived {len} m long, not 0.1 m");
+        assert!(
+            (len - 0.1).abs() < 1e-9,
+            "the symbol arrived {len} m long, not 0.1 m"
+        );
     }
 }
 
@@ -2153,10 +2386,16 @@ mod previews {
         for side in [0.5_f64, 500.0, 500_000.0] {
             let d = doc_with_block(
                 "B",
-                vec![Geom::Line(Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(side, side) })],
+                vec![Geom::Line(Line {
+                    a: Vec2::new(0.0, 0.0),
+                    b: Vec2::new(side, side),
+                })],
             );
             let paths = symbol_preview_paths(&flatten_block(&d, 0, 0));
-            assert!(!paths.is_empty(), "a line block previewed as nothing at scale {side}");
+            assert!(
+                !paths.is_empty(),
+                "a line block previewed as nothing at scale {side}"
+            );
             let (mnx, mny, mxx, mxy) = bounds(&paths);
             assert!(
                 mnx >= -1e-4 && mny >= -1e-4 && mxx <= 1.0 + 1e-4 && mxy <= 1.0 + 1e-4,
@@ -2174,10 +2413,22 @@ mod previews {
         let d = doc_with_block(
             "BATTEN",
             vec![
-                Geom::Line(Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 0.0) }),
-                Geom::Line(Line { a: Vec2::new(10.0, 0.0), b: Vec2::new(10.0, 1.0) }),
-                Geom::Line(Line { a: Vec2::new(10.0, 1.0), b: Vec2::new(0.0, 1.0) }),
-                Geom::Line(Line { a: Vec2::new(0.0, 1.0), b: Vec2::new(0.0, 0.0) }),
+                Geom::Line(Line {
+                    a: Vec2::new(0.0, 0.0),
+                    b: Vec2::new(10.0, 0.0),
+                }),
+                Geom::Line(Line {
+                    a: Vec2::new(10.0, 0.0),
+                    b: Vec2::new(10.0, 1.0),
+                }),
+                Geom::Line(Line {
+                    a: Vec2::new(10.0, 1.0),
+                    b: Vec2::new(0.0, 1.0),
+                }),
+                Geom::Line(Line {
+                    a: Vec2::new(0.0, 1.0),
+                    b: Vec2::new(0.0, 0.0),
+                }),
             ],
         );
         let (mnx, mny, mxx, mxy) = bounds(&symbol_preview_paths(&flatten_block(&d, 0, 0)));
@@ -2187,7 +2438,10 @@ mod previews {
             "a 10:1 batten previewed at {:.2}:1 — the aspect was not preserved",
             w / h,
         );
-        assert!((w - 1.0).abs() < 1e-3, "the long axis should fill the box, got {w}");
+        assert!(
+            (w - 1.0).abs() < 1e-3,
+            "the long axis should fill the box, got {w}"
+        );
     }
 
     /// A BLOCK WITH NOTHING DRAWABLE PREVIEWS AS NOTHING, and says so by being empty rather than
@@ -2206,24 +2460,33 @@ mod previews {
     fn a_round_block_previews_round() {
         let d = doc_with_block(
             "DOWNLIGHT",
-            vec![Geom::Circle(Circle { center: Vec2::new(3.0, 3.0), radius: 2.0 })],
+            vec![Geom::Circle(Circle {
+                center: Vec2::new(3.0, 3.0),
+                radius: 2.0,
+            })],
         );
         let paths = symbol_preview_paths(&flatten_block(&d, 0, 0));
         let (mnx, mny, mxx, mxy) = bounds(&paths);
         assert!(
             ((mxx - mnx) - (mxy - mny)).abs() < 1e-3,
             "a circle previewed {:.3} wide and {:.3} tall",
-            mxx - mnx, mxy - mny,
+            mxx - mnx,
+            mxy - mny,
         );
-        assert!(paths.iter().map(|p| p.len()).sum::<usize>() > 8, "a circle needs more than a box");
+        assert!(
+            paths.iter().map(|p| p.len()).sum::<usize>() > 8,
+            "a circle needs more than a box"
+        );
     }
 
     // ── THE PHOTOMETRIC CURVE ──────────────────────────────────────────────────────────────
 
     fn downlight() -> cad_light::IesProfile {
         let vertical_angles: Vec<f64> = (0..=18).map(|i| i as f64 * 5.0).collect();
-        let candela: Vec<f64> =
-            vertical_angles.iter().map(|g| 1000.0 * g.to_radians().cos().max(0.0)).collect();
+        let candela: Vec<f64> = vertical_angles
+            .iter()
+            .map(|g| 1000.0 * g.to_radians().cos().max(0.0))
+            .collect();
         cad_light::IesProfile {
             manufacturer: String::new(),
             catalogue: String::new(),
@@ -2251,8 +2514,15 @@ mod previews {
     fn a_downlight_points_down() {
         let pts = polar_points(&downlight(), 0.0);
         assert!(!pts.is_empty(), "a downlight produced no curve");
-        let lowest = pts.iter().cloned().fold([0.0_f32, 0.0], |a, b| if b[1] < a[1] { b } else { a });
-        assert!(lowest[1] < -0.9, "the peak of the lobe is at y = {}, not below", lowest[1]);
+        let lowest = pts
+            .iter()
+            .cloned()
+            .fold([0.0_f32, 0.0], |a, b| if b[1] < a[1] { b } else { a });
+        assert!(
+            lowest[1] < -0.9,
+            "the peak of the lobe is at y = {}, not below",
+            lowest[1]
+        );
         assert!(
             pts.iter().all(|p| p[1] <= 1e-6),
             "part of a downlight's curve was drawn ABOVE the fitting",
@@ -2271,7 +2541,9 @@ mod previews {
                 }
             }
             let pts = polar_points(&p, 0.0);
-            let far = pts.iter().fold(0.0_f32, |m, q| m.max((q[0] * q[0] + q[1] * q[1]).sqrt()));
+            let far = pts
+                .iter()
+                .fold(0.0_f32, |m, q| m.max((q[0] * q[0] + q[1] * q[1]).sqrt()));
             assert!(
                 (far - 1.0).abs() < 1e-3,
                 "at {scale}x the curve reached {far}, not the unit disc",
@@ -2306,8 +2578,15 @@ mod previews {
         p.watts = 0.0;
         let f = profile_figures(&p);
         assert_eq!(f.watts, None);
-        assert_eq!(f.efficacy, None, "an efficacy was invented from a missing wattage");
-        assert_eq!(f.lumens, Some(3140.0), "…but the flux it DOES state is still reported");
+        assert_eq!(
+            f.efficacy, None,
+            "an efficacy was invented from a missing wattage"
+        );
+        assert_eq!(
+            f.lumens,
+            Some(3140.0),
+            "…but the flux it DOES state is still reported"
+        );
     }
 
     /// THE BEAM ANGLE IS THE HALF-PEAK WIDTH. A perfect cosine downlight falls to half at 60° off
@@ -2315,8 +2594,13 @@ mod previews {
     /// rather than against whatever the code happens to produce.
     #[test]
     fn the_beam_angle_is_the_full_width_at_half_peak() {
-        let b = profile_figures(&downlight()).beam_deg.expect("a downlight has a beam angle");
-        assert!((b - 120.0).abs() < 2.0, "a cosine downlight's beam came out {b:.1}°, not 120°");
+        let b = profile_figures(&downlight())
+            .beam_deg
+            .expect("a downlight has a beam angle");
+        assert!(
+            (b - 120.0).abs() < 2.0,
+            "a cosine downlight's beam came out {b:.1}°, not 120°"
+        );
     }
 
     /// AND A FITTING WITH NO BEAM SAYS SO. A distribution that never falls to half within its
@@ -2330,6 +2614,3 @@ mod previews {
         assert_eq!(profile_figures(&p).beam_deg, None);
     }
 }
-
-
-

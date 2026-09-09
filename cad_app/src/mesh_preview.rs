@@ -40,7 +40,13 @@ pub struct PartLook {
 
 impl Default for PartLook {
     fn default() -> Self {
-        Self { albedo: [0.55, 0.55, 0.55], roughness: 0.5, metallic: 0.0, opacity: 1.0, proc: None }
+        Self {
+            albedo: [0.55, 0.55, 0.55],
+            roughness: 0.5,
+            metallic: 0.0,
+            opacity: 1.0,
+            proc: None,
+        }
     }
 }
 
@@ -57,7 +63,11 @@ impl Default for Orbit {
     /// A three-quarter view from slightly above — the angle that shows a door's face, its leading
     /// edge and the projection of its handle in one picture.
     fn default() -> Self {
-        Self { yaw: -0.62, pitch: 0.20, zoom: 1.0 }
+        Self {
+            yaw: -0.62,
+            pitch: 0.20,
+            zoom: 1.0,
+        }
     }
 }
 
@@ -83,8 +93,14 @@ pub enum View {
 }
 
 impl View {
-    pub const ALL: [View; 6] =
-        [View::Front, View::Back, View::Left, View::Right, View::Top, View::Bottom];
+    pub const ALL: [View; 6] = [
+        View::Front,
+        View::Back,
+        View::Left,
+        View::Right,
+        View::Top,
+        View::Bottom,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -158,7 +174,11 @@ pub fn render(
     if tris == 0 || lo[0] > hi[0] {
         return backdrop_only(size, color);
     }
-    let centre = Vec3::new((lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5);
+    let centre = Vec3::new(
+        (lo[0] + hi[0]) * 0.5,
+        (lo[1] + hi[1]) * 0.5,
+        (lo[2] + hi[2]) * 0.5,
+    );
 
     let (cy, sy) = (orbit.yaw.cos(), orbit.yaw.sin());
     let (cp, sp) = (orbit.pitch.cos(), orbit.pitch.sin());
@@ -221,10 +241,22 @@ pub fn render(
         if area.abs() < 1e-9 {
             continue;
         }
-        let x0 = s.iter().map(|p| p.0).fold(f32::MAX, f32::min).floor().max(0.0) as usize;
-        let x1 = (s.iter().map(|p| p.0).fold(f32::MIN, f32::max).ceil() as isize).clamp(0, w as isize) as usize;
-        let y0 = s.iter().map(|p| p.1).fold(f32::MAX, f32::min).floor().max(0.0) as usize;
-        let y1 = (s.iter().map(|p| p.1).fold(f32::MIN, f32::max).ceil() as isize).clamp(0, w as isize) as usize;
+        let x0 = s
+            .iter()
+            .map(|p| p.0)
+            .fold(f32::MAX, f32::min)
+            .floor()
+            .max(0.0) as usize;
+        let x1 = (s.iter().map(|p| p.0).fold(f32::MIN, f32::max).ceil() as isize)
+            .clamp(0, w as isize) as usize;
+        let y0 = s
+            .iter()
+            .map(|p| p.1)
+            .fold(f32::MAX, f32::min)
+            .floor()
+            .max(0.0) as usize;
+        let y1 = (s.iter().map(|p| p.1).fold(f32::MIN, f32::max).ceil() as isize)
+            .clamp(0, w as isize) as usize;
         if x0 >= x1 || y0 >= y1 {
             continue;
         }
@@ -262,7 +294,12 @@ pub fn render(
                 let (b0, b1, b2) = (w0 / v[0].z * z, w1 / v[1].z * z, w2 / v[2].z * z);
                 let nn = (n[0] * b0 + n[1] * b1 + n[2] * b2).normalize_or(Vec3::Z);
                 let pp = wp[0] * b0 + wp[1] * b1 + wp[2] * b2;
-                gbuf[o] = Some(Frag { depth: z, p: pp.into(), n: nn.into(), look });
+                gbuf[o] = Some(Frag {
+                    depth: z,
+                    p: pp.into(),
+                    n: nn.into(),
+                    look,
+                });
             }
         }
     }
@@ -275,18 +312,27 @@ pub fn render(
     // …but only when there is a floor to cast it on. Looking straight down or straight up, the
     // ground plane is perpendicular to the view and a shadow under the object is meaningless.
     let base = Vec3::new(centre.x, centre.y, lo[2]);
-    let shadow = (dir.z.abs() < 0.9).then_some(()).and_then(|_| project(base, &to_view, half, half_fov)).map(|(sx, sy2)| {
-        let rx = (hi[0] - lo[0]).max(hi[1] - lo[1]) * 0.62;
-        let edge = project(base + right * rx, &to_view, half, half_fov);
-        let r = edge.map(|(ex, _)| (ex - sx).abs()).unwrap_or(w as f32 * 0.2).max(4.0);
-        (sx, sy2, r, r * 0.30)
-    });
+    let shadow = (dir.z.abs() < 0.9)
+        .then_some(())
+        .and_then(|_| project(base, &to_view, half, half_fov))
+        .map(|(sx, sy2)| {
+            let rx = (hi[0] - lo[0]).max(hi[1] - lo[1]) * 0.62;
+            let edge = project(base + right * rx, &to_view, half, half_fov);
+            let r = edge
+                .map(|(ex, _)| (ex - sx).abs())
+                .unwrap_or(w as f32 * 0.2)
+                .max(4.0);
+            (sx, sy2, r, r * 0.30)
+        });
 
     // A supersampled render is the SETTLED one, so it also pays for the procedural relief; `ss == 1`
     // is the draft the user sees while they are still changing something.
     let relief = ss > 1;
     let mut hi_res = vec![0u8; w * w * 4];
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16);
     let band = w.div_ceil(threads);
     std::thread::scope(|scope| {
         for (bi, rows) in hi_res.chunks_mut(band * w * 4).enumerate() {
@@ -317,9 +363,19 @@ pub fn render(
                                         // without it; the settled one has it. Same pattern either
                                         // way, so the draft is never a different material.
                                         let s = if relief {
-                                            crate::proc_tex::sample(def, Vec3::from(f.p), n, f.look.roughness)
+                                            crate::proc_tex::sample(
+                                                def,
+                                                Vec3::from(f.p),
+                                                n,
+                                                f.look.roughness,
+                                            )
                                         } else {
-                                            crate::proc_tex::sample_flat(def, Vec3::from(f.p), n, f.look.roughness)
+                                            crate::proc_tex::sample_flat(
+                                                def,
+                                                Vec3::from(f.p),
+                                                n,
+                                                f.look.roughness,
+                                            )
                                         };
                                         n = s.normal;
                                         (s.albedo, s.roughness)
@@ -327,8 +383,17 @@ pub fn render(
                                     None => (f.look.albedo, f.look.roughness),
                                 };
                                 let mut c = crate::matball::shade_point(
-                                    albedo, rough, f.look.metallic, 1.5,
-                                    n, -vdir, sun_dir, sun_col, sky, sh, 0.55,
+                                    albedo,
+                                    rough,
+                                    f.look.metallic,
+                                    1.5,
+                                    n,
+                                    -vdir,
+                                    sun_dir,
+                                    sun_col,
+                                    sky,
+                                    sh,
+                                    0.55,
                                 );
                                 // TRANSPARENCY, as a straight blend with the BACKDROP — not with
                                 // whatever the mesh has behind it. For a glazed door panel those
@@ -386,14 +451,27 @@ pub fn render(
 }
 
 /// The ray through a pixel, in world space.
-fn view_ray(x: usize, y: usize, half: f32, half_fov: f32, right: Vec3, up: Vec3, fwd: Vec3) -> Vec3 {
+fn view_ray(
+    x: usize,
+    y: usize,
+    half: f32,
+    half_fov: f32,
+    right: Vec3,
+    up: Vec3,
+    fwd: Vec3,
+) -> Vec3 {
     let px = ((x as f32 + 0.5) - half) / half * half_fov;
     let py = (half - (y as f32 + 0.5)) / half * half_fov;
     (fwd + right * px + up * py).normalize()
 }
 
 /// World point → pixel, or `None` when it is behind the camera.
-fn project(p: Vec3, to_view: &dyn Fn(Vec3) -> Vec3, half: f32, half_fov: f32) -> Option<(f32, f32)> {
+fn project(
+    p: Vec3,
+    to_view: &dyn Fn(Vec3) -> Vec3,
+    half: f32,
+    half_fov: f32,
+) -> Option<(f32, f32)> {
     let v = to_view(p);
     if v.z <= 1e-4 {
         return None;
@@ -447,13 +525,22 @@ mod tests {
     /// A unit cube at the origin, as triangle soup with outward normals.
     fn cube(part: u32) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<u32>) {
         let c = [
-            [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5],
-            [-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5],
+            [-0.5, -0.5, -0.5],
+            [0.5, -0.5, -0.5],
+            [0.5, 0.5, -0.5],
+            [-0.5, 0.5, -0.5],
+            [-0.5, -0.5, 0.5],
+            [0.5, -0.5, 0.5],
+            [0.5, 0.5, 0.5],
+            [-0.5, 0.5, 0.5],
         ];
         let quads: [([usize; 4], [f32; 3]); 6] = [
-            ([0, 3, 2, 1], [0.0, 0.0, -1.0]), ([4, 5, 6, 7], [0.0, 0.0, 1.0]),
-            ([0, 1, 5, 4], [0.0, -1.0, 0.0]), ([3, 7, 6, 2], [0.0, 1.0, 0.0]),
-            ([0, 4, 7, 3], [-1.0, 0.0, 0.0]), ([1, 2, 6, 5], [1.0, 0.0, 0.0]),
+            ([0, 3, 2, 1], [0.0, 0.0, -1.0]),
+            ([4, 5, 6, 7], [0.0, 0.0, 1.0]),
+            ([0, 1, 5, 4], [0.0, -1.0, 0.0]),
+            ([3, 7, 6, 2], [0.0, 1.0, 0.0]),
+            ([0, 4, 7, 3], [-1.0, 0.0, 0.0]),
+            ([1, 2, 6, 5], [1.0, 0.0, 0.0]),
         ];
         let (mut p, mut n, mut ids) = (Vec::new(), Vec::new(), Vec::new());
         for (q, nn) in quads {
@@ -469,7 +556,11 @@ mod tests {
     }
 
     fn white(_: u32) -> PartLook {
-        PartLook { albedo: [0.8, 0.8, 0.8], roughness: 0.4, ..Default::default() }
+        PartLook {
+            albedo: [0.8, 0.8, 0.8],
+            roughness: 0.4,
+            ..Default::default()
+        }
     }
 
     /// The mesh must actually appear, and appear in the MIDDLE — the camera fit is the part most
@@ -479,14 +570,29 @@ mod tests {
     fn the_mesh_lands_in_the_middle_of_the_frame() {
         let (p, n, ids) = cube(1);
         let size = 96;
-        let img = render(&p, &n, &ids, &white, Orbit::default(), size, 1, ColorPipeline::default());
+        let img = render(
+            &p,
+            &n,
+            &ids,
+            &white,
+            Orbit::default(),
+            size,
+            1,
+            ColorPipeline::default(),
+        );
         assert_eq!(img.len(), size * size * 4);
         let centre = |x: usize, y: usize| img[(y * size + x) * 4] as i32;
         let mid = centre(size / 2, size / 2);
         let corner = centre(2, 2);
-        assert!(mid > corner + 20, "object ({mid}) is brighter than the backdrop ({corner})");
+        assert!(
+            mid > corner + 20,
+            "object ({mid}) is brighter than the backdrop ({corner})"
+        );
         // …and it does not fill the frame, or the fit is too tight to be a preview.
-        assert!(centre(1, size / 2) < mid, "the frame has margin on the left");
+        assert!(
+            centre(1, size / 2) < mid,
+            "the frame has margin on the left"
+        );
         assert!(centre(size - 2, size / 2) < mid, "…and on the right");
     }
 
@@ -496,14 +602,38 @@ mod tests {
     fn orbiting_changes_what_is_drawn() {
         let (p, n, ids) = cube(1);
         let size = 64;
-        let a = render(&p, &n, &ids, &white, Orbit::default(), size, 1, ColorPipeline::default());
-        let b = render(
-            &p, &n, &ids, &white,
-            Orbit { yaw: 0.9, ..Orbit::default() },
-            size, 1, ColorPipeline::default(),
+        let a = render(
+            &p,
+            &n,
+            &ids,
+            &white,
+            Orbit::default(),
+            size,
+            1,
+            ColorPipeline::default(),
         );
-        let diff = a.iter().zip(&b).filter(|(x, y)| x.abs_diff(**y) > 4).count();
-        assert!(diff > size * size / 20, "a 0.9 rad yaw moved {diff} subpixels");
+        let b = render(
+            &p,
+            &n,
+            &ids,
+            &white,
+            Orbit {
+                yaw: 0.9,
+                ..Orbit::default()
+            },
+            size,
+            1,
+            ColorPipeline::default(),
+        );
+        let diff = a
+            .iter()
+            .zip(&b)
+            .filter(|(x, y)| x.abs_diff(**y) > 4)
+            .count();
+        assert!(
+            diff > size * size / 20,
+            "a 0.9 rad yaw moved {diff} subpixels"
+        );
     }
 
     /// Parts are shaded independently: a hardware id must not pick up the wood's albedo.
@@ -519,11 +649,28 @@ mod tests {
         ids.extend(std::iter::repeat_n(2u32, 12));
         let size = 96;
         let look = |id: u32| PartLook {
-            albedo: if id == 1 { [0.85, 0.15, 0.15] } else { [0.15, 0.15, 0.85] },
+            albedo: if id == 1 {
+                [0.85, 0.15, 0.15]
+            } else {
+                [0.15, 0.15, 0.85]
+            },
             roughness: 0.4,
             ..Default::default()
         };
-        let img = render(&p, &n, &ids, &look, Orbit { yaw: 0.0, pitch: 0.0, zoom: 1.0 }, size, 1, ColorPipeline::default());
+        let img = render(
+            &p,
+            &n,
+            &ids,
+            &look,
+            Orbit {
+                yaw: 0.0,
+                pitch: 0.0,
+                zoom: 1.0,
+            },
+            size,
+            1,
+            ColorPipeline::default(),
+        );
         // Somewhere on the left half a pixel must be red-dominant, and on the right, blue-dominant.
         let mut redish = 0;
         let mut blueish = 0;
@@ -549,23 +696,58 @@ mod tests {
     fn glass_lets_the_backdrop_through() {
         let (p, n, ids) = cube(1);
         let size = 64;
-        let orbit = Orbit { yaw: 0.0, pitch: 0.0, zoom: 1.0 };
-        let solid = |_: u32| PartLook { albedo: [0.05, 0.35, 0.08], roughness: 0.3, ..Default::default() };
+        let orbit = Orbit {
+            yaw: 0.0,
+            pitch: 0.0,
+            zoom: 1.0,
+        };
+        let solid = |_: u32| PartLook {
+            albedo: [0.05, 0.35, 0.08],
+            roughness: 0.3,
+            ..Default::default()
+        };
         let glass = |_: u32| PartLook {
             albedo: [0.05, 0.35, 0.08],
             roughness: 0.3,
             opacity: 0.15,
             ..Default::default()
         };
-        let a = render(&p, &n, &ids, &solid, orbit, size, 1, ColorPipeline::default());
-        let b = render(&p, &n, &ids, &glass, orbit, size, 1, ColorPipeline::default());
+        let a = render(
+            &p,
+            &n,
+            &ids,
+            &solid,
+            orbit,
+            size,
+            1,
+            ColorPipeline::default(),
+        );
+        let b = render(
+            &p,
+            &n,
+            &ids,
+            &glass,
+            orbit,
+            size,
+            1,
+            ColorPipeline::default(),
+        );
         let o = ((size / 2) * size + size / 2) * 4;
         let bg = ColorPipeline::default();
         let want = crate::color::tonemap8(bg, backdrop(size / 2, size / 2, size, None));
-        let d_solid = (a[o] as i32 - want[0] as i32).abs() + (a[o + 1] as i32 - want[1] as i32).abs();
-        let d_glass = (b[o] as i32 - want[0] as i32).abs() + (b[o + 1] as i32 - want[1] as i32).abs();
-        assert!(d_glass * 2 < d_solid, "glass ({d_glass}) sits far nearer the backdrop than the solid ({d_solid})");
-        assert_ne!(a[o..o + 3], b[o..o + 3], "and the two are not the same pixel");
+        let d_solid =
+            (a[o] as i32 - want[0] as i32).abs() + (a[o + 1] as i32 - want[1] as i32).abs();
+        let d_glass =
+            (b[o] as i32 - want[0] as i32).abs() + (b[o + 1] as i32 - want[1] as i32).abs();
+        assert!(
+            d_glass * 2 < d_solid,
+            "glass ({d_glass}) sits far nearer the backdrop than the solid ({d_solid})"
+        );
+        assert_ne!(
+            a[o..o + 3],
+            b[o..o + 3],
+            "and the two are not the same pixel"
+        );
     }
 
     /// A procedural must paint a PATTERN, not its average colour. Flat brown where there should be
@@ -574,7 +756,11 @@ mod tests {
     fn a_procedural_paints_its_grain() {
         let (p, n, ids) = cube(1);
         let size = 80;
-        let orbit = Orbit { yaw: 0.0, pitch: 0.0, zoom: 1.0 };
+        let orbit = Orbit {
+            yaw: 0.0,
+            pitch: 0.0,
+            zoom: 1.0,
+        };
         let oak = crate::factory::ProcDef::oak();
         let flat = |_: u32| PartLook {
             albedo: crate::color::srgb_to_linear3(oak.avg_color()),
@@ -595,10 +781,31 @@ mod tests {
             let mean = row.iter().sum::<i32>() / row.len() as i32;
             row.iter().map(|v| (v - mean).abs()).sum::<i32>() / row.len() as i32
         };
-        let a = render(&p, &n, &ids, &flat, orbit, size, 1, ColorPipeline::default());
-        let b = render(&p, &n, &ids, &grain, orbit, size, 1, ColorPipeline::default());
+        let a = render(
+            &p,
+            &n,
+            &ids,
+            &flat,
+            orbit,
+            size,
+            1,
+            ColorPipeline::default(),
+        );
+        let b = render(
+            &p,
+            &n,
+            &ids,
+            &grain,
+            orbit,
+            size,
+            1,
+            ColorPipeline::default(),
+        );
         let (fa, fb) = (spread(&a), spread(&b));
-        assert!(fa <= 1, "a flat colour on a flat face is flat (spread {fa})");
+        assert!(
+            fa <= 1,
+            "a flat colour on a flat face is flat (spread {fa})"
+        );
         assert!(fb > 4, "the grain varies across the face (spread {fb})");
     }
 
@@ -631,7 +838,10 @@ mod tests {
         if x1 < x0 {
             return (0.0, 0.0);
         }
-        ((x1 - x0) as f32 / size as f32, (y1 - y0) as f32 / size as f32)
+        (
+            (x1 - x0) as f32 / size as f32,
+            (y1 - y0) as f32 / size as f32,
+        )
     }
 
     /// THE regression behind the six fixed views: the camera must fit to the object's extent ACROSS
@@ -642,18 +852,40 @@ mod tests {
     fn every_fixed_view_fills_its_frame() {
         let (p, n, ids) = slab();
         let size = 96;
-        let red = |_: u32| PartLook { albedo: [0.75, 0.05, 0.05], roughness: 0.5, ..Default::default() };
+        let red = |_: u32| PartLook {
+            albedo: [0.75, 0.05, 0.05],
+            roughness: 0.5,
+            ..Default::default()
+        };
         for v in View::ALL {
-            let img = render(&p, &n, &ids, &red, v.orbit(1.0), size, 1, ColorPipeline::default());
+            let img = render(
+                &p,
+                &n,
+                &ids,
+                &red,
+                v.orbit(1.0),
+                size,
+                1,
+                ColorPipeline::default(),
+            );
             let (sx, sy) = spans(&img, size);
-            assert!(sx > 0.02 && sy > 0.02, "{}: the object is visible at all ({sx}, {sy})", v.label());
+            assert!(
+                sx > 0.02 && sy > 0.02,
+                "{}: the object is visible at all ({sx}, {sy})",
+                v.label()
+            );
             // Whichever way round it is, its LONG axis must nearly fill the frame.
             assert!(
                 sx.max(sy) > 0.60,
-                "{}: fills the frame — spans {sx:.2} × {sy:.2}", v.label()
+                "{}: fills the frame — spans {sx:.2} × {sy:.2}",
+                v.label()
             );
             // …and never overflow it, or the fit is too tight to see the whole thing.
-            assert!(sx < 0.99 && sy < 0.99, "{}: still has margin ({sx:.2}, {sy:.2})", v.label());
+            assert!(
+                sx < 0.99 && sy < 0.99,
+                "{}: still has margin ({sx:.2}, {sy:.2})",
+                v.label()
+            );
         }
     }
 
@@ -665,17 +897,36 @@ mod tests {
         let size = 48;
         // A cube is symmetric, so tag one end differently to tell front from back.
         let look = |id: u32| PartLook {
-            albedo: if id == 1 { [0.75, 0.05, 0.05] } else { [0.05, 0.05, 0.75] },
+            albedo: if id == 1 {
+                [0.75, 0.05, 0.05]
+            } else {
+                [0.05, 0.05, 0.75]
+            },
             roughness: 0.5,
             ..Default::default()
         };
         let imgs: Vec<Vec<u8>> = View::ALL
             .iter()
-            .map(|v| render(&p, &n, &ids, &look, v.orbit(1.0), size, 1, ColorPipeline::default()))
+            .map(|v| {
+                render(
+                    &p,
+                    &n,
+                    &ids,
+                    &look,
+                    v.orbit(1.0),
+                    size,
+                    1,
+                    ColorPipeline::default(),
+                )
+            })
             .collect();
         for i in 0..imgs.len() {
             for j in i + 1..imgs.len() {
-                let d = imgs[i].iter().zip(&imgs[j]).filter(|(a, b)| a.abs_diff(**b) > 4).count();
+                let d = imgs[i]
+                    .iter()
+                    .zip(&imgs[j])
+                    .filter(|(a, b)| a.abs_diff(**b) > 4)
+                    .count();
                 assert!(
                     d > size * size / 10,
                     "{} and {} differ ({d} subpixels)",
@@ -692,17 +943,42 @@ mod tests {
     fn zooming_in_enlarges_the_object_without_losing_it() {
         let (p, n, ids) = slab();
         let size = 96;
-        let red = |_: u32| PartLook { albedo: [0.75, 0.05, 0.05], roughness: 0.5, ..Default::default() };
+        let red = |_: u32| PartLook {
+            albedo: [0.75, 0.05, 0.05],
+            roughness: 0.5,
+            ..Default::default()
+        };
         let at = |z: f32| {
-            let img = render(&p, &n, &ids, &red, View::Front.orbit(z), size, 1, ColorPipeline::default());
+            let img = render(
+                &p,
+                &n,
+                &ids,
+                &red,
+                View::Front.orbit(z),
+                size,
+                1,
+                ColorPipeline::default(),
+            );
             spans(&img, size).0
         };
         let (out, mid, in_) = (at(0.5), at(1.0), at(4.0));
         assert!(out < mid, "zooming out shrinks it ({out:.2} < {mid:.2})");
         assert!(in_ > mid, "zooming in grows it ({in_:.2} > {mid:.2})");
         // The extreme is still a picture of the door, not an empty frame.
-        let img = render(&p, &n, &ids, &red, View::Front.orbit(8.0), size, 1, ColorPipeline::default());
-        assert!(spans(&img, size).0 > 0.5, "fully zoomed in, the object is still there");
+        let img = render(
+            &p,
+            &n,
+            &ids,
+            &red,
+            View::Front.orbit(8.0),
+            size,
+            1,
+            ColorPipeline::default(),
+        );
+        assert!(
+            spans(&img, size).0 > 0.5,
+            "fully zoomed in, the object is still there"
+        );
     }
 
     /// The draft pass drops the procedural RELIEF, never the pattern — so it is the same material
@@ -720,7 +996,16 @@ mod tests {
             ..Default::default()
         };
         let orbit = View::Front.orbit(1.0);
-        let draft = render(&p, &n, &ids, &grain, orbit, size, 1, ColorPipeline::default());
+        let draft = render(
+            &p,
+            &n,
+            &ids,
+            &grain,
+            orbit,
+            size,
+            1,
+            ColorPipeline::default(),
+        );
         let spread = |img: &[u8]| {
             let row: Vec<i32> = (size / 4..size * 3 / 4)
                 .map(|x| img[((size / 2) * size + x) * 4] as i32)
@@ -728,13 +1013,26 @@ mod tests {
             let mean = row.iter().sum::<i32>() / row.len() as i32;
             row.iter().map(|v| (v - mean).abs()).sum::<i32>() / row.len() as i32
         };
-        assert!(spread(&draft) > 4, "the draft still shows the grain (spread {})", spread(&draft));
+        assert!(
+            spread(&draft) > 4,
+            "the draft still shows the grain (spread {})",
+            spread(&draft)
+        );
     }
 
     /// Nothing to draw must still produce a well-formed opaque image, not a panic or a black hole.
     #[test]
     fn an_empty_mesh_renders_an_empty_frame() {
-        let img = render(&[], &[], &[], &white, Orbit::default(), 32, 2, ColorPipeline::default());
+        let img = render(
+            &[],
+            &[],
+            &[],
+            &white,
+            Orbit::default(),
+            32,
+            2,
+            ColorPipeline::default(),
+        );
         assert_eq!(img.len(), 32 * 32 * 4);
         assert!(img.chunks(4).all(|p| p[3] == 255), "fully opaque");
         assert!(img.chunks(4).any(|p| p[0] > 0), "and not black");
@@ -747,11 +1045,11 @@ mod tests {
     fn door_preview_probe() {
         // The library handle, welded on exactly as the app welds it — with the door's own lever
         // switched off, which is the pair of decisions this probe exists to look at.
-        let lib = crate::handles::HandleLibrary::load(
-            std::env::var("SIMLUX_HANDLES")
-                .unwrap_or_else(|_| r"G:\blender dev\staircase\door handles_\assets\handles".into()),
-        )
-        .ok();
+        let lib =
+            crate::handles::HandleLibrary::load(std::env::var("SIMLUX_HANDLES").unwrap_or_else(
+                |_| r"G:\blender dev\staircase\door handles_\assets\handles".into(),
+            ))
+            .ok();
         let chosen = std::env::var("SIMLUX_HANDLE").unwrap_or_else(|_| "lever_rose_chrome".into());
         let handle = lib.as_ref().and_then(|l| l.get(&chosen).cloned());
 
@@ -773,8 +1071,13 @@ mod tests {
                 hinge_side: inp.hinge_side,
             };
             crate::handles::weld_onto(
-                &fit, &hm.positions, &hm.normals, &hp.part_ids,
-                &mut mesh.positions, &mut mesh.normals, &mut mesh.face_ids,
+                &fit,
+                &hm.positions,
+                &hm.normals,
+                &hp.part_ids,
+                &mut mesh.positions,
+                &mut mesh.normals,
+                &mut mesh.face_ids,
             );
             println!("welded '{}' ({} tris)", h.id, hm.tri_count());
         } else {
@@ -805,13 +1108,30 @@ mod tests {
             for (label, size, ss) in [("draft", 230usize, 1usize), ("final", 460, 2)] {
                 let t0 = std::time::Instant::now();
                 let px = render(
-                    &mesh.positions, &mesh.normals, &mesh.face_ids, &look, v.orbit(1.0), size, ss,
+                    &mesh.positions,
+                    &mesh.normals,
+                    &mesh.face_ids,
+                    &look,
+                    v.orbit(1.0),
+                    size,
+                    ss,
                     ColorPipeline::default(),
                 );
-                println!("{:>6} {label}: {} tris in {:?}", v.label(), mesh.tri_count(), t0.elapsed());
+                println!(
+                    "{:>6} {label}: {} tris in {:?}",
+                    v.label(),
+                    mesh.tri_count(),
+                    t0.elapsed()
+                );
                 if ss == 2 {
                     let name = format!("door_view_{}", v.label().to_ascii_lowercase());
-                    crate::render_probe::write_png(&dir.join(format!("{name}.png")), size, size, &px).unwrap();
+                    crate::render_probe::write_png(
+                        &dir.join(format!("{name}.png")),
+                        size,
+                        size,
+                        &px,
+                    )
+                    .unwrap();
                 }
             }
         }
@@ -823,8 +1143,26 @@ mod tests {
     fn supersampling_only_touches_the_edges() {
         let (p, n, ids) = cube(1);
         let size = 64;
-        let a = render(&p, &n, &ids, &white, Orbit::default(), size, 1, ColorPipeline::default());
-        let b = render(&p, &n, &ids, &white, Orbit::default(), size, 2, ColorPipeline::default());
+        let a = render(
+            &p,
+            &n,
+            &ids,
+            &white,
+            Orbit::default(),
+            size,
+            1,
+            ColorPipeline::default(),
+        );
+        let b = render(
+            &p,
+            &n,
+            &ids,
+            &white,
+            Orbit::default(),
+            size,
+            2,
+            ColorPipeline::default(),
+        );
         let far: Vec<usize> = (0..size * size)
             .filter(|i| {
                 let (x, y) = (i % size, i / size);
@@ -832,7 +1170,14 @@ mod tests {
                 (12..size - 12).contains(&x) && (12..size - 12).contains(&y)
             })
             .collect();
-        let bad = far.iter().filter(|&&i| a[i * 4].abs_diff(b[i * 4]) > 24).count();
-        assert!(bad * 20 < far.len(), "{bad}/{} interior pixels moved", far.len());
+        let bad = far
+            .iter()
+            .filter(|&&i| a[i * 4].abs_diff(b[i * 4]) > 24)
+            .count();
+        assert!(
+            bad * 20 < far.len(),
+            "{bad}/{} interior pixels moved",
+            far.len()
+        );
     }
 }

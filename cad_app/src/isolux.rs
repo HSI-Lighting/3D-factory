@@ -51,15 +51,13 @@ pub type Seg = [(f64, f64); 2];
 ///
 /// The grid's values sit at CELL CENTRES, so a lattice corner at fraction `u` across the plane
 /// reads at `u · cols − 0.5` in cell space; the half-cell is why this is not just a scale.
-pub fn sample(
-    grid: &cad_light::LuxGrid,
-    mask: &[bool],
-    nx: usize,
-    ny: usize,
-) -> Field {
+pub fn sample(grid: &cad_light::LuxGrid, mask: &[bool], nx: usize, ny: usize) -> Field {
     let (gc, gr) = (grid.cols.max(1) as usize, grid.rows.max(1) as usize);
     let at = |cx: usize, cy: usize| -> f64 {
-        grid.values.get(cy.min(gr - 1) * gc + cx.min(gc - 1)).copied().unwrap_or(0.0)
+        grid.values
+            .get(cy.min(gr - 1) * gc + cx.min(gc - 1))
+            .copied()
+            .unwrap_or(0.0)
     };
     let read = |fx: f64, fy: f64| -> f64 {
         let x = fx.clamp(0.0, (gc - 1) as f64);
@@ -89,8 +87,10 @@ pub fn sample(
             for i in 0..nx {
                 let cx = ((i as f64 + 0.5) / nx as f64 * gc as f64) as usize;
                 let cy = ((j as f64 + 0.5) / ny as f64 * gr as f64) as usize;
-                inside[j * nx + i] =
-                    mask.get(cy.min(gr - 1) * gc + cx.min(gc - 1)).copied().unwrap_or(true);
+                inside[j * nx + i] = mask
+                    .get(cy.min(gr - 1) * gc + cx.min(gc - 1))
+                    .copied()
+                    .unwrap_or(true);
             }
         }
     }
@@ -130,8 +130,16 @@ pub fn trace(f: &Field, t: f64) -> Vec<Seg> {
             if !f.cell_in(i, j) {
                 continue;
             }
-            let (a, b, c, d) = (f.at(i, j), f.at(i + 1, j), f.at(i + 1, j + 1), f.at(i, j + 1));
-            let code = (a >= t) as u8 | ((b >= t) as u8) << 1 | ((c >= t) as u8) << 2 | ((d >= t) as u8) << 3;
+            let (a, b, c, d) = (
+                f.at(i, j),
+                f.at(i + 1, j),
+                f.at(i + 1, j + 1),
+                f.at(i, j + 1),
+            );
+            let code = (a >= t) as u8
+                | ((b >= t) as u8) << 1
+                | ((c >= t) as u8) << 2
+                | ((d >= t) as u8) << 3;
             if code == 0 || code == 15 {
                 continue;
             }
@@ -190,7 +198,12 @@ mod tests {
                 v[j * (nx + 1) + i] = lo + (hi - lo) * i as f64 / nx as f64;
             }
         }
-        Field { nx, ny, v, inside: vec![true; nx * ny] }
+        Field {
+            nx,
+            ny,
+            v,
+            inside: vec![true; nx * ny],
+        }
     }
 
     /// THE LINE LANDS WHERE THE VALUE IS, not on the nearest sample.
@@ -202,7 +215,10 @@ mod tests {
     fn the_contour_is_interpolated_not_snapped() {
         let f = ramp_field(10, 4, 0.0, 500.0);
         let segs = trace(&f, 275.0);
-        assert!(!segs.is_empty(), "a field crossing 275 lx produced no contour at all");
+        assert!(
+            !segs.is_empty(),
+            "a field crossing 275 lx produced no contour at all"
+        );
         let want = 0.55 * 10.0;
         for s in &segs {
             for p in s {
@@ -245,7 +261,10 @@ mod tests {
             };
             let (e0, e1) = (on(&s[0]), on(&s[1]));
             let edges = |e: (bool, bool, bool, bool)| {
-                [e.0, e.1, e.2, e.3].iter().position(|b| *b).map(|i| i as u8)
+                [e.0, e.1, e.2, e.3]
+                    .iter()
+                    .position(|b| *b)
+                    .map(|i| i as u8)
             };
             Some((edges(e0)?, edges(e1)?))
         };
@@ -260,7 +279,10 @@ mod tests {
 
         // MIDDLE LOW: a and c are islands, so the segments wrap a {0,3} and c {1,2}.
         let low = cell(300.0, 50.0, 300.0, 50.0);
-        assert!((300.0 + 50.0 + 300.0 + 50.0) / 4.0 < 200.0, "fixture's centre is not low");
+        assert!(
+            (300.0 + 50.0 + 300.0 + 50.0) / 4.0 < 200.0,
+            "fixture's centre is not low"
+        );
         let segs = trace(&low, 200.0);
         assert_eq!(segs.len(), 2, "a saddle traces two segments");
         let mut got: Vec<[u8; 2]> = segs.iter().map(pair).collect();
@@ -274,7 +296,10 @@ mod tests {
 
         // MIDDLE HIGH: a and c are joined, so the segments wrap the LOW corners b {0,1} and d {2,3}.
         let high = cell(300.0, 150.0, 300.0, 150.0);
-        assert!((300.0 + 150.0 + 300.0 + 150.0) / 4.0 >= 200.0, "fixture's centre is not high");
+        assert!(
+            (300.0 + 150.0 + 300.0 + 150.0) / 4.0 >= 200.0,
+            "fixture's centre is not high"
+        );
         let segs = trace(&high, 200.0);
         assert_eq!(segs.len(), 2, "a saddle traces two segments");
         let mut got: Vec<[u8; 2]> = segs.iter().map(pair).collect();
@@ -305,13 +330,21 @@ mod tests {
                 v[j * (nx + 1) + i] = 200.0 + 400.0 * x * y;
             }
         }
-        let f = Field { nx, ny, v, inside: vec![true; nx * ny] };
+        let f = Field {
+            nx,
+            ny,
+            v,
+            inside: vec![true; nx * ny],
+        };
         let segs = trace(&f, 200.0);
         assert!(!segs.is_empty(), "the saddle produced no contour");
         for s in &segs {
             for p in s {
                 // Bilinear read-back at the traced point.
-                let (i, j) = (p.0.floor().min((nx - 1) as f64) as usize, p.1.floor().min((ny - 1) as f64) as usize);
+                let (i, j) = (
+                    p.0.floor().min((nx - 1) as f64) as usize,
+                    p.1.floor().min((ny - 1) as f64) as usize,
+                );
                 let (tx, ty) = (p.0 - i as f64, p.1 - j as f64);
                 let got = f.at(i, j) * (1.0 - tx) * (1.0 - ty)
                     + f.at(i + 1, j) * tx * (1.0 - ty)
@@ -343,7 +376,11 @@ mod tests {
         );
         for s in trace(&f, 275.0) {
             for p in s {
-                assert!(p.1 >= 1.0 - 1e-9, "a segment was traced at y = {:.3}, inside the masked row", p.1);
+                assert!(
+                    p.1 >= 1.0 - 1e-9,
+                    "a segment was traced at y = {:.3}, inside the masked row",
+                    p.1
+                );
             }
         }
     }
@@ -352,8 +389,14 @@ mod tests {
     #[test]
     fn a_field_that_never_crosses_produces_nothing() {
         let f = ramp_field(6, 6, 300.0, 300.0);
-        assert!(trace(&f, 100.0).is_empty(), "a flat 300 lx field crossed 100 lx");
-        assert!(trace(&f, 500.0).is_empty(), "a flat 300 lx field crossed 500 lx");
+        assert!(
+            trace(&f, 100.0).is_empty(),
+            "a flat 300 lx field crossed 100 lx"
+        );
+        assert!(
+            trace(&f, 500.0).is_empty(),
+            "a flat 300 lx field crossed 500 lx"
+        );
     }
 }
 
@@ -391,7 +434,10 @@ mod resampling {
             "row 0 reads {bottom:.1} lx and the last row {top:.1} — the field came out flipped",
         );
         // And it spans the right RANGE: the grid runs 0 → 400 lx.
-        assert!(bottom < 50.0 && top > 350.0, "sampled {bottom:.1} … {top:.1}, expected ~0 … ~400");
+        assert!(
+            bottom < 50.0 && top > 350.0,
+            "sampled {bottom:.1} … {top:.1}, expected ~0 … ~400"
+        );
     }
 
     /// THE HALF-CELL IS NOT FORGOTTEN. Values sit at cell CENTRES, so the lattice corner at the
@@ -410,8 +456,16 @@ mod resampling {
             f.at(2, 2),
         );
         // The bottom corner clamps to row 0's own value rather than extrapolating below it.
-        assert!((f.at(2, 0) - 0.0).abs() < 1e-6, "the bottom edge reads {:.2}", f.at(2, 0));
-        assert!((f.at(2, 4) - 300.0).abs() < 1e-6, "the top edge reads {:.2}", f.at(2, 4));
+        assert!(
+            (f.at(2, 0) - 0.0).abs() < 1e-6,
+            "the bottom edge reads {:.2}",
+            f.at(2, 0)
+        );
+        assert!(
+            (f.at(2, 4) - 300.0).abs() < 1e-6,
+            "the top edge reads {:.2}",
+            f.at(2, 4)
+        );
     }
 
     /// AN EXCLUDED CELL STAYS EXCLUDED THROUGH THE RESAMPLE. The buried cells are kept out of the
@@ -430,7 +484,11 @@ mod resampling {
         assert!(!f.inside[8], "only part of the excluded cell was excluded");
         assert!(f.inside[2], "the exclusion spread into the cell beside it");
         assert!(f.inside[16], "the exclusion spread into the cell above it");
-        assert_eq!(f.inside.iter().filter(|k| !**k).count(), 4, "one calculated cell is four here");
+        assert_eq!(
+            f.inside.iter().filter(|k| !**k).count(),
+            4,
+            "one calculated cell is four here"
+        );
     }
 
     /// NO MASK MEANS EVERYTHING. A plane that IS the room carries an empty mask, and reading that
@@ -438,6 +496,9 @@ mod resampling {
     #[test]
     fn an_empty_mask_excludes_nothing() {
         let f = sample(&rows_grid(4, 4), &[], 8, 8);
-        assert!(f.inside.iter().all(|k| *k), "an empty mask threw cells away");
+        assert!(
+            f.inside.iter().all(|k| *k),
+            "an empty mask threw cells away"
+        );
     }
 }

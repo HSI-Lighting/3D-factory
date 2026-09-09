@@ -40,10 +40,10 @@ fn fits(emin: Vec2, emax: Vec2, origin: Vec2, cs: f64, cols: usize, rows: usize)
 
 pub struct UniformGrid {
     pub cell_size: f64,
-    pub origin:    Vec2,   // world coord of the grid's (0,0) corner
-    pub cols:      usize,
-    pub rows:      usize,
-    cells: Vec<Vec<u32>>,  // row-major, cells[row * cols + col]
+    pub origin: Vec2, // world coord of the grid's (0,0) corner
+    pub cols: usize,
+    pub rows: usize,
+    cells: Vec<Vec<u32>>, // row-major, cells[row * cols + col]
     /// Per-dobject cell range `[xmin, xmax, ymin, ymax]` — the cells it currently
     /// occupies. Exists so [`Self::update`] can REMOVE a changed dobject from its old
     /// cells without scanning the grid; a moved dobject's old position is otherwise
@@ -72,19 +72,24 @@ impl UniformGrid {
     /// World bounds of the whole grid (origin → origin + cols·cell_size).
     /// `None` for an empty grid (cols or rows == 0).
     pub fn world_bounds(&self) -> Option<(Vec2, Vec2)> {
-        if self.cols == 0 || self.rows == 0 { return None; }
+        if self.cols == 0 || self.rows == 0 {
+            return None;
+        }
         Some((
             self.origin,
-            Vec2::new(self.origin.x + self.cols as f64 * self.cell_size,
-                      self.origin.y + self.rows as f64 * self.cell_size),
+            Vec2::new(
+                self.origin.x + self.cols as f64 * self.cell_size,
+                self.origin.y + self.rows as f64 * self.cell_size,
+            ),
         ))
     }
 
     pub fn empty() -> Self {
         Self {
             cell_size: 1.0,
-            origin:    Vec2::ZERO,
-            cols: 0, rows: 0,
+            origin: Vec2::ZERO,
+            cols: 0,
+            rows: 0,
             cells: Vec::new(),
             ranges: Vec::new(),
             view_independent: Vec::new(),
@@ -95,7 +100,9 @@ impl UniformGrid {
     /// Build the index from `dobjects`. Panics if `cell_size <= 0`.
     pub fn build(dobjects: &[DObject], cell_size: f64) -> Self {
         assert!(cell_size > 0.0, "cell_size must be positive");
-        if dobjects.is_empty() { return Self::empty(); }
+        if dobjects.is_empty() {
+            return Self::empty();
+        }
 
         // overall world bbox — only over dobjects whose bbox is
         // view-meaningful. View-independent bboxes (e.g. Hatch's
@@ -110,17 +117,28 @@ impl UniformGrid {
                 continue;
             }
             let (emin, emax) = e.bbox();
-            if emin.x < min.x { min.x = emin.x; }
-            if emin.y < min.y { min.y = emin.y; }
-            if emax.x > max.x { max.x = emax.x; }
-            if emax.y > max.y { max.y = emax.y; }
+            if emin.x < min.x {
+                min.x = emin.x;
+            }
+            if emin.y < min.y {
+                min.y = emin.y;
+            }
+            if emax.x > max.x {
+                max.x = emax.x;
+            }
+            if emax.y > max.y {
+                max.y = emax.y;
+            }
         }
         // If EVERY dobject is view-independent, there's no spatial grid
         // to build — return an empty grid that still carries the
         // global list, so query_bbox keeps returning the hatches.
         if !min.x.is_finite() {
             return Self {
-                cell_size, origin: Vec2::ZERO, cols: 0, rows: 0,
+                cell_size,
+                origin: Vec2::ZERO,
+                cols: 0,
+                rows: 0,
                 cells: Vec::new(),
                 ranges: vec![SKIP; dobjects.len()],
                 view_independent,
@@ -136,7 +154,7 @@ impl UniformGrid {
         for (i, e) in dobjects.iter().enumerate() {
             if e.geom.is_view_independent_bbox() {
                 ranges.push(SKIP);
-                continue;   // already in view_independent
+                continue; // already in view_independent
             }
             let r = cell_range(&e.bbox(), min, cell_size, cols, rows);
             ranges.push(r);
@@ -148,8 +166,16 @@ impl UniformGrid {
             }
         }
 
-        Self { cell_size, origin: min, cols, rows, cells, ranges, view_independent,
-               n_entities: dobjects.len() }
+        Self {
+            cell_size,
+            origin: min,
+            cols,
+            rows,
+            cells,
+            ranges,
+            view_independent,
+            n_entities: dobjects.len(),
+        }
     }
 
     /// [`Self::build`] with a resolved-bbox resolver: a dobject whose
@@ -162,7 +188,9 @@ impl UniformGrid {
         bbox_of: &dyn Fn(&DObject) -> Option<(Vec2, Vec2)>,
     ) -> Self {
         assert!(cell_size > 0.0, "cell_size must be positive");
-        if dobjects.is_empty() { return Self::empty(); }
+        if dobjects.is_empty() {
+            return Self::empty();
+        }
 
         let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
         let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
@@ -176,10 +204,18 @@ impl UniformGrid {
             };
             match b {
                 Some((emin, emax)) if emax.x >= emin.x && emax.y >= emin.y => {
-                    if emin.x < min.x { min.x = emin.x; }
-                    if emin.y < min.y { min.y = emin.y; }
-                    if emax.x > max.x { max.x = emax.x; }
-                    if emax.y > max.y { max.y = emax.y; }
+                    if emin.x < min.x {
+                        min.x = emin.x;
+                    }
+                    if emin.y < min.y {
+                        min.y = emin.y;
+                    }
+                    if emax.x > max.x {
+                        max.x = emax.x;
+                    }
+                    if emax.y > max.y {
+                        max.y = emax.y;
+                    }
                     boxes.push(Some((emin, emax)));
                 }
                 _ => {
@@ -190,7 +226,10 @@ impl UniformGrid {
         }
         if !min.x.is_finite() {
             return Self {
-                cell_size, origin: Vec2::ZERO, cols: 0, rows: 0,
+                cell_size,
+                origin: Vec2::ZERO,
+                cols: 0,
+                rows: 0,
                 cells: Vec::new(),
                 ranges: vec![SKIP; dobjects.len()],
                 view_independent,
@@ -206,7 +245,7 @@ impl UniformGrid {
         for (i, b) in boxes.iter().enumerate() {
             let Some((emin, emax)) = b else {
                 ranges.push(SKIP);
-                continue;   // already in view_independent
+                continue; // already in view_independent
             };
             let r = cell_range(&(*emin, *emax), min, cell_size, cols, rows);
             ranges.push(r);
@@ -218,8 +257,16 @@ impl UniformGrid {
             }
         }
 
-        Self { cell_size, origin: min, cols, rows, cells, ranges, view_independent,
-               n_entities: dobjects.len() }
+        Self {
+            cell_size,
+            origin: min,
+            cols,
+            rows,
+            cells,
+            ranges,
+            view_independent,
+            n_entities: dobjects.len(),
+        }
     }
 
     /// Absorb dobjects APPENDED to the end of the document — the shape a DRAW makes. **O(added)**.
@@ -254,10 +301,23 @@ impl UniformGrid {
                 continue;
             }
             let (emin, emax) = e.bbox();
-            if !fits(emin, emax, self.origin, self.cell_size, self.cols, self.rows) {
+            if !fits(
+                emin,
+                emax,
+                self.origin,
+                self.cell_size,
+                self.cols,
+                self.rows,
+            ) {
                 return false; // outside the grid → it would have to grow → rebuild
             }
-            planned.push(cell_range(&(emin, emax), self.origin, self.cell_size, self.cols, self.rows));
+            planned.push(cell_range(
+                &(emin, emax),
+                self.origin,
+                self.cell_size,
+                self.cols,
+                self.rows,
+            ));
         }
         // Pass 2 — commit.
         for (k, r) in planned.into_iter().enumerate() {
@@ -299,7 +359,10 @@ impl UniformGrid {
         // rejected update leaves the grid untouched (no half-applied state).
         let mut new_ranges: Vec<(usize, [u32; 4])> = Vec::with_capacity(changed.len());
         for &i in changed {
-            let e = match dobjects.get(i) { Some(e) => e, None => return false };
+            let e = match dobjects.get(i) {
+                Some(e) => e,
+                None => return false,
+            };
             if e.geom.is_view_independent_bbox() {
                 return false; // changed KIND — rebuild handles the bookkeeping
             }
@@ -307,10 +370,26 @@ impl UniformGrid {
                 return false; // was view-independent, now isn't
             }
             let (emin, emax) = e.bbox();
-            if !fits(emin, emax, self.origin, self.cell_size, self.cols, self.rows) {
+            if !fits(
+                emin,
+                emax,
+                self.origin,
+                self.cell_size,
+                self.cols,
+                self.rows,
+            ) {
                 return false; // outside the grid → must grow → rebuild
             }
-            new_ranges.push((i, cell_range(&(emin, emax), self.origin, self.cell_size, self.cols, self.rows)));
+            new_ranges.push((
+                i,
+                cell_range(
+                    &(emin, emax),
+                    self.origin,
+                    self.cell_size,
+                    self.cols,
+                    self.rows,
+                ),
+            ));
         }
         // Pass 2 — remove from old cells, insert into new.
         for (i, new) in new_ranges {
@@ -351,7 +430,9 @@ impl UniformGrid {
     /// size from the same pass. Same result as `build(d, auto_cell_size(d, t))`, which
     /// `index_rebuild_matches_build_auto` asserts.
     pub fn build_auto(dobjects: &[DObject], target_per_cell: f64) -> Self {
-        if dobjects.is_empty() { return Self::empty(); }
+        if dobjects.is_empty() {
+            return Self::empty();
+        }
 
         // ---- the ONE bbox sweep -------------------------------------------
         let mut bbs: Vec<(Vec2, Vec2)> = Vec::with_capacity(dobjects.len());
@@ -367,17 +448,30 @@ impl UniformGrid {
             }
             let bb = e.bbox();
             count_real += 1;
-            if bb.0.x < min.x { min.x = bb.0.x; }
-            if bb.0.y < min.y { min.y = bb.0.y; }
-            if bb.1.x > max.x { max.x = bb.1.x; }
-            if bb.1.y > max.y { max.y = bb.1.y; }
+            if bb.0.x < min.x {
+                min.x = bb.0.x;
+            }
+            if bb.0.y < min.y {
+                min.y = bb.0.y;
+            }
+            if bb.1.x > max.x {
+                max.x = bb.1.x;
+            }
+            if bb.1.y > max.y {
+                max.y = bb.1.y;
+            }
             bbs.push(bb);
         }
         if count_real == 0 || !min.x.is_finite() {
             return Self {
-                cell_size: 1.0, origin: Vec2::ZERO, cols: 0, rows: 0,
-                cells: Vec::new(), ranges: vec![SKIP; dobjects.len()],
-                view_independent, n_entities: dobjects.len(),
+                cell_size: 1.0,
+                origin: Vec2::ZERO,
+                cols: 0,
+                rows: 0,
+                cells: Vec::new(),
+                ranges: vec![SKIP; dobjects.len()],
+                view_independent,
+                n_entities: dobjects.len(),
             };
         }
 
@@ -385,7 +479,9 @@ impl UniformGrid {
         let w = (max.x - min.x).max(1.0);
         let h = (max.y - min.y).max(1.0);
         let cell_size = (w * h * target_per_cell / count_real as f64)
-            .sqrt().max(0.001).min(1.0e6);
+            .sqrt()
+            .max(0.001)
+            .min(1.0e6);
 
         // ---- bucket, reusing the cached bboxes (no third sweep) ----------
         let cols = (((max.x - min.x) / cell_size).floor() as isize + 1).max(1) as usize;
@@ -406,27 +502,49 @@ impl UniformGrid {
                 }
             }
         }
-        Self { cell_size, origin: min, cols, rows, cells, ranges, view_independent,
-               n_entities: dobjects.len() }
+        Self {
+            cell_size,
+            origin: min,
+            cols,
+            rows,
+            cells,
+            ranges,
+            view_independent,
+            n_entities: dobjects.len(),
+        }
     }
 
     /// Pick a cell size that targets `target_per_cell` dobjects per cell, on
     /// average, given the dobjects' overall bbox area.
     pub fn auto_cell_size(dobjects: &[DObject], target_per_cell: f64) -> f64 {
-        if dobjects.is_empty() { return 1.0; }
+        if dobjects.is_empty() {
+            return 1.0;
+        }
         let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
         let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
         let mut count_real: usize = 0;
         for e in dobjects {
-            if e.geom.is_view_independent_bbox() { continue; }
+            if e.geom.is_view_independent_bbox() {
+                continue;
+            }
             count_real += 1;
             let (emin, emax) = e.bbox();
-            if emin.x < min.x { min.x = emin.x; }
-            if emin.y < min.y { min.y = emin.y; }
-            if emax.x > max.x { max.x = emax.x; }
-            if emax.y > max.y { max.y = emax.y; }
+            if emin.x < min.x {
+                min.x = emin.x;
+            }
+            if emin.y < min.y {
+                min.y = emin.y;
+            }
+            if emax.x > max.x {
+                max.x = emax.x;
+            }
+            if emax.y > max.y {
+                max.y = emax.y;
+            }
         }
-        if count_real == 0 { return 1.0; }
+        if count_real == 0 {
+            return 1.0;
+        }
         let w = (max.x - min.x).max(1.0);
         let h = (max.y - min.y).max(1.0);
         let by_density = (w * h * target_per_cell / count_real as f64).sqrt();
@@ -441,7 +559,9 @@ impl UniformGrid {
         target_per_cell: f64,
         bbox_of: &dyn Fn(&DObject) -> Option<(Vec2, Vec2)>,
     ) -> f64 {
-        if dobjects.is_empty() { return 1.0; }
+        if dobjects.is_empty() {
+            return 1.0;
+        }
         let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
         let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
         let mut count_real: usize = 0;
@@ -451,15 +571,29 @@ impl UniformGrid {
             } else {
                 Some(e.bbox())
             };
-            let Some((emin, emax)) = b else { continue; };
-            if emax.x < emin.x || emax.y < emin.y { continue; }
+            let Some((emin, emax)) = b else {
+                continue;
+            };
+            if emax.x < emin.x || emax.y < emin.y {
+                continue;
+            }
             count_real += 1;
-            if emin.x < min.x { min.x = emin.x; }
-            if emin.y < min.y { min.y = emin.y; }
-            if emax.x > max.x { max.x = emax.x; }
-            if emax.y > max.y { max.y = emax.y; }
+            if emin.x < min.x {
+                min.x = emin.x;
+            }
+            if emin.y < min.y {
+                min.y = emin.y;
+            }
+            if emax.x > max.x {
+                max.x = emax.x;
+            }
+            if emax.y > max.y {
+                max.y = emax.y;
+            }
         }
-        if count_real == 0 { return 1.0; }
+        if count_real == 0 {
+            return 1.0;
+        }
         let w = (max.x - min.x).max(1.0);
         let h = (max.y - min.y).max(1.0);
         let by_density = (w * h * target_per_cell / count_real as f64).sqrt();
@@ -477,9 +611,8 @@ impl UniformGrid {
             return self.view_independent.clone();
         }
         let cs = self.cell_size;
-        let to_cell = |v: f64, axis_origin: f64| -> isize {
-            ((v - axis_origin) / cs).floor() as isize
-        };
+        let to_cell =
+            |v: f64, axis_origin: f64| -> isize { ((v - axis_origin) / cs).floor() as isize };
         let xmin = to_cell(q_min.x, self.origin.x).max(0) as usize;
         let xmax = (to_cell(q_max.x, self.origin.x).max(0) as usize).min(self.cols - 1);
         let ymin = to_cell(q_min.y, self.origin.y).max(0) as usize;
@@ -554,7 +687,11 @@ mod tests {
     use crate::geom::Circle;
 
     fn c(x: f64, y: f64, r: f64) -> DObject {
-        Circle { center: Vec2::new(x, y), radius: r }.into()
+        Circle {
+            center: Vec2::new(x, y),
+            radius: r,
+        }
+        .into()
     }
 
     /// VIEW-INDEPENDENT ENTITIES MUST REACH EVERY QUERY, and this is load-bearing beyond the
@@ -572,8 +709,14 @@ mod tests {
     #[test]
     fn view_independent_entities_reach_every_query() {
         let mut hatch = c(0.0, 0.0, 1.0);
-        hatch.geom = crate::geom::Geom::Hatch(crate::geom::Hatch { boundary_handles: Vec::new(), pattern: crate::geom::HatchPattern::Solid });
-        assert!(hatch.geom.is_view_independent_bbox(), "a Hatch must be view-independent");
+        hatch.geom = crate::geom::Geom::Hatch(crate::geom::Hatch {
+            boundary_handles: Vec::new(),
+            pattern: crate::geom::HatchPattern::Solid,
+        });
+        assert!(
+            hatch.geom.is_view_independent_bbox(),
+            "a Hatch must be view-independent"
+        );
 
         // The hatch sits at index 1; the query is a pinprick nowhere near anything.
         let ents = vec![c(0.0, 0.0, 1.0), hatch, c(500.0, 500.0, 1.0)];
@@ -589,16 +732,18 @@ mod tests {
     #[test]
     fn empty_grid_returns_empty() {
         let g = UniformGrid::build(&[], 1.0);
-        assert!(g.query_bbox(Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0)).is_empty());
+        assert!(g
+            .query_bbox(Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0))
+            .is_empty());
     }
 
     #[test]
     fn basic_query() {
         let ents = vec![
-            c(  0.0,  0.0, 1.0),
-            c( 10.0, 10.0, 1.0),
-            c( 50.0, 50.0, 1.0),
-            c(100.0,100.0, 1.0),
+            c(0.0, 0.0, 1.0),
+            c(10.0, 10.0, 1.0),
+            c(50.0, 50.0, 1.0),
+            c(100.0, 100.0, 1.0),
         ];
         let g = UniformGrid::build(&ents, 5.0);
         let r = g.query_bbox(Vec2::new(-2.0, -2.0), Vec2::new(12.0, 12.0));
@@ -609,11 +754,7 @@ mod tests {
 
     #[test]
     fn near_point_query() {
-        let ents = vec![
-            c( 0.0, 0.0, 1.0),
-            c(50.0, 0.0, 1.0),
-            c( 0.0,50.0, 1.0),
-        ];
+        let ents = vec![c(0.0, 0.0, 1.0), c(50.0, 0.0, 1.0), c(0.0, 50.0, 1.0)];
         let g = UniformGrid::build(&ents, 5.0);
         let r = g.query_near(Vec2::new(0.0, 0.0), 10.0);
         assert!(r.contains(&0));
@@ -624,10 +765,17 @@ mod tests {
     // ---- incremental update (UniformGrid::update) --------------------------
 
     fn line(x: f64, y: f64) -> DObject {
-        crate::geom::Line { a: Vec2::new(x, y), b: Vec2::new(x + 3.0, y + 2.0) }.into()
+        crate::geom::Line {
+            a: Vec2::new(x, y),
+            b: Vec2::new(x + 3.0, y + 2.0),
+        }
+        .into()
     }
 
-    fn sorted(mut v: Vec<u32>) -> Vec<u32> { v.sort_unstable(); v }
+    fn sorted(mut v: Vec<u32>) -> Vec<u32> {
+        v.sort_unstable();
+        v
+    }
 
     /// ⭐ THE ACCEPTANCE TEST. An incrementally-updated grid must answer queries
     /// IDENTICALLY to a full rebuild. A wrong index is a CORRECTNESS bug — you would
@@ -648,8 +796,10 @@ mod tests {
         let changed: Vec<usize> = (0..400).step_by(7).collect();
         for &i in &changed {
             if let crate::geom::Geom::Line(l) = &mut ents[i].geom {
-                l.a.x += 5.0; l.a.y += 5.0;
-                l.b.x += 5.0; l.b.y += 5.0;
+                l.a.x += 5.0;
+                l.a.y += 5.0;
+                l.b.x += 5.0;
+                l.b.y += 5.0;
             }
         }
         assert!(g.update(&ents, &changed), "in-bounds move must be absorbed");
@@ -677,7 +827,8 @@ mod tests {
         let mut ents: Vec<DObject> = (0..50).map(|i| line(i as f64 * 5.0, 0.0)).collect();
         let mut g = UniformGrid::build(&ents, 8.0);
         if let crate::geom::Geom::Line(l) = &mut ents[3].geom {
-            l.a.x += 100_000.0; l.b.x += 100_000.0; // far outside
+            l.a.x += 100_000.0;
+            l.b.x += 100_000.0; // far outside
         }
         assert!(!g.update(&ents, &[3]), "must reject → caller rebuilds");
     }
@@ -701,8 +852,14 @@ mod tests {
         let mut g = UniformGrid::build(&ents, 8.0);
         let before = sorted(g.query_bbox(Vec2::new(-1.0, -1.0), Vec2::new(200.0, 20.0)));
         // one legal move, one illegal — the batch must be rejected WHOLE
-        if let crate::geom::Geom::Line(l) = &mut ents[1].geom { l.a.x += 2.0; l.b.x += 2.0; }
-        if let crate::geom::Geom::Line(l) = &mut ents[2].geom { l.a.x += 99_999.0; l.b.x += 99_999.0; }
+        if let crate::geom::Geom::Line(l) = &mut ents[1].geom {
+            l.a.x += 2.0;
+            l.b.x += 2.0;
+        }
+        if let crate::geom::Geom::Line(l) = &mut ents[2].geom {
+            l.a.x += 99_999.0;
+            l.b.x += 99_999.0;
+        }
         assert!(!g.update(&ents, &[1, 2]));
         let after = sorted(g.query_bbox(Vec2::new(-1.0, -1.0), Vec2::new(200.0, 20.0)));
         assert_eq!(before, after, "a rejected update must not mutate the grid");
@@ -735,13 +892,21 @@ mod tests {
     /// …and it must still support incremental update afterwards.
     #[test]
     fn build_auto_grid_can_still_absorb_updates() {
-        let mut ents: Vec<DObject> = (0..200).map(|i| line((i % 20) as f64 * 10.0, (i / 20) as f64 * 10.0)).collect();
+        let mut ents: Vec<DObject> = (0..200)
+            .map(|i| line((i % 20) as f64 * 10.0, (i / 20) as f64 * 10.0))
+            .collect();
         let mut g = UniformGrid::build_auto(&ents, 10.0);
         let changed: Vec<usize> = (0..200).step_by(5).collect();
         for &i in &changed {
-            if let crate::geom::Geom::Line(l) = &mut ents[i].geom { l.a.x += 1.0; l.b.x += 1.0; }
+            if let crate::geom::Geom::Line(l) = &mut ents[i].geom {
+                l.a.x += 1.0;
+                l.b.x += 1.0;
+            }
         }
-        assert!(g.update(&ents, &changed), "ranges are populated by build_auto too");
+        assert!(
+            g.update(&ents, &changed),
+            "ranges are populated by build_auto too"
+        );
     }
 
     // ---- APPEND ABSORPTION ------------------------------------------------------------------
@@ -769,7 +934,10 @@ mod tests {
         objs.push(c(11.0, 6.0, 0.5));
         objs.push(c(3.0, 14.0, 2.0));
         objs.push(c(28.0, 2.0, 1.5));
-        assert!(grid.insert_appended(&objs), "an in-bounds append must be absorbed");
+        assert!(
+            grid.insert_appended(&objs),
+            "an in-bounds append must be absorbed"
+        );
 
         let rebuilt = UniformGrid::build(&objs, 4.0);
         // Sweep the whole populated area plus a margin, in windows of several sizes — one
@@ -784,7 +952,10 @@ mod tests {
                     let mut b = rebuilt.query_bbox(lo, hi);
                     a.sort_unstable();
                     b.sort_unstable();
-                    assert_eq!(a, b, "absorbed grid disagrees with a rebuild at ({x},{y}) w={w}");
+                    assert_eq!(
+                        a, b,
+                        "absorbed grid disagrees with a rebuild at ({x},{y}) w={w}"
+                    );
                     y += 3.0;
                 }
                 x += 3.0;
@@ -801,7 +972,10 @@ mod tests {
         objs.push(c(5.0, 0.0, 0.5));
         assert!(grid.insert_appended(&objs));
         let hit = grid.query_bbox(Vec2::new(4.5, -0.5), Vec2::new(5.5, 0.5));
-        assert!(hit.contains(&2), "the appended circle is not in its own cell: {hit:?}");
+        assert!(
+            hit.contains(&2),
+            "the appended circle is not in its own cell: {hit:?}"
+        );
     }
 
     /// OUT OF BOUNDS IS REFUSED, because the grid's origin/cols/rows are fixed at build time and
@@ -812,7 +986,10 @@ mod tests {
         let mut objs = vec![c(0.0, 0.0, 1.0), c(5.0, 5.0, 1.0)];
         let mut grid = UniformGrid::build(&objs, 4.0);
         objs.push(c(10_000.0, 10_000.0, 1.0));
-        assert!(!grid.insert_appended(&objs), "an out-of-bounds append must be refused");
+        assert!(
+            !grid.insert_appended(&objs),
+            "an out-of-bounds append must be refused"
+        );
     }
 
     /// …AND A REFUSAL LEAVES THE GRID EXACTLY AS IT WAS. The caller's answer to `false` is to
@@ -832,7 +1009,11 @@ mod tests {
 
         let after: Vec<u32> = grid.query_bbox(Vec2::new(-9.0, -9.0), Vec2::new(9.0, 9.0));
         assert_eq!(before, after, "a refused append modified the grid anyway");
-        assert_eq!(grid.ranges.len(), 2, "a refused append grew the range table");
+        assert_eq!(
+            grid.ranges.len(),
+            2,
+            "a refused append grew the range table"
+        );
     }
 
     /// A VIEW-INDEPENDENT APPEND JOINS THE GLOBAL LIST rather than a cell. Hatches and block
@@ -841,16 +1022,25 @@ mod tests {
     /// append has to preserve that or a newly drawn hatch stops being clickable.
     #[test]
     fn an_appended_view_independent_object_still_reaches_every_query() {
-        use crate::geom::{Hatch, Geom};
+        use crate::geom::{Geom, Hatch};
         let mut objs = vec![c(0.0, 0.0, 1.0), c(5.0, 5.0, 1.0)];
         let mut grid = UniformGrid::build(&objs, 4.0);
-        let h = Hatch { boundary_handles: Vec::new(), pattern: crate::geom::HatchPattern::Solid };
+        let h = Hatch {
+            boundary_handles: Vec::new(),
+            pattern: crate::geom::HatchPattern::Solid,
+        };
         objs.push(DObject::new(Geom::Hatch(h)));
-        assert!(grid.insert_appended(&objs), "a view-independent append is always absorbable");
+        assert!(
+            grid.insert_appended(&objs),
+            "a view-independent append is always absorbable"
+        );
 
         // Far from anything, so only the global list can supply it.
         let far = grid.query_bbox(Vec2::new(500.0, 500.0), Vec2::new(501.0, 501.0));
-        assert!(far.contains(&2), "the appended hatch does not reach a distant query: {far:?}");
+        assert!(
+            far.contains(&2),
+            "the appended hatch does not reach a distant query: {far:?}"
+        );
     }
 
     /// Appends are for GROWTH only. A delete shifts every index after it, which is the whole
@@ -861,7 +1051,10 @@ mod tests {
         let mut objs = vec![c(0.0, 0.0, 1.0), c(5.0, 5.0, 1.0), c(2.0, 2.0, 1.0)];
         let mut grid = UniformGrid::build(&objs, 4.0);
         objs.pop();
-        assert!(!grid.insert_appended(&objs), "a shrunk document must be refused");
+        assert!(
+            !grid.insert_appended(&objs),
+            "a shrunk document must be refused"
+        );
         objs.pop();
         assert!(!grid.insert_appended(&objs), "…and so must a shorter one");
     }

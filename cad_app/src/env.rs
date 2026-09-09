@@ -90,7 +90,8 @@ fn yxy_to_rgb(yy: f32, x: f32, y: f32) -> [f32; 3] {
     let xyz = [x / y * yy, yy, (1.0 - x - y) / y * yy];
     let mut out = [0.0f32; 3];
     for (k, o) in out.iter_mut().enumerate() {
-        *o = (XYZ_TO_RGB[k][0] * xyz[0] + XYZ_TO_RGB[k][1] * xyz[1] + XYZ_TO_RGB[k][2] * xyz[2]).max(0.0);
+        *o = (XYZ_TO_RGB[k][0] * xyz[0] + XYZ_TO_RGB[k][1] * xyz[1] + XYZ_TO_RGB[k][2] * xyz[2])
+            .max(0.0);
     }
     out
 }
@@ -137,7 +138,11 @@ impl Sky {
         let t = turbidity.clamp(1.7, 12.0);
         // Solar ZENITH angle: 0 = overhead. Clamped just off the horizon — the Perez normalisation
         // divides by F(0, ts), which stays finite, but the model's colours become nonsense below it.
-        let ts = sun_dir.z.clamp(-1.0, 1.0).acos().min(std::f32::consts::FRAC_PI_2 - 0.02);
+        let ts = sun_dir
+            .z
+            .clamp(-1.0, 1.0)
+            .acos()
+            .min(std::f32::consts::FRAC_PI_2 - 0.02);
         let mut s = Self {
             sun_dir,
             perez: perez_coefficients(t),
@@ -158,7 +163,13 @@ impl Sky {
     /// The Perez function `F(θ, γ) = (1 + A·e^(B/cos θ))·(1 + C·e^(D·γ) + E·cos²γ)` for channel
     /// `ch`, where `cos_theta` is measured from the zenith and `gamma` is the angle to the sun.
     fn perez_f(&self, ch: usize, cos_theta: f32, gamma: f32) -> f32 {
-        let [a, b, c, d, e] = [self.perez[0][ch], self.perez[1][ch], self.perez[2][ch], self.perez[3][ch], self.perez[4][ch]];
+        let [a, b, c, d, e] = [
+            self.perez[0][ch],
+            self.perez[1][ch],
+            self.perez[2][ch],
+            self.perez[3][ch],
+            self.perez[4][ch],
+        ];
         // cos θ is floored, not clamped to 0: `e^(B/cos θ)` with B < 0 tends to 1 as cos θ → 0⁺, but
         // in floating point it is a division by zero on the way there.
         let ct = cos_theta.max(0.01);
@@ -182,8 +193,16 @@ impl Sky {
         }
         // Luminance is relative to a zenith of 1; chromaticity is the zenith chromaticity carried
         // through the same ratio, which is exactly how Preetham applies it.
-        let rgb = yxy_to_rgb(yxy[0], self.zenith_xy[0] * yxy[1], self.zenith_xy[1] * yxy[2]);
-        [rgb[0] * self.scale, rgb[1] * self.scale, rgb[2] * self.scale]
+        let rgb = yxy_to_rgb(
+            yxy[0],
+            self.zenith_xy[0] * yxy[1],
+            self.zenith_xy[1] * yxy[2],
+        );
+        [
+            rgb[0] * self.scale,
+            rgb[1] * self.scale,
+            rgb[2] * self.scale,
+        ]
     }
 
     /// Radiance including the **sun's disc** — what a camera ray or a mirror sees, as opposed to
@@ -258,7 +277,11 @@ impl Sky {
         // rewrite the sky's colour, which is the one thing this model is here to get right.
         let lum = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
         let (want, have) = (lum(target), lum(up));
-        self.scale = if have > 1e-6 { (want / have).max(0.0) } else { 0.0 };
+        self.scale = if have > 1e-6 {
+            (want / have).max(0.0)
+        } else {
+            0.0
+        };
         if !self.scale.is_finite() {
             self.scale = 0.0;
         }
@@ -311,7 +334,8 @@ pub fn sh_ambient(sh: &[[f32; 3]; 9], n: Vec3) -> [f32; 3] {
     let (x, y, z) = (n.x, n.y, n.z);
     let mut out = [0.0f32; 3];
     for (c, o) in out.iter_mut().enumerate() {
-        let e = C1 * sh[8][c] * (x * x - y * y) + C3 * sh[6][c] * z * z + C4 * sh[0][c] - C5 * sh[6][c]
+        let e = C1 * sh[8][c] * (x * x - y * y) + C3 * sh[6][c] * z * z + C4 * sh[0][c]
+            - C5 * sh[6][c]
             + 2.0 * C1 * (sh[4][c] * x * y + sh[7][c] * x * z + sh[5][c] * y * z)
             + 2.0 * C2 * (sh[3][c] * x + sh[1][c] * y + sh[2][c] * z);
         *o = (e / std::f32::consts::PI).max(0.0);
@@ -337,7 +361,11 @@ impl Default for AoSettings {
     fn default() -> Self {
         // 0.5 m suits interiors and furniture — big enough to darken a wall/floor junction, small
         // enough that a doorway does not smear onto the room behind it.
-        Self { enabled: true, radius: 0.5, strength: 1.0 }
+        Self {
+            enabled: true,
+            radius: 0.5,
+            strength: 1.0,
+        }
     }
 }
 
@@ -362,7 +390,11 @@ impl Default for GiSettings {
     fn default() -> Self {
         // 1.5 m: far enough that a wall lights the floor beside it and a rug tints what stands on
         // it, short enough that the gather stays inside what one screen can actually show.
-        Self { enabled: false, radius: 1.5, strength: 1.0 }
+        Self {
+            enabled: false,
+            radius: 1.5,
+            strength: 1.0,
+        }
     }
 }
 
@@ -392,7 +424,11 @@ impl Default for RefractSettings {
         // On, and gentle. Window glass at 1.52 with a few centimetres of apparent thickness gives
         // the slight, correct-looking offset a real pane has, without turning a flat window into a
         // funhouse mirror.
-        Self { enabled: true, ior: 1.52, thickness: 0.04 }
+        Self {
+            enabled: true,
+            ior: 1.52,
+            thickness: 0.04,
+        }
     }
 }
 
@@ -417,7 +453,11 @@ pub struct SsrSettings {
 
 impl Default for SsrSettings {
     fn default() -> Self {
-        Self { enabled: true, distance: 40.0, thickness: 0.5 }
+        Self {
+            enabled: true,
+            distance: 40.0,
+            thickness: 0.5,
+        }
     }
 }
 
@@ -475,7 +515,10 @@ pub struct HdriUse {
 
 impl Default for HdriUse {
     fn default() -> Self {
-        Self { strength: 1.0, rot: 0.0 }
+        Self {
+            strength: 1.0,
+            rot: 0.0,
+        }
     }
 }
 
@@ -510,7 +553,13 @@ impl Default for FogSettings {
     fn default() -> Self {
         // OFF, and gentle when switched on: at 0.0015/m an object is barely touched at 20 m and
         // clearly softened at 400 m, which is the range a building site actually spans.
-        Self { enabled: false, color: [0.55, 0.62, 0.75], density: 0.0015, base_z: 0.0, falloff: 0.02 }
+        Self {
+            enabled: false,
+            color: [0.55, 0.62, 0.75],
+            density: 0.0015,
+            base_z: 0.0,
+            falloff: 0.02,
+        }
     }
 }
 
@@ -557,7 +606,19 @@ pub const ENV_UV_GLSL: &str = r#"
 
 impl Default for EnvRender {
     fn default() -> Self {
-        Self { sky: None, sh: [[0.0; 3]; 9], ao: AoSettings::default(), gi: GiSettings::default(), refract: RefractSettings::default(), ssr: SsrSettings::default(), backdrop: Backdrop::Studio, reflections: 1.0, hdri: None, sun_angle_deg: SUN_ANGLE_DEG, fog: FogSettings::default() }
+        Self {
+            sky: None,
+            sh: [[0.0; 3]; 9],
+            ao: AoSettings::default(),
+            gi: GiSettings::default(),
+            refract: RefractSettings::default(),
+            ssr: SsrSettings::default(),
+            backdrop: Backdrop::Studio,
+            reflections: 1.0,
+            hdri: None,
+            sun_angle_deg: SUN_ANGLE_DEG,
+            fog: FogSettings::default(),
+        }
     }
 }
 
@@ -566,7 +627,34 @@ impl EnvRender {
     pub fn none() -> Self {
         // GI off too: the lux view is a MEASUREMENT, and a term whose value depends on where the
         // camera is standing has no business anywhere near a false-colour illuminance scale.
-        Self { sky: None, sh: [[0.0; 3]; 9], ao: AoSettings { enabled: false, ..Default::default() }, gi: GiSettings { enabled: false, ..Default::default() }, refract: RefractSettings { enabled: false, ..Default::default() }, ssr: SsrSettings { enabled: false, ..Default::default() }, backdrop: Backdrop::Studio, reflections: 0.0, hdri: None, sun_angle_deg: 0.0, fog: FogSettings { enabled: false, ..FogSettings::default() } }
+        Self {
+            sky: None,
+            sh: [[0.0; 3]; 9],
+            ao: AoSettings {
+                enabled: false,
+                ..Default::default()
+            },
+            gi: GiSettings {
+                enabled: false,
+                ..Default::default()
+            },
+            refract: RefractSettings {
+                enabled: false,
+                ..Default::default()
+            },
+            ssr: SsrSettings {
+                enabled: false,
+                ..Default::default()
+            },
+            backdrop: Backdrop::Studio,
+            reflections: 0.0,
+            hdri: None,
+            sun_angle_deg: 0.0,
+            fog: FogSettings {
+                enabled: false,
+                ..FogSettings::default()
+            },
+        }
     }
 }
 
@@ -748,11 +836,23 @@ mod tests {
             let e = elev_deg.to_radians();
             (sun_h * bearing * e.cos() + Vec3::Z * e.sin()).normalize()
         };
-        let (near, far) = (lum(s.radiance(at(1.0, 30.0))), lum(s.radiance(at(-1.0, 30.0))));
-        assert!(near > far * 1.2, "the sun's side of the sky must be brighter: {near} vs {far}");
+        let (near, far) = (
+            lum(s.radiance(at(1.0, 30.0))),
+            lum(s.radiance(at(-1.0, 30.0))),
+        );
+        assert!(
+            near > far * 1.2,
+            "the sun's side of the sky must be brighter: {near} vs {far}"
+        );
 
-        let (high, low) = (lum(s.radiance(at(-1.0, 60.0))), lum(s.radiance(at(-1.0, 3.0))));
-        assert!(low > high * 1.05, "radiance must rise toward the horizon: {low} at 3° vs {high} at 60°");
+        let (high, low) = (
+            lum(s.radiance(at(-1.0, 60.0))),
+            lum(s.radiance(at(-1.0, 3.0))),
+        );
+        assert!(
+            low > high * 1.05,
+            "radiance must rise toward the horizon: {low} at 3° vs {high} at 60°"
+        );
     }
 
     /// A clear sky is BLUE — the chromaticity fit has to survive the Yxy → RGB trip. (This catches
@@ -761,13 +861,21 @@ mod tests {
     fn a_clear_zenith_is_blue() {
         let s = noon();
         let z = s.radiance(Vec3::Z);
-        assert!(z[2] > z[1] && z[1] > z[0], "clear zenith should run B > G > R: {z:?}");
+        assert!(
+            z[2] > z[1] && z[1] > z[0],
+            "clear zenith should run B > G > R: {z:?}"
+        );
         // …and a very hazy sky is much closer to neutral.
         let mut hazy = Sky::new(s.sun_dir, 9.0);
         hazy.calibrate([1.0; 3], [0.2; 3], [2.0; 3]);
         let hz = hazy.radiance(Vec3::Z);
         let ratio = |c: [f32; 3]| c[2] / c[0].max(1e-6);
-        assert!(ratio(hz) < ratio(z), "turbidity must wash the blue out: {} vs {}", ratio(hz), ratio(z));
+        assert!(
+            ratio(hz) < ratio(z),
+            "turbidity must wash the blue out: {} vs {}",
+            ratio(hz),
+            ratio(z)
+        );
     }
 
     /// Every direction must give finite, non-negative radiance — including straight at the horizon,
@@ -781,7 +889,10 @@ mod tests {
                 let d = Vec3::new(r * a.cos(), r * a.sin(), alt);
                 for s in [noon(), Sky::new(Vec3::new(1.0, 0.0, 0.02).normalize(), 6.0)] {
                     let c = s.radiance_with_sun(d.normalize_or(Vec3::Z));
-                    assert!(c.iter().all(|v| v.is_finite() && *v >= 0.0), "{c:?} at {d:?}");
+                    assert!(
+                        c.iter().all(|v| v.is_finite() && *v >= 0.0),
+                        "{c:?} at {d:?}"
+                    );
                 }
             }
         }
@@ -797,7 +908,14 @@ mod tests {
     fn sh_reconstructs_the_hemisphere_integral() {
         let s = noon();
         let sh = s.sh9();
-        for n in [Vec3::Z, Vec3::X, Vec3::Y, -Vec3::X, Vec3::new(0.6, 0.5, 0.62).normalize(), -Vec3::Z] {
+        for n in [
+            Vec3::Z,
+            Vec3::X,
+            Vec3::Y,
+            -Vec3::X,
+            Vec3::new(0.6, 0.5, 0.62).normalize(),
+            -Vec3::Z,
+        ] {
             let n = n.normalize();
             // Brute force: ∫ L(ω) max(n·ω, 0) dω / π, over a Fibonacci sphere.
             const N: usize = 20000;
@@ -818,11 +936,19 @@ mod tests {
                 }
             }
             let w = 4.0 * std::f64::consts::PI / N as f64 / std::f64::consts::PI;
-            let exact = [(acc[0] * w) as f32, (acc[1] * w) as f32, (acc[2] * w) as f32];
+            let exact = [
+                (acc[0] * w) as f32,
+                (acc[1] * w) as f32,
+                (acc[2] * w) as f32,
+            ];
             let got = sh_ambient(&sh, n);
             for k in 0..3 {
                 let rel = (got[k] - exact[k]).abs() / exact[k].max(1e-4);
-                assert!(rel < 0.12, "n={n:?} ch{k}: SH {got:?} vs exact {exact:?} ({:.1}%)", rel * 100.0);
+                assert!(
+                    rel < 0.12,
+                    "n={n:?} ch{k}: SH {got:?} vs exact {exact:?} ({:.1}%)",
+                    rel * 100.0
+                );
             }
         }
     }
@@ -837,7 +963,11 @@ mod tests {
             let got = sh_ambient(&s.sh9(), Vec3::Z);
             let lum = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
             let rel = (lum(got) - lum(target)).abs() / lum(target);
-            assert!(rel < 0.02, "target {target:?} got {got:?} ({:.1}%)", rel * 100.0);
+            assert!(
+                rel < 0.02,
+                "target {target:?} got {got:?} ({:.1}%)",
+                rel * 100.0
+            );
         }
         // A sun below the horizon must not divide by a collapsed normalisation.
         let mut night = Sky::new(Vec3::new(0.3, 0.1, -0.4).normalize(), DEFAULT_TURBIDITY);
@@ -853,11 +983,17 @@ mod tests {
         let s = noon();
         let on_sun = s.radiance_with_sun(s.sun_dir);
         let dome = s.radiance(s.sun_dir);
-        assert!(on_sun[0] > dome[0] + 1.0, "the disc must be visible: {on_sun:?} vs {dome:?}");
+        assert!(
+            on_sun[0] > dome[0] + 1.0,
+            "the disc must be visible: {on_sun:?} vs {dome:?}"
+        );
         // 3° off the sun there is no disc left.
         let off = Vec3::new(s.sun_dir.x + 0.06, s.sun_dir.y, s.sun_dir.z).normalize();
         let c = s.radiance_with_sun(off);
-        assert!((c[0] - s.radiance(off)[0]).abs() < 1e-4, "disc must be tight: {c:?}");
+        assert!(
+            (c[0] - s.radiance(off)[0]).abs() < 1e-4,
+            "disc must be tight: {c:?}"
+        );
     }
 
     /// The GLSL copy is a separate text. Pin the pieces that would silently diverge: the XYZ→RGB
@@ -871,15 +1007,34 @@ mod tests {
             .collect();
         for row in XYZ_TO_RGB.iter() {
             for v in row {
-                assert!(lits.iter().any(|l| (l - v).abs() < 1e-4), "{v} missing from SKY_GLSL");
+                assert!(
+                    lits.iter().any(|l| (l - v).abs() < 1e-4),
+                    "{v} missing from SKY_GLSL"
+                );
             }
         }
         for c in ["0.429043", "0.511664", "0.743125", "0.886227", "0.247708"] {
-            assert!(SKY_GLSL.contains(c), "SH constant {c} missing from the shader");
+            assert!(
+                SKY_GLSL.contains(c),
+                "SH constant {c} missing from the shader"
+            );
         }
-        assert!(SKY_GLSL.contains("0.9997"), "the sun-disc width must match radiance_with_sun");
+        assert!(
+            SKY_GLSL.contains("0.9997"),
+            "the sun-disc width must match radiance_with_sun"
+        );
         // Uniform names the renderer looks up must exist in the source it is linked from.
-        for u in ["u_perez", "u_perez_norm", "u_zenith_xy", "u_sky_scale", "u_sky_sun", "u_sky_ground", "u_sky_sun_col", "u_sky_on", "u_sh"] {
+        for u in [
+            "u_perez",
+            "u_perez_norm",
+            "u_zenith_xy",
+            "u_sky_scale",
+            "u_sky_sun",
+            "u_sky_ground",
+            "u_sky_sun_col",
+            "u_sky_on",
+            "u_sh",
+        ] {
             assert!(SKY_GLSL.contains(u), "SKY_GLSL has no `{u}`");
         }
         assert!(ENV_BRDF_GLSL.contains("env_brdf"));
@@ -892,11 +1047,17 @@ mod tests {
         let mirror = env_brdf(0.0, 1.0);
         let matte = env_brdf(1.0, 1.0);
         assert!(mirror[0] > 0.9, "a smooth surface keeps its F0: {mirror:?}");
-        assert!(matte[0] < mirror[0], "roughness must cost energy: {matte:?} vs {mirror:?}");
+        assert!(
+            matte[0] < mirror[0],
+            "roughness must cost energy: {matte:?} vs {mirror:?}"
+        );
         for ri in 0..=10 {
             for vi in 1..=10 {
                 let ab = env_brdf(ri as f32 / 10.0, vi as f32 / 10.0);
-                assert!(ab[0] >= -0.01 && ab[0] <= 1.01 && ab[1] >= -0.01 && ab[1] <= 1.01, "{ab:?}");
+                assert!(
+                    ab[0] >= -0.01 && ab[0] <= 1.01 && ab[1] >= -0.01 && ab[1] <= 1.01,
+                    "{ab:?}"
+                );
             }
         }
     }

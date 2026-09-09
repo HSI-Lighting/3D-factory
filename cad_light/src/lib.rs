@@ -26,10 +26,9 @@ pub use ugr::{
 };
 
 pub use types::{
-    default_materials, en12464_cells, en12464_spacing, installation_summary, CalcPlane, Installation,
-    MATERIAL_FURNITURE,
-    LuxGrid, Luminaire,
-    Maintenance, Material, MaterialId, Mesh, RaySettings, Triangle, Vertex,
+    default_materials, en12464_cells, en12464_spacing, installation_summary, CalcPlane,
+    Installation, Luminaire, LuxGrid, Maintenance, Material, MaterialId, Mesh, RaySettings,
+    Triangle, Vertex, MATERIAL_FURNITURE,
 };
 
 use std::collections::HashMap;
@@ -50,7 +49,13 @@ pub fn calculate_document(
     let (w, d) = (max_x - min_x, max_y - min_y);
     let cols = ((w / 0.2).round() as u32).clamp(8, 48);
     let rows = ((d / 0.2).round() as u32).clamp(8, 48);
-    let plane = CalcPlane { origin: Vertex::new(min_x, min_y, plane_height), width: w, depth: d, cols, rows };
+    let plane = CalcPlane {
+        origin: Vertex::new(min_x, min_y, plane_height),
+        width: w,
+        depth: d,
+        cols,
+        rows,
+    };
     let meshes = extrude(doc, height);
     let grid = calculate(&meshes, luminaires, profiles, materials, &plane, settings);
     Some((meshes, plane, grid))

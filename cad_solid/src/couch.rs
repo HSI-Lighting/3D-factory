@@ -108,7 +108,11 @@ impl Run {
     }
     /// Resolved cushion count — never zero.
     pub fn count(self) -> u32 {
-        if self.cushions > 0 { self.cushions } else { ((self.length / CUSH_PITCH).round() as u32).max(1) }
+        if self.cushions > 0 {
+            self.cushions
+        } else {
+            ((self.length / CUSH_PITCH).round() as u32).max(1)
+        }
     }
 }
 
@@ -158,7 +162,13 @@ pub enum Preset {
 }
 
 impl Preset {
-    pub const ALL: [Preset; 5] = [Preset::Straight, Preset::Loveseat, Preset::L, Preset::U, Preset::Bench];
+    pub const ALL: [Preset; 5] = [
+        Preset::Straight,
+        Preset::Loveseat,
+        Preset::L,
+        Preset::U,
+        Preset::Bench,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             Preset::Straight => "Straight (reference)",
@@ -187,9 +197,18 @@ impl Preset {
         };
         match self {
             Preset::Straight => base,
-            Preset::Loveseat => CouchInput { runs: vec![Run::new(1.350, 2)], ..base },
-            Preset::L => CouchInput { runs: vec![Run::new(2.001, 3), Run::new(1.350, 2)], ..base },
-            Preset::U => CouchInput { runs: vec![Run::new(1.350, 2), Run::new(2.001, 3), Run::new(1.350, 2)], ..base },
+            Preset::Loveseat => CouchInput {
+                runs: vec![Run::new(1.350, 2)],
+                ..base
+            },
+            Preset::L => CouchInput {
+                runs: vec![Run::new(2.001, 3), Run::new(1.350, 2)],
+                ..base
+            },
+            Preset::U => CouchInput {
+                runs: vec![Run::new(1.350, 2), Run::new(2.001, 3), Run::new(1.350, 2)],
+                ..base
+            },
             Preset::Bench => CouchInput {
                 runs: vec![Run::new(1.800, 0)],
                 back: BackKind::None,
@@ -262,7 +281,12 @@ fn chain(runs: &[Run], w: f32) -> Vec<Frame> {
     let mut b = Vec3::ZERO;
     let mut d = Vec3::X;
     for (i, r) in runs.iter().enumerate() {
-        out.push(Frame { b, d, n: rot90(d), w });
+        out.push(Frame {
+            b,
+            d,
+            n: rot90(d),
+            w,
+        });
         if i + 1 < runs.len() {
             let dn = rot90(d);
             b = b + d * r.length + d * w + dn * w;
@@ -293,7 +317,14 @@ fn push_quad(mesh: &mut SolidMesh, part: u32, a: Vec3, b: Vec3, c: Vec3, d: Vec3
 }
 
 /// A box in run-local coordinates, `y` given from the FRONT edge. Flat outward normals.
-fn push_lbox(mesh: &mut SolidMesh, part: u32, fr: &Frame, u: [f32; 2], y_front: [f32; 2], z: [f32; 2]) {
+fn push_lbox(
+    mesh: &mut SolidMesh,
+    part: u32,
+    fr: &Frame,
+    u: [f32; 2],
+    y_front: [f32; 2],
+    z: [f32; 2],
+) {
     let (u0, u1) = (u[0].min(u[1]), u[0].max(u[1]));
     let (ya, yb) = (fr.yb(y_front[0]), fr.yb(y_front[1]));
     let (y0, y1) = (ya.min(yb), ya.max(yb));
@@ -320,7 +351,15 @@ fn push_lbox(mesh: &mut SolidMesh, part: u32, fr: &Frame, u: [f32; 2], y_front: 
         ([1, 2, 6, 5], [1.0, 0.0, 0.0]),
     ];
     for (q, n) in quads {
-        push_quad(mesh, part, c[q[0]], c[q[1]], c[q[2]], c[q[3]], fr.dir(n[0], n[1], n[2]));
+        push_quad(
+            mesh,
+            part,
+            c[q[0]],
+            c[q[1]],
+            c[q[2]],
+            c[q[3]],
+            fr.dir(n[0], n[1], n[2]),
+        );
     }
 }
 
@@ -340,8 +379,14 @@ fn earclip(poly: &[[f32; 2]]) -> Vec<[usize; 3]> {
     if n < 3 {
         return Vec::new();
     }
-    let mut ring: Vec<usize> = if signed_area(poly) < 0.0 { (0..n).rev().collect() } else { (0..n).collect() };
-    let cross = |o: [f32; 2], a: [f32; 2], b: [f32; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let mut ring: Vec<usize> = if signed_area(poly) < 0.0 {
+        (0..n).rev().collect()
+    } else {
+        (0..n).collect()
+    };
+    let cross = |o: [f32; 2], a: [f32; 2], b: [f32; 2]| {
+        (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    };
     let in_tri = |p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]| {
         let (d1, d2, d3) = (cross(a, b, p), cross(b, c, p), cross(c, a, p));
         !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
@@ -358,7 +403,10 @@ fn earclip(poly: &[[f32; 2]]) -> Vec<[usize; 3]> {
             if cross(a, b, c) <= 0.0 {
                 continue; // reflex — not an ear
             }
-            if ring.iter().any(|&iv| iv != ia && iv != ib && iv != ic && in_tri(poly[iv], a, b, c)) {
+            if ring
+                .iter()
+                .any(|&iv| iv != ia && iv != ib && iv != ic && in_tri(poly[iv], a, b, c))
+            {
                 continue;
             }
             out.push([ia, ib, ic]);
@@ -396,8 +444,22 @@ fn push_lprism(mesh: &mut SolidMesh, part: u32, fr: &Frame, poly: &[[f32; 2]], u
     let (u0, u1) = (u0.min(u1), u0.max(u1));
     let p = |i: usize, u: f32| fr.pos(u, poly[i][0], poly[i][1]);
     for t in earclip(poly) {
-        push_tri(mesh, part, p(t[0], u1), p(t[1], u1), p(t[2], u1), fr.dir(1.0, 0.0, 0.0));
-        push_tri(mesh, part, p(t[2], u0), p(t[1], u0), p(t[0], u0), fr.dir(-1.0, 0.0, 0.0));
+        push_tri(
+            mesh,
+            part,
+            p(t[0], u1),
+            p(t[1], u1),
+            p(t[2], u1),
+            fr.dir(1.0, 0.0, 0.0),
+        );
+        push_tri(
+            mesh,
+            part,
+            p(t[2], u0),
+            p(t[1], u0),
+            p(t[0], u0),
+            fr.dir(-1.0, 0.0, 0.0),
+        );
     }
     for i in 0..n {
         let j = (i + 1) % n;
@@ -406,7 +468,15 @@ fn push_lprism(mesh: &mut SolidMesh, part: u32, fr: &Frame, poly: &[[f32; 2]], u
         if len < 1e-9 {
             continue;
         }
-        push_quad(mesh, part, p(i, u0), p(j, u0), p(j, u1), p(i, u1), fr.dir(0.0, dz / len, -dy / len));
+        push_quad(
+            mesh,
+            part,
+            p(i, u0),
+            p(j, u0),
+            p(j, u1),
+            p(i, u1),
+            fr.dir(0.0, dz / len, -dy / len),
+        );
     }
 }
 
@@ -461,7 +531,11 @@ impl Soft {
             }
         }
         for t in &self.t {
-            if (self.v[t[1]] - self.v[t[0]]).cross(self.v[t[2]] - self.v[t[0]]).length() < 1e-12 {
+            if (self.v[t[1]] - self.v[t[0]])
+                .cross(self.v[t[2]] - self.v[t[0]])
+                .length()
+                < 1e-12
+            {
                 continue;
             }
             for &i in t {
@@ -474,12 +548,22 @@ impl Soft {
 }
 
 /// A seat pillow: a box with its bottom and top rings pulled in and a domed top (spec §B3.4).
-fn push_pillow(mesh: &mut SolidMesh, part: u32, fr: &Frame, u: [f32; 2], y_front: [f32; 2], z: [f32; 2]) {
+fn push_pillow(
+    mesh: &mut SolidMesh,
+    part: u32,
+    fr: &Frame,
+    u: [f32; 2],
+    y_front: [f32; 2],
+    z: [f32; 2],
+) {
     let (u0, u1) = (u[0].min(u[1]), u[0].max(u[1]));
     let (ya, yb) = (fr.yb(y_front[0]), fr.yb(y_front[1]));
     let (y0, y1) = (ya.min(yb), ya.max(yb));
     let (z0, z1) = (z[0].min(z[1]), z[0].max(z[1]));
-    let r = PILLOW_R.min((u1 - u0) * 0.3).min((y1 - y0) * 0.3).min((z1 - z0) * 0.45);
+    let r = PILLOW_R
+        .min((u1 - u0) * 0.3)
+        .min((y1 - y0) * 0.3)
+        .min((z1 - z0) * 0.45);
     if r <= 1e-5 {
         return;
     }
@@ -488,7 +572,12 @@ fn push_pillow(mesh: &mut SolidMesh, part: u32, fr: &Frame, u: [f32; 2], y_front
     let mut ring = |inset: f32, z: f32| -> Vec<usize> {
         let (a, b) = (u0 + inset, u1 - inset);
         let (c, d) = (y0 + inset, y1 - inset);
-        s.ring([fr.pos(a, c, z), fr.pos(b, c, z), fr.pos(b, d, z), fr.pos(a, d, z)])
+        s.ring([
+            fr.pos(a, c, z),
+            fr.pos(b, c, z),
+            fr.pos(b, d, z),
+            fr.pos(a, d, z),
+        ])
     };
     let r0 = ring(r * 0.8, z0);
     let r1 = ring(0.0, z0 + r);
@@ -519,9 +608,13 @@ fn fillet_closed(pts: &[[f32; 2]], r: f32, seg: usize) -> Vec<[f32; 2]> {
         let (a, p, b) = (v(pts[(i + n - 1) % n]), v(pts[i]), v(pts[(i + 1) % n]));
         let (t1, t2) = ((p - a).normalize_or_zero(), (b - p).normalize_or_zero());
         let ang = t1.dot(t2).clamp(-1.0, 1.0).acos();
-        let d = if ang > 1e-3 { r * (ang / 2.0).tan() } else { 0.0 }
-            .min((p - a).length() * 0.45)
-            .min((b - p).length() * 0.45);
+        let d = if ang > 1e-3 {
+            r * (ang / 2.0).tan()
+        } else {
+            0.0
+        }
+        .min((p - a).length() * 0.45)
+        .min((b - p).length() * 0.45);
         let (p1, p2) = (p - t1 * d, p + t2 * d);
         out.push([p1.x, p1.y]);
         for k in 1..seg {
@@ -543,7 +636,16 @@ fn fillet_closed(pts: &[[f32; 2]], r: f32, seg: usize) -> Vec<[f32; 2]> {
 
 /// A back cushion: a leaning wedge whose profile is filleted and whose end rings shrink to 0.82, so
 /// it reads as a pillow rather than a slab (spec §B3.5).
-fn push_wedge(mesh: &mut SolidMesh, part: u32, fr: &Frame, u0: f32, u1: f32, y_rear: f32, z0: f32, z1: f32) {
+fn push_wedge(
+    mesh: &mut SolidMesh,
+    part: u32,
+    fr: &Frame,
+    u0: f32,
+    u1: f32,
+    y_rear: f32,
+    z0: f32,
+    z1: f32,
+) {
     if u1 - u0 < 0.02 || z1 - z0 < 0.02 {
         return;
     }
@@ -559,11 +661,17 @@ fn push_wedge(mesh: &mut SolidMesh, part: u32, fr: &Frame, u0: f32, u1: f32, y_r
     let prof: Vec<[f32; 2]> = ensure_ccw(prof.iter().map(|p| [fr.yb(p[0]), p[1]]).collect());
     let (cy, cz) = {
         let n = prof.len() as f32;
-        (prof.iter().map(|p| p[0]).sum::<f32>() / n, prof.iter().map(|p| p[1]).sum::<f32>() / n)
+        (
+            prof.iter().map(|p| p[0]).sum::<f32>() / n,
+            prof.iter().map(|p| p[1]).sum::<f32>() / n,
+        )
     };
     let mut s = Soft::default();
     let mut ring = |u: f32, k: f32| -> Vec<usize> {
-        let pts: Vec<Vec3> = prof.iter().map(|p| fr.pos(u, cy + (p[0] - cy) * k, cz + (p[1] - cz) * k)).collect();
+        let pts: Vec<Vec3> = prof
+            .iter()
+            .map(|p| fr.pos(u, cy + (p[0] - cy) * k, cz + (p[1] - cz) * k))
+            .collect();
         s.ring(pts)
     };
     let inset = ((u1 - u0) * 0.25).min(0.040);
@@ -607,7 +715,14 @@ pub fn build(inp: &CouchInput) -> Result<(CouchMetrics, SolidMesh, Vec<Material>
     if inp.runs.is_empty() {
         return Err("a sofa needs at least one run".into());
     }
-    for (name, v) in [("depth", w), ("seat top", inp.seat_top), ("back height", inp.back_h), ("arm height", inp.arm_h), ("arm thickness", inp.arm_t), ("cushion thickness", inp.cushion_t)] {
+    for (name, v) in [
+        ("depth", w),
+        ("seat top", inp.seat_top),
+        ("back height", inp.back_h),
+        ("arm height", inp.arm_h),
+        ("arm thickness", inp.arm_t),
+        ("cushion thickness", inp.cushion_t),
+    ] {
         if !(v > 0.0) || !v.is_finite() {
             return Err(format!("{name} must be greater than 0"));
         }
@@ -627,7 +742,10 @@ pub fn build(inp: &CouchInput) -> Result<(CouchMetrics, SolidMesh, Vec<Material>
         ));
     }
     if inp.back == BackKind::Spindle && inp.back_h <= box_z1 + RAIL_T + 0.02 {
-        return Err(format!("back height {:.0} mm leaves no room for a rail above the seat box", inp.back_h * 1000.0));
+        return Err(format!(
+            "back height {:.0} mm leaves no room for a rail above the seat box",
+            inp.back_h * 1000.0
+        ));
     }
     if inp.arm_t > inp.runs[0].length || inp.arm_t > inp.runs[inp.runs.len() - 1].length {
         return Err("the arm is thicker than the run it sits on".into());
@@ -638,16 +756,30 @@ pub fn build(inp: &CouchInput) -> Result<(CouchMetrics, SolidMesh, Vec<Material>
     for (i, r) in inp.runs.iter().enumerate() {
         let cw = r.length / r.count() as f32;
         if !(0.45..=0.85).contains(&cw) {
-            warnings.push(format!("run {} at {:.2} m / {} cushions is {:.0} mm wide (aim 450–850)", i + 1, r.length, r.count(), cw * 1000.0));
+            warnings.push(format!(
+                "run {} at {:.2} m / {} cushions is {:.0} mm wide (aim 450–850)",
+                i + 1,
+                r.length,
+                r.count(),
+                cw * 1000.0
+            ));
         }
         if r.length < 0.60 {
-            warnings.push(format!("run {} is {:.0} mm — under 600 mm cannot hold one cushion sensibly", i + 1, r.length * 1000.0));
+            warnings.push(format!(
+                "run {} is {:.0} mm — under 600 mm cannot hold one cushion sensibly",
+                i + 1,
+                r.length * 1000.0
+            ));
         }
     }
     if inp.runs.len() > 2 {
         for (i, r) in inp.runs.iter().enumerate().take(inp.runs.len() - 1).skip(1) {
             if r.length - 2.0 * w < 0.40 {
-                warnings.push(format!("U inner clearance {:.0} mm (< 400) — run {} is too short between the corners", (r.length - 2.0 * w) * 1000.0, i + 1));
+                warnings.push(format!(
+                    "U inner clearance {:.0} mm (< 400) — run {} is too short between the corners",
+                    (r.length - 2.0 * w) * 1000.0,
+                    i + 1
+                ));
             }
         }
     }
@@ -668,11 +800,25 @@ pub fn build(inp: &CouchInput) -> Result<(CouchMetrics, SolidMesh, Vec<Material>
     if inp.frame {
         for (i, (fr, r)) in frames.iter().zip(&inp.runs).enumerate() {
             let part = alloc(&mut mats, Material::Oak);
-            push_lbox(&mut mesh, part, fr, [0.0, r.length], [0.0, w], [BOX_Z0, box_z1]);
+            push_lbox(
+                &mut mesh,
+                part,
+                fr,
+                [0.0, r.length],
+                [0.0, w],
+                [BOX_Z0, box_z1],
+            );
             if i < last {
                 // Overlap the corner square 1 mm into the run — coplanar faces z-fight (§B2).
                 let part = alloc(&mut mats, Material::Oak);
-                push_lbox(&mut mesh, part, fr, [r.length - 0.001, r.length + w], [0.0, w], [BOX_Z0, box_z1]);
+                push_lbox(
+                    &mut mesh,
+                    part,
+                    fr,
+                    [r.length - 0.001, r.length + w],
+                    [0.0, w],
+                    [BOX_Z0, box_z1],
+                );
             }
         }
         features.push("frame".into());
@@ -682,23 +828,31 @@ pub fn build(inp: &CouchInput) -> Result<(CouchMetrics, SolidMesh, Vec<Material>
     let rail_z0 = inp.back_h - RAIL_T;
     let spin_z0 = box_z1 + SPIN_LIFT;
     if inp.back == BackKind::Spindle {
-        let back_span = |mesh: &mut SolidMesh, mats: &mut Vec<Material>, fr: &Frame, u0: f32, u1: f32| {
-            let part = alloc(mats, Material::Oak);
-            push_lbox(mesh, part, fr, [u0, u1], [w - RAIL_D, w], [rail_z0, inp.back_h]);
-            let span = u1 - u0;
-            let n = ((span / SPIN_PITCH) as usize).max(2);
-            for k in 0..=n {
-                let uc = u0 + SPIN_INSET + (span - 2.0 * SPIN_INSET) * k as f32 / n as f32;
+        let back_span =
+            |mesh: &mut SolidMesh, mats: &mut Vec<Material>, fr: &Frame, u0: f32, u1: f32| {
+                let part = alloc(mats, Material::Oak);
                 push_lbox(
                     mesh,
                     part,
                     fr,
-                    [uc - SPIN_W / 2.0, uc + SPIN_W / 2.0],
-                    [w - 0.022, w - 0.006],
-                    [spin_z0, rail_z0],
+                    [u0, u1],
+                    [w - RAIL_D, w],
+                    [rail_z0, inp.back_h],
                 );
-            }
-        };
+                let span = u1 - u0;
+                let n = ((span / SPIN_PITCH) as usize).max(2);
+                for k in 0..=n {
+                    let uc = u0 + SPIN_INSET + (span - 2.0 * SPIN_INSET) * k as f32 / n as f32;
+                    push_lbox(
+                        mesh,
+                        part,
+                        fr,
+                        [uc - SPIN_W / 2.0, uc + SPIN_W / 2.0],
+                        [w - 0.022, w - 0.006],
+                        [spin_z0, rail_z0],
+                    );
+                }
+            };
         for (i, (fr, r)) in frames.iter().zip(&inp.runs).enumerate() {
             back_span(&mut mesh, &mut mats, fr, 0.0, r.length);
             if i < last {
@@ -712,7 +866,14 @@ pub fn build(inp: &CouchInput) -> Result<(CouchMetrics, SolidMesh, Vec<Material>
     // ── arms: only ever at the two FREE chain ends (§B3.3) ──
     if inp.arm_start {
         let part = alloc(&mut mats, Material::Oak);
-        push_arm(&mut mesh, part, &frames[0], -ARM_PROUD, -ARM_PROUD + inp.arm_t, inp.arm_h);
+        push_arm(
+            &mut mesh,
+            part,
+            &frames[0],
+            -ARM_PROUD,
+            -ARM_PROUD + inp.arm_t,
+            inp.arm_h,
+        );
     }
     if inp.arm_end {
         let part = alloc(&mut mats, Material::Oak);
@@ -770,13 +931,40 @@ pub fn build(inp: &CouchInput) -> Result<(CouchMetrics, SolidMesh, Vec<Material>
             let cw = r.length / n as f32;
             for k in 0..n {
                 let part = alloc(&mut mats, Material::Fabric);
-                push_wedge(&mut mesh, part, fr, k as f32 * cw + WEDGE_GAP, (k + 1) as f32 * cw - WEDGE_GAP, y_rear, z0, z1);
+                push_wedge(
+                    &mut mesh,
+                    part,
+                    fr,
+                    k as f32 * cw + WEDGE_GAP,
+                    (k + 1) as f32 * cw - WEDGE_GAP,
+                    y_rear,
+                    z0,
+                    z1,
+                );
             }
             if i < last {
                 let part = alloc(&mut mats, Material::Fabric);
-                push_wedge(&mut mesh, part, fr, r.length + WEDGE_CORNER_CLEAR, r.length + w - 0.020, y_rear, z0, z1);
+                push_wedge(
+                    &mut mesh,
+                    part,
+                    fr,
+                    r.length + WEDGE_CORNER_CLEAR,
+                    r.length + w - 0.020,
+                    y_rear,
+                    z0,
+                    z1,
+                );
                 let part = alloc(&mut mats, Material::Fabric);
-                push_wedge(&mut mesh, part, &frames[i + 1], -w + WEDGE_CORNER_CLEAR, -0.020, y_rear, z0, z1);
+                push_wedge(
+                    &mut mesh,
+                    part,
+                    &frames[i + 1],
+                    -w + WEDGE_CORNER_CLEAR,
+                    -0.020,
+                    y_rear,
+                    z0,
+                    z1,
+                );
             }
         }
         features.push("back_cushions".into());
@@ -796,7 +984,11 @@ pub fn build(inp: &CouchInput) -> Result<(CouchMetrics, SolidMesh, Vec<Material>
         arm_h: inp.arm_h,
         seats,
         cushion_pitch: inp.runs[0].length / inp.runs[0].count() as f32,
-        spindle_z0: if inp.back == BackKind::Spindle { spin_z0 } else { 0.0 },
+        spindle_z0: if inp.back == BackKind::Spindle {
+            spin_z0
+        } else {
+            0.0
+        },
         features,
         tris: mesh.tri_count(),
         warnings,
@@ -846,15 +1038,31 @@ mod tests {
             ("spindle z0", 0.210, m.spindle_z0),
         ] {
             let err = (built - reference).abs() / reference;
-            assert!(err < 0.01, "{name}: ref {reference:.3}, built {built:.3} ({:.1}%)", err * 100.0);
+            assert!(
+                err < 0.01,
+                "{name}: ref {reference:.3}, built {built:.3} ({:.1}%)",
+                err * 100.0
+            );
         }
         // The oak reaches the floor (the arms ARE the legs) while the frame box floats.
         let (lo, hi) = bbox_of(&mesh);
         assert!(lo[2].abs() < 1e-5, "sofa floats at z {}", lo[2]);
-        assert!((hi[1] - lo[1] - 0.780).abs() < 0.002, "depth {}", hi[1] - lo[1]);
-        assert!((hi[0] - lo[0] - 2.141).abs() < 0.002, "overall length {}", hi[0] - lo[0]);
+        assert!(
+            (hi[1] - lo[1] - 0.780).abs() < 0.002,
+            "depth {}",
+            hi[1] - lo[1]
+        );
+        assert!(
+            (hi[0] - lo[0] - 2.141).abs() < 0.002,
+            "overall length {}",
+            hi[0] - lo[0]
+        );
         let (flo, _) = bbox_mat(&mesh, &mats, Material::Fabric);
-        assert!(flo[2] > 0.15, "upholstery should sit on the frame, not the floor: {}", flo[2]);
+        assert!(
+            flo[2] > 0.15,
+            "upholstery should sit on the frame, not the floor: {}",
+            flo[2]
+        );
     }
 
     /// §B2 — the chain turns +90° at each corner and the seats face the inside of the L.
@@ -866,9 +1074,17 @@ mod tests {
         let (lo, hi) = bbox_of(&mesh);
         // run 0 (2.001) + corner (0.780) along x, plus 70 mm of proud arm at the start;
         // run 1 (1.350) + the corner's depth along y, plus 70 mm of proud arm at the far end.
-        assert!((lo[0] + 0.070).abs() < 0.005, "start arm should stand 70 mm proud: {}", lo[0]);
+        assert!(
+            (lo[0] + 0.070).abs() < 0.005,
+            "start arm should stand 70 mm proud: {}",
+            lo[0]
+        );
         assert!((hi[0] - 2.781).abs() < 0.005, "x reach {}", hi[0]);
-        assert!(lo[1].abs() < 0.005, "back edge of run 0 sits on y = 0: {}", lo[1]);
+        assert!(
+            lo[1].abs() < 0.005,
+            "back edge of run 0 sits on y = 0: {}",
+            lo[1]
+        );
         assert!((hi[1] - 2.200).abs() < 0.005, "y reach {}", hi[1]);
         // The corner square bridges the two back edges — nothing may be missing in the elbow.
         let filled = (0..mesh.tri_count()).any(|t| {
@@ -887,12 +1103,24 @@ mod tests {
         for p in Preset::ALL {
             let (_, mesh, _) = build(&p.input()).unwrap();
             for t in 0..mesh.tri_count() {
-                let v: Vec<Vec3> = (0..3).map(|i| Vec3::from(mesh.positions[t * 3 + i])).collect();
+                let v: Vec<Vec3> = (0..3)
+                    .map(|i| Vec3::from(mesh.positions[t * 3 + i]))
+                    .collect();
                 let face = (v[1] - v[0]).cross(v[2] - v[0]);
-                assert!(face.length() > 1e-9, "{}: degenerate triangle {t} at {:?}", p.label(), v[0]);
+                assert!(
+                    face.length() > 1e-9,
+                    "{}: degenerate triangle {t} at {:?}",
+                    p.label(),
+                    v[0]
+                );
                 let shade: Vec3 = (0..3).map(|i| Vec3::from(mesh.normals[t * 3 + i])).sum();
                 let dot = face.normalize().dot(shade.normalize_or_zero());
-                assert!(dot > 0.2, "{}: triangle {t} is wound against its normal (dot {dot:.3}) at {:?}", p.label(), v[0]);
+                assert!(
+                    dot > 0.2,
+                    "{}: triangle {t} is wound against its normal (dot {dot:.3}) at {:?}",
+                    p.label(),
+                    v[0]
+                );
             }
         }
     }
@@ -907,13 +1135,23 @@ mod tests {
         let (m, mesh, mats) = build(&inp).unwrap();
         assert!(mesh.tri_count() < full.1.tri_count());
         assert!(!m.features.iter().any(|f| f == "back"), "{:?}", m.features);
-        assert_eq!(m.seats, full.0.seats, "seat count changed with the back deleted");
-        assert!(m.features.iter().any(|f| f.starts_with("arms")), "{:?}", m.features);
+        assert_eq!(
+            m.seats, full.0.seats,
+            "seat count changed with the back deleted"
+        );
+        assert!(
+            m.features.iter().any(|f| f.starts_with("arms")),
+            "{:?}",
+            m.features
+        );
         // Same fabric envelope: the wedges still lean where they leaned.
         let a = bbox_mat(&mesh, &mats, Material::Fabric);
         let b = bbox_mat(&full.1, &full.2, Material::Fabric);
         for k in 0..3 {
-            assert!((a.0[k] - b.0[k]).abs() < 1e-4 && (a.1[k] - b.1[k]).abs() < 1e-4, "fabric envelope moved on axis {k}");
+            assert!(
+                (a.0[k] - b.0[k]).abs() < 1e-4 && (a.1[k] - b.1[k]).abs() < 1e-4,
+                "fabric envelope moved on axis {k}"
+            );
         }
         assert_eq!(m.spindle_z0, 0.0);
     }
@@ -922,12 +1160,23 @@ mod tests {
     #[test]
     fn bench_is_the_chain_minus_back_and_arms() {
         let (m, mesh, mats) = build(&Preset::Bench.input()).unwrap();
-        assert_eq!(m.features, vec!["frame".to_string(), "seat_cushions".to_string()]);
+        assert_eq!(
+            m.features,
+            vec!["frame".to_string(), "seat_cushions".to_string()]
+        );
         assert!(!mats.iter().any(|x| *x == Material::Fabric && false)); // fabric is the cushions only
-        assert!(mesh.tri_count() > 50 && mesh.tri_count() < 1_000, "{} tris", mesh.tri_count());
+        assert!(
+            mesh.tri_count() > 50 && mesh.tri_count() < 1_000,
+            "{} tris",
+            mesh.tri_count()
+        );
         // With no arms the sofa stands on nothing but its floating box — the frame starts at 50 mm.
         let (lo, _) = bbox_of(&mesh);
-        assert!((lo[2] - BOX_Z0).abs() < 1e-5, "bench should float on its box: z {}", lo[2]);
+        assert!(
+            (lo[2] - BOX_Z0).abs() < 1e-5,
+            "bench should float on its box: z {}",
+            lo[2]
+        );
         // auto cushion count: 1.800 / 0.667 rounds to 3
         assert_eq!(m.seats, 3);
     }
@@ -953,8 +1202,16 @@ mod tests {
         let (lo, hi) = bbox_of(&mesh);
         assert!(lo[2].abs() < 1e-5, "arm stiles must reach z = 0: {}", lo[2]);
         assert!((hi[2] - inp.arm_h).abs() < 1e-5, "arm top {}", hi[2]);
-        assert!((lo[0] + ARM_PROUD).abs() < 1e-5, "start arm proud edge {}", lo[0]);
-        assert!((hi[0] - (inp.runs[0].length + ARM_PROUD)).abs() < 1e-5, "end arm proud edge {}", hi[0]);
+        assert!(
+            (lo[0] + ARM_PROUD).abs() < 1e-5,
+            "start arm proud edge {}",
+            lo[0]
+        );
+        assert!(
+            (hi[0] - (inp.runs[0].length + ARM_PROUD)).abs() < 1e-5,
+            "end arm proud edge {}",
+            hi[0]
+        );
         // The window really is open: nothing spans the middle of the arch at knee height.
         let solid = (0..mesh.tri_count()).any(|t| {
             (0..3).all(|i| {
@@ -963,7 +1220,10 @@ mod tests {
                 y_front > 0.25 && y_front < 0.50 && p[2] > 0.05 && p[2] < 0.30
             })
         });
-        assert!(!solid, "the arm window is blocked — it should be open to the floor");
+        assert!(
+            !solid,
+            "the arm window is blocked — it should be open to the floor"
+        );
     }
 
     #[test]
@@ -972,26 +1232,54 @@ mod tests {
         let mut inp = Preset::Straight.input();
         inp.runs = vec![Run::new(2.001, 1)];
         let (m, _, _) = build(&inp).unwrap();
-        assert!(m.warnings.iter().any(|w| w.contains("450–850")), "{:?}", m.warnings);
+        assert!(
+            m.warnings.iter().any(|w| w.contains("450–850")),
+            "{:?}",
+            m.warnings
+        );
         // a run too short to hold a cushion
         let mut inp = Preset::Straight.input();
         inp.runs = vec![Run::new(0.500, 1)];
         let (m, _, _) = build(&inp).unwrap();
-        assert!(m.warnings.iter().any(|w| w.contains("under 600 mm")), "{:?}", m.warnings);
+        assert!(
+            m.warnings.iter().any(|w| w.contains("under 600 mm")),
+            "{:?}",
+            m.warnings
+        );
         // U with no inner clearance
         let mut inp = Preset::U.input();
         inp.runs[1] = Run::new(1.600, 2);
         let (m, _, _) = build(&inp).unwrap();
-        assert!(m.warnings.iter().any(|w| w.contains("inner clearance")), "{:?}", m.warnings);
+        assert!(
+            m.warnings.iter().any(|w| w.contains("inner clearance")),
+            "{:?}",
+            m.warnings
+        );
         // back cushions with nothing to lean on
         let mut inp = Preset::Straight.input();
         inp.back = BackKind::None;
         let (m, _, _) = build(&inp).unwrap();
-        assert!(m.warnings.iter().any(|w| w.contains("lean on")), "{:?}", m.warnings);
+        assert!(
+            m.warnings.iter().any(|w| w.contains("lean on")),
+            "{:?}",
+            m.warnings
+        );
         // hard errors
-        assert!(build(&CouchInput { runs: Vec::new(), ..Preset::Straight.input() }).is_err());
-        assert!(build(&CouchInput { cushion_t: 0.4, ..Preset::Straight.input() }).is_err());
-        assert!(build(&CouchInput { back_h: 0.25, ..Preset::Straight.input() }).is_err());
+        assert!(build(&CouchInput {
+            runs: Vec::new(),
+            ..Preset::Straight.input()
+        })
+        .is_err());
+        assert!(build(&CouchInput {
+            cushion_t: 0.4,
+            ..Preset::Straight.input()
+        })
+        .is_err());
+        assert!(build(&CouchInput {
+            back_h: 0.25,
+            ..Preset::Straight.input()
+        })
+        .is_err());
     }
 
     /// §B5 — rebuild all five presets; a regression in shared code shows up in whichever uses it.
@@ -1000,15 +1288,38 @@ mod tests {
         for p in Preset::ALL {
             let inp = p.input();
             let (m, mesh, mats) = build(&inp).unwrap_or_else(|e| panic!("{}: {e}", p.label()));
-            assert!(mesh.tri_count() > 50, "{}: {} tris", p.label(), mesh.tri_count());
-            assert!(mesh.tri_count() < 12_000, "{}: {} tris is far past the reference budget", p.label(), mesh.tri_count());
+            assert!(
+                mesh.tri_count() > 50,
+                "{}: {} tris",
+                p.label(),
+                mesh.tri_count()
+            );
+            assert!(
+                mesh.tri_count() < 12_000,
+                "{}: {} tris is far past the reference budget",
+                p.label(),
+                mesh.tri_count()
+            );
             assert_eq!(mesh.face_ids.len(), mesh.tri_count(), "{}", p.label());
-            assert!((*mesh.face_ids.iter().max().unwrap() as usize) < mats.len(), "{}", p.label());
+            assert!(
+                (*mesh.face_ids.iter().max().unwrap() as usize) < mats.len(),
+                "{}",
+                p.label()
+            );
             for v in &mesh.positions {
-                assert!(v.iter().all(|c| c.is_finite()), "{}: non-finite vertex", p.label());
+                assert!(
+                    v.iter().all(|c| c.is_finite()),
+                    "{}: non-finite vertex",
+                    p.label()
+                );
             }
             for n in &mesh.normals {
-                assert!((Vec3::from(*n).length() - 1.0).abs() < 1e-3, "{}: normal length {}", p.label(), Vec3::from(*n).length());
+                assert!(
+                    (Vec3::from(*n).length() - 1.0).abs() < 1e-3,
+                    "{}: normal length {}",
+                    p.label(),
+                    Vec3::from(*n).length()
+                );
             }
             assert!(m.warnings.is_empty(), "{}: {:?}", p.label(), m.warnings);
         }
@@ -1032,7 +1343,13 @@ mod tests {
             if mats[mesh.face_ids[t] as usize] != Material::Fabric {
                 continue;
             }
-            let e = boxes.entry(mesh.face_ids[t]).or_insert([f32::MAX, f32::MIN, f32::MAX, f32::MIN, f32::MIN]);
+            let e = boxes.entry(mesh.face_ids[t]).or_insert([
+                f32::MAX,
+                f32::MIN,
+                f32::MAX,
+                f32::MIN,
+                f32::MIN,
+            ]);
             for i in 0..3 {
                 let p = mesh.positions[t * 3 + i];
                 e[0] = e[0].min(p[0]);
@@ -1043,13 +1360,25 @@ mod tests {
             }
         }
         // Seat pillows top out a hair above `seat_top` (the 14 mm dome), so the cut has to clear it.
-        let wedges: Vec<[f32; 5]> = boxes.into_values().filter(|b| b[4] > inp.seat_top + 0.10).collect();
-        assert_eq!(wedges.len(), 3 + 2 + 2, "expected one wedge per seat plus two at the corner");
+        let wedges: Vec<[f32; 5]> = boxes
+            .into_values()
+            .filter(|b| b[4] > inp.seat_top + 0.10)
+            .collect();
+        assert_eq!(
+            wedges.len(),
+            3 + 2 + 2,
+            "expected one wedge per seat plus two at the corner"
+        );
         for (i, a) in wedges.iter().enumerate() {
             for b in wedges.iter().skip(i + 1) {
                 let ox = a[1].min(b[1]) - a[0].max(b[0]);
                 let oy = a[3].min(b[3]) - a[2].max(b[2]);
-                assert!(ox.min(oy) < 0.015, "two back wedges overlap by {:.3} × {:.3} m", ox, oy);
+                assert!(
+                    ox.min(oy) < 0.015,
+                    "two back wedges overlap by {:.3} × {:.3} m",
+                    ox,
+                    oy
+                );
             }
         }
     }

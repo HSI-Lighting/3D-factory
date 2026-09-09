@@ -137,7 +137,10 @@ fn unpack(s: &str) -> Vec<f64> {
     if s.is_empty() {
         return Vec::new();
     }
-    crate::factory::decode_f32_blob(s).into_iter().map(|x| x as f64).collect()
+    crate::factory::decode_f32_blob(s)
+        .into_iter()
+        .map(|x| x as f64)
+        .collect()
 }
 
 /// The room mask as bits, LSB first.
@@ -172,7 +175,9 @@ fn unpack_mask(s: &str, len: usize) -> Vec<bool> {
     if bytes.len() < len.div_ceil(8) {
         return Vec::new();
     }
-    (0..len).map(|i| bytes[i / 8] & (1 << (i % 8)) != 0).collect()
+    (0..len)
+        .map(|i| bytes[i / 8] & (1 << (i % 8)) != 0)
+        .collect()
 }
 
 impl StoredGrid {

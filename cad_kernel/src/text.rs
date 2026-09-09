@@ -65,42 +65,42 @@ pub struct Text {
     /// Cap height in world units. The rendered glyph box height is
     /// approximately this value (font-dependent ascent / descent
     /// extends slightly above / below).
-    pub height:   f64,
+    pub height: f64,
     /// Rotation in RADIANS measured CCW from the +X axis. Applied
     /// about `position`.
-    pub angle:    f64,
+    pub angle: f64,
     /// The text string. Newlines are NOT honoured in v1 — render them
     /// as a literal control char or drop. Multi-line wants `MText`.
-    pub text:     String,
-    pub h_align:  HAlign,
-    pub v_align:  VAlign,
+    pub text: String,
+    pub h_align: HAlign,
+    pub v_align: VAlign,
     /// Index into `Document.text_styles`. `0` = the reserved
     /// `STANDARD` style; never deletable.
-    pub style:    u32,
+    pub style: u32,
     // ── Per-entity render properties (SNAPSHOT at placement) ──────────────
     // These make every Text INDEPENDENT: editing a style (the "defaults
     // template") never retro-changes already-placed text. The renderer reads
     // THESE, not the style. `font_name == ""` means "inherit the style's font"
     // (back-compat for text created before these fields existed).
     /// Font family name. "" = inherit from the referenced style.
-    pub font_name:     String,
+    pub font_name: String,
     /// Synthetic bold (renderer thickens the edge).
-    pub bold:          bool,
+    pub bold: bool,
     /// Italic shear angle in radians (0 = upright).
-    pub oblique:       f64,
+    pub oblique: f64,
     /// Horizontal scale (1.0 = normal).
-    pub width_factor:  f64,
+    pub width_factor: f64,
     /// Stroke-only (outline) rendering instead of solid fill.
-    pub outline_only:  bool,
+    pub outline_only: bool,
     /// Pen width (world units) for outline strokes; 0.0 = hairline.
     pub outline_width: f64,
     /// Underline — the renderer draws a line under the glyphs.
-    pub underline:     bool,
+    pub underline: bool,
     /// Paragraph list decoration (bullet / number), applied at render time.
-    pub list_mode:     TextListKind,
+    pub list_mode: TextListKind,
     /// Line spacing as a multiple of `height` for multi-line paragraphs
     /// (`text` containing '\n'). 1.5 = the default CAD leading.
-    pub line_spacing:  f64,
+    pub line_spacing: f64,
 }
 
 impl Text {
@@ -110,21 +110,21 @@ impl Text {
     pub fn empty() -> Self {
         Self {
             position: Vec2::ZERO,
-            height:   1.0,
-            angle:    0.0,
-            text:     String::new(),
-            h_align:  HAlign::Left,
-            v_align:  VAlign::Baseline,
-            style:    TextStyleTable::STANDARD,
-            font_name:     String::new(),
-            bold:          false,
-            oblique:       0.0,
-            width_factor:  1.0,
-            outline_only:  false,
+            height: 1.0,
+            angle: 0.0,
+            text: String::new(),
+            h_align: HAlign::Left,
+            v_align: VAlign::Baseline,
+            style: TextStyleTable::STANDARD,
+            font_name: String::new(),
+            bold: false,
+            oblique: 0.0,
+            width_factor: 1.0,
+            outline_only: false,
             outline_width: 0.0,
-            underline:     false,
-            list_mode:     TextListKind::None,
-            line_spacing:  1.5,
+            underline: false,
+            list_mode: TextListKind::None,
+            line_spacing: 1.5,
         }
     }
 
@@ -148,30 +148,33 @@ impl Text {
         let n = lines.len().max(1);
         // Allowance for the render-time list marker ("• " / "N. ").
         let marker_chars = match self.list_mode {
-            TextListKind::None     => 0,
+            TextListKind::None => 0,
             TextListKind::Bulleted => 2,
             TextListKind::Numbered => 3,
         };
-        let max_chars =
-            lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) + marker_chars;
+        let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) + marker_chars;
         let w = (max_chars as f64) * self.height * 0.6;
         let h = self.height;
-        let line_h = h * if self.line_spacing > 1e-6 { self.line_spacing } else { 1.5 };
+        let line_h = h * if self.line_spacing > 1e-6 {
+            self.line_spacing
+        } else {
+            1.5
+        };
         let (left, right) = match self.h_align {
-            HAlign::Left   => (0.0, w),
+            HAlign::Left => (0.0, w),
             HAlign::Center => (-w * 0.5, w * 0.5),
-            HAlign::Right  => (-w, 0.0),
+            HAlign::Right => (-w, 0.0),
         };
         let (bottom1, top) = match self.v_align {
             VAlign::Baseline => (0.0, h),
-            VAlign::Bottom   => (0.0, h),
-            VAlign::Middle   => (-h * 0.5, h * 0.5),
-            VAlign::Top      => (-h, 0.0),
+            VAlign::Bottom => (0.0, h),
+            VAlign::Middle => (-h * 0.5, h * 0.5),
+            VAlign::Top => (-h, 0.0),
         };
         let bottom = bottom1 - (n as f64 - 1.0) * line_h;
         (
-            Vec2::new(self.position.x + left,   self.position.y + bottom),
-            Vec2::new(self.position.x + right,  self.position.y + top),
+            Vec2::new(self.position.x + left, self.position.y + bottom),
+            Vec2::new(self.position.x + right, self.position.y + top),
         )
     }
 
@@ -234,7 +237,7 @@ impl Text {
 pub struct Leader {
     /// Leader chain vertices; the FIRST is the arrowhead tip, the last
     /// is where the text label anchors (AutoCAD's landing point).
-    pub pts:   Vec<Vec2>,
+    pub pts: Vec<Vec2>,
     /// The annotation. `label.position` is the landing anchor; the
     /// renderer offsets the text next to the landing point.
     pub label: Text,
@@ -246,8 +249,11 @@ impl Leader {
     /// A straight two-point leader with an empty label at `b`.
     pub fn new(a: Vec2, b: Vec2) -> Self {
         Self {
-            pts:   vec![a, b],
-            label: Text { position: b, ..Text::empty() },
+            pts: vec![a, b],
+            label: Text {
+                position: b,
+                ..Text::empty()
+            },
             arrow: true,
         }
     }
@@ -256,8 +262,10 @@ impl Leader {
     pub fn bbox(&self) -> (Vec2, Vec2) {
         let (mut mn, mut mx) = self.label.bbox_unrotated();
         for p in &self.pts {
-            mn.x = mn.x.min(p.x); mn.y = mn.y.min(p.y);
-            mx.x = mx.x.max(p.x); mx.y = mx.y.max(p.y);
+            mn.x = mn.x.min(p.x);
+            mn.y = mn.y.min(p.y);
+            mx.x = mx.x.max(p.x);
+            mx.y = mx.y.max(p.y);
         }
         (mn, mx)
     }
@@ -269,7 +277,9 @@ impl Leader {
         let mut best = self.label.distance_to_point(p);
         for w in self.pts.windows(2) {
             let d = crate::geom::Line { a: w[0], b: w[1] }.distance_to_point(p);
-            if d < best { best = d; }
+            if d < best {
+                best = d;
+            }
         }
         best
     }
@@ -286,28 +296,28 @@ impl Leader {
 /// name even if we render with a different font).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextStyle {
-    pub name:           String,
+    pub name: String,
     /// Font reference. For v1 just a name string ("standard"); the
     /// renderer ignores it and uses egui's bundled font. When LFF
     /// parsing lands the renderer looks the name up in a font cache.
-    pub font_name:      String,
+    pub font_name: String,
     /// Width multiplier (1.0 = normal). DXF group 41.
-    pub width_factor:   f64,
+    pub width_factor: f64,
     /// Oblique angle in radians (italic shear). 0.0 = upright.
-    pub oblique:        f64,
+    pub oblique: f64,
     /// Default text height; 0.0 = use the entity's own `Text.height`.
     /// Non-zero forces every Text on this style to render at this height.
     pub default_height: f64,
     /// Synthetic bold — the TTF renderer thickens the glyph edge (no separate
     /// bold font file is loaded). `false` = regular weight.
-    pub bold:           bool,
+    pub bold: bool,
     /// Outline (stroke-only) rendering instead of solid fill.
-    pub outline_only:   bool,
+    pub outline_only: bool,
     /// Pen width (world units) for `outline_only` strokes. 0.0 = a hairline
     /// (one screen pixel).
-    pub outline_width:  f64,
+    pub outline_width: f64,
     /// Underline — renderer draws a line under the glyphs.
-    pub underline:      bool,
+    pub underline: bool,
 }
 
 impl TextStyle {
@@ -316,15 +326,15 @@ impl TextStyle {
     /// a style called "STANDARD" to exist; do not rename id 0.
     pub fn standard() -> Self {
         Self {
-            name:           "STANDARD".into(),
-            font_name:      "standard".into(),
-            width_factor:   1.0,
-            oblique:        0.0,
+            name: "STANDARD".into(),
+            font_name: "standard".into(),
+            width_factor: 1.0,
+            oblique: 0.0,
             default_height: 0.0,
-            bold:           false,
-            outline_only:   false,
-            outline_width:  0.0,
-            underline:      false,
+            bold: false,
+            outline_only: false,
+            outline_width: 0.0,
+            underline: false,
         }
     }
 }
@@ -341,7 +351,9 @@ impl TextStyleTable {
 
     /// Constructed with `STANDARD` only.
     pub fn with_defaults() -> Self {
-        Self { styles: vec![TextStyle::standard()] }
+        Self {
+            styles: vec![TextStyle::standard()],
+        }
     }
 
     pub fn get(&self, id: u32) -> Option<&TextStyle> {
@@ -355,16 +367,24 @@ impl TextStyleTable {
     }
 
     pub fn find(&self, name: &str) -> Option<u32> {
-        self.styles.iter().position(|s| s.name.eq_ignore_ascii_case(name))
+        self.styles
+            .iter()
+            .position(|s| s.name.eq_ignore_ascii_case(name))
             .map(|i| i as u32)
     }
 
-    pub fn len(&self) -> usize { self.styles.len() }
-    pub fn is_empty(&self) -> bool { self.styles.is_empty() }
+    pub fn len(&self) -> usize {
+        self.styles.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.styles.is_empty()
+    }
 }
 
 impl Default for TextStyleTable {
-    fn default() -> Self { Self::with_defaults() }
+    fn default() -> Self {
+        Self::with_defaults()
+    }
 }
 
 #[cfg(test)]
@@ -406,7 +426,10 @@ mod tests {
         let (min, max) = t.bbox_unrotated();
         // Top = +height (first line), bottom = -(n-1)*1.5*height = -15.
         assert!((max.y - 10.0).abs() < 1e-9);
-        assert!((min.y + 15.0).abs() < 1e-9, "second line drops the box by 1.5×h");
+        assert!(
+            (min.y + 15.0).abs() < 1e-9,
+            "second line drops the box by 1.5×h"
+        );
         // Width follows the longer line (16 chars × 10 × 0.6 = 96).
         assert!((max.x - min.x - 96.0).abs() < 1e-6);
         // A single-line Text is unchanged (baseline..height, width = chars×0.6×h).

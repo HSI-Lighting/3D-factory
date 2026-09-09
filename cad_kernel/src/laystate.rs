@@ -13,20 +13,20 @@ use crate::lineweight::Lineweight;
 /// One layer's saved properties (by name — ids are not stable).
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayerStateEntry {
-    pub layer:     String,
-    pub visible:   bool,
-    pub frozen:    bool,
-    pub locked:    bool,
-    pub color:     Color,
+    pub layer: String,
+    pub visible: bool,
+    pub frozen: bool,
+    pub locked: bool,
+    pub color: Color,
     pub lineweight: Lineweight,
     /// Linetype by NAME (ids shift too).
-    pub linetype:  String,
+    pub linetype: String,
 }
 
 /// A named layer-state snapshot.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayerState {
-    pub name:    String,
+    pub name: String,
     pub entries: Vec<LayerStateEntry>,
 }
 
@@ -37,24 +37,33 @@ pub fn save(doc: &mut Document, name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("layerstate: name is empty");
     }
-    if doc.layer_states.iter().any(|s| s.name.eq_ignore_ascii_case(name)) {
+    if doc
+        .layer_states
+        .iter()
+        .any(|s| s.name.eq_ignore_ascii_case(name))
+    {
         return Err("layerstate: that name already exists (delete it first)");
     }
     let mut entries = Vec::with_capacity(doc.layers.layers.len());
     for l in &doc.layers.layers {
         entries.push(LayerStateEntry {
-            layer:      l.name.clone(),
-            visible:    l.visible,
-            frozen:     l.frozen,
-            locked:     l.locked,
-            color:      l.color,
+            layer: l.name.clone(),
+            visible: l.visible,
+            frozen: l.frozen,
+            locked: l.locked,
+            color: l.color,
             lineweight: l.lineweight,
-            linetype:   doc.linetypes.get(l.linetype)
+            linetype: doc
+                .linetypes
+                .get(l.linetype)
                 .map(|t| t.name.clone())
                 .unwrap_or_else(|| "Continuous".into()),
         });
     }
-    doc.layer_states.push(LayerState { name: name.to_string(), entries });
+    doc.layer_states.push(LayerState {
+        name: name.to_string(),
+        entries,
+    });
     Ok(())
 }
 
@@ -62,7 +71,11 @@ pub fn save(doc: &mut Document, name: &str) -> Result<(), &'static str> {
 /// the saved color + visibility); saved linetype names resolve when present.
 /// Returns false when no such state exists.
 pub fn restore(doc: &mut Document, name: &str) -> bool {
-    let Some(state) = doc.layer_states.iter().find(|s| s.name.eq_ignore_ascii_case(name)) else {
+    let Some(state) = doc
+        .layer_states
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case(name))
+    else {
         return false;
     };
     let st = state.clone();
@@ -101,19 +114,31 @@ pub fn restore(doc: &mut Document, name: &str) -> bool {
 /// Delete a named state. False when it doesn't exist.
 pub fn delete(doc: &mut Document, name: &str) -> bool {
     let before = doc.layer_states.len();
-    doc.layer_states.retain(|s| !s.name.eq_ignore_ascii_case(name));
+    doc.layer_states
+        .retain(|s| !s.name.eq_ignore_ascii_case(name));
     doc.layer_states.len() != before
 }
 
 /// Rename a state. False when the source doesn't exist or the target is taken.
 pub fn rename(doc: &mut Document, from: &str, to: &str) -> bool {
     let to = to.trim();
-    if to.is_empty() { return false; }
-    if doc.layer_states.iter().any(|s| s.name.eq_ignore_ascii_case(to)) {
+    if to.is_empty() {
         return false;
     }
-    let Some(st) = doc.layer_states.iter_mut()
-        .find(|s| s.name.eq_ignore_ascii_case(from)) else { return false };
+    if doc
+        .layer_states
+        .iter()
+        .any(|s| s.name.eq_ignore_ascii_case(to))
+    {
+        return false;
+    }
+    let Some(st) = doc
+        .layer_states
+        .iter_mut()
+        .find(|s| s.name.eq_ignore_ascii_case(from))
+    else {
+        return false;
+    };
     st.name = to.to_string();
     true
 }
@@ -132,9 +157,15 @@ mod tests {
 
     fn mk_layer(name: &str, color: Color) -> Layer {
         Layer {
-            name: name.into(), color,
-            linetype: 0, lineweight: Lineweight::Default,
-            visible: true, locked: false, frozen: false, plottable: true, order: 0,
+            name: name.into(),
+            color,
+            linetype: 0,
+            lineweight: Lineweight::Default,
+            visible: true,
+            locked: false,
+            frozen: false,
+            plottable: true,
+            order: 0,
         }
     }
 
@@ -154,7 +185,7 @@ mod tests {
             l.locked = false;
             l.color = Color::Aci(7);
         }
-        assert!(restore(&mut doc, "mystate"));   // case-insensitive
+        assert!(restore(&mut doc, "mystate")); // case-insensitive
         let l = doc.layers.get(1).unwrap();
         assert!(!l.visible, "visibility restored");
         assert!(l.locked, "locked restored");

@@ -64,12 +64,31 @@ pub struct MeshCut {
 impl MeshCut {
     /// A through-cut from a drawn loop.
     pub fn through(frame: Frame, profile: Vec<[f32; 2]>, label: impl Into<String>) -> Self {
-        Self { profile, frame, depth: 0.0, through: true, enabled: true, label: label.into() }
+        Self {
+            profile,
+            frame,
+            depth: 0.0,
+            through: true,
+            enabled: true,
+            label: label.into(),
+        }
     }
 
     /// A blind pocket `depth` metres deep.
-    pub fn pocket(frame: Frame, profile: Vec<[f32; 2]>, depth: f32, label: impl Into<String>) -> Self {
-        Self { profile, frame, depth: depth.max(1e-4), through: false, enabled: true, label: label.into() }
+    pub fn pocket(
+        frame: Frame,
+        profile: Vec<[f32; 2]>,
+        depth: f32,
+        label: impl Into<String>,
+    ) -> Self {
+        Self {
+            profile,
+            frame,
+            depth: depth.max(1e-4),
+            through: false,
+            enabled: true,
+            label: label.into(),
+        }
     }
 }
 
@@ -134,7 +153,11 @@ pub fn closure(positions: &[[f32; 3]]) -> (usize, usize) {
     let mut net: std::collections::HashMap<([i64; 3], [i64; 3]), i32> =
         std::collections::HashMap::with_capacity(tris * 3);
     for t in 0..tris {
-        let v = [key(positions[t * 3]), key(positions[t * 3 + 1]), key(positions[t * 3 + 2])];
+        let v = [
+            key(positions[t * 3]),
+            key(positions[t * 3 + 1]),
+            key(positions[t * 3 + 2]),
+        ];
         for e in 0..3 {
             let (a, b) = (v[e], v[(e + 1) % 3]);
             if a == b {
@@ -145,8 +168,11 @@ pub fn closure(positions: &[[f32; 3]]) -> (usize, usize) {
             *net.entry(k).or_insert(0) += step;
         }
     }
-    let unbalanced: Vec<([i64; 3], [i64; 3], i32)> =
-        net.into_iter().filter(|(_, n)| *n != 0).map(|((a, b), n)| (a, b, n)).collect();
+    let unbalanced: Vec<([i64; 3], [i64; 3], i32)> = net
+        .into_iter()
+        .filter(|(_, n)| *n != 0)
+        .map(|((a, b), n)| (a, b, n))
+        .collect();
     (genuine_openings(&unbalanced), tris)
 }
 
@@ -187,12 +213,18 @@ fn genuine_openings(unbalanced: &[([i64; 3], [i64; 3], i32)]) -> usize {
         // 0.01 of the 0.1 mm grid: tight enough that two different lines never merge, loose enough
         // that the same line always does.
         let q = |v: f64| (v * 100.0).round() as i64;
-        let key = ([q(anchor.x), q(anchor.y), q(anchor.z)], [q(dir.x * 1e4), q(dir.y * 1e4), q(dir.z * 1e4)]);
+        let key = (
+            [q(anchor.x), q(anchor.y), q(anchor.z)],
+            [q(dir.x * 1e4), q(dir.y * 1e4), q(dir.z * 1e4)],
+        );
         let (ta, tb) = (pa.dot(dir), pb.dot(dir));
         // `n` counts a→b traversals; on the canonical direction that sign may invert.
         let sign = if (tb > ta) != flip { n } else { -n };
         let (lo, hi) = if ta <= tb { (ta, tb) } else { (tb, ta) };
-        lines.entry(key).or_default().push((lo, hi, if ta <= tb { sign } else { -sign }));
+        lines
+            .entry(key)
+            .or_default()
+            .push((lo, hi, if ta <= tb { sign } else { -sign }));
     }
 
     let mut open = 0usize;
@@ -203,7 +235,11 @@ fn genuine_openings(unbalanced: &[([i64; 3], [i64; 3], i32)]) -> usize {
         marks.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
         for w in marks.windows(2) {
             let mid = (w[0] + w[1]) * 0.5;
-            let sum: i32 = spans.iter().filter(|s| s.0 < mid && mid < s.1).map(|s| s.2).sum();
+            let sum: i32 = spans
+                .iter()
+                .filter(|s| s.0 < mid && mid < s.1)
+                .map(|s| s.2)
+                .sum();
             if sum != 0 {
                 open += 1;
             }
@@ -289,15 +325,18 @@ fn decal_triangles(positions: &[[f32; 3]]) -> Vec<bool> {
             count[comp[t]] += 1.0;
         }
     }
-    let centroid: Vec<glam::DVec3> =
-        (0..n).map(|i| sum[i] / count[i].max(1.0)).collect();
+    let centroid: Vec<glam::DVec3> = (0..n).map(|i| sum[i] / count[i].max(1.0)).collect();
 
     let mut vol = vec![0.0f64; n];
     let mut area = vec![0.0f64; n];
     let mut open = vec![false; n];
     for t in 0..tris {
         let c = comp[t];
-        let (a, b, d) = (p(t * 3) - centroid[c], p(t * 3 + 1) - centroid[c], p(t * 3 + 2) - centroid[c]);
+        let (a, b, d) = (
+            p(t * 3) - centroid[c],
+            p(t * 3 + 1) - centroid[c],
+            p(t * 3 + 2) - centroid[c],
+        );
         vol[c] += a.dot(b.cross(d)) / 6.0;
         area[c] += (b - a).cross(d - a).length() / 2.0;
     }
@@ -404,7 +443,11 @@ pub fn apply(
 
 /// The cutting prism for one cut, in the mesh's local space.
 fn prism(cut: &MeshCut, lo: [f32; 3], hi: [f32; 3], part: u32) -> Result<PartMesh, CutError> {
-    let pts: Vec<[f64; 2]> = cut.profile.iter().map(|p| [p[0] as f64, p[1] as f64]).collect();
+    let pts: Vec<[f64; 2]> = cut
+        .profile
+        .iter()
+        .map(|p| [p[0] as f64, p[1] as f64])
+        .collect();
     if pts.len() < 3 || shoelace(&pts).abs() < 1e-9 {
         return Err(CutError::DegenerateProfile);
     }
@@ -525,13 +568,22 @@ mod tests {
     /// An axis-aligned box as closed triangle soup, tagged `part`.
     fn boxsoup(lo: [f32; 3], hi: [f32; 3], part: u32) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<u32>) {
         let c = [
-            [lo[0], lo[1], lo[2]], [hi[0], lo[1], lo[2]], [hi[0], hi[1], lo[2]], [lo[0], hi[1], lo[2]],
-            [lo[0], lo[1], hi[2]], [hi[0], lo[1], hi[2]], [hi[0], hi[1], hi[2]], [lo[0], hi[1], hi[2]],
+            [lo[0], lo[1], lo[2]],
+            [hi[0], lo[1], lo[2]],
+            [hi[0], hi[1], lo[2]],
+            [lo[0], hi[1], lo[2]],
+            [lo[0], lo[1], hi[2]],
+            [hi[0], lo[1], hi[2]],
+            [hi[0], hi[1], hi[2]],
+            [lo[0], hi[1], hi[2]],
         ];
         let quads: [([usize; 4], [f32; 3]); 6] = [
-            ([0, 3, 2, 1], [0.0, 0.0, -1.0]), ([4, 5, 6, 7], [0.0, 0.0, 1.0]),
-            ([0, 1, 5, 4], [0.0, -1.0, 0.0]), ([3, 7, 6, 2], [0.0, 1.0, 0.0]),
-            ([0, 4, 7, 3], [-1.0, 0.0, 0.0]), ([1, 2, 6, 5], [1.0, 0.0, 0.0]),
+            ([0, 3, 2, 1], [0.0, 0.0, -1.0]),
+            ([4, 5, 6, 7], [0.0, 0.0, 1.0]),
+            ([0, 1, 5, 4], [0.0, -1.0, 0.0]),
+            ([3, 7, 6, 2], [0.0, 1.0, 0.0]),
+            ([0, 4, 7, 3], [-1.0, 0.0, 0.0]),
+            ([1, 2, 6, 5], [1.0, 0.0, 0.0]),
         ];
         let (mut p, mut n, mut ids) = (Vec::new(), Vec::new(), Vec::new());
         for (q, nn) in quads {
@@ -574,7 +626,10 @@ mod tests {
         let open: Vec<[f32; 3]> = p[3..].to_vec();
         let (n_open, tris) = closure(&open);
         assert_eq!(tris, 11);
-        assert_eq!(n_open, 3, "a missing triangle leaves exactly its three edges open");
+        assert_eq!(
+            n_open, 3,
+            "a missing triangle leaves exactly its three edges open"
+        );
         assert!(!is_closed(&open));
     }
 
@@ -584,14 +639,18 @@ mod tests {
     fn a_through_cut_removes_a_column_and_leaves_a_solid() {
         let (p, n, ids) = boxsoup([-0.5, -0.5, 0.0], [0.5, 0.5, 0.2], 3);
         let before = volume(&SolidMesh {
-            positions: p.clone(), normals: n.clone(), face_ids: ids.clone(),
+            positions: p.clone(),
+            normals: n.clone(),
+            face_ids: ids.clone(),
         });
         assert!((before - 0.2).abs() < 1e-4, "1 × 1 × 0.2 box, got {before}");
 
         // Draw on the top face (normal +Z) and cut down through the slab.
         let frame = Frame::from_point_normal(Vec3::new(0.0, 0.0, 0.2), Vec3::Z);
         let cut = MeshCut::through(frame, square(0.1), "hole");
-        let out = apply(&p, &n, &ids, &[cut]).unwrap().expect("a cut was applied");
+        let out = apply(&p, &n, &ids, &[cut])
+            .unwrap()
+            .expect("a cut was applied");
 
         let after = volume(&out);
         let want = 0.2 - 0.2 * 0.2 * 0.2; // slab minus a 0.2 × 0.2 column
@@ -600,7 +659,10 @@ mod tests {
         // The hole goes all the way THROUGH: the surface the cut exposed spans the full 0.2 m
         // thickness. Volume alone cannot tell a through-hole from a deep pocket.
         let (lo, hi) = cut_face_z(&out, 3);
-        assert!(lo < 1e-3 && hi > 0.2 - 1e-3, "the cut surface spans the slab ({lo}..{hi})");
+        assert!(
+            lo < 1e-3 && hi > 0.2 - 1e-3,
+            "the cut surface spans the slab ({lo}..{hi})"
+        );
     }
 
     /// The z range of the triangles that are NOT part of the original body — the surface the cut
@@ -624,18 +686,40 @@ mod tests {
     fn a_pocket_stops_at_its_depth() {
         let (p, n, ids) = boxsoup([-0.5, -0.5, 0.0], [0.5, 0.5, 0.2], 3);
         let frame = Frame::from_point_normal(Vec3::new(0.0, 0.0, 0.2), Vec3::Z);
-        let shallow = apply(&p, &n, &ids, &[MeshCut::pocket(frame, square(0.1), 0.05, "pocket")])
-            .unwrap().unwrap();
-        let deep = apply(&p, &n, &ids, &[MeshCut::through(frame, square(0.1), "hole")])
-            .unwrap().unwrap();
-        assert!(volume(&shallow) > volume(&deep), "a pocket keeps more material than a hole");
+        let shallow = apply(
+            &p,
+            &n,
+            &ids,
+            &[MeshCut::pocket(frame, square(0.1), 0.05, "pocket")],
+        )
+        .unwrap()
+        .unwrap();
+        let deep = apply(
+            &p,
+            &n,
+            &ids,
+            &[MeshCut::through(frame, square(0.1), "hole")],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            volume(&shallow) > volume(&deep),
+            "a pocket keeps more material than a hole"
+        );
         let want = 0.2 - 0.2 * 0.2 * 0.05;
-        assert!((volume(&shallow) - want).abs() < 2e-3, "pocket volume {}", volume(&shallow));
+        assert!(
+            (volume(&shallow) - want).abs() < 2e-3,
+            "pocket volume {}",
+            volume(&shallow)
+        );
         // THE difference from a through-cut: the pocket has a FLOOR. Its exposed surface stops
         // 0.05 m down from the top face and never reaches the base.
         let (lo, hi) = cut_face_z(&shallow, 3);
         assert!(hi > 0.2 - 1e-3, "the pocket is open at the top ({hi})");
-        assert!(lo > 0.15 - 2e-3, "…and floored 50 mm down, not open to the base ({lo})");
+        assert!(
+            lo > 0.15 - 2e-3,
+            "…and floored 50 mm down, not open to the base ({lo})"
+        );
     }
 
     /// Part ids survive the boolean, and the cut's own surface arrives as a NEW part — so a door
@@ -644,8 +728,14 @@ mod tests {
     fn part_ids_survive_and_the_cut_face_is_its_own_part() {
         let (p, n, ids) = boxsoup([-0.5, -0.5, 0.0], [0.5, 0.5, 0.2], 7);
         let frame = Frame::from_point_normal(Vec3::new(0.0, 0.0, 0.2), Vec3::Z);
-        let out = apply(&p, &n, &ids, &[MeshCut::through(frame, square(0.1), "hole")])
-            .unwrap().unwrap();
+        let out = apply(
+            &p,
+            &n,
+            &ids,
+            &[MeshCut::through(frame, square(0.1), "hole")],
+        )
+        .unwrap()
+        .unwrap();
         let parts: std::collections::HashSet<u32> = out.face_ids.iter().copied().collect();
         assert!(parts.contains(&7), "the body kept its part id");
         assert_eq!(parts.len(), 2, "body + cut surface, got {parts:?}");
@@ -663,8 +753,14 @@ mod tests {
         let frame = Frame::from_point_normal(Vec3::new(0.5, 0.5, 1.0), Vec3::Z);
         let err = apply(&p, &n, &ids, &[MeshCut::through(frame, square(0.2), "x")]).unwrap_err();
         assert_eq!(err, CutError::NotClosed { open: 3, tris: 11 });
-        assert!(err.to_string().contains("3 open edges"), "says how open: {err}");
-        assert!(err.to_string().contains("imported"), "says which meshes can be cut: {err}");
+        assert!(
+            err.to_string().contains("3 open edges"),
+            "says how open: {err}"
+        );
+        assert!(
+            err.to_string().contains("imported"),
+            "says which meshes can be cut: {err}"
+        );
     }
 
     /// Disabling a cut must restore the mesh exactly — the point of an editable list. `None` means
@@ -674,10 +770,19 @@ mod tests {
         let (p, n, ids) = boxsoup([-0.5, -0.5, 0.0], [0.5, 0.5, 0.2], 3);
         let frame = Frame::from_point_normal(Vec3::new(0.0, 0.0, 0.2), Vec3::Z);
         let mut cut = MeshCut::through(frame, square(0.1), "hole");
-        assert!(apply(&p, &n, &ids, &[cut.clone()]).unwrap().is_some(), "enabled cuts");
+        assert!(
+            apply(&p, &n, &ids, &[cut.clone()]).unwrap().is_some(),
+            "enabled cuts"
+        );
         cut.enabled = false;
-        assert!(apply(&p, &n, &ids, &[cut]).unwrap().is_none(), "disabled does nothing at all");
-        assert!(apply(&p, &n, &ids, &[]).unwrap().is_none(), "and an empty list does nothing");
+        assert!(
+            apply(&p, &n, &ids, &[cut]).unwrap().is_none(),
+            "disabled does nothing at all"
+        );
+        assert!(
+            apply(&p, &n, &ids, &[]).unwrap().is_none(),
+            "and an empty list does nothing"
+        );
     }
 
     /// Two cuts compose, and the order they are listed in does not change the result — a
@@ -690,12 +795,18 @@ mod tests {
         let a = MeshCut::through(top, square(0.08), "a");
         let b = MeshCut::pocket(side, square(0.05), 0.3, "b");
 
-        let one = apply(&p, &n, &ids, &[a.clone(), b.clone()]).unwrap().unwrap();
+        let one = apply(&p, &n, &ids, &[a.clone(), b.clone()])
+            .unwrap()
+            .unwrap();
         let two = apply(&p, &n, &ids, &[b, a]).unwrap().unwrap();
-        assert!((volume(&one) - volume(&two)).abs() < 1e-4, "order does not matter");
+        assert!(
+            (volume(&one) - volume(&two)).abs() < 1e-4,
+            "order does not matter"
+        );
         // …and both removed more than either alone.
         let solo = apply(&p, &n, &ids, &[MeshCut::through(top, square(0.08), "a")])
-            .unwrap().unwrap();
+            .unwrap()
+            .unwrap();
         assert!(volume(&one) < volume(&solo), "the second cut removed more");
     }
 
@@ -704,8 +815,12 @@ mod tests {
     fn a_profile_with_no_area_is_refused() {
         let (p, n, ids) = boxsoup([0.0; 3], [1.0; 3], 1);
         let frame = Frame::from_point_normal(Vec3::new(0.5, 0.5, 1.0), Vec3::Z);
-        for bad in [vec![], vec![[0.0, 0.0]], vec![[0.0, 0.0], [0.1, 0.0]],
-                    vec![[0.0, 0.0], [0.1, 0.0], [0.2, 0.0]]] {
+        for bad in [
+            vec![],
+            vec![[0.0, 0.0]],
+            vec![[0.0, 0.0], [0.1, 0.0]],
+            vec![[0.0, 0.0], [0.1, 0.0], [0.2, 0.0]],
+        ] {
             let err = apply(&p, &n, &ids, &[MeshCut::through(frame, bad, "x")]).unwrap_err();
             assert_eq!(err, CutError::DegenerateProfile);
         }
@@ -729,9 +844,13 @@ mod tests {
         ] {
             let f = Frame::from_point_normal(o, nrm);
             let out = apply(&p, &n, &ids, &[MeshCut::pocket(f, square(0.04), 0.03, "p")])
-                .unwrap().unwrap();
+                .unwrap()
+                .unwrap();
             let v = volume(&out);
-            assert!(v < before - 1e-5, "cutting at {o:?}/{nrm:?} removed material ({v} < {before})");
+            assert!(
+                v < before - 1e-5,
+                "cutting at {o:?}/{nrm:?} removed material ({v} < {before})"
+            );
             assert!(v > before * 0.9, "…and only a little of it ({v})");
         }
     }
@@ -745,23 +864,48 @@ mod tests {
     /// shell (a stray triangle fan, a missing cap) and taking cutting away from that piece.
     #[test]
     fn every_generated_piece_is_cuttable() {
-        let door = crate::door::build(&crate::door::DoorInput::default()).unwrap().1;
-        let cupboard = crate::cupboard::build(&crate::cupboard::CupboardInput::default()).unwrap().1;
-        let kitchen = crate::kitchen::build(&crate::kitchen::KitchenInput::default()).unwrap().1;
-        let cabin = crate::cabin::build(&crate::cabin::CabinInput::default()).unwrap().1;
-        let desk = crate::desk::build(&crate::desk::DeskInput::default()).unwrap().1;
-        let couch = crate::couch::build(&crate::couch::CouchInput::default()).unwrap().1;
-        let stair = crate::architecture::build_stairs(&crate::architecture::StairParams::default()).unwrap();
-        let spiral = crate::architecture::build_spiral(&crate::architecture::SpiralParams::default()).unwrap();
-        let ramp = crate::architecture::build_ramp(&crate::architecture::RampParams::default()).unwrap();
+        let door = crate::door::build(&crate::door::DoorInput::default())
+            .unwrap()
+            .1;
+        let cupboard = crate::cupboard::build(&crate::cupboard::CupboardInput::default())
+            .unwrap()
+            .1;
+        let kitchen = crate::kitchen::build(&crate::kitchen::KitchenInput::default())
+            .unwrap()
+            .1;
+        let cabin = crate::cabin::build(&crate::cabin::CabinInput::default())
+            .unwrap()
+            .1;
+        let desk = crate::desk::build(&crate::desk::DeskInput::default())
+            .unwrap()
+            .1;
+        let couch = crate::couch::build(&crate::couch::CouchInput::default())
+            .unwrap()
+            .1;
+        let stair = crate::architecture::build_stairs(&crate::architecture::StairParams::default())
+            .unwrap();
+        let spiral =
+            crate::architecture::build_spiral(&crate::architecture::SpiralParams::default())
+                .unwrap();
+        let ramp =
+            crate::architecture::build_ramp(&crate::architecture::RampParams::default()).unwrap();
 
         for (name, m) in [
-            ("door", &door), ("cupboard", &cupboard), ("kitchen", &kitchen), ("cabin", &cabin),
-            ("desk", &desk), ("couch", &couch), ("stair", &stair), ("spiral", &spiral),
+            ("door", &door),
+            ("cupboard", &cupboard),
+            ("kitchen", &kitchen),
+            ("cabin", &cabin),
+            ("desk", &desk),
+            ("couch", &couch),
+            ("stair", &stair),
+            ("spiral", &spiral),
             ("ramp", &ramp),
         ] {
             let (open, tris) = closure_for_cutting(&m.positions);
-            assert_eq!(open, 0, "{name}: {open} open edges in {tris} triangles — not cuttable");
+            assert_eq!(
+                open, 0,
+                "{name}: {open} open edges in {tris} triangles — not cuttable"
+            );
         }
     }
 
@@ -770,23 +914,39 @@ mod tests {
     /// solids alone are clean. If a future generator makes its PANELS open, this still catches it.
     #[test]
     fn flat_decals_do_not_condemn_a_solid_piece() {
-        let cabin = crate::cabin::build(&crate::cabin::CabinInput::default()).unwrap().1;
+        let cabin = crate::cabin::build(&crate::cabin::CabinInput::default())
+            .unwrap()
+            .1;
         let (raw, _) = closure(&cabin.positions);
         assert!(raw > 0, "the raw mesh really does have open edges ({raw})");
-        assert_eq!(closure_for_cutting(&cabin.positions).0, 0, "its solids do not");
+        assert_eq!(
+            closure_for_cutting(&cabin.positions).0,
+            0,
+            "its solids do not"
+        );
         let decal = decal_triangles(&cabin.positions);
         let n = decal.iter().filter(|&&d| d).count();
         assert!(n > 0, "the dimples were identified as decals");
         // 96 dimples × 8 triangles = 768 of the cabin's 864; the carcass is the small remainder.
-        assert!(n < decal.len(), "…and not the whole mesh ({n} of {})", decal.len());
+        assert!(
+            n < decal.len(),
+            "…and not the whole mesh ({n} of {})",
+            decal.len()
+        );
 
         // A solid box must never be mistaken for a decal — that would exempt a genuine hole.
         let (p, _, _) = boxsoup([0.0; 3], [1.0; 3], 4);
-        assert!(!decal_triangles(&p).iter().any(|&d| d), "a box is not a decal");
+        assert!(
+            !decal_triangles(&p).iter().any(|&d| d),
+            "a box is not a decal"
+        );
 
         // …and a genuinely BROKEN solid — open, but enclosing real volume — is still condemned.
         let broken: Vec<[f32; 3]> = p[3..].to_vec();
-        assert!(!decal_triangles(&broken).iter().any(|&d| d), "a box with a hole is not a decal");
+        assert!(
+            !decal_triangles(&broken).iter().any(|&d| d),
+            "a box with a hole is not a decal"
+        );
         assert!(closure_for_cutting(&broken).0 > 0, "and is still refused");
     }
 
@@ -804,14 +964,30 @@ mod tests {
         // removes nothing, and looks like a boolean failure rather than an aiming error.
         let frame = Frame::from_point_normal(Vec3::new(0.0, 0.0, 0.9), Vec3::Y);
         let slot = vec![[-0.13, -0.04], [0.13, -0.04], [0.13, 0.04], [-0.13, 0.04]];
-        let out = apply(&mesh.positions, &mesh.normals, &mesh.face_ids, &[MeshCut::through(frame, slot, "letterbox")])
-            .unwrap()
-            .expect("the door was cut");
+        let out = apply(
+            &mesh.positions,
+            &mesh.normals,
+            &mesh.face_ids,
+            &[MeshCut::through(frame, slot, "letterbox")],
+        )
+        .unwrap()
+        .expect("the door was cut");
 
-        assert!(volume(&out) < before, "material came out ({} < {before})", volume(&out));
+        assert!(
+            volume(&out) < before,
+            "material came out ({} < {before})",
+            volume(&out)
+        );
         let parts: std::collections::HashSet<u32> = out.face_ids.iter().copied().collect();
-        for keep in [crate::door::Part::Leaf, crate::door::Part::Lining, crate::door::Part::ArchFront] {
-            assert!(parts.contains(&(keep as u32)), "{keep:?} survived the cut with its id");
+        for keep in [
+            crate::door::Part::Leaf,
+            crate::door::Part::Lining,
+            crate::door::Part::ArchFront,
+        ] {
+            assert!(
+                parts.contains(&(keep as u32)),
+                "{keep:?} survived the cut with its id"
+            );
         }
         assert!(
             parts.iter().any(|&p| p > crate::door::Part::Handle as u32),
@@ -849,8 +1025,14 @@ mod tests {
         let (_m, mesh) = crate::door::build(&inp).unwrap();
         let frame = Frame::from_point_normal(Vec3::new(0.0, 0.0, 0.9), Vec3::Y);
         let slot = vec![[-0.13, -0.04], [0.13, -0.04], [0.13, 0.04], [-0.13, 0.04]];
-        let out = apply(&mesh.positions, &mesh.normals, &mesh.face_ids,
-            &[MeshCut::through(frame, slot, "letterbox")]).unwrap().expect("cut");
+        let out = apply(
+            &mesh.positions,
+            &mesh.normals,
+            &mesh.face_ids,
+            &[MeshCut::through(frame, slot, "letterbox")],
+        )
+        .unwrap()
+        .expect("cut");
 
         let before_max = mesh.face_ids.iter().copied().max().unwrap_or(0);
         assert!(
@@ -873,7 +1055,10 @@ mod tests {
             let on_plane = w - n * (w - f.origin).dot(n);
             let uv: Vec2 = f.to_uv(on_plane);
             let back = f.from_uv(uv);
-            assert!((back - on_plane).length() < 1e-5, "{on_plane:?} → {uv:?} → {back:?}");
+            assert!(
+                (back - on_plane).length() < 1e-5,
+                "{on_plane:?} → {uv:?} → {back:?}"
+            );
         }
     }
 }

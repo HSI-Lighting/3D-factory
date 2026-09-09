@@ -24,10 +24,10 @@ use eframe::glow::HasContext;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CircleInstance {
-    pub x:     f32,
-    pub y:     f32,
-    pub r:     f32,
-    pub color: u32,    // packed RGBA, byte order R high … A low
+    pub x: f32,
+    pub y: f32,
+    pub r: f32,
+    pub color: u32, // packed RGBA, byte order R high … A low
 }
 
 /// Analytic arc — a circle ring clamped to an angular sweep, evaluated in
@@ -37,11 +37,11 @@ pub struct CircleInstance {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ArcInstance {
-    pub x:     f32,
-    pub y:     f32,
-    pub r:     f32,
-    pub a0:    f32,    // start angle (radians, world)
-    pub sweep: f32,    // sweep (radians, 0..TAU, CCW)
+    pub x: f32,
+    pub y: f32,
+    pub r: f32,
+    pub a0: f32,    // start angle (radians, world)
+    pub sweep: f32, // sweep (radians, 0..TAU, CCW)
     pub color: u32,
 }
 
@@ -52,28 +52,28 @@ pub struct ArcInstance {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct EllipseInstance {
-    pub x:     f32,
-    pub y:     f32,
-    pub a:     f32,    // semi-major
-    pub b:     f32,    // semi-minor
-    pub rot:   f32,    // major-axis angle (radians)
+    pub x: f32,
+    pub y: f32,
+    pub a: f32,   // semi-major
+    pub b: f32,   // semi-minor
+    pub rot: f32, // major-axis angle (radians)
     pub color: u32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct LineInstance {
-    pub ax:     f32,
-    pub ay:     f32,
-    pub bx:     f32,
-    pub by:     f32,
-    pub half_w: f32,   // world-space HALF stroke width (screen-min applied CPU-side)
-    pub color:  u32,
+    pub ax: f32,
+    pub ay: f32,
+    pub bx: f32,
+    pub by: f32,
+    pub half_w: f32, // world-space HALF stroke width (screen-min applied CPU-side)
+    pub color: u32,
     /// Cap flags — bit0: round cap at A, bit1: round cap at B. Chained
     /// segments (polyline/spline/wall interiors) set both ends so the
     /// overlapping half-discs union into a seamless ROUND JOIN; terminal
     /// ends stay butt. Zero-length flag = butt both ends (classic line).
-    pub flags:  u32,
+    pub flags: u32,
 }
 
 /// One vertex of a filled triangle. Fills are NOT instanced — the CPU emits
@@ -84,29 +84,29 @@ pub struct LineInstance {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FillVertex {
-    pub x:     f32,
-    pub y:     f32,
-    pub color: u32,    // packed RGBA (alpha honoured — poché is translucent)
+    pub x: f32,
+    pub y: f32,
+    pub color: u32, // packed RGBA (alpha honoured — poché is translucent)
 }
 
 /// One shader program + its instance buffer + VAO (attributes wired).
 struct GpuPipeline {
-    program:      glow::Program,
-    vao:          glow::VertexArray,
+    program: glow::Program,
+    vao: glow::VertexArray,
     instance_vbo: glow::Buffer,
-    u_view:       Option<glow::UniformLocation>,
+    u_view: Option<glow::UniformLocation>,
     /// Stroke AA head-room added to the analytic quad radius/axes (world
     /// units). The quad must extend past the ring/SDF band or the outline
     /// clips at the quad edge (issue #30).
-    u_pad:        Option<glow::UniformLocation>,
+    u_pad: Option<glow::UniformLocation>,
 }
 
 pub struct GpuShapeRenderer {
-    circle:   Option<GpuPipeline>,
-    arc:      Option<GpuPipeline>,
-    ellipse:  Option<GpuPipeline>,
-    line:     Option<GpuPipeline>,
-    fill:     Option<GpuPipeline>,
+    circle: Option<GpuPipeline>,
+    arc: Option<GpuPipeline>,
+    ellipse: Option<GpuPipeline>,
+    line: Option<GpuPipeline>,
+    fill: Option<GpuPipeline>,
     quad_vbo: Option<glow::Buffer>,
     /// Set ONCE if GL init (shader compile / link / buffer or VAO creation)
     /// fails — e.g. a GLES/ANGLE or GL<3.3 context that can't handle
@@ -133,9 +133,18 @@ unsafe impl Sync for GpuShapeRenderer {}
 
 impl Default for GpuShapeRenderer {
     fn default() -> Self {
-        Self { circle: None, arc: None, ellipse: None, line: None, fill: None,
-               quad_vbo: None, init_error: None, last_frame_us: 0, profile_finish: false,
-               last_counts: [0; 5] }
+        Self {
+            circle: None,
+            arc: None,
+            ellipse: None,
+            line: None,
+            fill: None,
+            quad_vbo: None,
+            init_error: None,
+            last_frame_us: 0,
+            profile_finish: false,
+            last_counts: [0; 5],
+        }
     }
 }
 
@@ -401,15 +410,21 @@ const FILL_FS: &str = r#"
 
 impl GpuShapeRenderer {
     /// True once GL init has FAILED (fail-soft — the main thread reverts to CPU).
-    pub fn init_failed(&self) -> bool { self.init_error.is_some() }
+    pub fn init_failed(&self) -> bool {
+        self.init_error.is_some()
+    }
 
     /// The GL-init failure message, if any (for the CPU-revert notice / logs).
-    pub fn init_error(&self) -> Option<&str> { self.init_error.as_deref() }
+    pub fn init_error(&self) -> Option<&str> {
+        self.init_error.as_deref()
+    }
 
     /// Test-only: force the init-failed state (a unit test has no GL context to
     /// trigger a real shader-compile failure).
     #[cfg(test)]
-    pub fn set_init_error_for_test(&mut self, e: String) { self.init_error = Some(e); }
+    pub fn set_init_error_for_test(&mut self, e: String) {
+        self.init_error = Some(e);
+    }
 
     /// Compile programs + create buffers, idempotently. FAIL-SOFT (GP4/WP1.7):
     /// on ANY GL error (shader compile/link, buffer/VAO creation — common on a
@@ -418,11 +433,17 @@ impl GpuShapeRenderer {
     /// the draw path then no-ops on the `None` pipelines and the main thread
     /// reverts render_mode to CPU.
     pub fn ensure_init(&mut self, gl: &glow::Context) {
-        if self.init_error.is_some() || self.quad_vbo.is_some() { return; }
+        if self.init_error.is_some() || self.quad_vbo.is_some() {
+            return;
+        }
         if let Err(e) = unsafe { self.try_init(gl) } {
             // Drop any half-built state so the draw path stays a clean no-op.
-            self.circle = None; self.arc = None; self.ellipse = None;
-            self.line = None; self.fill = None; self.quad_vbo = None;
+            self.circle = None;
+            self.arc = None;
+            self.ellipse = None;
+            self.line = None;
+            self.fill = None;
+            self.quad_vbo = None;
             eprintln!("GPU init failed — reverting to CPU:\n{}", e);
             self.init_error = Some(e);
         }
@@ -430,36 +451,39 @@ impl GpuShapeRenderer {
 
     unsafe fn try_init(&mut self, gl: &glow::Context) -> Result<(), String> {
         let quad: [f32; 12] = [
-            -1.0, -1.0,  1.0, -1.0,  1.0,  1.0,
-            -1.0, -1.0,  1.0,  1.0, -1.0,  1.0,
+            -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0,
         ];
         let qvbo = gl.create_buffer()?;
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(qvbo));
         gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&quad), glow::STATIC_DRAW);
         self.quad_vbo = Some(qvbo);
 
-        self.circle  = Some(Self::build_circle(gl, qvbo)?);
-        self.arc     = Some(Self::build_arc(gl, qvbo)?);
+        self.circle = Some(Self::build_circle(gl, qvbo)?);
+        self.arc = Some(Self::build_arc(gl, qvbo)?);
         self.ellipse = Some(Self::build_ellipse(gl, qvbo)?);
-        self.line    = Some(Self::build_line(gl, qvbo)?);
-        self.fill    = Some(Self::build_fill(gl)?);
+        self.line = Some(Self::build_line(gl, qvbo)?);
+        self.fill = Some(Self::build_fill(gl)?);
 
         gl.bind_buffer(glow::ARRAY_BUFFER, None);
         gl.bind_vertex_array(None);
         Ok(())
     }
 
-    unsafe fn compile(gl: &glow::Context, vs_src: &str, fs_src: &str)
-        -> Result<glow::Program, String>
-    {
+    unsafe fn compile(
+        gl: &glow::Context,
+        vs_src: &str,
+        fs_src: &str,
+    ) -> Result<glow::Program, String> {
         let program = gl.create_program()?;
         let compile = |src: &str, kind: u32| -> Result<glow::Shader, String> {
             let s = gl.create_shader(kind)?;
             gl.shader_source(s, src);
             gl.compile_shader(s);
             if !gl.get_shader_compile_status(s) {
-                return Err(format!("GPU shader compile failed:\n{}",
-                    gl.get_shader_info_log(s)));
+                return Err(format!(
+                    "GPU shader compile failed:\n{}",
+                    gl.get_shader_info_log(s)
+                ));
             }
             Ok(s)
         };
@@ -469,18 +493,23 @@ impl GpuShapeRenderer {
         gl.attach_shader(program, fs);
         gl.link_program(program);
         if !gl.get_program_link_status(program) {
-            return Err(format!("GPU program link failed:\n{}",
-                gl.get_program_info_log(program)));
+            return Err(format!(
+                "GPU program link failed:\n{}",
+                gl.get_program_info_log(program)
+            ));
         }
         gl.delete_shader(vs);
         gl.delete_shader(fs);
         Ok(program)
     }
 
-    unsafe fn build_circle(gl: &glow::Context, quad_vbo: glow::Buffer) -> Result<GpuPipeline, String> {
+    unsafe fn build_circle(
+        gl: &glow::Context,
+        quad_vbo: glow::Buffer,
+    ) -> Result<GpuPipeline, String> {
         let program = Self::compile(gl, CIRCLE_VS, CIRCLE_FS)?;
         let u_view = gl.get_uniform_location(program, "u_view");
-        let u_pad  = gl.get_uniform_location(program, "u_pad");
+        let u_pad = gl.get_uniform_location(program, "u_pad");
         let ivbo = gl.create_buffer()?;
         let vao = gl.create_vertex_array()?;
         gl.bind_vertex_array(Some(vao));
@@ -495,13 +524,19 @@ impl GpuShapeRenderer {
         gl.enable_vertex_attrib_array(2);
         gl.vertex_attrib_pointer_i32(2, 1, glow::UNSIGNED_INT, stride, 12);
         gl.vertex_attrib_divisor(2, 1);
-        Ok(GpuPipeline { program, vao, instance_vbo: ivbo, u_view, u_pad })
+        Ok(GpuPipeline {
+            program,
+            vao,
+            instance_vbo: ivbo,
+            u_view,
+            u_pad,
+        })
     }
 
     unsafe fn build_arc(gl: &glow::Context, quad_vbo: glow::Buffer) -> Result<GpuPipeline, String> {
         let program = Self::compile(gl, ARC_VS, ARC_FS)?;
         let u_view = gl.get_uniform_location(program, "u_view");
-        let u_pad  = gl.get_uniform_location(program, "u_pad");
+        let u_pad = gl.get_uniform_location(program, "u_pad");
         let ivbo = gl.create_buffer()?;
         let vao = gl.create_vertex_array()?;
         gl.bind_vertex_array(Some(vao));
@@ -509,23 +544,32 @@ impl GpuShapeRenderer {
         gl.enable_vertex_attrib_array(0);
         gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(ivbo));
-        let stride = size_of::<ArcInstance>() as i32;   // 24
-        gl.enable_vertex_attrib_array(1);               // x,y,r
+        let stride = size_of::<ArcInstance>() as i32; // 24
+        gl.enable_vertex_attrib_array(1); // x,y,r
         gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, stride, 0);
         gl.vertex_attrib_divisor(1, 1);
-        gl.enable_vertex_attrib_array(2);               // a0, sweep
+        gl.enable_vertex_attrib_array(2); // a0, sweep
         gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, 12);
         gl.vertex_attrib_divisor(2, 1);
-        gl.enable_vertex_attrib_array(3);               // color
+        gl.enable_vertex_attrib_array(3); // color
         gl.vertex_attrib_pointer_i32(3, 1, glow::UNSIGNED_INT, stride, 20);
         gl.vertex_attrib_divisor(3, 1);
-        Ok(GpuPipeline { program, vao, instance_vbo: ivbo, u_view, u_pad })
+        Ok(GpuPipeline {
+            program,
+            vao,
+            instance_vbo: ivbo,
+            u_view,
+            u_pad,
+        })
     }
 
-    unsafe fn build_ellipse(gl: &glow::Context, quad_vbo: glow::Buffer) -> Result<GpuPipeline, String> {
+    unsafe fn build_ellipse(
+        gl: &glow::Context,
+        quad_vbo: glow::Buffer,
+    ) -> Result<GpuPipeline, String> {
         let program = Self::compile(gl, ELLIPSE_VS, ELLIPSE_FS)?;
         let u_view = gl.get_uniform_location(program, "u_view");
-        let u_pad  = gl.get_uniform_location(program, "u_pad");
+        let u_pad = gl.get_uniform_location(program, "u_pad");
         let ivbo = gl.create_buffer()?;
         let vao = gl.create_vertex_array()?;
         gl.bind_vertex_array(Some(vao));
@@ -533,20 +577,29 @@ impl GpuShapeRenderer {
         gl.enable_vertex_attrib_array(0);
         gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(ivbo));
-        let stride = size_of::<EllipseInstance>() as i32;   // 24
-        gl.enable_vertex_attrib_array(1);                   // cx,cy,a,b
+        let stride = size_of::<EllipseInstance>() as i32; // 24
+        gl.enable_vertex_attrib_array(1); // cx,cy,a,b
         gl.vertex_attrib_pointer_f32(1, 4, glow::FLOAT, false, stride, 0);
         gl.vertex_attrib_divisor(1, 1);
-        gl.enable_vertex_attrib_array(2);                   // rot
+        gl.enable_vertex_attrib_array(2); // rot
         gl.vertex_attrib_pointer_f32(2, 1, glow::FLOAT, false, stride, 16);
         gl.vertex_attrib_divisor(2, 1);
-        gl.enable_vertex_attrib_array(3);                   // color
+        gl.enable_vertex_attrib_array(3); // color
         gl.vertex_attrib_pointer_i32(3, 1, glow::UNSIGNED_INT, stride, 20);
         gl.vertex_attrib_divisor(3, 1);
-        Ok(GpuPipeline { program, vao, instance_vbo: ivbo, u_view, u_pad })
+        Ok(GpuPipeline {
+            program,
+            vao,
+            instance_vbo: ivbo,
+            u_view,
+            u_pad,
+        })
     }
 
-    unsafe fn build_line(gl: &glow::Context, quad_vbo: glow::Buffer) -> Result<GpuPipeline, String> {
+    unsafe fn build_line(
+        gl: &glow::Context,
+        quad_vbo: glow::Buffer,
+    ) -> Result<GpuPipeline, String> {
         let program = Self::compile(gl, LINE_VS, LINE_FS)?;
         let u_view = gl.get_uniform_location(program, "u_view");
         let ivbo = gl.create_buffer()?;
@@ -556,21 +609,27 @@ impl GpuShapeRenderer {
         gl.enable_vertex_attrib_array(0);
         gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(ivbo));
-        let stride = size_of::<LineInstance>() as i32;   // 28
-        gl.enable_vertex_attrib_array(1);                // ax,ay,bx,by
+        let stride = size_of::<LineInstance>() as i32; // 28
+        gl.enable_vertex_attrib_array(1); // ax,ay,bx,by
         gl.vertex_attrib_pointer_f32(1, 4, glow::FLOAT, false, stride, 0);
         gl.vertex_attrib_divisor(1, 1);
-        gl.enable_vertex_attrib_array(2);                // half_w
+        gl.enable_vertex_attrib_array(2); // half_w
         gl.vertex_attrib_pointer_f32(2, 1, glow::FLOAT, false, stride, 16);
         gl.vertex_attrib_divisor(2, 1);
-        gl.enable_vertex_attrib_array(3);                // color
+        gl.enable_vertex_attrib_array(3); // color
         gl.vertex_attrib_pointer_i32(3, 1, glow::UNSIGNED_INT, stride, 20);
         gl.vertex_attrib_divisor(3, 1);
-        gl.enable_vertex_attrib_array(4);                // cap flags
+        gl.enable_vertex_attrib_array(4); // cap flags
         gl.vertex_attrib_pointer_i32(4, 1, glow::UNSIGNED_INT, stride, 24);
         gl.vertex_attrib_divisor(4, 1);
         // LINE_VS pads its own quad (PAD = 2.5·half_w) — no u_pad uniform.
-        Ok(GpuPipeline { program, vao, instance_vbo: ivbo, u_view, u_pad: None })
+        Ok(GpuPipeline {
+            program,
+            vao,
+            instance_vbo: ivbo,
+            u_view,
+            u_pad: None,
+        })
     }
 
     // Triangle-soup fill pipeline: per-VERTEX position + color, NO instancing,
@@ -582,13 +641,19 @@ impl GpuShapeRenderer {
         let vao = gl.create_vertex_array()?;
         gl.bind_vertex_array(Some(vao));
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-        let stride = size_of::<FillVertex>() as i32;   // 12
-        gl.enable_vertex_attrib_array(0);              // pos
+        let stride = size_of::<FillVertex>() as i32; // 12
+        gl.enable_vertex_attrib_array(0); // pos
         gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
-        gl.enable_vertex_attrib_array(1);              // color
+        gl.enable_vertex_attrib_array(1); // color
         gl.vertex_attrib_pointer_i32(1, 1, glow::UNSIGNED_INT, stride, 8);
         // The fill pipeline has no quad/ring SDF — no u_pad uniform.
-        Ok(GpuPipeline { program, vao, instance_vbo: vbo, u_view, u_pad: None })
+        Ok(GpuPipeline {
+            program,
+            vao,
+            instance_vbo: vbo,
+            u_view,
+            u_pad: None,
+        })
     }
 
     /// Upload both instance buffers and draw (one call per non-empty pipeline).
@@ -610,16 +675,42 @@ impl GpuShapeRenderer {
         }
         // Fills first so strokes (faces, outlines) land ON TOP of areas.
         Self::draw_fill(gl, &self.fill, Some(bytes(fills)), fills.len(), view);
-        Self::draw(gl, &self.circle,  Some(bytes(circles)),  circles.len(),  view, pad);
-        Self::draw(gl, &self.arc,     Some(bytes(arcs)),     arcs.len(),     view, pad);
-        Self::draw(gl, &self.ellipse, Some(bytes(ellipses)), ellipses.len(), view, pad);
-        Self::draw(gl, &self.line,    Some(bytes(lines)),    lines.len(),    view, 0.0);
-        unsafe { gl.use_program(None); }
+        Self::draw(
+            gl,
+            &self.circle,
+            Some(bytes(circles)),
+            circles.len(),
+            view,
+            pad,
+        );
+        Self::draw(gl, &self.arc, Some(bytes(arcs)), arcs.len(), view, pad);
+        Self::draw(
+            gl,
+            &self.ellipse,
+            Some(bytes(ellipses)),
+            ellipses.len(),
+            view,
+            pad,
+        );
+        Self::draw(gl, &self.line, Some(bytes(lines)), lines.len(), view, 0.0);
+        unsafe {
+            gl.use_program(None);
+        }
         // B25: remember counts so render_cached can redraw the VBOs without upload.
-        self.last_counts = [fills.len(), circles.len(), arcs.len(), ellipses.len(), lines.len()];
+        self.last_counts = [
+            fills.len(),
+            circles.len(),
+            arcs.len(),
+            ellipses.len(),
+            lines.len(),
+        ];
         // P0.1: with profiling on, block for GPU completion so last_frame_us
         // captures actual draw EXECUTION, not just the CPU-side submit.
-        if self.profile_finish { unsafe { gl.finish(); } }
+        if self.profile_finish {
+            unsafe {
+                gl.finish();
+            }
+        }
         // P0: upload+draw µs (the buffer_data DYNAMIC_DRAW cost B25 targets).
         self.last_frame_us = _p0.elapsed().as_micros() as u64;
     }
@@ -634,12 +725,18 @@ impl GpuShapeRenderer {
             gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
         }
         Self::draw_fill(gl, &self.fill, None, self.last_counts[0], view);
-        Self::draw(gl, &self.circle,  None, self.last_counts[1], view, pad);
-        Self::draw(gl, &self.arc,     None, self.last_counts[2], view, pad);
+        Self::draw(gl, &self.circle, None, self.last_counts[1], view, pad);
+        Self::draw(gl, &self.arc, None, self.last_counts[2], view, pad);
         Self::draw(gl, &self.ellipse, None, self.last_counts[3], view, pad);
-        Self::draw(gl, &self.line,    None, self.last_counts[4], view, 0.0);
-        unsafe { gl.use_program(None); }
-        if self.profile_finish { unsafe { gl.finish(); } }
+        Self::draw(gl, &self.line, None, self.last_counts[4], view, 0.0);
+        unsafe {
+            gl.use_program(None);
+        }
+        if self.profile_finish {
+            unsafe {
+                gl.finish();
+            }
+        }
         self.last_frame_us = _p0.elapsed().as_micros() as u64;
     }
 
@@ -652,11 +749,18 @@ impl GpuShapeRenderer {
         vert_count: usize,
         view: &[f32; 16],
     ) {
-        if vert_count == 0 { return; }
-        let p = match pipe { Some(p) => p, None => return };
+        if vert_count == 0 {
+            return;
+        }
+        let p = match pipe {
+            Some(p) => p,
+            None => return,
+        };
         unsafe {
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
-            if let Some(d) = data { gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, d, glow::DYNAMIC_DRAW); }
+            if let Some(d) = data {
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, d, glow::DYNAMIC_DRAW);
+            }
             gl.use_program(Some(p.program));
             if let Some(loc) = &p.u_view {
                 gl.uniform_matrix_4_f32_slice(Some(loc), false, view);
@@ -675,11 +779,18 @@ impl GpuShapeRenderer {
         view: &[f32; 16],
         pad: f32,
     ) {
-        if count == 0 { return; }
-        let p = match pipe { Some(p) => p, None => return };
+        if count == 0 {
+            return;
+        }
+        let p = match pipe {
+            Some(p) => p,
+            None => return,
+        };
         unsafe {
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
-            if let Some(d) = data { gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, d, glow::DYNAMIC_DRAW); }
+            if let Some(d) = data {
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, d, glow::DYNAMIC_DRAW);
+            }
             gl.use_program(Some(p.program));
             if let Some(loc) = &p.u_view {
                 gl.uniform_matrix_4_f32_slice(Some(loc), false, view);
@@ -709,9 +820,21 @@ pub fn view_matrix(rect_w: f32, rect_h: f32, scale: f32, ox: f32, oy: f32) -> [f
     let sx = 2.0 * scale / rect_w;
     let sy = 2.0 * scale / rect_h;
     [
-        sx,       0.0,      0.0, 0.0,
-        0.0,      sy,       0.0, 0.0,
-        0.0,      0.0,      1.0, 0.0,
-        sx * ox,  sy * oy,  0.0, 1.0,
+        sx,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        sy,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        sx * ox,
+        sy * oy,
+        0.0,
+        1.0,
     ]
 }

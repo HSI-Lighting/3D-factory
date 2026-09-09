@@ -125,7 +125,9 @@ impl Default for ProcParams {
 // toggle said. Hiding the ceiling is the caller's decision now, so nothing here needs the id.)
 const FLOOR: u32 = 0;
 
-const IDENTITY16: [f32; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+const IDENTITY16: [f32; 16] = [
+    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+];
 
 /// Per-texture PBR maps (Texture Phase 2): tangent-space **normal** + **roughness** map indices (into
 /// the app's texture list, so they upload through the normal texture cache), plus the scalar
@@ -170,7 +172,23 @@ pub struct PbrParams {
 
 impl Default for PbrParams {
     fn default() -> Self {
-        Self { normal_idx: None, rough_idx: None, metal_idx: None, ao_idx: None, triplanar: false, tiles_per_m: 1.0, roughness: 0.5, transmission: 0.0, metallic: 0.0, ior: 1.5, emission: [0.0; 3], clearcoat: 0.0, clearcoat_rough: 0.1, sheen: 0.0, sheen_tint: [1.0; 3] }
+        Self {
+            normal_idx: None,
+            rough_idx: None,
+            metal_idx: None,
+            ao_idx: None,
+            triplanar: false,
+            tiles_per_m: 1.0,
+            roughness: 0.5,
+            transmission: 0.0,
+            metallic: 0.0,
+            ior: 1.5,
+            emission: [0.0; 3],
+            clearcoat: 0.0,
+            clearcoat_rough: 0.1,
+            sheen: 0.0,
+            sheen_tint: [1.0; 3],
+        }
     }
 }
 
@@ -185,7 +203,11 @@ fn shade(base: [f32; 3], n: Vec3) -> [f32; 3] {
 }
 
 fn material_color(materials: &[Material], id: u32) -> [f32; 3] {
-    materials.iter().find(|m| m.id == id).map(|m| m.color).unwrap_or([0.7, 0.7, 0.7])
+    materials
+        .iter()
+        .find(|m| m.id == id)
+        .map(|m| m.color)
+        .unwrap_or([0.7, 0.7, 0.7])
 }
 
 /// Build the flat-shaded triangle soup for the room. If `floor_grid` is given, floor vertices are
@@ -204,15 +226,22 @@ fn material_color(materials: &[Material], id: u32) -> [f32; 3] {
 pub fn build_scene_verts(
     meshes: &[Mesh],
     materials: &[Material],
-    floor_grid: Option<(&LuxGrid, &cad_light::CalcPlane, f64, fn(f32) -> (f32, f32, f32))>,
+    floor_grid: Option<(
+        &LuxGrid,
+        &cad_light::CalcPlane,
+        f64,
+        fn(f32) -> (f32, f32, f32),
+    )>,
 ) -> Vec<V3> {
     let mut out = Vec::new();
     for m in meshes {
         let base = material_color(materials, m.material);
         for t in &m.triangles {
-            let (Some(a), Some(b), Some(c)) =
-                (m.vertices.get(t.a as usize), m.vertices.get(t.b as usize), m.vertices.get(t.c as usize))
-            else {
+            let (Some(a), Some(b), Some(c)) = (
+                m.vertices.get(t.a as usize),
+                m.vertices.get(t.b as usize),
+                m.vertices.get(t.c as usize),
+            ) else {
                 continue;
             };
             let (pa, pb, pc) = (a.to_vec3(), b.to_vec3(), c.to_vec3());
@@ -230,7 +259,18 @@ pub fn build_scene_verts(
                 };
                 // amb = 0: this is the SIMLUX lighting view, whose colours are a false-colour lux
                 // scale or a fixed studio shade — neither is something occlusion may re-grade.
-                out.push(V3 { x: p.x, y: p.y, z: p.z, r: col[0], g: col[1], b: col[2], nx: 0.0, ny: 0.0, nz: 0.0, mode: 0.0 });
+                out.push(V3 {
+                    x: p.x,
+                    y: p.y,
+                    z: p.z,
+                    r: col[0],
+                    g: col[1],
+                    b: col[2],
+                    nx: 0.0,
+                    ny: 0.0,
+                    nz: 0.0,
+                    mode: 0.0,
+                });
             }
         }
     }
@@ -438,7 +478,18 @@ pub fn push_aim_target(out: &mut Vec<V3>, at: Vec3, size: f32, rgb: [f32; 3]) {
 /// Append a small bright octahedron marking a luminaire at (x, y, z).
 pub fn push_luminaire_marker(out: &mut Vec<V3>, x: f32, y: f32, z: f32, s: f32) {
     let c = [1.0, 0.86, 0.38];
-    let v = |dx: f32, dy: f32, dz: f32| V3 { x: x + dx, y: y + dy, z: z + dz, r: c[0], g: c[1], b: c[2], nx: 0.0, ny: 0.0, nz: 0.0, mode: 0.0 };
+    let v = |dx: f32, dy: f32, dz: f32| V3 {
+        x: x + dx,
+        y: y + dy,
+        z: z + dz,
+        r: c[0],
+        g: c[1],
+        b: c[2],
+        nx: 0.0,
+        ny: 0.0,
+        nz: 0.0,
+        mode: 0.0,
+    };
     let top = v(0.0, 0.0, s);
     let bot = v(0.0, 0.0, -s);
     let pn = v(s, 0.0, 0.0);
@@ -482,7 +533,14 @@ pub fn cam_eye(yaw: f32, pitch: f32, dist: f32, target: [f32; 3]) -> [f32; 3] {
 }
 
 /// Orbit-camera MVP: yaw/pitch around `target`, `dist` away, GL depth convention.
-pub fn mvp(yaw: f32, pitch: f32, dist: f32, target: [f32; 3], aspect: f32, ortho: bool) -> [f32; 16] {
+pub fn mvp(
+    yaw: f32,
+    pitch: f32,
+    dist: f32,
+    target: [f32; 3],
+    aspect: f32,
+    ortho: bool,
+) -> [f32; 16] {
     let t = Vec3::from(target);
     let (cp, sp) = (pitch.cos(), pitch.sin());
     let (cy, sy) = (yaw.cos(), yaw.sin());
@@ -511,7 +569,12 @@ pub fn mvp(yaw: f32, pitch: f32, dist: f32, target: [f32; 3], aspect: f32, ortho
         // nothing to see 5 cm in front of the lens. The 0.05 floor still governs close work,
         // where near never binds and behaviour is unchanged.
         let near = (dist * 0.01).max(0.05);
-        Mat4::perspective_rh_gl(45f32.to_radians(), aspect.max(0.01), near, (dist * 6.0).max(80.0))
+        Mat4::perspective_rh_gl(
+            45f32.to_radians(),
+            aspect.max(0.01),
+            near,
+            (dist * 6.0).max(80.0),
+        )
     };
     (proj * view).to_cols_array()
 }
@@ -547,12 +610,24 @@ pub fn aabb_in_frustum(clip: &[f32; 16], mn: [f32; 3], mx: [f32; 3]) -> bool {
         // `w` is negative behind the eye, which makes these comparisons flip — and that is the
         // behaviour wanted, not a bug to guard: a point behind the camera then fails both the
         // near test and one of each opposing pair, so a box entirely behind is culled by `z < -w`.
-        if c.x < -c.w { out[0] += 1; }
-        if c.x > c.w { out[1] += 1; }
-        if c.y < -c.w { out[2] += 1; }
-        if c.y > c.w { out[3] += 1; }
-        if c.z < -c.w { out[4] += 1; }
-        if c.z > c.w { out[5] += 1; }
+        if c.x < -c.w {
+            out[0] += 1;
+        }
+        if c.x > c.w {
+            out[1] += 1;
+        }
+        if c.y < -c.w {
+            out[2] += 1;
+        }
+        if c.y > c.w {
+            out[3] += 1;
+        }
+        if c.z < -c.w {
+            out[4] += 1;
+        }
+        if c.z > c.w {
+            out[5] += 1;
+        }
     }
     !out.iter().any(|&n| n == 8)
 }
@@ -1775,9 +1850,16 @@ const SKY_FS: &str = r#"
 /// translation column and hand back the very error this exists to remove.
 fn camera_relative_vp(vp: &[f32; 16], cam: [f32; 3]) -> ([f32; 16], [f32; 16]) {
     let vp64 = glam::DMat4::from_cols_array(&std::array::from_fn(|i| vp[i] as f64));
-    let rel = vp64 * glam::DMat4::from_translation(
-        glam::DVec3::new(cam[0] as f64, cam[1] as f64, cam[2] as f64));
-    (rel.as_mat4().to_cols_array(), rel.inverse().as_mat4().to_cols_array())
+    let rel = vp64
+        * glam::DMat4::from_translation(glam::DVec3::new(
+            cam[0] as f64,
+            cam[1] as f64,
+            cam[2] as f64,
+        ));
+    (
+        rel.as_mat4().to_cols_array(),
+        rel.inverse().as_mat4().to_cols_array(),
+    )
 }
 
 const SSAO_FS: &str = r#"
@@ -2273,10 +2355,15 @@ fn jitter_mvp(mvp: &[f32; 16], jx: f32, jy: f32, w: i32, h: i32) -> [f32; 16] {
 /// point the light frustum is centred on is exactly equivalent to rotating the light by `R`, and
 /// leaves the fit intact — at half a degree the frustum still covers what it covered.
 fn jitter_sun(
-    dir: [f32; 3], shadow: Option<[f32; 16]>, half_angle: f32, i: u32,
+    dir: [f32; 3],
+    shadow: Option<[f32; 16]>,
+    half_angle: f32,
+    i: u32,
 ) -> ([f32; 3], Option<[f32; 16]>) {
     let (d2, spin) = sun_disc_sample(dir, half_angle, i);
-    let Some(spin) = spin else { return (dir, shadow) };
+    let Some(spin) = spin else {
+        return (dir, shadow);
+    };
     (d2, shadow.map(|m| rotate_light(m, spin)))
 }
 
@@ -2304,7 +2391,10 @@ fn sun_disc_sample(dir: [f32; 3], half_angle: f32, i: u32) -> ([f32; 3], Option<
     if d2 == Vec3::ZERO {
         return (dir, None);
     }
-    ([d2.x, d2.y, d2.z], Some(glam::Quat::from_rotation_arc(d, d2)))
+    (
+        [d2.x, d2.y, d2.z],
+        Some(glam::Quat::from_rotation_arc(d, d2)),
+    )
 }
 
 /// Turn a light matrix by `spin`, as if the light itself had moved.
@@ -2824,7 +2914,10 @@ impl GlCaps {
         // The version string starts "<major>.<minor>" for desktop GL; anything unparseable is
         // treated as the 3.3 floor, which is the safe answer.
         let (mj, mn) = {
-            let head: String = version.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+            let head: String = version
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
             let mut it = head.split('.');
             (
                 it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(3),
@@ -2871,17 +2964,42 @@ impl Scene3dRenderer {
             gl.delete_texture(t);
         }
         for &(lw, lh) in &want {
-            let Ok(t) = gl.create_texture() else { return false };
+            let Ok(t) = gl.create_texture() else {
+                return false;
+            };
             gl.bind_texture(glow::TEXTURE_2D, Some(t));
             gl.tex_image_2d(
-                glow::TEXTURE_2D, 0, glow::RGBA16F as i32, lw, lh, 0,
-                glow::RGBA, glow::FLOAT, glow::PixelUnpackData::Slice(None),
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA16F as i32,
+                lw,
+                lh,
+                0,
+                glow::RGBA,
+                glow::FLOAT,
+                glow::PixelUnpackData::Slice(None),
             );
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::LINEAR as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::LINEAR as i32,
+            );
             // CLAMP, never repeat: a bright window at the left edge must not bleed in from the right.
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_S,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_T,
+                glow::CLAMP_TO_EDGE as i32,
+            );
             self.bloom_tex.push(t);
         }
         gl.bind_texture(glow::TEXTURE_2D, None);
@@ -2894,22 +3012,31 @@ impl Scene3dRenderer {
     /// Returns false when it could not run, so the composite skips it rather than sampling a
     /// texture nothing ever wrote.
     unsafe fn bloom_pass(
-        &mut self, gl: &glow::Context, w: i32, h: i32, ao_ready: bool,
+        &mut self,
+        gl: &glow::Context,
+        w: i32,
+        h: i32,
+        ao_ready: bool,
         color: crate::color::ColorPipeline,
     ) -> bool {
         if color.bloom <= 0.0 || !self.bloom_targets(gl, w, h) {
             return false;
         }
         let (Some(fbo), Some(vao), Some(vbo), Some(pre), Some(down), Some(up), Some(src)) = (
-            self.bloom_fbo, self.blit_vao, self.blit_vbo,
-            self.bloom_pre_prog, self.bloom_down_prog, self.bloom_up_prog, self.color,
+            self.bloom_fbo,
+            self.blit_vao,
+            self.blit_vbo,
+            self.bloom_pre_prog,
+            self.bloom_down_prog,
+            self.bloom_up_prog,
+            self.color,
         ) else {
             return false;
         };
         // A fullscreen pair of triangles in NDC; every bloom pass draws exactly this.
         const FULL: [f32; 24] = [
-            -1.0, -1.0, 0.0, 0.0,  1.0, -1.0, 1.0, 0.0,  1.0, 1.0, 1.0, 1.0,
-            -1.0, -1.0, 0.0, 0.0,  1.0, 1.0, 1.0, 1.0,  -1.0, 1.0, 0.0, 1.0,
+            -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 0.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0,
         ];
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
         gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&FULL), glow::DYNAMIC_DRAW);
@@ -2920,7 +3047,11 @@ impl Scene3dRenderer {
 
         // 1 — bright pass, straight into the top of the pyramid.
         gl.framebuffer_texture_2d(
-            glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(self.bloom_tex[0]), 0,
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(self.bloom_tex[0]),
+            0,
         );
         gl.viewport(0, 0, self.bloom_size[0].0, self.bloom_size[0].1);
         gl.use_program(Some(pre));
@@ -2929,8 +3060,16 @@ impl Scene3dRenderer {
         gl.active_texture(glow::TEXTURE1);
         gl.bind_texture(glow::TEXTURE_2D, self.ambient);
         gl.active_texture(glow::TEXTURE2);
-        gl.bind_texture(glow::TEXTURE_2D, if ao_ready { self.ao_tex[1] } else { None });
-        for (n, v) in [("u_tex", 0), ("u_amb", 1), ("u_ao", 2), ("u_ao_on", ao_ready as i32)] {
+        gl.bind_texture(
+            glow::TEXTURE_2D,
+            if ao_ready { self.ao_tex[1] } else { None },
+        );
+        for (n, v) in [
+            ("u_tex", 0),
+            ("u_amb", 1),
+            ("u_ao", 2),
+            ("u_ao_on", ao_ready as i32),
+        ] {
             if let Some(l) = gl.get_uniform_location(pre, n) {
                 gl.uniform_1_i32(Some(&l), v);
             }
@@ -2954,7 +3093,11 @@ impl Scene3dRenderer {
         }
         for lv in 1..self.bloom_tex.len() {
             gl.framebuffer_texture_2d(
-                glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(self.bloom_tex[lv]), 0,
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(self.bloom_tex[lv]),
+                0,
             );
             gl.viewport(0, 0, self.bloom_size[lv].0, self.bloom_size[lv].1);
             gl.bind_texture(glow::TEXTURE_2D, Some(self.bloom_tex[lv - 1]));
@@ -2975,7 +3118,11 @@ impl Scene3dRenderer {
         gl.blend_func(glow::ONE, glow::ONE);
         for lv in (0..self.bloom_tex.len() - 1).rev() {
             gl.framebuffer_texture_2d(
-                glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(self.bloom_tex[lv]), 0,
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(self.bloom_tex[lv]),
+                0,
             );
             gl.viewport(0, 0, self.bloom_size[lv].0, self.bloom_size[lv].1);
             gl.bind_texture(glow::TEXTURE_2D, Some(self.bloom_tex[lv + 1]));
@@ -3005,8 +3152,13 @@ impl Scene3dRenderer {
     /// accumulation history. Passing `on: false` is how the composite is told the fog is already in
     /// its input: the uniforms still go up, so the shader stays valid, but the branch is skipped.
     unsafe fn set_fog(
-        &self, gl: &glow::Context, prog: glow::Program, fog: &crate::env::FogSettings,
-        cam: [f32; 3], inv_vp: &[f32; 16], on: bool,
+        &self,
+        gl: &glow::Context,
+        prog: glow::Program,
+        fog: &crate::env::FogSettings,
+        cam: [f32; 3],
+        inv_vp: &[f32; 16],
+        on: bool,
     ) {
         const UNIT: i32 = 5;
         gl.active_texture(glow::TEXTURE0 + UNIT as u32);
@@ -3073,13 +3225,18 @@ impl Scene3dRenderer {
         self.geom
     }
 
-
     /// How many groups the frame key is hashed in — see [`Self::taa_sections`].
     const TAA_SECTIONS: usize = 7;
 
     /// What each group is called, in the order they are folded in.
     const TAA_SECTION_NAMES: [&'static str; Self::TAA_SECTIONS] = [
-        "camera", "scene", "overlay/lines", "furniture", "textures", "sun/shadow/env", "materials",
+        "camera",
+        "scene",
+        "overlay/lines",
+        "furniture",
+        "textures",
+        "sun/shadow/env",
+        "materials",
     ];
 
     /// The FIRST section whose hash moved — the culprit.
@@ -3091,7 +3248,10 @@ impl Scene3dRenderer {
     /// A free function rather than an inline `find`, because the first version of its test
     /// re-implemented the search instead of calling it — and then passed happily against a
     /// renderer changed to report the LAST section that moved.
-    fn taa_first_changed(now: &[u64; Self::TAA_SECTIONS], was: &[u64; Self::TAA_SECTIONS]) -> &'static str {
+    fn taa_first_changed(
+        now: &[u64; Self::TAA_SECTIONS],
+        was: &[u64; Self::TAA_SECTIONS],
+    ) -> &'static str {
         Self::TAA_SECTION_NAMES
             .iter()
             .zip(now.iter().zip(was.iter()))
@@ -3111,13 +3271,21 @@ impl Scene3dRenderer {
     /// report: `n=1/16`, every frame, at 300 ms each. This names the group that moved, which is
     /// the difference between "you were dragging the camera" and a real defect.
     pub fn taa_reason(&self) -> &str {
-        if self.taa_stable { "" } else { self.taa_why }
+        if self.taa_stable {
+            ""
+        } else {
+            self.taa_why
+        }
     }
 
     /// Record the frame's geometry for the session dump. Cheap: one `check_framebuffer_status`.
     unsafe fn note_geom(
-        &mut self, gl: &glow::Context, vp: (i32, i32, i32, i32), screen: (i32, i32),
-        env: &crate::env::EnvRender, cascades: usize,
+        &mut self,
+        gl: &glow::Context,
+        vp: (i32, i32, i32, i32),
+        screen: (i32, i32),
+        env: &crate::env::EnvRender,
+        cascades: usize,
     ) {
         let complete = self.fbo.is_some_and(|f| {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f));
@@ -3164,14 +3332,23 @@ impl Scene3dRenderer {
         }
         self.taa_valid = false; // the fresh buffers hold nothing until a resolve writes one
         for i in 0..2 {
-            let Ok(t) = gl.create_texture() else { return false };
+            let Ok(t) = gl.create_texture() else {
+                return false;
+            };
             gl.bind_texture(glow::TEXTURE_2D, Some(t));
             // RGBA16F for the same reason every other buffer here is: this holds scene-referred
             // light, which routinely exceeds 1.0. Accumulating in 8 bits would clip the highlights
             // the view transform exists to roll off, and quantise the average into banding.
             gl.tex_image_2d(
-                glow::TEXTURE_2D, 0, glow::RGBA16F as i32, w, h, 0,
-                glow::RGBA, glow::FLOAT, glow::PixelUnpackData::Slice(None),
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA16F as i32,
+                w,
+                h,
+                0,
+                glow::RGBA,
+                glow::FLOAT,
+                glow::PixelUnpackData::Slice(None),
             );
             for (p, v) in [
                 (glow::TEXTURE_MIN_FILTER, glow::NEAREST),
@@ -3195,16 +3372,29 @@ impl Scene3dRenderer {
     /// `taa_tex[taa_cur]`. Returns the texture the composite should read, or `None` on failure —
     /// in which case the caller falls back to the ordinary single-sample path.
     unsafe fn taa_resolve(
-        &mut self, gl: &glow::Context, w: i32, h: i32, ao_ready: bool, bloom_ready: bool,
-        ssgi_ready: bool, color: crate::color::ColorPipeline, fog: &crate::env::FogSettings,
-        cam: [f32; 3], inv_vp: &[f32; 16], gi: &crate::env::GiSettings,
+        &mut self,
+        gl: &glow::Context,
+        w: i32,
+        h: i32,
+        ao_ready: bool,
+        bloom_ready: bool,
+        ssgi_ready: bool,
+        color: crate::color::ColorPipeline,
+        fog: &crate::env::FogSettings,
+        cam: [f32; 3],
+        inv_vp: &[f32; 16],
+        gi: &crate::env::GiSettings,
     ) -> Option<glow::Texture> {
         if !self.taa_targets(gl, w, h) {
             return None;
         }
-        let (Some(prog), Some(fbo), Some(vao), Some(vbo), Some(src)) =
-            (self.taa_prog, self.taa_fbo, self.blit_vao, self.blit_vbo, self.color)
-        else {
+        let (Some(prog), Some(fbo), Some(vao), Some(vbo), Some(src)) = (
+            self.taa_prog,
+            self.taa_fbo,
+            self.blit_vao,
+            self.blit_vbo,
+            self.color,
+        ) else {
             return None;
         };
         let prev = self.taa_cur;
@@ -3213,15 +3403,19 @@ impl Scene3dRenderer {
             return None;
         };
         const FULL: [f32; 24] = [
-            -1.0, -1.0, 0.0, 0.0,  1.0, -1.0, 1.0, 0.0,  1.0, 1.0, 1.0, 1.0,
-            -1.0, -1.0, 0.0, 0.0,  1.0, 1.0, 1.0, 1.0,  -1.0, 1.0, 0.0, 1.0,
+            -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 0.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0,
         ];
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
         gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&FULL), glow::DYNAMIC_DRAW);
         gl.bind_vertex_array(Some(vao));
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
         gl.framebuffer_texture_2d(
-            glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(dst), 0,
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(dst),
+            0,
         );
         gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
         gl.viewport(0, 0, w, h);
@@ -3240,7 +3434,12 @@ impl Scene3dRenderer {
             gl.bind_texture(glow::TEXTURE_2D, tex);
         }
         for (n, v) in [
-            ("u_tex", 0), ("u_amb", 1), ("u_ao", 2), ("u_bloom", 3), ("u_hist", 4), ("u_ssgi", 6),
+            ("u_tex", 0),
+            ("u_amb", 1),
+            ("u_ao", 2),
+            ("u_bloom", 3),
+            ("u_hist", 4),
+            ("u_ssgi", 6),
             ("u_ao_on", ao_ready as i32),
         ] {
             if let Some(l) = gl.get_uniform_location(prog, n) {
@@ -3279,9 +3478,19 @@ impl Scene3dRenderer {
     /// The one place scene-referred light becomes display pixels: draw `src` into the panel rect
     /// through the view transform. `composed` says `src` already has ambient/occlusion/bloom in it.
     unsafe fn composite(
-        &mut self, gl: &glow::Context, quad: &[f32; 24], src: glow::Texture, composed: bool,
-        ao_ready: bool, bloom_ready: bool, ssgi_ready: bool, color: crate::color::ColorPipeline,
-        fog: &crate::env::FogSettings, cam: [f32; 3], inv_vp: &[f32; 16], rect: (i32, i32, i32, i32),
+        &mut self,
+        gl: &glow::Context,
+        quad: &[f32; 24],
+        src: glow::Texture,
+        composed: bool,
+        ao_ready: bool,
+        bloom_ready: bool,
+        ssgi_ready: bool,
+        color: crate::color::ColorPipeline,
+        fog: &crate::env::FogSettings,
+        cam: [f32; 3],
+        inv_vp: &[f32; 16],
+        rect: (i32, i32, i32, i32),
     ) {
         let (Some(prog), Some(vao), Some(vbo)) = (self.blit_prog, self.blit_vao, self.blit_vbo)
         else {
@@ -3300,37 +3509,72 @@ impl Scene3dRenderer {
         gl.use_program(Some(prog));
         gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, Some(src));
-        if let Some(loc) = &self.u_tex { gl.uniform_1_i32(Some(loc), 0); }
+        if let Some(loc) = &self.u_tex {
+            gl.uniform_1_i32(Some(loc), 0);
+        }
         // Attachment 1 (the ambient) and the blurred occlusion, on their own units.
         gl.active_texture(glow::TEXTURE1);
         gl.bind_texture(glow::TEXTURE_2D, self.ambient);
-        if let Some(loc) = &self.u_blit_amb { gl.uniform_1_i32(Some(loc), 1); }
+        if let Some(loc) = &self.u_blit_amb {
+            gl.uniform_1_i32(Some(loc), 1);
+        }
         gl.active_texture(glow::TEXTURE2);
-        gl.bind_texture(glow::TEXTURE_2D, if ao_ready { self.ao_tex[1] } else { None });
-        if let Some(loc) = &self.u_blit_ao { gl.uniform_1_i32(Some(loc), 2); }
-        if let Some(loc) = &self.u_blit_ao_on { gl.uniform_1_i32(Some(loc), (ao_ready && !composed) as i32); }
+        gl.bind_texture(
+            glow::TEXTURE_2D,
+            if ao_ready { self.ao_tex[1] } else { None },
+        );
+        if let Some(loc) = &self.u_blit_ao {
+            gl.uniform_1_i32(Some(loc), 2);
+        }
+        if let Some(loc) = &self.u_blit_ao_on {
+            gl.uniform_1_i32(Some(loc), (ao_ready && !composed) as i32);
+        }
         gl.active_texture(glow::TEXTURE3);
         gl.bind_texture(glow::TEXTURE_2D, bloom_ready.then(|| self.bloom_tex[0]));
-        if let Some(loc) = &self.u_blit_bloom { gl.uniform_1_i32(Some(loc), 3); }
+        if let Some(loc) = &self.u_blit_bloom {
+            gl.uniform_1_i32(Some(loc), 3);
+        }
         if let Some(loc) = &self.u_blit_bloom_k {
-            gl.uniform_1_f32(Some(loc), if bloom_ready && !composed { color.bloom } else { 0.0 });
+            gl.uniform_1_f32(
+                Some(loc),
+                if bloom_ready && !composed {
+                    color.bloom
+                } else {
+                    0.0
+                },
+            );
         }
         gl.active_texture(glow::TEXTURE0 + 6);
-        gl.bind_texture(glow::TEXTURE_2D, ssgi_ready.then_some(self.ssgi_tex[1]).flatten());
-        if let Some(loc) = &self.u_blit_ssgi { gl.uniform_1_i32(Some(loc), 6); }
+        gl.bind_texture(
+            glow::TEXTURE_2D,
+            ssgi_ready.then_some(self.ssgi_tex[1]).flatten(),
+        );
+        if let Some(loc) = &self.u_blit_ssgi {
+            gl.uniform_1_i32(Some(loc), 6);
+        }
         // 1, not the strength — the gather already applied it. And zero when the input is already
         // composed, so an accumulated buffer's bounce is never counted a second time.
         if let Some(loc) = &self.u_blit_ssgi_k {
             gl.uniform_1_f32(Some(loc), (ssgi_ready && !composed) as i32 as f32);
         }
-        if let Some(loc) = &self.u_blit_composed { gl.uniform_1_i32(Some(loc), composed as i32); }
+        if let Some(loc) = &self.u_blit_composed {
+            gl.uniform_1_i32(Some(loc), composed as i32);
+        }
         // `!composed`: an accumulated buffer already has the fog folded in.
         self.set_fog(gl, prog, fog, cam, inv_vp, !composed);
         gl.active_texture(glow::TEXTURE0);
-        if let Some(loc) = &self.u_blit_view { gl.uniform_1_i32(Some(loc), color.view.id()); }
-        if let Some(loc) = &self.u_blit_exposure { gl.uniform_1_f32(Some(loc), color.exposure); }
-        if let Some(loc) = &self.u_blit_look { gl.uniform_1_f32(Some(loc), color.look); }
-        if let Some(loc) = &self.u_blit_punchy { gl.uniform_1_f32(Some(loc), color.punchy); }
+        if let Some(loc) = &self.u_blit_view {
+            gl.uniform_1_i32(Some(loc), color.view.id());
+        }
+        if let Some(loc) = &self.u_blit_exposure {
+            gl.uniform_1_f32(Some(loc), color.exposure);
+        }
+        if let Some(loc) = &self.u_blit_look {
+            gl.uniform_1_f32(Some(loc), color.look);
+        }
+        if let Some(loc) = &self.u_blit_punchy {
+            gl.uniform_1_f32(Some(loc), color.punchy);
+        }
         gl.bind_vertex_array(Some(vao));
         gl.draw_arrays(glow::TRIANGLES, 0, 6);
         gl.bind_vertex_array(None);
@@ -3354,7 +3598,10 @@ impl Scene3dRenderer {
         unsafe {
             match up {
                 None => {
-                    for t in [self.env_tex.take(), self.env_bg_tex.take()].into_iter().flatten() {
+                    for t in [self.env_tex.take(), self.env_bg_tex.take()]
+                        .into_iter()
+                        .flatten()
+                    {
                         gl.delete_texture(t);
                     }
                     self.env_version = 0;
@@ -3363,7 +3610,10 @@ impl Scene3dRenderer {
                     if self.env_version == up.version && self.env_tex.is_some() {
                         return; // same environment; the pixels are already on the GPU
                     }
-                    for t in [self.env_tex.take(), self.env_bg_tex.take()].into_iter().flatten() {
+                    for t in [self.env_tex.take(), self.env_bg_tex.take()]
+                        .into_iter()
+                        .flatten()
+                    {
                         gl.delete_texture(t);
                     }
                     // The BACKDROP copy: full resolution, its own ordinary mip chain (so a distant
@@ -3388,8 +3638,16 @@ impl Scene3dRenderer {
                             glow::TEXTURE_MIN_FILTER,
                             glow::LINEAR_MIPMAP_LINEAR as i32,
                         );
-                        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-                        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::REPEAT as i32);
+                        gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_MAG_FILTER,
+                            glow::LINEAR as i32,
+                        );
+                        gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_WRAP_S,
+                            glow::REPEAT as i32,
+                        );
                         gl.tex_parameter_i32(
                             glow::TEXTURE_2D,
                             glow::TEXTURE_WRAP_T,
@@ -3424,8 +3682,16 @@ impl Scene3dRenderer {
                         glow::TEXTURE_MIN_FILTER,
                         glow::LINEAR_MIPMAP_LINEAR as i32,
                     );
-                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::REPEAT as i32);
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_MAG_FILTER,
+                        glow::LINEAR as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_WRAP_S,
+                        glow::REPEAT as i32,
+                    );
                     gl.tex_parameter_i32(
                         glow::TEXTURE_2D,
                         glow::TEXTURE_WRAP_T,
@@ -3469,8 +3735,12 @@ impl Scene3dRenderer {
                 }
             }
             // Anisotropic filtering is an extension on GL 3.3 — resolve it once, by name.
-            if gl.supported_extensions().contains("GL_EXT_texture_filter_anisotropic")
-                || gl.supported_extensions().contains("GL_ARB_texture_filter_anisotropic")
+            if gl
+                .supported_extensions()
+                .contains("GL_EXT_texture_filter_anisotropic")
+                || gl
+                    .supported_extensions()
+                    .contains("GL_ARB_texture_filter_anisotropic")
             {
                 self.aniso_max = gl.get_parameter_f32(0x84FF).clamp(1.0, 8.0); // MAX_TEXTURE_MAX_ANISOTROPY
             }
@@ -3641,7 +3911,12 @@ impl Scene3dRenderer {
                 self.blit_prog = Some(blit_prog);
             }
             // Temporal accumulation shares the blit's fullscreen vertex shader too.
-            self.taa_prog = compile(gl, "taa-resolve", BLIT_VS, &TAA_FS.replace("FOG_GLSL", &fog_glsl()));
+            self.taa_prog = compile(
+                gl,
+                "taa-resolve",
+                BLIT_VS,
+                &TAA_FS.replace("FOG_GLSL", &fog_glsl()),
+            );
             self.taa_fbo = gl.create_framebuffer().ok();
 
             // --- sky backdrop, SSAO and its blur: all full-viewport passes sharing BLIT_VS ---
@@ -3721,9 +3996,14 @@ impl Scene3dRenderer {
         if let Some(f) = self.fbo.take() {
             gl.delete_framebuffer(f);
         }
-        for t in [self.color.take(), self.ambient.take(), self.albedo.take(), self.depth.take()]
-            .into_iter()
-            .flatten()
+        for t in [
+            self.color.take(),
+            self.ambient.take(),
+            self.albedo.take(),
+            self.depth.take(),
+        ]
+        .into_iter()
+        .flatten()
         {
             gl.delete_texture(t);
         }
@@ -3744,16 +4024,35 @@ impl Scene3dRenderer {
         }
 
         // A small helper: every target here wants the same clamped, unfiltered-neighbourhood setup.
-        let make_tex = |internal: u32, format: u32, ty: u32, filter: u32| -> Option<glow::Texture> {
-            let t = gl.create_texture().ok()?;
-            gl.bind_texture(glow::TEXTURE_2D, Some(t));
-            gl.tex_image_2d(glow::TEXTURE_2D, 0, internal as i32, w, h, 0, format, ty, glow::PixelUnpackData::Slice(None));
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
-            Some(t)
-        };
+        let make_tex =
+            |internal: u32, format: u32, ty: u32, filter: u32| -> Option<glow::Texture> {
+                let t = gl.create_texture().ok()?;
+                gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    internal as i32,
+                    w,
+                    h,
+                    0,
+                    format,
+                    ty,
+                    glow::PixelUnpackData::Slice(None),
+                );
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter as i32);
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_WRAP_S,
+                    glow::CLAMP_TO_EDGE as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_WRAP_T,
+                    glow::CLAMP_TO_EDGE as i32,
+                );
+                Some(t)
+            };
 
         // RGBA16F, not RGBA8: every pass writes SCENE-REFERRED linear light, which routinely
         // exceeds 1.0 (a sunlit wall, a lamp lens). In 8 bits those values were clipped before the
@@ -3772,14 +4071,43 @@ impl Scene3dRenderer {
         // Depth as a TEXTURE: SSAO reconstructs world position by sampling it, which is impossible
         // with the renderbuffer this used to be. NEAREST — interpolating depth across a silhouette
         // would invent surfaces that are not there.
-        let depth = make_tex(glow::DEPTH_COMPONENT24, glow::DEPTH_COMPONENT, glow::FLOAT, glow::NEAREST);
+        let depth = make_tex(
+            glow::DEPTH_COMPONENT24,
+            glow::DEPTH_COMPONENT,
+            glow::FLOAT,
+            glow::NEAREST,
+        );
 
         let fbo = gl.create_framebuffer().unwrap();
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-        gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, color, 0);
-        gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT1, glow::TEXTURE_2D, ambient, 0);
-        gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT2, glow::TEXTURE_2D, albedo, 0);
-        gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::DEPTH_ATTACHMENT, glow::TEXTURE_2D, depth, 0);
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            color,
+            0,
+        );
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT1,
+            glow::TEXTURE_2D,
+            ambient,
+            0,
+        );
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT2,
+            glow::TEXTURE_2D,
+            albedo,
+            0,
+        );
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::DEPTH_ATTACHMENT,
+            glow::TEXTURE_2D,
+            depth,
+            0,
+        );
         gl.draw_buffers(&[
             glow::COLOR_ATTACHMENT0,
             glow::COLOR_ATTACHMENT1,
@@ -3793,7 +4121,13 @@ impl Scene3dRenderer {
             let f = gl.create_framebuffer().ok();
             if let (Some(t), Some(f)) = (t, f) {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f));
-                gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(t), 0);
+                gl.framebuffer_texture_2d(
+                    glow::FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(t),
+                    0,
+                );
                 gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
                 self.ao_fbo[i] = Some(f);
                 self.ao_tex[i] = Some(t);
@@ -3815,16 +4149,32 @@ impl Scene3dRenderer {
     /// Run the occlusion pass over the depth texture and blur it, leaving the result in
     /// `ao_tex[1]`. Returns `false` if anything it needs is missing, in which case the composite
     /// falls back to no occlusion rather than sampling a stale or absent buffer.
-    unsafe fn run_ssao(&mut self, gl: &glow::Context, ao: &crate::env::AoSettings, mvp: &[f32; 16], cam: [f32; 3], w: i32, h: i32) -> bool {
-        let (Some(prog), Some(blur), Some(depth)) = (self.ssao_prog, self.blur_prog, self.depth) else { return false };
-        let (Some(f0), Some(f1), Some(t0)) = (self.ao_fbo[0], self.ao_fbo[1], self.ao_tex[0]) else { return false };
-        let (Some(vao), Some(vbo)) = (self.blit_vao, self.blit_vbo) else { return false };
+    unsafe fn run_ssao(
+        &mut self,
+        gl: &glow::Context,
+        ao: &crate::env::AoSettings,
+        mvp: &[f32; 16],
+        cam: [f32; 3],
+        w: i32,
+        h: i32,
+    ) -> bool {
+        let (Some(prog), Some(blur), Some(depth)) = (self.ssao_prog, self.blur_prog, self.depth)
+        else {
+            return false;
+        };
+        let (Some(f0), Some(f1), Some(t0)) = (self.ao_fbo[0], self.ao_fbo[1], self.ao_tex[0])
+        else {
+            return false;
+        };
+        let (Some(vao), Some(vbo)) = (self.blit_vao, self.blit_vbo) else {
+            return false;
+        };
         let (rel_vp, rel_inv) = camera_relative_vp(mvp, cam);
 
         // A full-NDC quad; the same buffer the composite uses, re-uploaded.
         const FULL: [f32; 24] = [
-            -1.0, -1.0, 0.0, 0.0,  1.0, -1.0, 1.0, 0.0,  1.0, 1.0, 1.0, 1.0,
-            -1.0, -1.0, 0.0, 0.0,  1.0,  1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0,
+            -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 0.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0,
         ];
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
         gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&FULL), glow::DYNAMIC_DRAW);
@@ -3836,20 +4186,32 @@ impl Scene3dRenderer {
         gl.use_program(Some(prog));
         gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, Some(depth));
-        if let Some(l) = &self.u_ssao_depth { gl.uniform_1_i32(Some(l), 0); }
+        if let Some(l) = &self.u_ssao_depth {
+            gl.uniform_1_i32(Some(l), 0);
+        }
         // CAMERA-RELATIVE, not world — see `camera_relative_vp`. The camera is the origin in this
         // pass, so there is no `u_cam` to send.
-        if let Some(l) = &self.u_ssao_vp { gl.uniform_matrix_4_f32_slice(Some(l), false, &rel_vp); }
-        if let Some(l) = &self.u_ssao_inv_vp { gl.uniform_matrix_4_f32_slice(Some(l), false, &rel_inv); }
-        if let Some(l) = &self.u_ssao_radius { gl.uniform_1_f32(Some(l), ao.radius.max(0.01)); }
-        if let Some(l) = &self.u_ssao_strength { gl.uniform_1_f32(Some(l), ao.strength.clamp(0.0, 2.0)); }
+        if let Some(l) = &self.u_ssao_vp {
+            gl.uniform_matrix_4_f32_slice(Some(l), false, &rel_vp);
+        }
+        if let Some(l) = &self.u_ssao_inv_vp {
+            gl.uniform_matrix_4_f32_slice(Some(l), false, &rel_inv);
+        }
+        if let Some(l) = &self.u_ssao_radius {
+            gl.uniform_1_f32(Some(l), ao.radius.max(0.01));
+        }
+        if let Some(l) = &self.u_ssao_strength {
+            gl.uniform_1_f32(Some(l), ao.strength.clamp(0.0, 2.0));
+        }
         gl.bind_vertex_array(Some(vao));
         gl.draw_arrays(glow::TRIANGLES, 0, 6);
 
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f1));
         gl.use_program(Some(blur));
         gl.bind_texture(glow::TEXTURE_2D, Some(t0));
-        if let Some(l) = &self.u_blur_ao { gl.uniform_1_i32(Some(l), 0); }
+        if let Some(l) = &self.u_blur_ao {
+            gl.uniform_1_i32(Some(l), 0);
+        }
         gl.draw_arrays(glow::TRIANGLES, 0, 6);
         gl.bind_vertex_array(None);
         gl.bind_texture(glow::TEXTURE_2D, None);
@@ -3865,13 +4227,22 @@ impl Scene3dRenderer {
             if let Some(t) = self.refr_tex.take() {
                 gl.delete_texture(t);
             }
-            let Ok(t) = gl.create_texture() else { return false };
+            let Ok(t) = gl.create_texture() else {
+                return false;
+            };
             gl.bind_texture(glow::TEXTURE_2D, Some(t));
             // RGBA16F, like everything else here: this is scene-referred light, and what shows
             // through a window is routinely the brightest thing in the frame.
             gl.tex_image_2d(
-                glow::TEXTURE_2D, 0, glow::RGBA16F as i32, w, h, 0,
-                glow::RGBA, glow::FLOAT, glow::PixelUnpackData::Slice(None),
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA16F as i32,
+                w,
+                h,
+                0,
+                glow::RGBA,
+                glow::FLOAT,
+                glow::PixelUnpackData::Slice(None),
             );
             for (p, v) in [
                 (glow::TEXTURE_MIN_FILTER, glow::LINEAR),
@@ -3901,8 +4272,15 @@ impl Scene3dRenderer {
             if let Ok(d) = gl.create_texture() {
                 gl.bind_texture(glow::TEXTURE_2D, Some(d));
                 gl.tex_image_2d(
-                    glow::TEXTURE_2D, 0, glow::DEPTH_COMPONENT24 as i32, w, h, 0,
-                    glow::DEPTH_COMPONENT, glow::FLOAT, glow::PixelUnpackData::Slice(None),
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::DEPTH_COMPONENT24 as i32,
+                    w,
+                    h,
+                    0,
+                    glow::DEPTH_COMPONENT,
+                    glow::FLOAT,
+                    glow::PixelUnpackData::Slice(None),
                 );
                 for (p, v) in [
                     // NEAREST: interpolating depth across a silhouette invents surfaces that are
@@ -3919,18 +4297,27 @@ impl Scene3dRenderer {
             }
         }
         let (Some(prog), Some(fbo), Some(tex), Some(vao), Some(vbo), Some(lit), Some(amb)) = (
-            self.scene_copy_prog, self.refr_fbo, self.refr_tex, self.blit_vao, self.blit_vbo,
-            self.color, self.ambient,
+            self.scene_copy_prog,
+            self.refr_fbo,
+            self.refr_tex,
+            self.blit_vao,
+            self.blit_vbo,
+            self.color,
+            self.ambient,
         ) else {
             return false;
         };
         const FULL: [f32; 24] = [
-            -1.0, -1.0, 0.0, 0.0,  1.0, -1.0, 1.0, 0.0,  1.0, 1.0, 1.0, 1.0,
-            -1.0, -1.0, 0.0, 0.0,  1.0, 1.0, 1.0, 1.0,  -1.0, 1.0, 0.0, 1.0,
+            -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 0.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0,
         ];
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
         gl.framebuffer_texture_2d(
-            glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0,
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(tex),
+            0,
         );
         gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
         gl.viewport(0, 0, w, h);
@@ -3958,12 +4345,25 @@ impl Scene3dRenderer {
         // …and the depth alongside it, so reflected rays have a scene to march through.
         if let Some(d) = self.refr_depth {
             gl.framebuffer_texture_2d(
-                glow::FRAMEBUFFER, glow::DEPTH_ATTACHMENT, glow::TEXTURE_2D, Some(d), 0,
+                glow::FRAMEBUFFER,
+                glow::DEPTH_ATTACHMENT,
+                glow::TEXTURE_2D,
+                Some(d),
+                0,
             );
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, self.fbo);
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(fbo));
             gl.blit_framebuffer(
-                0, 0, w, h, 0, 0, w, h, glow::DEPTH_BUFFER_BIT, glow::NEAREST,
+                0,
+                0,
+                w,
+                h,
+                0,
+                0,
+                w,
+                h,
+                glow::DEPTH_BUFFER_BIT,
+                glow::NEAREST,
             );
         }
         // Back to the scene, with depth on — the transparent pass draws next.
@@ -3978,10 +4378,16 @@ impl Scene3dRenderer {
     /// Returns false when it could not run, so the composite skips it rather than sampling a
     /// texture nothing ever wrote.
     unsafe fn run_ssgi(
-        &mut self, gl: &glow::Context, gi: &crate::env::GiSettings, ao_ready: bool,
+        &mut self,
+        gl: &glow::Context,
+        gi: &crate::env::GiSettings,
+        ao_ready: bool,
         // No `inv_vp`: this pass derives its own CAMERA-RELATIVE pair from `mvp` + `cam`, because
         // the world one the caller holds is exactly what made the gather's normals noise.
-        mvp: &[f32; 16], cam: [f32; 3], w: i32, h: i32,
+        mvp: &[f32; 16],
+        cam: [f32; 3],
+        w: i32,
+        h: i32,
     ) -> bool {
         if !gi.enabled || gi.strength <= 0.0 {
             return false;
@@ -4002,8 +4408,15 @@ impl Scene3dRenderer {
                 };
                 gl.bind_texture(glow::TEXTURE_2D, Some(t));
                 gl.tex_image_2d(
-                    glow::TEXTURE_2D, 0, glow::RGBA16F as i32, gw, gh, 0,
-                    glow::RGBA, glow::FLOAT, glow::PixelUnpackData::Slice(None),
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA16F as i32,
+                    gw,
+                    gh,
+                    0,
+                    glow::RGBA,
+                    glow::FLOAT,
+                    glow::PixelUnpackData::Slice(None),
                 );
                 for (p, v) in [
                     (glow::TEXTURE_MIN_FILTER, glow::LINEAR),
@@ -4015,7 +4428,11 @@ impl Scene3dRenderer {
                 }
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f));
                 gl.framebuffer_texture_2d(
-                    glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(t), 0,
+                    glow::FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(t),
+                    0,
                 );
                 gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
                 self.ssgi_tex[i] = Some(t);
@@ -4024,20 +4441,28 @@ impl Scene3dRenderer {
             gl.bind_texture(glow::TEXTURE_2D, None);
             self.ssgi_size = (gw, gh);
         }
-        let (Some(prog), Some(blur), Some(vao), Some(vbo)) =
-            (self.ssgi_prog, self.blur_rgb_prog, self.blit_vao, self.blit_vbo)
-        else {
+        let (Some(prog), Some(blur), Some(vao), Some(vbo)) = (
+            self.ssgi_prog,
+            self.blur_rgb_prog,
+            self.blit_vao,
+            self.blit_vbo,
+        ) else {
             return false;
         };
         let (Some(f0), Some(f1), Some(t0), Some(depth), Some(lit), Some(amb), Some(alb)) = (
-            self.ssgi_fbo[0], self.ssgi_fbo[1], self.ssgi_tex[0],
-            self.depth, self.color, self.ambient, self.albedo,
+            self.ssgi_fbo[0],
+            self.ssgi_fbo[1],
+            self.ssgi_tex[0],
+            self.depth,
+            self.color,
+            self.ambient,
+            self.albedo,
         ) else {
             return false;
         };
         const FULL: [f32; 24] = [
-            -1.0, -1.0, 0.0, 0.0,  1.0, -1.0, 1.0, 0.0,  1.0, 1.0, 1.0, 1.0,
-            -1.0, -1.0, 0.0, 0.0,  1.0, 1.0, 1.0, 1.0,  -1.0, 1.0, 0.0, 1.0,
+            -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 0.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0,
         ];
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
         gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&FULL), glow::DYNAMIC_DRAW);
@@ -4050,14 +4475,21 @@ impl Scene3dRenderer {
         gl.viewport(0, 0, gw, gh);
         gl.use_program(Some(prog));
         for (unit, tex) in [
-            (0, Some(depth)), (1, Some(lit)), (2, Some(amb)), (3, Some(alb)),
+            (0, Some(depth)),
+            (1, Some(lit)),
+            (2, Some(amb)),
+            (3, Some(alb)),
             (4, if ao_ready { self.ao_tex[1] } else { None }),
         ] {
             gl.active_texture(glow::TEXTURE0 + unit as u32);
             gl.bind_texture(glow::TEXTURE_2D, tex);
         }
         for (n, v) in [
-            ("u_depth", 0), ("u_lit", 1), ("u_amb", 2), ("u_alb", 3), ("u_ao", 4),
+            ("u_depth", 0),
+            ("u_lit", 1),
+            ("u_amb", 2),
+            ("u_alb", 3),
+            ("u_ao", 4),
             ("u_ao_on", ao_ready as i32),
             // The accumulation sample index, so the gather's jitter varies frame to frame and the
             // refinement converges to the integral instead of re-averaging one fixed set of rays.
@@ -4123,8 +4555,16 @@ impl Scene3dRenderer {
         let tex = gl.create_texture().unwrap();
         gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(tex));
         gl.tex_image_3d(
-            glow::TEXTURE_2D_ARRAY, 0, glow::DEPTH_COMPONENT24 as i32, s, s, CASCADE_MAX as i32, 0,
-            glow::DEPTH_COMPONENT, glow::FLOAT, glow::PixelUnpackData::Slice(None),
+            glow::TEXTURE_2D_ARRAY,
+            0,
+            glow::DEPTH_COMPONENT24 as i32,
+            s,
+            s,
+            CASCADE_MAX as i32,
+            0,
+            glow::DEPTH_COMPONENT,
+            glow::FLOAT,
+            glow::PixelUnpackData::Slice(None),
         );
         for (p, v) in [
             (glow::TEXTURE_MIN_FILTER, glow::NEAREST),
@@ -4136,7 +4576,11 @@ impl Scene3dRenderer {
         }
         // A white border means "nothing in front of this" — a fragment that lands just off the
         // edge of a cascade reads as lit rather than as shadowed by a texel that was never drawn.
-        gl.tex_parameter_f32_slice(glow::TEXTURE_2D_ARRAY, glow::TEXTURE_BORDER_COLOR, &[1.0, 1.0, 1.0, 1.0]);
+        gl.tex_parameter_f32_slice(
+            glow::TEXTURE_2D_ARRAY,
+            glow::TEXTURE_BORDER_COLOR,
+            &[1.0, 1.0, 1.0, 1.0],
+        );
 
         let fbo = gl.create_framebuffer().unwrap();
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
@@ -4151,7 +4595,12 @@ impl Scene3dRenderer {
 
     /// Ensure a furniture instance's GPU buffer exists (shared by the main + shadow passes) and
     /// return its VAO + vertex count.
-    unsafe fn furn_buf(&mut self, gl: &glow::Context, key: u64, verts: &[V3]) -> Option<(glow::VertexArray, i32)> {
+    unsafe fn furn_buf(
+        &mut self,
+        gl: &glow::Context,
+        key: u64,
+        verts: &[V3],
+    ) -> Option<(glow::VertexArray, i32)> {
         if let Some((vao, _vbo, len)) = self.furn_bufs.get(&key).copied() {
             return Some((vao, len));
         }
@@ -4187,12 +4636,21 @@ impl Scene3dRenderer {
     /// Draw one opaque triangle batch. `ver = Some(v)` uses the persistent static VBO for
     /// `slot` and re-uploads only when `v` differs from the last upload; `None` re-uploads into
     /// the shared dynamic VBO every call. Caller has already set the opaque GL state.
-    unsafe fn draw_opaque_batch(&mut self, gl: &glow::Context, verts: &[V3], mvp: &[f32; 16], ver: Option<u64>, slot: usize) {
+    unsafe fn draw_opaque_batch(
+        &mut self,
+        gl: &glow::Context,
+        verts: &[V3],
+        mvp: &[f32; 16],
+        ver: Option<u64>,
+        slot: usize,
+    ) {
         let Some(prog) = self.scene_prog else { return };
         let (vao, vbo, count) = match ver {
             Some(v) => {
                 let (vao, vbo) = (self.static_vao[slot], self.static_vbo[slot]);
-                let (Some(vao), Some(vbo)) = (vao, vbo) else { return };
+                let (Some(vao), Some(vbo)) = (vao, vbo) else {
+                    return;
+                };
                 if self.static_ver[slot] != v {
                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                     gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(verts), glow::STATIC_DRAW);
@@ -4202,7 +4660,9 @@ impl Scene3dRenderer {
                 (vao, vbo, self.static_len[slot])
             }
             None => {
-                let (Some(vao), Some(vbo)) = (self.scene_vao, self.scene_vbo) else { return };
+                let (Some(vao), Some(vbo)) = (self.scene_vao, self.scene_vbo) else {
+                    return;
+                };
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                 gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(verts), glow::DYNAMIC_DRAW);
                 (vao, vbo, verts.len() as i32)
@@ -4210,10 +4670,16 @@ impl Scene3dRenderer {
         };
         let _ = vbo;
         gl.use_program(Some(prog));
-        if let Some(loc) = &self.u_mvp { gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp); }
-        if let Some(loc) = &self.u_alpha { gl.uniform_1_f32(Some(loc), 1.0); }
+        if let Some(loc) = &self.u_mvp {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
+        }
+        if let Some(loc) = &self.u_alpha {
+            gl.uniform_1_f32(Some(loc), 1.0);
+        }
         // The opaque scene batch is already in WORLD space → identity model for the shadow lookup.
-        if let Some(loc) = &self.u_scene_model { gl.uniform_matrix_4_f32_slice(Some(loc), false, &IDENTITY16); }
+        if let Some(loc) = &self.u_scene_model {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, &IDENTITY16);
+        }
         gl.bind_vertex_array(Some(vao));
         gl.draw_arrays(glow::TRIANGLES, 0, count);
         gl.bind_vertex_array(None);
@@ -4223,14 +4689,29 @@ impl Scene3dRenderer {
     /// asset+colour). The buffer is created + uploaded the FIRST time a key is seen and reused
     /// forever after; `mvp` = camera·model, so moving/rotating is just a matrix — no CPU
     /// transform, no re-upload, regardless of triangle count. Opaque GL state already set.
-    unsafe fn draw_furn(&mut self, gl: &glow::Context, key: u64, verts: &[V3], mvp: &[f32; 16], model: &[f32; 16]) {
+    unsafe fn draw_furn(
+        &mut self,
+        gl: &glow::Context,
+        key: u64,
+        verts: &[V3],
+        mvp: &[f32; 16],
+        model: &[f32; 16],
+    ) {
         let Some(prog) = self.scene_prog else { return };
-        let Some((vao, count)) = self.furn_buf(gl, key, verts) else { return };
+        let Some((vao, count)) = self.furn_buf(gl, key, verts) else {
+            return;
+        };
         gl.use_program(Some(prog));
-        if let Some(loc) = &self.u_mvp { gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp); }
-        if let Some(loc) = &self.u_alpha { gl.uniform_1_f32(Some(loc), 1.0); }
+        if let Some(loc) = &self.u_mvp {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
+        }
+        if let Some(loc) = &self.u_alpha {
+            gl.uniform_1_f32(Some(loc), 1.0);
+        }
         // Furniture verts are LOCAL → give the shadow lookup the instance model matrix.
-        if let Some(loc) = &self.u_scene_model { gl.uniform_matrix_4_f32_slice(Some(loc), false, model); }
+        if let Some(loc) = &self.u_scene_model {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, model);
+        }
         gl.bind_vertex_array(Some(vao));
         gl.draw_arrays(glow::TRIANGLES, 0, count);
         gl.bind_vertex_array(None);
@@ -4239,14 +4720,27 @@ impl Scene3dRenderer {
     /// Draw one furniture instance's TRANSLUCENT triangles (glass panes etc.) from a persistent
     /// per-key buffer of [`V3A`]. Blend state (SRC_ALPHA / ONE_MINUS_SRC_ALPHA, depth-write off)
     /// is set once by the caller around the whole transparent pass; ordering is handled CPU-side.
-    unsafe fn draw_transp(&mut self, gl: &glow::Context, key: u64, verts: &[V3A], mvp: &[f32; 16], model: &[f32; 16]) {
+    unsafe fn draw_transp(
+        &mut self,
+        gl: &glow::Context,
+        key: u64,
+        verts: &[V3A],
+        mvp: &[f32; 16],
+        model: &[f32; 16],
+    ) {
         let Some(prog) = self.transp_prog else { return };
         let entry = self.transp_bufs.get(&key).copied();
         let (vao, count) = match entry {
             Some((vao, _vbo, len)) => (vao, len),
             None => {
-                let vbo = match gl.create_buffer() { Ok(b) => b, Err(_) => return };
-                let vao = match gl.create_vertex_array() { Ok(v) => v, Err(_) => return };
+                let vbo = match gl.create_buffer() {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                let vao = match gl.create_vertex_array() {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
                 gl.bind_vertex_array(Some(vao));
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                 gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(verts), glow::STATIC_DRAW);
@@ -4264,10 +4758,14 @@ impl Scene3dRenderer {
             }
         };
         gl.use_program(Some(prog));
-        if let Some(loc) = &self.u_transp_mvp { gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp); }
+        if let Some(loc) = &self.u_transp_mvp {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
+        }
         // Verts are LOCAL, so the world placement has to come in separately — the pane's normal
         // is built from it. See TRANSP_VS.
-        if let Some(loc) = &self.u_transp_model { gl.uniform_matrix_4_f32_slice(Some(loc), false, model); }
+        if let Some(loc) = &self.u_transp_model {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, model);
+        }
         if let Some(loc) = &self.u_transp_uv_org {
             let o = self.uv_origin;
             gl.uniform_3_f32(Some(loc), o[0], o[1], o[2]);
@@ -4286,7 +4784,15 @@ impl Scene3dRenderer {
     /// **data map** (tangent-space normals, roughness) carries numbers rather than colour and must
     /// stay `RGBA8`; decoding one of those would bend every normal toward the surface. The cache is
     /// keyed on the flag too, so the same image can serve as both without fighting over one upload.
-    unsafe fn ensure_texture(&mut self, gl: &glow::Context, idx: usize, w: i32, h: i32, rgba: &[u8], srgb: bool) -> Option<glow::Texture> {
+    unsafe fn ensure_texture(
+        &mut self,
+        gl: &glow::Context,
+        idx: usize,
+        w: i32,
+        h: i32,
+        rgba: &[u8],
+        srgb: bool,
+    ) -> Option<glow::Texture> {
         if let Some(t) = self.tex_images.get(&(idx, srgb)) {
             return Some(*t);
         }
@@ -4296,13 +4802,31 @@ impl Scene3dRenderer {
         let tex = gl.create_texture().ok()?;
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
         gl.tex_image_2d(
-            glow::TEXTURE_2D, 0, if srgb { glow::SRGB8_ALPHA8 } else { glow::RGBA8 } as i32, w, h, 0,
-            glow::RGBA, glow::UNSIGNED_BYTE,
+            glow::TEXTURE_2D,
+            0,
+            if srgb {
+                glow::SRGB8_ALPHA8
+            } else {
+                glow::RGBA8
+            } as i32,
+            w,
+            h,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
             glow::PixelUnpackData::Slice(Some(&rgba[..(w as usize * h as usize * 4)])),
         );
         gl.generate_mipmap(glow::TEXTURE_2D);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR_MIPMAP_LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::LINEAR_MIPMAP_LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::LINEAR as i32,
+        );
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::REPEAT as i32);
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::REPEAT as i32);
         // Anisotropic filtering where the driver has it: a tiled floor seen at a grazing angle is
@@ -4320,68 +4844,134 @@ impl Scene3dRenderer {
     /// Set the procedural-material uniforms for the textured program (already bound). `mode 0`
     /// leaves the shader sampling the bound image.
     unsafe fn set_proc(&self, gl: &glow::Context, proc: &ProcParams) {
-        if let Some(loc) = &self.u_tex_proc { gl.uniform_1_i32(Some(loc), proc.mode); }
-        if let Some(loc) = &self.u_tex_col_a { gl.uniform_3_f32(Some(loc), proc.col_a[0], proc.col_a[1], proc.col_a[2]); }
-        if let Some(loc) = &self.u_tex_col_b { gl.uniform_3_f32(Some(loc), proc.col_b[0], proc.col_b[1], proc.col_b[2]); }
-        if let Some(loc) = &self.u_tex_pscale { gl.uniform_3_f32(Some(loc), proc.scale[0], proc.scale[1], proc.scale[2]); }
-        if let Some(loc) = &self.u_tex_detail { gl.uniform_1_f32(Some(loc), proc.detail); }
-        if let Some(loc) = &self.u_tex_prough { gl.uniform_1_f32(Some(loc), proc.rough); }
-        if let Some(loc) = &self.u_tex_pcontrast { gl.uniform_1_f32(Some(loc), proc.contrast); }
-        if let Some(loc) = &self.u_tex_ramp { gl.uniform_2_f32(Some(loc), proc.ramp[0], proc.ramp[1]); }
-        if let Some(loc) = &self.u_tex_rough_lo { gl.uniform_1_f32(Some(loc), proc.rough_lo); }
-        if let Some(loc) = &self.u_tex_rough_hi { gl.uniform_1_f32(Some(loc), proc.rough_hi); }
-        if let Some(loc) = &self.u_tex_bump { gl.uniform_1_f32(Some(loc), proc.bump); }
+        if let Some(loc) = &self.u_tex_proc {
+            gl.uniform_1_i32(Some(loc), proc.mode);
+        }
+        if let Some(loc) = &self.u_tex_col_a {
+            gl.uniform_3_f32(Some(loc), proc.col_a[0], proc.col_a[1], proc.col_a[2]);
+        }
+        if let Some(loc) = &self.u_tex_col_b {
+            gl.uniform_3_f32(Some(loc), proc.col_b[0], proc.col_b[1], proc.col_b[2]);
+        }
+        if let Some(loc) = &self.u_tex_pscale {
+            gl.uniform_3_f32(Some(loc), proc.scale[0], proc.scale[1], proc.scale[2]);
+        }
+        if let Some(loc) = &self.u_tex_detail {
+            gl.uniform_1_f32(Some(loc), proc.detail);
+        }
+        if let Some(loc) = &self.u_tex_prough {
+            gl.uniform_1_f32(Some(loc), proc.rough);
+        }
+        if let Some(loc) = &self.u_tex_pcontrast {
+            gl.uniform_1_f32(Some(loc), proc.contrast);
+        }
+        if let Some(loc) = &self.u_tex_ramp {
+            gl.uniform_2_f32(Some(loc), proc.ramp[0], proc.ramp[1]);
+        }
+        if let Some(loc) = &self.u_tex_rough_lo {
+            gl.uniform_1_f32(Some(loc), proc.rough_lo);
+        }
+        if let Some(loc) = &self.u_tex_rough_hi {
+            gl.uniform_1_f32(Some(loc), proc.rough_hi);
+        }
+        if let Some(loc) = &self.u_tex_bump {
+            gl.uniform_1_f32(Some(loc), proc.bump);
+        }
     }
 
     /// Bind the PBR normal/roughness maps (units 2/3) for the textured program and set their
     /// presence flags + scalar roughness. Maps come from the app's texture cache (`tex_images`).
     unsafe fn set_pbr(&self, gl: &glow::Context, pbr: &PbrParams) {
         // Data maps, so the LINEAR upload of each (see `ensure_texture`) — never the sRGB one.
-        let nrm = pbr.normal_idx.and_then(|i| self.tex_images.get(&(i, false)).copied());
-        let rgh = pbr.rough_idx.and_then(|i| self.tex_images.get(&(i, false)).copied());
-        let met = pbr.metal_idx.and_then(|i| self.tex_images.get(&(i, false)).copied());
-        let aom = pbr.ao_idx.and_then(|i| self.tex_images.get(&(i, false)).copied());
-        if let Some(loc) = &self.u_tex_has_nrm { gl.uniform_1_i32(Some(loc), nrm.is_some() as i32); }
-        if let Some(loc) = &self.u_tex_has_rough { gl.uniform_1_i32(Some(loc), rgh.is_some() as i32); }
-        if let Some(loc) = &self.u_tex_has_metal { gl.uniform_1_i32(Some(loc), met.is_some() as i32); }
-        if let Some(loc) = &self.u_tex_has_ao { gl.uniform_1_i32(Some(loc), aom.is_some() as i32); }
-        if let Some(loc) = &self.u_tex_triplanar { gl.uniform_1_i32(Some(loc), pbr.triplanar as i32); }
-        if let Some(loc) = &self.u_tex_tpm { gl.uniform_1_f32(Some(loc), pbr.tiles_per_m.max(1e-3)); }
+        let nrm = pbr
+            .normal_idx
+            .and_then(|i| self.tex_images.get(&(i, false)).copied());
+        let rgh = pbr
+            .rough_idx
+            .and_then(|i| self.tex_images.get(&(i, false)).copied());
+        let met = pbr
+            .metal_idx
+            .and_then(|i| self.tex_images.get(&(i, false)).copied());
+        let aom = pbr
+            .ao_idx
+            .and_then(|i| self.tex_images.get(&(i, false)).copied());
+        if let Some(loc) = &self.u_tex_has_nrm {
+            gl.uniform_1_i32(Some(loc), nrm.is_some() as i32);
+        }
+        if let Some(loc) = &self.u_tex_has_rough {
+            gl.uniform_1_i32(Some(loc), rgh.is_some() as i32);
+        }
+        if let Some(loc) = &self.u_tex_has_metal {
+            gl.uniform_1_i32(Some(loc), met.is_some() as i32);
+        }
+        if let Some(loc) = &self.u_tex_has_ao {
+            gl.uniform_1_i32(Some(loc), aom.is_some() as i32);
+        }
+        if let Some(loc) = &self.u_tex_triplanar {
+            gl.uniform_1_i32(Some(loc), pbr.triplanar as i32);
+        }
+        if let Some(loc) = &self.u_tex_tpm {
+            gl.uniform_1_f32(Some(loc), pbr.tiles_per_m.max(1e-3));
+        }
         if let Some(loc) = &self.u_tex_uv_org {
             let o = self.uv_origin;
             gl.uniform_3_f32(Some(loc), o[0], o[1], o[2]);
         }
-        if let Some(loc) = &self.u_tex_rough_base { gl.uniform_1_f32(Some(loc), pbr.roughness); }
-        if let Some(loc) = &self.u_tex_transmission { gl.uniform_1_f32(Some(loc), pbr.transmission.clamp(0.0, 1.0)); }
-        if let Some(loc) = &self.u_tex_metallic { gl.uniform_1_f32(Some(loc), pbr.metallic.clamp(0.0, 1.0)); }
-        if let Some(loc) = &self.u_tex_ior { gl.uniform_1_f32(Some(loc), pbr.ior.clamp(1.0, 3.0)); }
-        if let Some(loc) = &self.u_tex_coat { gl.uniform_1_f32(Some(loc), pbr.clearcoat.clamp(0.0, 1.0)); }
-        if let Some(loc) = &self.u_tex_coat_rough { gl.uniform_1_f32(Some(loc), pbr.clearcoat_rough.clamp(0.01, 1.0)); }
-        if let Some(loc) = &self.u_tex_sheen { gl.uniform_1_f32(Some(loc), pbr.sheen.clamp(0.0, 1.0)); }
+        if let Some(loc) = &self.u_tex_rough_base {
+            gl.uniform_1_f32(Some(loc), pbr.roughness);
+        }
+        if let Some(loc) = &self.u_tex_transmission {
+            gl.uniform_1_f32(Some(loc), pbr.transmission.clamp(0.0, 1.0));
+        }
+        if let Some(loc) = &self.u_tex_metallic {
+            gl.uniform_1_f32(Some(loc), pbr.metallic.clamp(0.0, 1.0));
+        }
+        if let Some(loc) = &self.u_tex_ior {
+            gl.uniform_1_f32(Some(loc), pbr.ior.clamp(1.0, 3.0));
+        }
+        if let Some(loc) = &self.u_tex_coat {
+            gl.uniform_1_f32(Some(loc), pbr.clearcoat.clamp(0.0, 1.0));
+        }
+        if let Some(loc) = &self.u_tex_coat_rough {
+            gl.uniform_1_f32(Some(loc), pbr.clearcoat_rough.clamp(0.01, 1.0));
+        }
+        if let Some(loc) = &self.u_tex_sheen {
+            gl.uniform_1_f32(Some(loc), pbr.sheen.clamp(0.0, 1.0));
+        }
         if let Some(loc) = &self.u_tex_sheen_tint {
             let t = pbr.sheen_tint;
             gl.uniform_3_f32(Some(loc), t[0], t[1], t[2]);
         }
-        if let Some(loc) = &self.u_tex_emission { gl.uniform_3_f32(Some(loc), pbr.emission[0], pbr.emission[1], pbr.emission[2]); }
+        if let Some(loc) = &self.u_tex_emission {
+            gl.uniform_3_f32(Some(loc), pbr.emission[0], pbr.emission[1], pbr.emission[2]);
+        }
         if let Some(tex) = nrm {
             gl.active_texture(glow::TEXTURE2);
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            if let Some(loc) = &self.u_tex_nrm { gl.uniform_1_i32(Some(loc), 2); }
+            if let Some(loc) = &self.u_tex_nrm {
+                gl.uniform_1_i32(Some(loc), 2);
+            }
         }
         if let Some(tex) = rgh {
             gl.active_texture(glow::TEXTURE3);
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            if let Some(loc) = &self.u_tex_rough { gl.uniform_1_i32(Some(loc), 3); }
+            if let Some(loc) = &self.u_tex_rough {
+                gl.uniform_1_i32(Some(loc), 3);
+            }
         }
         if let Some(tex) = met {
             gl.active_texture(glow::TEXTURE4);
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            if let Some(loc) = &self.u_tex_metal_map { gl.uniform_1_i32(Some(loc), 4); }
+            if let Some(loc) = &self.u_tex_metal_map {
+                gl.uniform_1_i32(Some(loc), 4);
+            }
         }
         if let Some(tex) = aom {
             gl.active_texture(glow::TEXTURE5);
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            if let Some(loc) = &self.u_tex_ao_map { gl.uniform_1_i32(Some(loc), 5); }
+            if let Some(loc) = &self.u_tex_ao_map {
+                gl.uniform_1_i32(Some(loc), 5);
+            }
         }
         gl.active_texture(glow::TEXTURE0);
     }
@@ -4390,14 +4980,33 @@ impl Scene3dRenderer {
     /// `TexVtx`, `img` is the bound GL image, `mvp` = camera·model, `model` the world matrix (for
     /// shadows/normal maps). Opaque GL state already set.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn draw_textured(&mut self, gl: &glow::Context, mesh_key: u64, verts: &[TexVtx], mvp: &[f32; 16], model: &[f32; 16], img: glow::Texture, cam: [f32; 3], reflect: f32, proc: ProcParams, pbr: PbrParams, hl: bool) {
+    unsafe fn draw_textured(
+        &mut self,
+        gl: &glow::Context,
+        mesh_key: u64,
+        verts: &[TexVtx],
+        mvp: &[f32; 16],
+        model: &[f32; 16],
+        img: glow::Texture,
+        cam: [f32; 3],
+        reflect: f32,
+        proc: ProcParams,
+        pbr: PbrParams,
+        hl: bool,
+    ) {
         let Some(prog) = self.tex_prog else { return };
         let entry = self.tex_bufs.get(&mesh_key).copied();
         let (vao, count) = match entry {
             Some((vao, _vbo, len)) => (vao, len),
             None => {
-                let vbo = match gl.create_buffer() { Ok(b) => b, Err(_) => return };
-                let vao = match gl.create_vertex_array() { Ok(v) => v, Err(_) => return };
+                let vbo = match gl.create_buffer() {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                let vao = match gl.create_vertex_array() {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
                 gl.bind_vertex_array(Some(vao));
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                 gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(verts), glow::STATIC_DRAW);
@@ -4417,16 +5026,28 @@ impl Scene3dRenderer {
             }
         };
         gl.use_program(Some(prog));
-        if let Some(loc) = &self.u_tex_mvp { gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp); }
-        if let Some(loc) = &self.u_tex_model { gl.uniform_matrix_4_f32_slice(Some(loc), false, model); }
-        if let Some(loc) = &self.u_tex_cam { gl.uniform_3_f32(Some(loc), cam[0], cam[1], cam[2]); }
-        if let Some(loc) = &self.u_tex_reflect { gl.uniform_1_f32(Some(loc), reflect); }
-        if let Some(loc) = &self.u_tex_hl { gl.uniform_1_i32(Some(loc), hl as i32); }
+        if let Some(loc) = &self.u_tex_mvp {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
+        }
+        if let Some(loc) = &self.u_tex_model {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, model);
+        }
+        if let Some(loc) = &self.u_tex_cam {
+            gl.uniform_3_f32(Some(loc), cam[0], cam[1], cam[2]);
+        }
+        if let Some(loc) = &self.u_tex_reflect {
+            gl.uniform_1_f32(Some(loc), reflect);
+        }
+        if let Some(loc) = &self.u_tex_hl {
+            gl.uniform_1_i32(Some(loc), hl as i32);
+        }
         self.set_proc(gl, &proc);
         self.set_pbr(gl, &pbr);
         gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, Some(img));
-        if let Some(loc) = &self.u_tex_img { gl.uniform_1_i32(Some(loc), 0); }
+        if let Some(loc) = &self.u_tex_img {
+            gl.uniform_1_i32(Some(loc), 0);
+        }
         gl.bind_vertex_array(Some(vao));
         gl.draw_arrays(glow::TRIANGLES, 0, count);
         gl.bind_vertex_array(None);
@@ -4437,21 +5058,48 @@ impl Scene3dRenderer {
     /// world-space feature surfaces whose geometry changes on recompute. `mvp` = scene matrix and
     /// the geometry is already world-space, so the world model is the identity.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn draw_textured_dyn(&mut self, gl: &glow::Context, verts: &[TexVtx], mvp: &[f32; 16], img: glow::Texture, cam: [f32; 3], reflect: f32, proc: ProcParams, pbr: PbrParams, hl: bool) {
-        let (Some(prog), Some(vao), Some(vbo)) = (self.tex_prog, self.tex_dyn_vao, self.tex_dyn_vbo) else { return };
+    unsafe fn draw_textured_dyn(
+        &mut self,
+        gl: &glow::Context,
+        verts: &[TexVtx],
+        mvp: &[f32; 16],
+        img: glow::Texture,
+        cam: [f32; 3],
+        reflect: f32,
+        proc: ProcParams,
+        pbr: PbrParams,
+        hl: bool,
+    ) {
+        let (Some(prog), Some(vao), Some(vbo)) =
+            (self.tex_prog, self.tex_dyn_vao, self.tex_dyn_vbo)
+        else {
+            return;
+        };
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
         gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(verts), glow::DYNAMIC_DRAW);
         gl.use_program(Some(prog));
-        if let Some(loc) = &self.u_tex_mvp { gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp); }
-        if let Some(loc) = &self.u_tex_model { gl.uniform_matrix_4_f32_slice(Some(loc), false, &IDENTITY16); }
-        if let Some(loc) = &self.u_tex_cam { gl.uniform_3_f32(Some(loc), cam[0], cam[1], cam[2]); }
-        if let Some(loc) = &self.u_tex_reflect { gl.uniform_1_f32(Some(loc), reflect); }
-        if let Some(loc) = &self.u_tex_hl { gl.uniform_1_i32(Some(loc), hl as i32); }
+        if let Some(loc) = &self.u_tex_mvp {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
+        }
+        if let Some(loc) = &self.u_tex_model {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, &IDENTITY16);
+        }
+        if let Some(loc) = &self.u_tex_cam {
+            gl.uniform_3_f32(Some(loc), cam[0], cam[1], cam[2]);
+        }
+        if let Some(loc) = &self.u_tex_reflect {
+            gl.uniform_1_f32(Some(loc), reflect);
+        }
+        if let Some(loc) = &self.u_tex_hl {
+            gl.uniform_1_i32(Some(loc), hl as i32);
+        }
         self.set_proc(gl, &proc);
         self.set_pbr(gl, &pbr);
         gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, Some(img));
-        if let Some(loc) = &self.u_tex_img { gl.uniform_1_i32(Some(loc), 0); }
+        if let Some(loc) = &self.u_tex_img {
+            gl.uniform_1_i32(Some(loc), 0);
+        }
         gl.bind_vertex_array(Some(vao));
         gl.draw_arrays(glow::TRIANGLES, 0, verts.len() as i32);
         gl.bind_vertex_array(None);
@@ -4667,7 +5315,10 @@ impl Scene3dRenderer {
             sec[6] = f.0; // material passes
 
             self.taa_dbg = dbg;
-            let key = FrameKey { hash: f.0, size: (vp_w, vp_h) };
+            let key = FrameKey {
+                hash: f.0,
+                size: (vp_w, vp_h),
+            };
             self.taa_stable = key == self.taa_key;
             if !self.taa_stable {
                 // NAME THE SECTIONS THAT MOVED, before overwriting them. Each section hash folds
@@ -4717,8 +5368,10 @@ impl Scene3dRenderer {
                         // The SAME rotation for every cascade. Drawing an independent sample per
                         // cascade would light each slice of the view from a slightly different sun,
                         // and the seam where two cascades meet would flicker.
-                        spun_cascades =
-                            shadow_mvp.iter().map(|m| rotate_light(*m, spin)).collect::<Vec<_>>();
+                        spun_cascades = shadow_mvp
+                            .iter()
+                            .map(|m| rotate_light(*m, spin))
+                            .collect::<Vec<_>>();
                         (Some((d2, col)), &spun_cascades[..])
                     }
                     _ => (sun, shadow_mvp),
@@ -4745,14 +5398,28 @@ impl Scene3dRenderer {
                     // `composed` = true, so the fog arguments are inert here — the accumulated
                     // buffer already has it.
                     self.composite(
-                        gl, &quad, src, true, false, false, false, color, &env.fog, cam_pos, mvp,
+                        gl,
+                        &quad,
+                        src,
+                        true,
+                        false,
+                        false,
+                        false,
+                        color,
+                        &env.fog,
+                        cam_pos,
+                        mvp,
                         (vp_left, vp_from_bottom, vp_w, vp_h),
                     );
                     release_scissor(gl, screen_w, screen_h);
                     gl.enable(glow::BLEND);
                     gl.use_program(None);
                     self.note_geom(
-                        gl, (vp_left, vp_from_bottom, vp_w, vp_h), (screen_w, screen_h), &env, 0,
+                        gl,
+                        (vp_left, vp_from_bottom, vp_w, vp_h),
+                        (screen_w, screen_h),
+                        &env,
+                        0,
                     );
                     return;
                 }
@@ -4765,29 +5432,40 @@ impl Scene3dRenderer {
                 use std::collections::HashSet;
                 let live_furn: HashSet<u64> = furn.iter().map(|&(k, _, _, _, _)| k).collect();
                 self.furn_bufs.retain(|k, &mut (vao, vbo, _)| {
-                    if live_furn.contains(k) { return true; }
+                    if live_furn.contains(k) {
+                        return true;
+                    }
                     gl.delete_vertex_array(vao);
                     gl.delete_buffer(vbo);
                     false
                 });
                 let live_transp: HashSet<u64> = transp.iter().map(|&(k, _, _, _)| k).collect();
                 self.transp_bufs.retain(|k, &mut (vao, vbo, _)| {
-                    if live_transp.contains(k) { return true; }
+                    if live_transp.contains(k) {
+                        return true;
+                    }
                     gl.delete_vertex_array(vao);
                     gl.delete_buffer(vbo);
                     false
                 });
-                let live_tex: HashSet<u64> = tex_draws.iter().map(|&(_, k, _, _, _)| k)
-                    .chain(tex_transp.iter().map(|&(_, k, _, _, _)| k)).collect();
+                let live_tex: HashSet<u64> = tex_draws
+                    .iter()
+                    .map(|&(_, k, _, _, _)| k)
+                    .chain(tex_transp.iter().map(|&(_, k, _, _, _)| k))
+                    .collect();
                 self.tex_bufs.retain(|k, &mut (vao, vbo, _)| {
-                    if live_tex.contains(k) { return true; }
+                    if live_tex.contains(k) {
+                        return true;
+                    }
                     gl.delete_vertex_array(vao);
                     gl.delete_buffer(vbo);
                     false
                 });
                 let live_img: HashSet<usize> = tex_assets.iter().map(|&(i, _, _, _)| i).collect();
                 self.tex_images.retain(|&(k, _srgb), &mut tex| {
-                    if live_img.contains(&k) { return true; }
+                    if live_img.contains(&k) {
+                        return true;
+                    }
                     gl.delete_texture(tex);
                     false
                 });
@@ -4801,7 +5479,9 @@ impl Scene3dRenderer {
             let do_shadow = sun.is_some() && !cascades.is_empty();
             if do_shadow {
                 self.ensure_shadow_fbo(gl);
-                if let (Some(dprog), Some(sfbo), Some(stex)) = (self.depth_prog, self.shadow_fbo, self.shadow_tex) {
+                if let (Some(dprog), Some(sfbo), Some(stex)) =
+                    (self.depth_prog, self.shadow_fbo, self.shadow_tex)
+                {
                     gl.bind_framebuffer(glow::FRAMEBUFFER, Some(sfbo));
                     // SCISSOR OFF, and this is the whole ballgame.
                     //
@@ -4829,11 +5509,19 @@ impl Scene3dRenderer {
                     // The scene's static buffer is uploaded ONCE, outside the cascade loop — three
                     // cascades must not mean three re-uploads of a million-triangle villa.
                     let scene_ready = !verts.is_empty()
-                        && match (scene_ver, self.static_vao[scene_slot], self.static_vbo[scene_slot]) {
+                        && match (
+                            scene_ver,
+                            self.static_vao[scene_slot],
+                            self.static_vbo[scene_slot],
+                        ) {
                             (Some(v), Some(_), Some(vbo)) => {
                                 if self.static_ver[scene_slot] != v {
                                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-                                    gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(verts), glow::STATIC_DRAW);
+                                    gl.buffer_data_u8_slice(
+                                        glow::ARRAY_BUFFER,
+                                        bytes(verts),
+                                        glow::STATIC_DRAW,
+                                    );
                                     self.static_ver[scene_slot] = v;
                                     self.static_len[scene_slot] = verts.len() as i32;
                                 }
@@ -4846,13 +5534,19 @@ impl Scene3dRenderer {
                         // clear has to be inside the loop or every cascade after the first would be
                         // drawn on top of the one before.
                         gl.framebuffer_texture_layer(
-                            glow::FRAMEBUFFER, glow::DEPTH_ATTACHMENT, Some(stex), 0, ci as i32,
+                            glow::FRAMEBUFFER,
+                            glow::DEPTH_ATTACHMENT,
+                            Some(stex),
+                            0,
+                            ci as i32,
                         );
                         gl.clear(glow::DEPTH_BUFFER_BIT);
                         // Scene (world-space) → depth_mvp = light_mvp.
                         if scene_ready {
                             if let Some(vao) = self.static_vao[scene_slot] {
-                                if let Some(loc) = &self.u_depth_mvp { gl.uniform_matrix_4_f32_slice(Some(loc), false, lmvp); }
+                                if let Some(loc) = &self.u_depth_mvp {
+                                    gl.uniform_matrix_4_f32_slice(Some(loc), false, lmvp);
+                                }
                                 gl.bind_vertex_array(Some(vao));
                                 gl.draw_arrays(glow::TRIANGLES, 0, self.static_len[scene_slot]);
                             }
@@ -4862,7 +5556,9 @@ impl Scene3dRenderer {
                         for &(key, fverts, _fmvp, ref model, _seen) in furn {
                             if let Some((vao, count)) = self.furn_buf(gl, key, fverts) {
                                 let dm = (lm * Mat4::from_cols_array(model)).to_cols_array();
-                                if let Some(loc) = &self.u_depth_mvp { gl.uniform_matrix_4_f32_slice(Some(loc), false, &dm); }
+                                if let Some(loc) = &self.u_depth_mvp {
+                                    gl.uniform_matrix_4_f32_slice(Some(loc), false, &dm);
+                                }
                                 gl.bind_vertex_array(Some(vao));
                                 gl.draw_arrays(glow::TRIANGLES, 0, count);
                             }
@@ -4910,35 +5606,65 @@ impl Scene3dRenderer {
             if let Some(prog) = self.scene_prog {
                 gl.use_program(Some(prog));
                 self.sky_u_scene.set(gl, &env, ENV_UNIT);
-                if let Some(loc) = &self.u_scene_shadow_on { gl.uniform_1_i32(Some(loc), do_shadow as i32); }
-                if let Some(loc) = &self.u_scene_light_mvp { gl.uniform_matrix_4_f32_slice(Some(loc), false, &lmvps); }
-                if let Some(loc) = &self.u_scene_csm_n { gl.uniform_1_i32(Some(loc), csm_n); }
-                if let Some(loc) = &self.u_scene_shadow { gl.uniform_1_i32(Some(loc), 1); }
-                if let Some(loc) = &self.u_scene_linearize { gl.uniform_1_i32(Some(loc), 0); }
+                if let Some(loc) = &self.u_scene_shadow_on {
+                    gl.uniform_1_i32(Some(loc), do_shadow as i32);
+                }
+                if let Some(loc) = &self.u_scene_light_mvp {
+                    gl.uniform_matrix_4_f32_slice(Some(loc), false, &lmvps);
+                }
+                if let Some(loc) = &self.u_scene_csm_n {
+                    gl.uniform_1_i32(Some(loc), csm_n);
+                }
+                if let Some(loc) = &self.u_scene_shadow {
+                    gl.uniform_1_i32(Some(loc), 1);
+                }
+                if let Some(loc) = &self.u_scene_linearize {
+                    gl.uniform_1_i32(Some(loc), 0);
+                }
             }
             if let Some(prog) = self.transp_prog {
                 gl.use_program(Some(prog));
-                if let Some(loc) = &self.u_transp_linearize { gl.uniform_1_i32(Some(loc), 0); }
+                if let Some(loc) = &self.u_transp_linearize {
+                    gl.uniform_1_i32(Some(loc), 0);
+                }
             }
             if let Some(prog) = self.tex_prog {
                 gl.use_program(Some(prog));
                 let on = sun.is_some();
-                if let Some(loc) = &self.u_tex_sun_on { gl.uniform_1_i32(Some(loc), on as i32); }
+                if let Some(loc) = &self.u_tex_sun_on {
+                    gl.uniform_1_i32(Some(loc), on as i32);
+                }
                 if let Some((d, sc)) = sun {
-                    if let Some(loc) = &self.u_tex_sun_dir { gl.uniform_3_f32(Some(loc), d[0], d[1], d[2]); }
-                    if let Some(loc) = &self.u_tex_sun_col { gl.uniform_3_f32(Some(loc), sc[0], sc[1], sc[2]); }
+                    if let Some(loc) = &self.u_tex_sun_dir {
+                        gl.uniform_3_f32(Some(loc), d[0], d[1], d[2]);
+                    }
+                    if let Some(loc) = &self.u_tex_sun_col {
+                        gl.uniform_3_f32(Some(loc), sc[0], sc[1], sc[2]);
+                    }
                 }
                 self.sky_u_tex.set(gl, &env, ENV_UNIT);
-                if let Some(loc) = &self.u_tex_shadow_on { gl.uniform_1_i32(Some(loc), do_shadow as i32); }
-                if let Some(loc) = &self.u_tex_light_mvp { gl.uniform_matrix_4_f32_slice(Some(loc), false, &lmvps); }
-                if let Some(loc) = &self.u_tex_csm_n { gl.uniform_1_i32(Some(loc), csm_n); }
-                if let Some(loc) = &self.u_tex_shadow { gl.uniform_1_i32(Some(loc), 1); }
-                if let Some(loc) = &self.u_tex_clay { gl.uniform_1_i32(Some(loc), clay as i32); }
+                if let Some(loc) = &self.u_tex_shadow_on {
+                    gl.uniform_1_i32(Some(loc), do_shadow as i32);
+                }
+                if let Some(loc) = &self.u_tex_light_mvp {
+                    gl.uniform_matrix_4_f32_slice(Some(loc), false, &lmvps);
+                }
+                if let Some(loc) = &self.u_tex_csm_n {
+                    gl.uniform_1_i32(Some(loc), csm_n);
+                }
+                if let Some(loc) = &self.u_tex_shadow {
+                    gl.uniform_1_i32(Some(loc), 1);
+                }
+                if let Some(loc) = &self.u_tex_clay {
+                    gl.uniform_1_i32(Some(loc), clay as i32);
+                }
                 // Highlight pulse strength once per frame; per-draw u_hl flags the matching material.
                 if let Some(loc) = &self.u_tex_hl_k {
                     gl.uniform_1_f32(Some(loc), highlight.map(|(_, k)| k).unwrap_or(0.0));
                 }
-                if let Some(loc) = &self.u_tex_hl { gl.uniform_1_i32(Some(loc), 0); }
+                if let Some(loc) = &self.u_tex_hl {
+                    gl.uniform_1_i32(Some(loc), 0);
+                }
             }
 
             // ---- 3D pass into the offscreen FBO --------------------------
@@ -4974,10 +5700,12 @@ impl Scene3dRenderer {
             // image, so the environment looked as though it had failed to load at all.
             let have_sky = env.hdri.is_some() || env.sky.map(|s| s.valid).unwrap_or(false);
             if env.backdrop == crate::env::Backdrop::Sky && have_sky {
-                if let (Some(prog), Some(vao), Some(vbo)) = (self.sky_prog, self.blit_vao, self.blit_vbo) {
+                if let (Some(prog), Some(vao), Some(vbo)) =
+                    (self.sky_prog, self.blit_vao, self.blit_vbo)
+                {
                     const FULL: [f32; 24] = [
-                        -1.0, -1.0, 0.0, 0.0,  1.0, -1.0, 1.0, 0.0,  1.0, 1.0, 1.0, 1.0,
-                        -1.0, -1.0, 0.0, 0.0,  1.0,  1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0,
+                        -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0,
+                        0.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0,
                     ];
                     let inv = Mat4::from_cols_array(mvp).inverse().to_cols_array();
                     gl.disable(glow::DEPTH_TEST);
@@ -4985,8 +5713,12 @@ impl Scene3dRenderer {
                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                     gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&FULL), glow::DYNAMIC_DRAW);
                     gl.use_program(Some(prog));
-                    if let Some(l) = &self.u_sky_inv_vp { gl.uniform_matrix_4_f32_slice(Some(l), false, &inv); }
-                    if let Some(l) = &self.u_sky_cam { gl.uniform_3_f32(Some(l), cam_pos[0], cam_pos[1], cam_pos[2]); }
+                    if let Some(l) = &self.u_sky_inv_vp {
+                        gl.uniform_matrix_4_f32_slice(Some(l), false, &inv);
+                    }
+                    if let Some(l) = &self.u_sky_cam {
+                        gl.uniform_3_f32(Some(l), cam_pos[0], cam_pos[1], cam_pos[2]);
+                    }
                     self.sky_u_bg.set(gl, &env, ENV_UNIT);
                     gl.bind_vertex_array(Some(vao));
                     gl.draw_arrays(glow::TRIANGLES, 0, 6);
@@ -5028,15 +5760,40 @@ impl Scene3dRenderer {
             // correct amount — the shader's `f0`/split-sum already decides how much that is. The
             // old 0.0 fallback made "no opinion" mean "matte", which is not a neutral default: it
             // switched the environment lobe off for every imported material in the scene.
-            let reflect_of = |idx: usize| tex_reflect.iter().find(|(i, _)| *i == idx).map(|(_, r)| *r).unwrap_or(1.0);
-            let proc_of = |idx: usize| tex_proc.iter().find(|(i, _)| *i == idx).map(|(_, p)| *p).unwrap_or_default();
-            let pbr_of = |idx: usize| tex_pbr.iter().find(|(i, _)| *i == idx).map(|(_, p)| *p).unwrap_or_default();
+            let reflect_of = |idx: usize| {
+                tex_reflect
+                    .iter()
+                    .find(|(i, _)| *i == idx)
+                    .map(|(_, r)| *r)
+                    .unwrap_or(1.0)
+            };
+            let proc_of = |idx: usize| {
+                tex_proc
+                    .iter()
+                    .find(|(i, _)| *i == idx)
+                    .map(|(_, p)| *p)
+                    .unwrap_or_default()
+            };
+            let pbr_of = |idx: usize| {
+                tex_pbr
+                    .iter()
+                    .find(|(i, _)| *i == idx)
+                    .map(|(_, p)| *p)
+                    .unwrap_or_default()
+            };
             let hl_of = |idx: usize| highlight.map(|(h, _)| h == idx).unwrap_or(false);
-            if !tex_draws.is_empty() || !tex_feat.is_empty() || !tex_transp.is_empty() || !tex_feat_transp.is_empty() {
+            if !tex_draws.is_empty()
+                || !tex_feat.is_empty()
+                || !tex_transp.is_empty()
+                || !tex_feat_transp.is_empty()
+            {
                 // Which indices are used as DATA maps this frame — they need a second, linear
                 // upload. Most textures are albedo-only and get just the sRGB one.
-                let data_maps: std::collections::HashSet<usize> =
-                    tex_pbr.iter().flat_map(|(_, p)| [p.normal_idx, p.rough_idx, p.metal_idx, p.ao_idx]).flatten().collect();
+                let data_maps: std::collections::HashSet<usize> = tex_pbr
+                    .iter()
+                    .flat_map(|(_, p)| [p.normal_idx, p.rough_idx, p.metal_idx, p.ao_idx])
+                    .flatten()
+                    .collect();
                 for &(idx, w, h, rgba) in tex_assets {
                     let _ = self.ensure_texture(gl, idx, w, h, rgba, true);
                     if data_maps.contains(&idx) {
@@ -5047,21 +5804,47 @@ impl Scene3dRenderer {
                 // the blended pass below, where the flag is turned back on.
                 if let Some(prog) = self.tex_prog {
                     gl.use_program(Some(prog));
-                    if let Some(l) = &self.u_tex_tr_on { gl.uniform_1_i32(Some(l), 0); }
+                    if let Some(l) = &self.u_tex_tr_on {
+                        gl.uniform_1_i32(Some(l), 0);
+                    }
                     // Nor can the opaque pass REFLECT the scene: the copy it would march does not
                     // exist yet — this pass is what fills it.
-                    if let Some(l) = &self.u_tex_ssr_on { gl.uniform_1_i32(Some(l), 0); }
+                    if let Some(l) = &self.u_tex_ssr_on {
+                        gl.uniform_1_i32(Some(l), 0);
+                    }
                 }
                 // Furniture (persistent per-key buffers + model matrix).
                 for &(tex_idx, mesh_key, verts, ref tmvp, ref model) in tex_draws {
                     if let Some(img) = self.tex_images.get(&(tex_idx, true)).copied() {
-                        self.draw_textured(gl, mesh_key, verts, tmvp, model, img, cam_pos, reflect_of(tex_idx), proc_of(tex_idx), pbr_of(tex_idx), hl_of(tex_idx));
+                        self.draw_textured(
+                            gl,
+                            mesh_key,
+                            verts,
+                            tmvp,
+                            model,
+                            img,
+                            cam_pos,
+                            reflect_of(tex_idx),
+                            proc_of(tex_idx),
+                            pbr_of(tex_idx),
+                            hl_of(tex_idx),
+                        );
                     }
                 }
                 // Feature surfaces (dynamic, world-space, scene mvp).
                 for &(tex_idx, verts) in tex_feat {
                     if let Some(img) = self.tex_images.get(&(tex_idx, true)).copied() {
-                        self.draw_textured_dyn(gl, verts, mvp, img, cam_pos, reflect_of(tex_idx), proc_of(tex_idx), pbr_of(tex_idx), hl_of(tex_idx));
+                        self.draw_textured_dyn(
+                            gl,
+                            verts,
+                            mvp,
+                            img,
+                            cam_pos,
+                            reflect_of(tex_idx),
+                            proc_of(tex_idx),
+                            pbr_of(tex_idx),
+                            hl_of(tex_idx),
+                        );
                     }
                 }
             }
@@ -5089,12 +5872,24 @@ impl Scene3dRenderer {
                         gl.active_texture(glow::TEXTURE5);
                         gl.bind_texture(glow::TEXTURE_2D, self.refr_tex);
                         gl.active_texture(glow::TEXTURE0);
-                        if let Some(l) = &self.u_transp_scene { gl.uniform_1_i32(Some(l), 5); }
-                        if let Some(l) = &self.u_transp_scene_vp { gl.uniform_matrix_4_f32_slice(Some(l), false, mvp); }
-                        if let Some(l) = &self.u_transp_cam { gl.uniform_3_f32(Some(l), cam_pos[0], cam_pos[1], cam_pos[2]); }
-                        if let Some(l) = &self.u_transp_refr_vp { gl.uniform_2_f32(Some(l), vp_w as f32, vp_h as f32); }
-                        if let Some(l) = &self.u_transp_ior { gl.uniform_1_f32(Some(l), env.refract.ior.max(1.0)); }
-                        if let Some(l) = &self.u_transp_thick { gl.uniform_1_f32(Some(l), env.refract.thickness.max(0.0)); }
+                        if let Some(l) = &self.u_transp_scene {
+                            gl.uniform_1_i32(Some(l), 5);
+                        }
+                        if let Some(l) = &self.u_transp_scene_vp {
+                            gl.uniform_matrix_4_f32_slice(Some(l), false, mvp);
+                        }
+                        if let Some(l) = &self.u_transp_cam {
+                            gl.uniform_3_f32(Some(l), cam_pos[0], cam_pos[1], cam_pos[2]);
+                        }
+                        if let Some(l) = &self.u_transp_refr_vp {
+                            gl.uniform_2_f32(Some(l), vp_w as f32, vp_h as f32);
+                        }
+                        if let Some(l) = &self.u_transp_ior {
+                            gl.uniform_1_f32(Some(l), env.refract.ior.max(1.0));
+                        }
+                        if let Some(l) = &self.u_transp_thick {
+                            gl.uniform_1_f32(Some(l), env.refract.thickness.max(0.0));
+                        }
                     }
                 }
                 gl.enable(glow::BLEND);
@@ -5119,16 +5914,32 @@ impl Scene3dRenderer {
                         gl.active_texture(glow::TEXTURE6);
                         gl.bind_texture(glow::TEXTURE_2D, self.refr_tex);
                         gl.active_texture(glow::TEXTURE0);
-                        if let Some(l) = &self.u_tex_tr_on { gl.uniform_1_i32(Some(l), 1); }
-                        if let Some(l) = &self.u_tex_tr_scene { gl.uniform_1_i32(Some(l), 6); }
-                        if let Some(l) = &self.u_tex_tr_scene_vp { gl.uniform_matrix_4_f32_slice(Some(l), false, mvp); }
-                        if let Some(l) = &self.u_tex_tr_vp { gl.uniform_2_f32(Some(l), vp_w as f32, vp_h as f32); }
-                        if let Some(l) = &self.u_tex_tr_ior { gl.uniform_1_f32(Some(l), env.refract.ior.max(1.0)); }
+                        if let Some(l) = &self.u_tex_tr_on {
+                            gl.uniform_1_i32(Some(l), 1);
+                        }
+                        if let Some(l) = &self.u_tex_tr_scene {
+                            gl.uniform_1_i32(Some(l), 6);
+                        }
+                        if let Some(l) = &self.u_tex_tr_scene_vp {
+                            gl.uniform_matrix_4_f32_slice(Some(l), false, mvp);
+                        }
+                        if let Some(l) = &self.u_tex_tr_vp {
+                            gl.uniform_2_f32(Some(l), vp_w as f32, vp_h as f32);
+                        }
+                        if let Some(l) = &self.u_tex_tr_ior {
+                            gl.uniform_1_f32(Some(l), env.refract.ior.max(1.0));
+                        }
                         // The Refraction toggle controls the BEND only. Transmission itself is not
                         // an effect to be switched off — it is what the material says it is, and
                         // turning it off would put the pool back to being a lid.
-                        let thick = if env.refract.enabled { env.refract.thickness.max(0.0) } else { 0.0 };
-                        if let Some(l) = &self.u_tex_tr_thick { gl.uniform_1_f32(Some(l), thick); }
+                        let thick = if env.refract.enabled {
+                            env.refract.thickness.max(0.0)
+                        } else {
+                            0.0
+                        };
+                        if let Some(l) = &self.u_tex_tr_thick {
+                            gl.uniform_1_f32(Some(l), thick);
+                        }
                         // The scene's DEPTH on unit 7, beside its colour on 6. Bound whenever the
                         // copy exists and NOT only when reflections are on: the medium/container
                         // test above reads it too, and gating it on an unrelated toggle would put
@@ -5139,30 +5950,64 @@ impl Scene3dRenderer {
                             gl.bind_texture(glow::TEXTURE_2D, self.refr_depth);
                             gl.active_texture(glow::TEXTURE0);
                             let inv = Mat4::from_cols_array(mvp).inverse().to_cols_array();
-                            if let Some(l) = &self.u_tex_ssr_depth { gl.uniform_1_i32(Some(l), 7); }
-                            if let Some(l) = &self.u_tex_ssr_inv_vp { gl.uniform_matrix_4_f32_slice(Some(l), false, &inv); }
+                            if let Some(l) = &self.u_tex_ssr_depth {
+                                gl.uniform_1_i32(Some(l), 7);
+                            }
+                            if let Some(l) = &self.u_tex_ssr_inv_vp {
+                                gl.uniform_matrix_4_f32_slice(Some(l), false, &inv);
+                            }
                         }
                         // SCREEN-SPACE REFLECTIONS proper.
                         let ssr = env.ssr.enabled && have_depth;
-                        if let Some(l) = &self.u_tex_ssr_on { gl.uniform_1_i32(Some(l), ssr as i32); }
+                        if let Some(l) = &self.u_tex_ssr_on {
+                            gl.uniform_1_i32(Some(l), ssr as i32);
+                        }
                         if ssr {
-                            if let Some(l) = &self.u_tex_ssr_dist { gl.uniform_1_f32(Some(l), env.ssr.distance.max(0.1)); }
-                            if let Some(l) = &self.u_tex_ssr_thick { gl.uniform_1_f32(Some(l), env.ssr.thickness.max(0.01)); }
+                            if let Some(l) = &self.u_tex_ssr_dist {
+                                gl.uniform_1_f32(Some(l), env.ssr.distance.max(0.1));
+                            }
+                            if let Some(l) = &self.u_tex_ssr_thick {
+                                gl.uniform_1_f32(Some(l), env.ssr.thickness.max(0.01));
+                            }
                             // The SAME counter the still-frame accumulation averages over, so the
                             // march's jitter decorrelates across exactly the frames being summed.
-                            if let Some(l) = &self.u_tex_ssr_frame { gl.uniform_1_i32(Some(l), self.taa_n as i32); }
+                            if let Some(l) = &self.u_tex_ssr_frame {
+                                gl.uniform_1_i32(Some(l), self.taa_n as i32);
+                            }
                         }
                     }
                 }
                 for &(tex_idx, mesh_key, verts, ref tmvp, ref model) in tex_transp {
                     if let Some(img) = self.tex_images.get(&(tex_idx, true)).copied() {
-                        self.draw_textured(gl, mesh_key, verts, tmvp, model, img, cam_pos, reflect_of(tex_idx), proc_of(tex_idx), pbr_of(tex_idx), hl_of(tex_idx));
+                        self.draw_textured(
+                            gl,
+                            mesh_key,
+                            verts,
+                            tmvp,
+                            model,
+                            img,
+                            cam_pos,
+                            reflect_of(tex_idx),
+                            proc_of(tex_idx),
+                            pbr_of(tex_idx),
+                            hl_of(tex_idx),
+                        );
                     }
                 }
                 // See-through CSG feature solids (world-space, scene mvp); caller sorts back-to-front.
                 for &(tex_idx, verts) in tex_feat_transp {
                     if let Some(img) = self.tex_images.get(&(tex_idx, true)).copied() {
-                        self.draw_textured_dyn(gl, verts, mvp, img, cam_pos, reflect_of(tex_idx), proc_of(tex_idx), pbr_of(tex_idx), hl_of(tex_idx));
+                        self.draw_textured_dyn(
+                            gl,
+                            verts,
+                            mvp,
+                            img,
+                            cam_pos,
+                            reflect_of(tex_idx),
+                            proc_of(tex_idx),
+                            pbr_of(tex_idx),
+                            hl_of(tex_idx),
+                        );
                     }
                 }
                 if scene_copied {
@@ -5191,8 +6036,12 @@ impl Scene3dRenderer {
                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                     gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(overlay), glow::DYNAMIC_DRAW);
                     gl.use_program(Some(prog));
-                    if let Some(loc) = &self.u_scene_shadow_on { gl.uniform_1_i32(Some(loc), 0); } // overlays never shadowed
-                    if let Some(loc) = &self.u_scene_linearize { gl.uniform_1_i32(Some(loc), lin); } // UI colours are sRGB
+                    if let Some(loc) = &self.u_scene_shadow_on {
+                        gl.uniform_1_i32(Some(loc), 0);
+                    } // overlays never shadowed
+                    if let Some(loc) = &self.u_scene_linearize {
+                        gl.uniform_1_i32(Some(loc), lin);
+                    } // UI colours are sRGB
                     if let Some(loc) = &self.u_mvp {
                         gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
                     }
@@ -5219,8 +6068,12 @@ impl Scene3dRenderer {
                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                     gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(lines), glow::DYNAMIC_DRAW);
                     gl.use_program(Some(prog));
-                    if let Some(loc) = &self.u_scene_shadow_on { gl.uniform_1_i32(Some(loc), 0); } // lines never shadowed
-                    if let Some(loc) = &self.u_scene_linearize { gl.uniform_1_i32(Some(loc), lin); } // UI colours are sRGB
+                    if let Some(loc) = &self.u_scene_shadow_on {
+                        gl.uniform_1_i32(Some(loc), 0);
+                    } // lines never shadowed
+                    if let Some(loc) = &self.u_scene_linearize {
+                        gl.uniform_1_i32(Some(loc), lin);
+                    } // UI colours are sRGB
                     if let Some(loc) = &self.u_mvp {
                         gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
                     }
@@ -5264,12 +6117,20 @@ impl Scene3dRenderer {
             // ONE BOUNCE of coloured light between visible surfaces, gathered from the G-buffer.
             // Before the accumulation resolve, so its noise is averaged away by the same sixteen
             // samples that anti-alias the image — a gather this sparse needs that.
-            let ssgi_ready =
-                self.run_ssgi(gl, &env.gi, ao_ready, mvp, cam_pos, vp_w, vp_h);
+            let ssgi_ready = self.run_ssgi(gl, &env.gi, ao_ready, mvp, cam_pos, vp_w, vp_h);
             let accumulated = if taa_on {
                 let t = self.taa_resolve(
-                    gl, vp_w, vp_h, ao_ready, bloom_ready, ssgi_ready, color, &env.fog, cam_pos,
-                    &inv_vp, &env.gi,
+                    gl,
+                    vp_w,
+                    vp_h,
+                    ao_ready,
+                    bloom_ready,
+                    ssgi_ready,
+                    color,
+                    &env.fog,
+                    cam_pos,
+                    &inv_vp,
+                    &env.gi,
                 );
                 if t.is_none() {
                     // The resolve could not run — no buffers, or the program failed to compile.
@@ -5295,8 +6156,18 @@ impl Scene3dRenderer {
             if let Some(src) = accumulated.or(self.color) {
                 let composed = accumulated.is_some();
                 self.composite(
-                    gl, &quad, src, composed, ao_ready, bloom_ready, ssgi_ready, color, &env.fog,
-                    cam_pos, &inv_vp, (vp_left, vp_from_bottom, vp_w, vp_h),
+                    gl,
+                    &quad,
+                    src,
+                    composed,
+                    ao_ready,
+                    bloom_ready,
+                    ssgi_ready,
+                    color,
+                    &env.fog,
+                    cam_pos,
+                    &inv_vp,
+                    (vp_left, vp_from_bottom, vp_w, vp_h),
                 );
             }
 
@@ -5305,12 +6176,14 @@ impl Scene3dRenderer {
             gl.enable(glow::BLEND);
             gl.use_program(None);
             self.note_geom(
-                gl, (vp_left, vp_from_bottom, vp_w, vp_h), (screen_w, screen_h), &env,
+                gl,
+                (vp_left, vp_from_bottom, vp_w, vp_h),
+                (screen_w, screen_h),
+                &env,
                 cascades.len(),
             );
         }
     }
-
 }
 
 /// Compile + link one program, returning `None` (and reporting to stderr) if the driver rejects it.
@@ -5320,14 +6193,22 @@ impl Scene3dRenderer {
 /// error, and every remaining feature dies with it. There is no way to compile GLSL in a unit test
 /// (no context), so the failure mode is real and the honest response is to lose ONE program: the
 /// feature it drove stops drawing, the rest of the viewport still works, and the log says which.
-unsafe fn compile(gl: &glow::Context, name: &str, vs_src: &str, fs_src: &str) -> Option<glow::Program> {
+unsafe fn compile(
+    gl: &glow::Context,
+    name: &str,
+    vs_src: &str,
+    fs_src: &str,
+) -> Option<glow::Program> {
     let program = gl.create_program().ok()?;
     let compile_one = |src: &str, kind: u32, stage: &str| -> Option<glow::Shader> {
         let s = gl.create_shader(kind).ok()?;
         gl.shader_source(s, src);
         gl.compile_shader(s);
         if !gl.get_shader_compile_status(s) {
-            eprintln!("SIMLUX 3D: {name} {stage} shader failed to compile:\n{}", gl.get_shader_info_log(s));
+            eprintln!(
+                "SIMLUX 3D: {name} {stage} shader failed to compile:\n{}",
+                gl.get_shader_info_log(s)
+            );
             gl.delete_shader(s);
             return None;
         }
@@ -5347,7 +6228,10 @@ unsafe fn compile(gl: &glow::Context, name: &str, vs_src: &str, fs_src: &str) ->
     gl.link_program(program);
     let linked = gl.get_program_link_status(program);
     if !linked {
-        eprintln!("SIMLUX 3D: {name} program failed to link:\n{}", gl.get_program_info_log(program));
+        eprintln!(
+            "SIMLUX 3D: {name} program failed to link:\n{}",
+            gl.get_program_info_log(program)
+        );
     }
     gl.delete_shader(vs);
     gl.delete_shader(fs);
@@ -5440,7 +6324,11 @@ pub const HALF_MAX: f32 = 65504.0;
 /// tracer both read the original full-precision map on the CPU, never this copy.
 fn half_safe(v: &f32) -> f32 {
     // NaNs occur in real EXR files, and would propagate exactly as badly.
-    if v.is_nan() { 0.0 } else { v.clamp(-HALF_MAX, HALF_MAX) }
+    if v.is_nan() {
+        0.0
+    } else {
+        v.clamp(-HALF_MAX, HALF_MAX)
+    }
 }
 
 /// Open the scissor back up to the whole window before handing control back to egui.
@@ -5461,7 +6349,14 @@ fn release_scissor(gl: &glow::Context, screen_w: i32, screen_h: i32) {
 }
 
 /// The six vertices (pos.xy, uv) that map the viewport texture onto the panel rect it belongs to.
-fn panel_quad(vp_left: i32, vp_from_bottom: i32, vp_w: i32, vp_h: i32, screen_w: i32, screen_h: i32) -> [f32; 24] {
+fn panel_quad(
+    vp_left: i32,
+    vp_from_bottom: i32,
+    vp_w: i32,
+    vp_h: i32,
+    screen_w: i32,
+    screen_h: i32,
+) -> [f32; 24] {
     let sw = screen_w.max(1) as f32;
     let sh = screen_h.max(1) as f32;
     let x0 = 2.0 * vp_left as f32 / sw - 1.0;
@@ -5469,8 +6364,8 @@ fn panel_quad(vp_left: i32, vp_from_bottom: i32, vp_w: i32, vp_h: i32, screen_w:
     let y0 = 2.0 * vp_from_bottom as f32 / sh - 1.0;
     let y1 = 2.0 * (vp_from_bottom + vp_h) as f32 / sh - 1.0;
     [
-        x0, y0, 0.0, 0.0,  x1, y0, 1.0, 0.0,  x1, y1, 1.0, 1.0,
-        x0, y0, 0.0, 0.0,  x1, y1, 1.0, 1.0,  x0, y1, 0.0, 1.0,
+        x0, y0, 0.0, 0.0, x1, y0, 1.0, 0.0, x1, y1, 1.0, 1.0, x0, y0, 0.0, 0.0, x1, y1, 1.0, 1.0,
+        x0, y1, 0.0, 1.0,
     ]
 }
 
@@ -5511,8 +6406,16 @@ mod taa_tests {
         for (jx, jy) in [(0.5, -0.25), (-0.5, 0.5), (0.125, 0.375)] {
             let j = jitter_mvp(&m, jx, jy, w, h);
             let moved = project(&j, p, w, h);
-            assert!((moved.0 - base.0 - jx).abs() < 1e-2, "x moved {} px, wanted {jx}", moved.0 - base.0);
-            assert!((moved.1 - base.1 - jy).abs() < 1e-2, "y moved {} px, wanted {jy}", moved.1 - base.1);
+            assert!(
+                (moved.0 - base.0 - jx).abs() < 1e-2,
+                "x moved {} px, wanted {jx}",
+                moved.0 - base.0
+            );
+            assert!(
+                (moved.1 - base.1 - jy).abs() < 1e-2,
+                "y moved {} px, wanted {jy}",
+                moved.1 - base.1
+            );
         }
     }
 
@@ -5537,8 +6440,10 @@ mod taa_tests {
             let (a, b) = (project(&m, far, w, h), project(&j, far, w, h));
             (b.0 - a.0, b.1 - a.1)
         };
-        assert!((dn.0 - df.0).abs() < 1e-2 && (dn.1 - df.1).abs() < 1e-2,
-            "near moved {dn:?}, far moved {df:?} — the shift is depth-dependent");
+        assert!(
+            (dn.0 - df.0).abs() < 1e-2 && (dn.1 - df.1).abs() < 1e-2,
+            "near moved {dn:?}, far moved {df:?} — the shift is depth-dependent"
+        );
     }
 
     /// Zero jitter must be the identity, because sample 0 is deliberately unjittered: the first
@@ -5556,10 +6461,16 @@ mod taa_tests {
         let mut quadrants = [0u32; 4];
         for i in 1..=16u32 {
             let (x, y) = halton_jitter(i);
-            assert!(x.abs() <= 0.5 && y.abs() <= 0.5, "sample {i} at ({x}, {y}) left the pixel");
+            assert!(
+                x.abs() <= 0.5 && y.abs() <= 0.5,
+                "sample {i} at ({x}, {y}) left the pixel"
+            );
             quadrants[((x > 0.0) as usize) | (((y > 0.0) as usize) << 1)] += 1;
         }
-        assert!(quadrants.iter().all(|&n| n >= 3), "samples bunched into a corner: {quadrants:?}");
+        assert!(
+            quadrants.iter().all(|&n| n >= 3),
+            "samples bunched into a corner: {quadrants:?}"
+        );
         // Halton's point is that SHORT prefixes are already even, so the image looks right long
         // before the last sample arrives.
         let (mut sx, mut sy) = (0.0, 0.0);
@@ -5568,7 +6479,10 @@ mod taa_tests {
             sx += x;
             sy += y;
         }
-        assert!(sx.abs() < 0.5 && sy.abs() < 0.5, "the first four samples are already lopsided");
+        assert!(
+            sx.abs() < 0.5 && sy.abs() < 0.5,
+            "the first four samples are already lopsided"
+        );
     }
 
     /// The running blend must be a TRUE mean, not an exponential fade.
@@ -5585,8 +6499,14 @@ mod taa_tests {
             acc = acc * (1.0 - b) + s * b; // exactly what `mix(hist, cur, u_blend)` computes
         }
         let mean = samples.iter().sum::<f32>() / samples.len() as f32;
-        assert!((acc - mean).abs() < 1e-5, "accumulated {acc}, true mean {mean}");
-        assert!((1.0f32 / 1.0 - 1.0).abs() < 1e-9, "the first sample must replace, not blend");
+        assert!(
+            (acc - mean).abs() < 1e-5,
+            "accumulated {acc}, true mean {mean}"
+        );
+        assert!(
+            (1.0f32 / 1.0 - 1.0).abs() < 1e-9,
+            "the first sample must replace, not blend"
+        );
     }
 
     /// The resolve has to compose the frame EXACTLY as the composite would, or turning
@@ -5594,11 +6514,16 @@ mod taa_tests {
     #[test]
     fn the_accumulator_composes_the_image_the_composite_does() {
         for term in ["u_amb", "u_ao", "u_ao_on", "u_bloom_k"] {
-            assert!(TAA_FS.contains(term), "the resolve reads {term}, as the composite does");
+            assert!(
+                TAA_FS.contains(term),
+                "the resolve reads {term}, as the composite does"
+            );
         }
         assert!(TAA_FS.contains("c.rgb + a * ao"), "composed identically");
-        assert!(TAA_FS.contains("if (u_bloom_k > 0.0) lit += texture(u_bloom, v_uv).rgb * u_bloom_k;"),
-            "bloom folded in identically");
+        assert!(
+            TAA_FS.contains("if (u_bloom_k > 0.0) lit += texture(u_bloom, v_uv).rgb * u_bloom_k;"),
+            "bloom folded in identically"
+        );
     }
 
     /// Averaging must happen in scene-referred LINEAR light, before the view transform.
@@ -5608,18 +6533,32 @@ mod taa_tests {
     /// map converges to the wrong answer, not merely a slightly different one.
     #[test]
     fn accumulation_happens_before_the_view_transform() {
-        assert!(!TAA_FS.contains("apply_view"), "the resolve must not tone-map");
-        assert!(!TAA_FS.contains("VIEW_GLSL"), "…nor carry the view transform at all");
-        assert!(BLIT_FS.contains("apply_view(lit)"), "the composite is still the one place it happens");
+        assert!(
+            !TAA_FS.contains("apply_view"),
+            "the resolve must not tone-map"
+        );
+        assert!(
+            !TAA_FS.contains("VIEW_GLSL"),
+            "…nor carry the view transform at all"
+        );
+        assert!(
+            BLIT_FS.contains("apply_view(lit)"),
+            "the composite is still the one place it happens"
+        );
     }
 
     /// …and the composite must not add ambient, occlusion or bloom a second time to a buffer that
     /// already has them folded in.
     #[test]
     fn the_composite_does_not_double_count_accumulated_light() {
-        assert!(BLIT_FS.contains("u_composed"), "the composite is told when its input is composed");
-        assert!(BLIT_FS.contains("(u_composed == 1) ? c.rgb : c.rgb + a * ao"),
-            "…and skips the ambient it already contains");
+        assert!(
+            BLIT_FS.contains("u_composed"),
+            "the composite is told when its input is composed"
+        );
+        assert!(
+            BLIT_FS.contains("(u_composed == 1) ? c.rgb : c.rgb + a * ao"),
+            "…and skips the ambient it already contains"
+        );
     }
 
     /// A changed input must produce a different key. This is the whole safety property: if a key
@@ -5660,37 +6599,77 @@ mod taa_tests {
         // Every field, one at a time — including the ones added last, which is exactly the class
         // of field a hand-written hash forgets.
         let mut variants = Vec::new();
-        let mut v = base; v.mode = 2; variants.push(v);
-        let mut v = base; v.col_a = [0.1, 0.2, 0.3]; variants.push(v);
-        let mut v = base; v.col_b = [0.1, 0.2, 0.3]; variants.push(v);
-        let mut v = base; v.scale = [2.0, 1.0, 1.0]; variants.push(v);
-        let mut v = base; v.detail += 1.0; variants.push(v);
-        let mut v = base; v.rough += 0.25; variants.push(v);
-        let mut v = base; v.contrast += 0.25; variants.push(v);
-        let mut v = base; v.ramp = [0.1, 0.9]; variants.push(v);
-        let mut v = base; v.rough_lo += 0.25; variants.push(v);
-        let mut v = base; v.rough_hi += 0.25; variants.push(v);
-        let mut v = base; v.bump += 0.5; variants.push(v);
+        let mut v = base;
+        v.mode = 2;
+        variants.push(v);
+        let mut v = base;
+        v.col_a = [0.1, 0.2, 0.3];
+        variants.push(v);
+        let mut v = base;
+        v.col_b = [0.1, 0.2, 0.3];
+        variants.push(v);
+        let mut v = base;
+        v.scale = [2.0, 1.0, 1.0];
+        variants.push(v);
+        let mut v = base;
+        v.detail += 1.0;
+        variants.push(v);
+        let mut v = base;
+        v.rough += 0.25;
+        variants.push(v);
+        let mut v = base;
+        v.contrast += 0.25;
+        variants.push(v);
+        let mut v = base;
+        v.ramp = [0.1, 0.9];
+        variants.push(v);
+        let mut v = base;
+        v.rough_lo += 0.25;
+        variants.push(v);
+        let mut v = base;
+        v.rough_hi += 0.25;
+        variants.push(v);
+        let mut v = base;
+        v.bump += 0.5;
+        variants.push(v);
         for (i, v) in variants.iter().enumerate() {
-            assert_ne!(h0, hash(v, &mut buf), "ProcParams variant {i} hashed the same as the default");
+            assert_ne!(
+                h0,
+                hash(v, &mut buf),
+                "ProcParams variant {i} hashed the same as the default"
+            );
         }
         // The colour pipeline too — including bloom, which changes the image without touching a
         // single vertex.
         let c0 = crate::color::ColorPipeline::default();
         let mut c1 = c0;
         c1.bloom += 0.1;
-        assert_ne!(hash(&c0, &mut buf), hash(&c1, &mut buf), "a bloom change went unnoticed");
+        assert_ne!(
+            hash(&c0, &mut buf),
+            hash(&c1, &mut buf),
+            "a bloom change went unnoticed"
+        );
         let mut c2 = c0;
         c2.exposure += 0.5;
-        assert_ne!(hash(&c0, &mut buf), hash(&c2, &mut buf), "an exposure change went unnoticed");
+        assert_ne!(
+            hash(&c0, &mut buf),
+            hash(&c2, &mut buf),
+            "an exposure change went unnoticed"
+        );
     }
 
     /// The key covers the viewport SIZE separately, because the accumulation buffers are
     /// viewport-sized: a resize invalidates the history even if every other input is identical.
     #[test]
     fn a_resize_invalidates_the_history() {
-        let a = FrameKey { hash: 7, size: (800, 600) };
-        let b = FrameKey { hash: 7, size: (800, 601) };
+        let a = FrameKey {
+            hash: 7,
+            size: (800, 600),
+        };
+        let b = FrameKey {
+            hash: 7,
+            size: (800, 601),
+        };
         assert_ne!(a, b);
     }
 
@@ -5749,12 +6728,18 @@ mod taa_tests {
         for i in 1..=32 {
             let (d, _) = jitter_sun([dir.x, dir.y, dir.z], None, half, i);
             let d = Vec3::from(d);
-            assert!((d.length() - 1.0).abs() < 1e-4, "sample {i} is not a unit direction");
+            assert!(
+                (d.length() - 1.0).abs() < 1e-4,
+                "sample {i} is not a unit direction"
+            );
             let a = d.dot(dir).clamp(-1.0, 1.0).acos();
             assert!(a <= half * 1.001, "sample {i} left the disc: {a} > {half}");
             spread = spread.max(a);
         }
-        assert!(spread > half * 0.8, "every sample huddled near the centre of the disc");
+        assert!(
+            spread > half * 0.8,
+            "every sample huddled near the centre of the disc"
+        );
     }
 
     /// Sample 0 and a zero-width sun must both leave everything exactly as it was.
@@ -5778,9 +6763,16 @@ mod taa_tests {
     #[test]
     fn the_sun_jitter_is_applied_after_the_frame_key() {
         let src = include_str!("light3d.rs");
-        let key = src.find("let key = FrameKey { hash: f.0").expect("the frame key");
-        let jit = src.find("let (sun, shadow_mvp) = match sun {").expect("the sun jitter");
-        assert!(key < jit, "the sun is jittered before the key is taken — accumulation cannot converge");
+        let key = src
+            .find("let key = FrameKey { hash: f.0")
+            .expect("the frame key");
+        let jit = src
+            .find("let (sun, shadow_mvp) = match sun {")
+            .expect("the sun jitter");
+        assert!(
+            key < jit,
+            "the sun is jittered before the key is taken — accumulation cannot converge"
+        );
     }
 
     /// The fog integral, transcribed from the GLSL — the only way to check it without a context.
@@ -5795,7 +6787,11 @@ mod taa_tests {
         }
         let rho = density * (-falloff * (cam.z - base)).exp();
         let kdz = falloff * seg.z;
-        let tau = if kdz.abs() < 1e-4 { rho * l } else { rho * l * (1.0 - (-kdz).exp()) / kdz };
+        let tau = if kdz.abs() < 1e-4 {
+            rho * l
+        } else {
+            rho * l * (1.0 - (-kdz).exp()) / kdz
+        };
         (-tau.max(0.0)).exp()
     }
 
@@ -5810,7 +6806,10 @@ mod taa_tests {
         let cam = Vec3::new(0.0, 0.0, 2.0);
         let level = transmittance(cam, cam + Vec3::new(200.0, 0.0, 0.0), d, base, k);
         let upward = transmittance(cam, cam + Vec3::new(150.0, 0.0, 132.0), d, base, k); // same length
-        assert!(upward > level, "looking up through the haze picked up MORE of it ({upward} vs {level})");
+        assert!(
+            upward > level,
+            "looking up through the haze picked up MORE of it ({upward} vs {level})"
+        );
         // …and a camera up on a roof sees a clearer world than one at street level.
         let high = Vec3::new(0.0, 0.0, 60.0);
         let from_roof = transmittance(high, high + Vec3::new(200.0, 0.0, 0.0), d, base, k);
@@ -5826,12 +6825,19 @@ mod taa_tests {
         let (d, k) = (0.003f32, 0.04f32);
         let cam = Vec3::new(0.0, 0.0, 1.6);
         let flat = transmittance(cam, cam + Vec3::new(300.0, 0.0, 0.0), d, 0.0, k);
-        assert!(flat.is_finite() && flat > 0.0 && flat < 1.0, "a level look gave {flat}");
+        assert!(
+            flat.is_finite() && flat > 0.0 && flat < 1.0,
+            "a level look gave {flat}"
+        );
         // Approaching level from both sides converges on it — no discontinuity to fall into.
         for eps in [1e-3f32, 1e-4, 1e-5] {
             for sign in [1.0f32, -1.0] {
                 let t = transmittance(cam, cam + Vec3::new(300.0, 0.0, sign * eps), d, 0.0, k);
-                assert!((t - flat).abs() < 5e-3, "Δz={} jumped to {t} from {flat}", sign * eps);
+                assert!(
+                    (t - flat).abs() < 5e-3,
+                    "Δz={} jumped to {t} from {flat}",
+                    sign * eps
+                );
             }
         }
     }
@@ -5846,14 +6852,20 @@ mod taa_tests {
             assert!(t < last, "{m} m was no hazier than the step before it");
             last = t;
         }
-        assert!(last < 0.2, "a kilometre of haze barely touched the image ({last})");
+        assert!(
+            last < 0.2,
+            "a kilometre of haze barely touched the image ({last})"
+        );
     }
 
     /// Zero density must be a true no-op — the setting has to be genuinely free when off.
     #[test]
     fn no_fog_is_no_change() {
         let cam = Vec3::new(3.0, -2.0, 1.5);
-        assert_eq!(transmittance(cam, cam + Vec3::new(500.0, 20.0, -30.0), 0.0, 0.0, 0.05), 1.0);
+        assert_eq!(
+            transmittance(cam, cam + Vec3::new(500.0, 20.0, -30.0), 0.0, 0.0, 0.05),
+            1.0
+        );
     }
 
     /// The composite and the accumulator must apply fog the SAME way, and neither twice.
@@ -5864,13 +6876,28 @@ mod taa_tests {
     #[test]
     fn fog_is_applied_once_and_identically() {
         for src in [TAA_FS, BLIT_FS] {
-            assert!(src.contains("apply_fog(lit, v_uv)"), "both compose fog through one helper");
-            assert!(src.contains("FOG_GLSL"), "…and both include the shared block");
+            assert!(
+                src.contains("apply_fog(lit, v_uv)"),
+                "both compose fog through one helper"
+            );
+            assert!(
+                src.contains("FOG_GLSL"),
+                "…and both include the shared block"
+            );
         }
         let block = fog_glsl();
-        assert!(!block.contains("FOG_GLSL_BODY"), "the integral is spliced in");
-        assert!(block.contains("fog_transmittance"), "…and is the one from crate::env");
-        assert!(block.contains("if (u_fog_on != 1) return lit;"), "off is a real early-out");
+        assert!(
+            !block.contains("FOG_GLSL_BODY"),
+            "the integral is spliced in"
+        );
+        assert!(
+            block.contains("fog_transmittance"),
+            "…and is the one from crate::env"
+        );
+        assert!(
+            block.contains("if (u_fog_on != 1) return lit;"),
+            "off is a real early-out"
+        );
         assert!(
             block.contains("if (d >= 0.999999) return lit;"),
             "the far plane is sky, not a surface — fogging it flattens the backdrop"
@@ -5925,16 +6952,33 @@ mod taa_tests {
     #[test]
     fn cascades_are_selected_by_containment() {
         let g = shadow_glsl();
-        assert!(g.contains(&format!("u_light_mvp[{CASCADE_MAX}]")), "the array is sized by Rust");
-        assert!(!g.contains("CASCADE_MAX_GLSL"), "…and the token is fully substituted");
-        assert!(g.contains("sampler2DArray"), "one array texture, so the layer can be chosen at runtime");
+        assert!(
+            g.contains(&format!("u_light_mvp[{CASCADE_MAX}]")),
+            "the array is sized by Rust"
+        );
+        assert!(
+            !g.contains("CASCADE_MAX_GLSL"),
+            "…and the token is fully substituted"
+        );
+        assert!(
+            g.contains("sampler2DArray"),
+            "one array texture, so the layer can be chosen at runtime"
+        );
         // The out-of-bounds branch must CONTINUE to the next cascade, not return.
         let body = g.split("for (int c = 0").nth(1).expect("the cascade loop");
         let oob = body.find("p.x < 0.0").expect("the bounds test");
-        let cont = body[oob..].find("continue;").expect("…falls through to the next cascade");
+        let cont = body[oob..]
+            .find("continue;")
+            .expect("…falls through to the next cascade");
         let ret = body[oob..].find("return 1.0;").unwrap_or(usize::MAX);
-        assert!(cont < ret, "a fragment outside a cascade gives up instead of trying the next");
-        assert!(g.trim_end().ends_with("}"), "…and the loop ends with an unshadowed fallback");
+        assert!(
+            cont < ret,
+            "a fragment outside a cascade gives up instead of trying the next"
+        );
+        assert!(
+            g.trim_end().ends_with("}"),
+            "…and the loop ends with an unshadowed fallback"
+        );
     }
 
     /// The shadow depth pass must run with egui's SCISSOR OFF.
@@ -5955,7 +6999,10 @@ mod taa_tests {
         let bind = src
             .find("gl.bind_framebuffer(glow::FRAMEBUFFER, Some(sfbo));")
             .expect("the shadow FBO bind");
-        let clear = src[bind..].find("gl.clear(glow::DEPTH_BUFFER_BIT)").expect("the depth clear") + bind;
+        let clear = src[bind..]
+            .find("gl.clear(glow::DEPTH_BUFFER_BIT)")
+            .expect("the depth clear")
+            + bind;
         let off = src[bind..clear].find("gl.disable(glow::SCISSOR_TEST)");
         assert!(
             off.is_some(),
@@ -5987,9 +7034,11 @@ mod taa_tests {
             ("transparent", assemble_transp_fs()),
             ("textured", assemble_tex_fs()),
         ] {
-            assert!(!src.contains("world_at("),
+            assert!(
+                !src.contains("world_at("),
                 "{name}: a world-space depth reconstruction is the bug — reconstruct relative to \
-                 the camera (`rel_at`) instead");
+                 the camera (`rel_at`) instead"
+            );
             for bad in ["dFdx(v_wpos)", "dFdy(v_wpos)"] {
                 assert!(!src.contains(bad),
                     "{name}: {bad} differentiates an un-rebased position, which is cancellation noise");
@@ -5999,14 +7048,21 @@ mod taa_tests {
         // there the name itself is the tell — its normal must come from `Q`.
         let transp = assemble_transp_fs();
         for bad in ["dFdx(P)", "dFdy(P)"] {
-            assert!(!transp.contains(bad),
-                "transparent: {bad} — the pane's normal must come from the rebased Q, not world P");
+            assert!(
+                !transp.contains(bad),
+                "transparent: {bad} — the pane's normal must come from the rebased Q, not world P"
+            );
         }
         // …and the two passes that DO build a normal this way must be doing it the accepted way.
-        assert!(SSAO_FS.contains("vec3 P = rel_at(v_uv);") && SSAO_FS.contains("cross(dFdx(P), dFdy(P))"),
-            "SSAO's normal must come from a camera-relative reconstruction");
-        assert!(SSGI_FS.contains("vec3 P = rel_at(v_uv);"),
-            "SSGI's gather must work camera-relative too");
+        assert!(
+            SSAO_FS.contains("vec3 P = rel_at(v_uv);")
+                && SSAO_FS.contains("cross(dFdx(P), dFdy(P))"),
+            "SSAO's normal must come from a camera-relative reconstruction"
+        );
+        assert!(
+            SSGI_FS.contains("vec3 P = rel_at(v_uv);"),
+            "SSGI's gather must work camera-relative too"
+        );
     }
 
     /// Factoring the camera translation out must happen in f64, and must actually remove it.
@@ -6018,12 +7074,13 @@ mod taa_tests {
     fn the_camera_translation_factors_out_exactly() {
         // A camera 6852 m from the origin, looking down at the model — the real project's siting.
         let eye = glam::Vec3::new(3516.0, -6846.0, 12.0);
-        let view = glam::Mat4::look_at_rh(eye, glam::Vec3::new(3516.0, -6838.0, 1.4), glam::Vec3::Z);
+        let view =
+            glam::Mat4::look_at_rh(eye, glam::Vec3::new(3516.0, -6838.0, 1.4), glam::Vec3::Z);
         let proj = glam::Mat4::perspective_rh_gl(0.9, 1.5, 0.1, 500.0);
         let vp = (proj * view).to_cols_array();
         let (rel_vp, rel_inv) = camera_relative_vp(&vp, eye.to_array());
 
-        let world = glam::Vec3::new(3516.0, -6840.0, 3.0);   // ~11 m in front of the camera
+        let world = glam::Vec3::new(3516.0, -6840.0, 3.0); // ~11 m in front of the camera
         let want = world - eye;
         let clip = glam::Mat4::from_cols_array(&vp) * world.extend(1.0);
 
@@ -6037,8 +7094,10 @@ mod taa_tests {
         // per-pixel one, where neighbouring fragments disagree and the derivative between them is
         // noise. Working relative is what makes those neighbours consistent.
         let clip_rel = glam::Mat4::from_cols_array(&rel_vp) * want.extend(1.0);
-        assert!((clip_rel - clip).truncate().length() / clip.w.abs() < 1e-4,
-            "rel_vp does not agree with vp: {clip_rel:?} vs {clip:?}");
+        assert!(
+            (clip_rel - clip).truncate().length() / clip.w.abs() < 1e-4,
+            "rel_vp does not agree with vp: {clip_rel:?} vs {clip:?}"
+        );
 
         // BACKWARD: the reconstruction hands back an 11 m relative position, not a 6852 m absolute
         // one. That is the whole point — every value downstream stays at scene scale.
@@ -6055,9 +7114,14 @@ mod taa_tests {
         let ndc = clip.truncate() / clip.w;
         let back = glam::Mat4::from_cols_array(&rel_inv) * ndc.extend(1.0);
         let rel = back.truncate() / back.w;
-        assert!((rel - want).length() < 1e-2,
-            "expected the camera-relative {want:?}, got {rel:?}");
-        assert!(rel.length() < 20.0, "…which must be at SCENE scale, not survey scale");
+        assert!(
+            (rel - want).length() < 1e-2,
+            "expected the camera-relative {want:?}, got {rel:?}"
+        );
+        assert!(
+            rel.length() < 20.0,
+            "…which must be at SCENE scale, not survey scale"
+        );
     }
 
     /// A refracting pane builds its normal from an INTERPOLATED rebased position, never from a
@@ -6081,20 +7145,36 @@ mod taa_tests {
     /// are local, so the world placement has to come in separately.
     #[test]
     fn a_refracting_pane_builds_its_normal_from_a_rebased_vertex_position() {
-        assert!(TRANSP_VS.contains("v_qpos = (u_model * vec4(a_pos, 1.0)).xyz - u_uv_org;"),
-            "the rebase must happen per vertex — verts are LOCAL, so the world model is required");
-        assert!(TRANSP_FS.contains("normalize(cross(dFdx(Q), dFdy(Q)))"),
-            "the normal must come from the rebased position");
-        assert!(!TRANSP_FS.contains("gl_FragCoord.z"),
-            "reconstructing position from depth is the bug — it quantises before the derivative");
-        assert!(!TRANSP_FS.contains("dFdx(P)"),
-            "and the un-rebased world position must never be differentiated");
+        assert!(
+            TRANSP_VS.contains("v_qpos = (u_model * vec4(a_pos, 1.0)).xyz - u_uv_org;"),
+            "the rebase must happen per vertex — verts are LOCAL, so the world model is required"
+        );
+        assert!(
+            TRANSP_FS.contains("normalize(cross(dFdx(Q), dFdy(Q)))"),
+            "the normal must come from the rebased position"
+        );
+        assert!(
+            !TRANSP_FS.contains("gl_FragCoord.z"),
+            "reconstructing position from depth is the bug — it quantises before the derivative"
+        );
+        assert!(
+            !TRANSP_FS.contains("dFdx(P)"),
+            "and the un-rebased world position must never be differentiated"
+        );
         // World metres are still needed for the ray itself, and f32 is ample there.
-        assert!(TRANSP_FS.contains("vec3 P = Q + u_uv_org;"),
-            "the refraction ray works in world space, which is fine at metre scale");
+        assert!(
+            TRANSP_FS.contains("vec3 P = Q + u_uv_org;"),
+            "the refraction ray works in world space, which is fine at metre scale"
+        );
         // The SCENE matrix, not the draw's own: `u_mvp` is camera·model here.
-        assert!(TRANSP_FS.contains("u_scene_vp"), "there is no world-space projection to re-project with");
-        assert!(!TRANSP_FS.contains("inverse(u_mvp)"), "inverting the draw matrix lands in model space");
+        assert!(
+            TRANSP_FS.contains("u_scene_vp"),
+            "there is no world-space projection to re-project with"
+        );
+        assert!(
+            !TRANSP_FS.contains("inverse(u_mvp)"),
+            "inverting the draw matrix lands in model space"
+        );
     }
 
     /// A refracting pane must be written OPAQUE.
@@ -6104,23 +7184,45 @@ mod taa_tests {
     /// halves the displacement and leaves a ghost of the straight-through image.
     #[test]
     fn a_refracting_pane_replaces_rather_than_blends() {
-        let f = TRANSP_FS.find("if (u_refr_on == 1)").expect("the refraction branch");
-        let branch = &TRANSP_FS[f..TRANSP_FS[f..].find("        frag = vec4(tint, v_a);").unwrap() + f];
-        assert!(branch.contains("frag = vec4(mix(behind * tint, tint, max(v_a, f)), 1.0);"),
-            "the refracted pane does not write opaque alpha");
-        assert!(branch.contains("return;"), "…and does not leave before the blended path");
+        let f = TRANSP_FS
+            .find("if (u_refr_on == 1)")
+            .expect("the refraction branch");
+        let branch = &TRANSP_FS[f..TRANSP_FS[f..]
+            .find("        frag = vec4(tint, v_a);")
+            .unwrap()
+            + f];
+        assert!(
+            branch.contains("frag = vec4(mix(behind * tint, tint, max(v_a, f)), 1.0);"),
+            "the refracted pane does not write opaque alpha"
+        );
+        assert!(
+            branch.contains("return;"),
+            "…and does not leave before the blended path"
+        );
         // Total internal reflection returns a zero vector; the pane must go clear, not black.
-        assert!(branch.contains("if (dot(Rf, Rf) < 1e-6) uv1 = uv;"), "total internal reflection is unhandled");
+        assert!(
+            branch.contains("if (dot(Rf, Rf) < 1e-6) uv1 = uv;"),
+            "total internal reflection is unhandled"
+        );
     }
 
     /// The scene copy must be taken BEFORE any glass is drawn, or a pane refracts itself.
     #[test]
     fn the_scene_copy_precedes_the_transparent_pass() {
         let src = include_str!("light3d.rs");
-        let copy = src.find("let scene_copied = self.scene_copy(gl, vp_w, vp_h);").expect("the copy call");
-        let draw = src.find("self.draw_transp(gl, key, verts, tmvp)").expect("the flat glass draw");
-        let tex = src.find("for &(tex_idx, mesh_key, verts, ref tmvp, ref model) in tex_transp").expect("the textured glass draw");
-        assert!(copy < draw, "the scene is copied after the flat glass has already been drawn into it");
+        let copy = src
+            .find("let scene_copied = self.scene_copy(gl, vp_w, vp_h);")
+            .expect("the copy call");
+        let draw = src
+            .find("self.draw_transp(gl, key, verts, tmvp)")
+            .expect("the flat glass draw");
+        let tex = src
+            .find("for &(tex_idx, mesh_key, verts, ref tmvp, ref model) in tex_transp")
+            .expect("the textured glass draw");
+        assert!(
+            copy < draw,
+            "the scene is copied after the flat glass has already been drawn into it"
+        );
         assert!(copy < tex, "…or after the TEXTURED glass has");
     }
 
@@ -6133,16 +7235,24 @@ mod taa_tests {
     #[test]
     fn transmission_tints_the_background_rather_than_uncovering_it() {
         let src = assemble_tex_fs();
-        let br = src.find("if (u_tr_on == 1 && alpha < 0.999)").expect("the transmission branch");
+        let br = src
+            .find("if (u_tr_on == 1 && alpha < 0.999)")
+            .expect("the transmission branch");
         let end = src[br..].find("return;").expect("its early out") + br;
         let branch = &src[br..end];
-        assert!(branch.contains("behind * albedo * transmit"),
-            "what comes through must be filtered by the material's own colour");
-        assert!(branch.contains("frag = vec4(spec + body * alpha + behind * albedo * transmit, 1.0);"),
-            "…and the whole result composed here, at alpha 1, so the blender cannot re-mix it");
+        assert!(
+            branch.contains("behind * albedo * transmit"),
+            "what comes through must be filtered by the material's own colour"
+        );
+        assert!(
+            branch.contains("frag = vec4(spec + body * alpha + behind * albedo * transmit, 1.0);"),
+            "…and the whole result composed here, at alpha 1, so the blender cannot re-mix it"
+        );
         // The reflection is NOT part of what fades away as the surface transmits more.
-        assert!(branch.contains("vec3 body = max(direct - spec, vec3(0.0)) + ambient;"),
-            "the specular has to be separated out before the diffuse is scaled by transmission");
+        assert!(
+            branch.contains("vec3 body = max(direct - spec, vec3(0.0)) + ambient;"),
+            "the specular has to be separated out before the diffuse is scaled by transmission"
+        );
         assert!(branch.contains("amb_out = vec4(0.0, 0.0, 0.0, 1.0);"),
             "the scene copy already carries the ambient behind this surface — adding it twice would double it");
     }
@@ -6167,25 +7277,39 @@ mod taa_tests {
     /// re-projection all need true world metres, and all of them are coarse enough not to care.
     #[test]
     fn fine_scale_position_is_rebased_in_the_vertex_shader() {
-        assert!(TEX_VS.contains("v_qpos = v_wpos - u_uv_org;"),
-            "the rebase must happen per vertex, so what gets interpolated is already small");
-        assert!(TEX_VS.contains("uniform vec3 u_uv_org;"),
-            "…which means the vertex stage needs the uniform too");
+        assert!(
+            TEX_VS.contains("v_qpos = v_wpos - u_uv_org;"),
+            "the rebase must happen per vertex, so what gets interpolated is already small"
+        );
+        assert!(
+            TEX_VS.contains("uniform vec3 u_uv_org;"),
+            "…which means the vertex stage needs the uniform too"
+        );
 
         let src = assemble_tex_fs();
-        assert!(!src.contains("v_wpos - u_uv_org"),
-            "rebasing in the fragment shader is the bug — the bits are gone before it runs");
+        assert!(
+            !src.contains("v_wpos - u_uv_org"),
+            "rebasing in the fragment shader is the bug — the bits are gone before it runs"
+        );
         for d in ["dFdx(v_wpos)", "dFdy(v_wpos)"] {
-            assert!(!src.contains(d),
-                "{d}: differentiating the un-rebased position is cancellation noise, not a normal");
+            assert!(
+                !src.contains(d),
+                "{d}: differentiating the un-rebased position is cancellation noise, not a normal"
+            );
         }
-        for call in ["proc_field(v_qpos)", "proc_bump(N, v_qpos, field)",
-                     "cross(dFdx(v_qpos), dFdy(v_qpos))", "dFdx(v_qpos), dp2 = dFdy(v_qpos)"] {
+        for call in [
+            "proc_field(v_qpos)",
+            "proc_bump(N, v_qpos, field)",
+            "cross(dFdx(v_qpos), dFdy(v_qpos))",
+            "dFdx(v_qpos), dp2 = dFdy(v_qpos)",
+        ] {
             assert!(src.contains(call), "{call} must read the rebased position");
         }
         // The lighting reads that legitimately want world metres are still world metres.
-        assert!(src.contains("normalize(u_cam - v_wpos)") && src.contains("shadow_lit(v_wpos)"),
-            "lighting is coarse and needs the true world position — do not rebase it");
+        assert!(
+            src.contains("normalize(u_cam - v_wpos)") && src.contains("shadow_lit(v_wpos)"),
+            "lighting is coarse and needs the true world position — do not rebase it"
+        );
     }
 
     /// A MEDIUM's surface lying ON an opaque one is the container, and must not be drawn.
@@ -6203,15 +7327,29 @@ mod taa_tests {
     #[test]
     fn a_medium_lying_on_its_container_is_not_drawn() {
         let src = assemble_tex_fs();
-        let at = src.find("if (u_transmission > 0.0 && u_tr_on == 1)").expect("the contact test");
+        let at = src
+            .find("if (u_transmission > 0.0 && u_tr_on == 1)")
+            .expect("the contact test");
         let block = &src[at..at + 500];
-        assert!(block.contains("distance(ssr_world(suv, sd), u_cam) - distance(v_wpos, u_cam) < 0.02) discard;"),
-            "the test is distance in front of what is already there, in metres");
-        assert!(block.contains("sd < 0.99999"), "sky behind the surface is not a container");
-        assert!(!block.contains("gl_FrontFacing"), "and it must not depend on winding");
+        assert!(
+            block.contains(
+                "distance(ssr_world(suv, sd), u_cam) - distance(v_wpos, u_cam) < 0.02) discard;"
+            ),
+            "the test is distance in front of what is already there, in metres"
+        );
+        assert!(
+            block.contains("sd < 0.99999"),
+            "sky behind the surface is not a container"
+        );
+        assert!(
+            !block.contains("gl_FrontFacing"),
+            "and it must not depend on winding"
+        );
         assert!(!block.contains("v_a"), "…nor on coverage");
         // Before any shading work — everything after it would be wasted on a discarded fragment.
-        let shade = src.find("vec3 Ng = normalize(cross(dFdx(v_qpos)").expect("the shading");
+        let shade = src
+            .find("vec3 Ng = normalize(cross(dFdx(v_qpos)")
+            .expect("the shading");
         assert!(at < shade, "discard first");
     }
 
@@ -6223,12 +7361,21 @@ mod taa_tests {
     #[test]
     fn the_depth_copy_is_bound_independently_of_the_reflection_toggle() {
         let src = include_str!("light3d.rs");
-        let bind = src.find("let have_depth = self.refr_depth.is_some();").expect("the bind gate");
-        let ssr = src.find("let ssr = env.ssr.enabled && have_depth;").expect("the SSR gate");
-        assert!(bind < ssr, "the depth is bound before, and independently of, the SSR decision");
+        let bind = src
+            .find("let have_depth = self.refr_depth.is_some();")
+            .expect("the bind gate");
+        let ssr = src
+            .find("let ssr = env.ssr.enabled && have_depth;")
+            .expect("the SSR gate");
+        assert!(
+            bind < ssr,
+            "the depth is bound before, and independently of, the SSR decision"
+        );
         let between = &src[bind..ssr];
-        assert!(between.contains("gl.bind_texture(glow::TEXTURE_2D, self.refr_depth);"),
-            "…and the bind itself is not inside the SSR branch");
+        assert!(
+            between.contains("gl.bind_texture(glow::TEXTURE_2D, self.refr_depth);"),
+            "…and the bind itself is not inside the SSR branch"
+        );
     }
 
     /// SSR must REPLACE the sky reflection where it finds geometry, never add to it.
@@ -6242,16 +7389,26 @@ mod taa_tests {
         let src = assemble_tex_fs();
         let at = src.find("vec3 with_ssr(").expect("the substitution");
         let body = &src[at..at + 900];
-        assert!(body.contains("return mix(sky_spec, hit.rgb * w, hit.a * (1.0 - smoothstep(0.15, 0.35, rgh)));"),
-            "the trace's confidence blends the two; it never sums them");
-        assert!(body.contains("if (u_ssr_on != 1 || rgh >= 0.35) return sky_spec;"),
-            "a rough surface keeps the sky — one ray cannot stand in for a wide lobe");
+        assert!(
+            body.contains(
+                "return mix(sky_spec, hit.rgb * w, hit.a * (1.0 - smoothstep(0.15, 0.35, rgh)));"
+            ),
+            "the trace's confidence blends the two; it never sums them"
+        );
+        assert!(
+            body.contains("if (u_ssr_on != 1 || rgh >= 0.35) return sky_spec;"),
+            "a rough surface keeps the sky — one ray cannot stand in for a wide lobe"
+        );
         // BOTH lighting branches must route through it. Shipping it in the daylight branch only
         // meant studio mode — which has no environment to reflect at all — silently got nothing.
-        assert!(src.contains("with_ssr(env_sample(R, rough) * env_w, R, rough, env_w)"),
-            "the daylight branch substitutes the scene for the sky");
-        assert!(src.contains("with_ssr(vec3(v_shade) * env_w, R, rough, env_w)"),
-            "…and so does studio mode");
+        assert!(
+            src.contains("with_ssr(env_sample(R, rough) * env_w, R, rough, env_w)"),
+            "the daylight branch substitutes the scene for the sky"
+        );
+        assert!(
+            src.contains("with_ssr(vec3(v_shade) * env_w, R, rough, env_w)"),
+            "…and so does studio mode"
+        );
     }
 
     /// The march must be sized over the part of the ray that is ON SCREEN.
@@ -6264,27 +7421,46 @@ mod taa_tests {
     fn the_march_is_sized_over_the_visible_part_of_the_ray() {
         assert!(SSR_GLSL.contains("if (abs(d.x) > 1e-6) tmax = min(tmax, max((0.0 - uv0.x) / d.x, (1.0 - uv0.x) / d.x));"),
             "the segment is clipped to the viewport");
-        assert!(SSR_GLSL.contains("float px = length(d * tmax * u_tr_vp);"),
-            "…and the step count comes from the CLIPPED length, not the whole ray");
-        assert!(SSR_GLSL.contains("float s = tmax * (float(i) - jit) / float(steps);"),
-            "…so every step lands inside the frame");
-        assert!(SSR_GLSL.contains("if (tmax <= 1e-4) return vec4(0.0);"),
-            "a ray that leaves immediately has nothing to find");
+        assert!(
+            SSR_GLSL.contains("float px = length(d * tmax * u_tr_vp);"),
+            "…and the step count comes from the CLIPPED length, not the whole ray"
+        );
+        assert!(
+            SSR_GLSL.contains("float s = tmax * (float(i) - jit) / float(steps);"),
+            "…so every step lands inside the frame"
+        );
+        assert!(
+            SSR_GLSL.contains("if (tmax <= 1e-4) return vec4(0.0);"),
+            "a ray that leaves immediately has nothing to find"
+        );
     }
 
     /// A miss must cost nothing. Every early-out in the trace returns zero confidence so the
     /// caller silently keeps the sky, which is what makes the edge of the effect invisible.
     #[test]
     fn a_lost_reflection_ray_falls_back_to_the_sky() {
-        assert!(SSR_GLSL.contains("if (hit_s < 0.0) return vec4(0.0);"), "a ray that hit nothing");
-        assert!(SSR_GLSL.contains("float edge = smoothstep(0.0, 0.12, min(e.x, e.y));"),
-            "…and one that hit near the frame edge fades out rather than stopping dead");
-        assert!(SSR_GLSL.contains("float reach = 1.0 - smoothstep(0.75, 1.0, hi);"),
-            "…as does one that ran to the end of its reach");
-        assert!(SSR_GLSL.contains("if (sd >= 0.99999) { prev = s; continue; }"),
-            "sky along the ray is not a hit — the march carries on past it");
-        assert!(SSR_GLSL.contains("if (distance(Q, cam) - distance(S, cam) > u_ssr_thick) return vec4(0.0);"),
-            "…and a ray that merely slid behind a distant surface has not hit it either");
+        assert!(
+            SSR_GLSL.contains("if (hit_s < 0.0) return vec4(0.0);"),
+            "a ray that hit nothing"
+        );
+        assert!(
+            SSR_GLSL.contains("float edge = smoothstep(0.0, 0.12, min(e.x, e.y));"),
+            "…and one that hit near the frame edge fades out rather than stopping dead"
+        );
+        assert!(
+            SSR_GLSL.contains("float reach = 1.0 - smoothstep(0.75, 1.0, hi);"),
+            "…as does one that ran to the end of its reach"
+        );
+        assert!(
+            SSR_GLSL.contains("if (sd >= 0.99999) { prev = s; continue; }"),
+            "sky along the ray is not a hit — the march carries on past it"
+        );
+        assert!(
+            SSR_GLSL.contains(
+                "if (distance(Q, cam) - distance(S, cam) > u_ssr_thick) return vec4(0.0);"
+            ),
+            "…and a ray that merely slid behind a distant surface has not hit it either"
+        );
     }
 
     /// The march has to step in SCREEN space, not along the world ray.
@@ -6296,20 +7472,35 @@ mod taa_tests {
     /// the step in PIXELS makes what the trace finds independent of where the camera is standing.
     #[test]
     fn the_march_steps_in_pixels_not_in_metres() {
-        assert!(SSR_GLSL.contains("float px = length(d * tmax * u_tr_vp);"),
-            "the ray's length is measured on screen");
-        assert!(SSR_GLSL.contains("int steps = int(clamp(px / 3.0, 12.0, 96.0));"),
-            "…and the step count comes from that, so each step is a few pixels wherever it is");
+        assert!(
+            SSR_GLSL.contains("float px = length(d * tmax * u_tr_vp);"),
+            "the ray's length is measured on screen"
+        );
+        assert!(
+            SSR_GLSL.contains("int steps = int(clamp(px / 3.0, 12.0, 96.0));"),
+            "…and the step count comes from that, so each step is a few pixels wherever it is"
+        );
         // Perspective-correct depth: 1/w and z/w are what interpolate linearly across the screen.
-        assert!(SSR_GLSL.contains("float zn0 = c0.z / c0.w, zn1 = c1.z / c1.w;"), "NDC z at both ends");
-        assert!(SSR_GLSL.contains("float rd = mix(zn0, zn1, s) * 0.5 + 0.5;"),
-            "…so the ray's depth at each pixel is a mix, not a fresh projection");
+        assert!(
+            SSR_GLSL.contains("float zn0 = c0.z / c0.w, zn1 = c1.z / c1.w;"),
+            "NDC z at both ends"
+        );
+        assert!(
+            SSR_GLSL.contains("float rd = mix(zn0, zn1, s) * 0.5 + 0.5;"),
+            "…so the ray's depth at each pixel is a mix, not a fresh projection"
+        );
         // The correction that must NOT be here. z_ndc is already `z_clip/w`; dividing it by an
         // interpolated 1/w a second time yields z_CLIP — tens to thousands rather than 0..1 — so
         // the very first step compared as "behind the scene", reported a hit at the fragment
         // itself, and the thickness test then discarded it. The trace never returned a hit at all.
-        assert!(!SSR_GLSL.contains("/ mix(iw"), "z_ndc is already divided by w; dividing again gives z_clip");
-        assert!(!SSR_GLSL.contains("P + R * t"), "no world-space stepping survives");
+        assert!(
+            !SSR_GLSL.contains("/ mix(iw"),
+            "z_ndc is already divided by w; dividing again gives z_clip"
+        );
+        assert!(
+            !SSR_GLSL.contains("P + R * t"),
+            "no world-space stepping survives"
+        );
     }
 
     /// Residual banding must be broken up per pixel AND per frame.
@@ -6319,14 +7510,24 @@ mod taa_tests {
     /// accumulator is summing over is what lets it resolve away to nothing.
     #[test]
     fn the_march_is_jittered_by_the_accumulation_frame() {
-        assert!(SSR_GLSL.contains("uniform int       u_ssr_frame;"), "the trace knows the frame");
+        assert!(
+            SSR_GLSL.contains("uniform int       u_ssr_frame;"),
+            "the trace knows the frame"
+        );
         let j = SSR_GLSL.find("float jit =").expect("the jitter");
-        assert!(SSR_GLSL[j..j + 200].contains("u_ssr_frame"), "…and the jitter varies with it");
-        assert!(SSR_GLSL.contains("float s = tmax * (float(i) - jit) / float(steps);"),
-            "the jitter offsets the sample position, not the result");
+        assert!(
+            SSR_GLSL[j..j + 200].contains("u_ssr_frame"),
+            "…and the jitter varies with it"
+        );
+        assert!(
+            SSR_GLSL.contains("float s = tmax * (float(i) - jit) / float(steps);"),
+            "the jitter offsets the sample position, not the result"
+        );
         let src = include_str!("light3d.rs");
-        assert!(src.contains("gl.uniform_1_i32(Some(l), self.taa_n as i32); }"),
-            "and it is fed the SAME counter the accumulation averages over");
+        assert!(
+            src.contains("gl.uniform_1_i32(Some(l), self.taa_n as i32); }"),
+            "and it is fed the SAME counter the accumulation averages over"
+        );
     }
 
     /// The march has to read a COPY of the depth, not the buffer being drawn into.
@@ -6337,11 +7538,22 @@ mod taa_tests {
     #[test]
     fn ssr_marches_a_copy_of_the_depth_not_the_live_buffer() {
         let src = include_str!("light3d.rs");
-        assert!(SSR_GLSL.contains("uniform sampler2D u_ssr_depth;"), "its own depth sampler");
-        assert!(src.contains("glow::DEPTH_BUFFER_BIT, glow::NEAREST,"), "the depth is blitted aside");
+        assert!(
+            SSR_GLSL.contains("uniform sampler2D u_ssr_depth;"),
+            "its own depth sampler"
+        );
+        assert!(
+            src.contains("glow::DEPTH_BUFFER_BIT, glow::NEAREST,"),
+            "the depth is blitted aside"
+        );
         let blit = src.find("glow::DEPTH_BUFFER_BIT").expect("the blit");
-        let bind = src.find("gl.bind_texture(glow::TEXTURE_2D, self.refr_depth);").expect("the bind");
-        assert!(blit < bind, "the copy has to exist before the pass that reads it");
+        let bind = src
+            .find("gl.bind_texture(glow::TEXTURE_2D, self.refr_depth);")
+            .expect("the bind");
+        assert!(
+            blit < bind,
+            "the copy has to exist before the pass that reads it"
+        );
     }
 
     /// The OPAQUE textured pass shares its program with the blended one, so the transmission flag
@@ -6350,11 +7562,16 @@ mod taa_tests {
     #[test]
     fn the_opaque_textured_pass_does_not_transmit() {
         let src = include_str!("light3d.rs");
-        let off = src.find("if let Some(l) = &self.u_tex_tr_on { gl.uniform_1_i32(Some(l), 0); }")
+        let off = src
+            .find("if let Some(l) = &self.u_tex_tr_on { gl.uniform_1_i32(Some(l), 0); }")
             .expect("the opaque pass clears the flag");
-        let on = src.find("if let Some(l) = &self.u_tex_tr_on { gl.uniform_1_i32(Some(l), 1); }")
+        let on = src
+            .find("if let Some(l) = &self.u_tex_tr_on { gl.uniform_1_i32(Some(l), 1); }")
             .expect("the blended pass sets it");
-        assert!(off < on, "the flag must be cleared BEFORE the opaque draws and set only after them");
+        assert!(
+            off < on,
+            "the flag must be cleared BEFORE the opaque draws and set only after them"
+        );
     }
 
     /// A loaded ENVIRONMENT must light the scene whether or not the analytic sun is switched on.
@@ -6365,7 +7582,10 @@ mod taa_tests {
     /// controls, casts no shadow, and is two-sided, so no face ever reads as turned away.
     #[test]
     fn an_environment_lights_the_scene_without_the_sun() {
-        for (name, src) in [("scene", assemble_scene_fs()), ("textured", assemble_tex_fs())] {
+        for (name, src) in [
+            ("scene", assemble_scene_fs()),
+            ("textured", assemble_tex_fs()),
+        ] {
             assert!(
                 src.contains("bool ibl = (u_sky_on == 1 || u_env_on == 1);"),
                 "{name}: environment lighting is not independent of the sun"
@@ -6392,9 +7612,14 @@ mod taa_tests {
     #[test]
     fn the_studio_lamp_is_only_the_no_environment_fallback() {
         let src = assemble_tex_fs();
-        let studio = src.find("abs(dot(N, normalize(STUDIO_DIR)))").expect("the studio key light");
+        let studio = src
+            .find("abs(dot(N, normalize(STUDIO_DIR)))")
+            .expect("the studio key light");
         let ibl = src.find("bool ibl =").expect("the environment test");
-        assert!(ibl < studio, "the studio lamp is chosen before anyone asks about the environment");
+        assert!(
+            ibl < studio,
+            "the studio lamp is chosen before anyone asks about the environment"
+        );
         assert!(
             src.contains("const vec3 STUDIO_DIR = vec3(0.35, 0.25, 0.9);"),
             "the studio direction is no longer a fixed world-space constant"
@@ -6408,8 +7633,14 @@ mod taa_tests {
     /// on a white floor and a black one — which reads as fog, not as bounce.
     #[test]
     fn bounced_light_is_multiplied_by_the_receiver_albedo() {
-        assert!(SSGI_FS.contains("u_alb"), "the gather reads the albedo buffer");
-        assert!(SSGI_FS.contains("frag = vec4(alb * gi"), "…and multiplies the bounce by it");
+        assert!(
+            SSGI_FS.contains("u_alb"),
+            "the gather reads the albedo buffer"
+        );
+        assert!(
+            SSGI_FS.contains("frag = vec4(alb * gi"),
+            "…and multiplies the bounce by it"
+        );
         // A surface with no albedo is background, glass or a UI swatch: it must bounce nothing
         // rather than a black-but-present term.
         assert!(
@@ -6425,7 +7656,10 @@ mod taa_tests {
     /// failure, and the reason the emitter's normal is reconstructed at all.
     #[test]
     fn the_emitter_must_face_the_receiver() {
-        assert!(SSGI_FS.contains("normal_at(su, Q)"), "the emitter's normal is reconstructed");
+        assert!(
+            SSGI_FS.contains("normal_at(su, Q)"),
+            "the emitter's normal is reconstructed"
+        );
         assert!(
             SSGI_FS.contains("if (-dot(normal_at(su, Q), to) <= 0.0) continue;"),
             "…and a back-facing emitter is dropped"
@@ -6434,9 +7668,15 @@ mod taa_tests {
         // so its derivative across the quad describes nothing.
         let f = SSGI_FS.find("vec3 normal_at(").expect("the reconstruction");
         let body = &SSGI_FS[f..f + 320];
-        assert!(!body.contains("dFdx"), "the emitter normal is taken from a texture-fetched value");
+        assert!(
+            !body.contains("dFdx"),
+            "the emitter normal is taken from a texture-fetched value"
+        );
         // The sky is not a bounce card either — it is already lighting the scene through its SH.
-        assert!(SSGI_FS.contains(">= 0.99999) continue;"), "the sky is gathered from");
+        assert!(
+            SSGI_FS.contains(">= 0.99999) continue;"),
+            "the sky is gathered from"
+        );
     }
 
     /// The receiver's cosine must be applied ONCE.
@@ -6450,7 +7690,10 @@ mod taa_tests {
     #[test]
     fn the_receiver_cosine_is_not_applied_twice() {
         // Cosine-weighted sampling, which is what carries the cosine.
-        assert!(SSGI_FS.contains("ct = sqrt(1.0 - a)"), "the directions are not cosine-weighted");
+        assert!(
+            SSGI_FS.contains("ct = sqrt(1.0 - a)"),
+            "the directions are not cosine-weighted"
+        );
         // The accumulation line must not re-apply it.
         let acc = SSGI_FS
             .lines()
@@ -6484,20 +7727,34 @@ mod taa_tests {
     fn the_bounce_is_composed_the_same_in_both_shaders() {
         let line = "if (u_ssgi_k > 0.0) lit += texture(u_ssgi, v_uv).rgb * u_ssgi_k;";
         assert!(BLIT_FS.contains(line), "the composite folds the bounce in");
-        assert!(TAA_FS.contains(line), "…and the accumulator does it identically");
+        assert!(
+            TAA_FS.contains(line),
+            "…and the accumulator does it identically"
+        );
         let add = BLIT_FS.find("u_ssgi_k").expect("the composite adds it");
-        let view = BLIT_FS.find("apply_view(lit)").expect("…then the view transform");
-        assert!(add < view, "bounced light goes in before the transform, not after");
+        let view = BLIT_FS
+            .find("apply_view(lit)")
+            .expect("…then the view transform");
+        assert!(
+            add < view,
+            "bounced light goes in before the transform, not after"
+        );
     }
 
     /// It must be OFF by default — a viewpoint-dependent term has no business appearing in
     /// someone's scene without being asked for, least of all in a lighting application.
     #[test]
     fn bounced_light_is_opt_in() {
-        assert!(!crate::env::GiSettings::default().enabled, "GI is on by default");
+        assert!(
+            !crate::env::GiSettings::default().enabled,
+            "GI is on by default"
+        );
         assert!(!crate::env::EnvRender::default().gi.enabled);
         // …and the lux view, which is a measurement, must never get it at all.
-        assert!(!crate::env::EnvRender::none().gi.enabled, "the lux view would be relit");
+        assert!(
+            !crate::env::EnvRender::none().gi.enabled,
+            "the lux view would be relit"
+        );
     }
 
     /// An HDRI's sun must not reach the GPU as infinity.
@@ -6511,11 +7768,17 @@ mod taa_tests {
     #[test]
     fn an_hdri_sun_survives_the_trip_to_the_gpu() {
         // The exact peak from the environment that broke it.
-        assert!(75360.0 > HALF_MAX, "the premise: this HDRI is brighter than half-float holds");
+        assert!(
+            75360.0 > HALF_MAX,
+            "the premise: this HDRI is brighter than half-float holds"
+        );
         for v in [75360.0f32, 1.0e9, f32::INFINITY, HALF_MAX * 2.0] {
             let out = half_safe(&v);
             assert!(out.is_finite(), "{v} still reaches the GPU as {out}");
-            assert!(out <= HALF_MAX, "{v} clamped to {out}, still above the ceiling");
+            assert!(
+                out <= HALF_MAX,
+                "{v} clamped to {out}, still above the ceiling"
+            );
         }
         // NaN in a source EXR would propagate exactly as badly.
         assert_eq!(half_safe(&f32::NAN), 0.0);
@@ -6544,12 +7807,24 @@ mod taa_tests {
     fn the_bright_pass_cannot_produce_a_nan() {
         let fs = BLOOM_PRE_FS.replace("BLOOM_CEILING", "4000.0");
         assert!(!fs.contains("BLOOM_CEILING"), "the ceiling is substituted");
-        let clamp = fs.find("c = min(max(c, vec3(0.0)), vec3(4000.0));").expect("the clamp");
-        let guard = fs.find("if (any(isnan(c))) c = vec3(0.0);").expect("the NaN guard");
-        let div = fs.find("/ max(br, 1e-5)").expect("the division that makes NaN");
-        assert!(clamp < div && guard < div, "the clamp must come BEFORE the division, not after");
+        let clamp = fs
+            .find("c = min(max(c, vec3(0.0)), vec3(4000.0));")
+            .expect("the clamp");
+        let guard = fs
+            .find("if (any(isnan(c))) c = vec3(0.0);")
+            .expect("the NaN guard");
+        let div = fs
+            .find("/ max(br, 1e-5)")
+            .expect("the division that makes NaN");
+        assert!(
+            clamp < div && guard < div,
+            "the clamp must come BEFORE the division, not after"
+        );
         // The ceiling has to leave headroom: the downsample sums four taps before averaging.
-        assert!(4000.0 * 4.0 < HALF_MAX, "the pyramid's own sums could overflow the ceiling");
+        assert!(
+            4000.0 * 4.0 < HALF_MAX,
+            "the pyramid's own sums could overflow the ceiling"
+        );
     }
 
     /// The callback must not leave a narrowed scissor behind it.
@@ -6569,8 +7844,13 @@ mod taa_tests {
         );
         // BOTH exits — the ordinary one and the converged re-present — must call it. The converged
         // path is the easy one to forget, because it returns early.
-        let calls = src.matches("release_scissor(gl, screen_w, screen_h)").count();
-        assert!(calls >= 2, "only {calls} of the render's exits reopen the scissor");
+        let calls = src
+            .matches("release_scissor(gl, screen_w, screen_h)")
+            .count();
+        assert!(
+            calls >= 2,
+            "only {calls} of the render's exits reopen the scissor"
+        );
         // …and it must open to the WINDOW, not to the viewport it just drew.
         let f = src.find("fn release_scissor(").expect("the helper");
         assert!(
@@ -6590,8 +7870,14 @@ mod taa_tests {
         let src = include_str!("light3d.rs");
         let f = src.find("unsafe fn composite(").expect("the composite");
         let body = &src[f..f + 1200];
-        assert!(body.contains("gl.scissor(rect.0, rect.1"), "the composite sets its own scissor");
-        assert!(body.contains("gl.enable(glow::SCISSOR_TEST)"), "…and enables it itself");
+        assert!(
+            body.contains("gl.scissor(rect.0, rect.1"),
+            "the composite sets its own scissor"
+        );
+        assert!(
+            body.contains("gl.enable(glow::SCISSOR_TEST)"),
+            "…and enables it itself"
+        );
     }
 
     /// The converged path must never present a buffer nothing has written.
@@ -6605,9 +7891,15 @@ mod taa_tests {
         r.taa_max = 16;
         r.taa_n = 16;
         r.taa_valid = false;
-        assert!(!(r.taa_max > 0 && r.taa_valid && r.taa_n >= r.taa_max), "would present an empty buffer");
+        assert!(
+            !(r.taa_max > 0 && r.taa_valid && r.taa_n >= r.taa_max),
+            "would present an empty buffer"
+        );
         r.taa_valid = true;
-        assert!(r.taa_max > 0 && r.taa_valid && r.taa_n >= r.taa_max, "…but a written one is fine");
+        assert!(
+            r.taa_max > 0 && r.taa_valid && r.taa_n >= r.taa_max,
+            "…but a written one is fine"
+        );
         // And the guard is really the one the renderer uses.
         let src = include_str!("light3d.rs");
         assert!(
@@ -6624,11 +7916,22 @@ mod taa_tests {
     #[test]
     fn a_failed_resolve_falls_back_to_drawing_the_scene() {
         let src = include_str!("light3d.rs");
-        let f = src.find("The resolve could not run").expect("the failure path");
+        let f = src
+            .find("The resolve could not run")
+            .expect("the failure path");
         let body = &src[f..f + 1000];
-        assert!(body.contains("self.taa_max = 0;"), "accumulation is switched off");
-        assert!(body.contains("self.taa_valid = false;"), "…and the buffer is marked empty");
-        assert!(!body.contains("self.taa_n = self.taa_max;"), "it must not fake convergence");
+        assert!(
+            body.contains("self.taa_max = 0;"),
+            "accumulation is switched off"
+        );
+        assert!(
+            body.contains("self.taa_valid = false;"),
+            "…and the buffer is marked empty"
+        );
+        assert!(
+            !body.contains("self.taa_n = self.taa_max;"),
+            "it must not fake convergence"
+        );
     }
 
     /// The offscreen post passes must run with egui's SCISSOR OFF.
@@ -6642,13 +7945,23 @@ mod taa_tests {
     #[test]
     fn the_post_passes_run_outside_egui_scissor() {
         let src = include_str!("light3d.rs");
-        let bloom = src.find("let bloom_ready = self.bloom_pass(").expect("the bloom pass");
-        let taa = src.find("let t = self.taa_resolve(").expect("the accumulation resolve");
+        let bloom = src
+            .find("let bloom_ready = self.bloom_pass(")
+            .expect("the bloom pass");
+        let taa = src
+            .find("let t = self.taa_resolve(")
+            .expect("the accumulation resolve");
         let scissor = src
             .find("gl.enable(glow::SCISSOR_TEST); // egui's scissor")
             .expect("the composite re-enables the scissor");
-        assert!(bloom < scissor, "bloom renders its pyramid inside egui's scissor");
-        assert!(taa < scissor, "the accumulator renders inside egui's scissor");
+        assert!(
+            bloom < scissor,
+            "bloom renders its pyramid inside egui's scissor"
+        );
+        assert!(
+            taa < scissor,
+            "the accumulator renders inside egui's scissor"
+        );
     }
 
     /// A fresh renderer must not claim to be converging — nothing has asked for accumulation yet,
@@ -6671,11 +7984,17 @@ mod taa_tests {
         r.taa_max = 16;
         r.taa_n = 1;
         r.taa_stable = false;
-        assert!(!r.taa_converging(), "a frame still changing asked to be redrawn");
+        assert!(
+            !r.taa_converging(),
+            "a frame still changing asked to be redrawn"
+        );
         r.taa_stable = true;
         assert!(r.taa_converging(), "a settled frame stopped refining early");
         r.taa_n = 16;
-        assert!(!r.taa_converging(), "a converged frame kept asking for more");
+        assert!(
+            !r.taa_converging(),
+            "a converged frame kept asking for more"
+        );
     }
 }
 
@@ -6692,10 +8011,16 @@ mod bloom_tests {
     #[test]
     fn bloom_sees_the_same_image_the_composite_does() {
         for term in ["u_amb", "u_ao", "u_ao_on"] {
-            assert!(BLOOM_PRE_FS.contains(term), "the bright pass reads {term}, as the composite does");
+            assert!(
+                BLOOM_PRE_FS.contains(term),
+                "the bright pass reads {term}, as the composite does"
+            );
             assert!(BLIT_FS.contains(term), "…and the composite still reads it");
         }
-        assert!(BLOOM_PRE_FS.contains("c += a * ao;"), "composed identically");
+        assert!(
+            BLOOM_PRE_FS.contains("c += a * ao;"),
+            "composed identically"
+        );
         assert!(BLIT_FS.contains("c.rgb + a * ao"), "composed identically");
     }
 
@@ -6705,10 +8030,18 @@ mod bloom_tests {
     #[test]
     fn bloom_is_added_before_the_view_transform() {
         let add = BLIT_FS.find("u_bloom_k").expect("the composite adds bloom");
-        let view = BLIT_FS.find("apply_view(lit)").expect("…and then applies the view transform");
-        assert!(add < view, "bloom goes in before the transform, not after it");
+        let view = BLIT_FS
+            .find("apply_view(lit)")
+            .expect("…and then applies the view transform");
+        assert!(
+            add < view,
+            "bloom goes in before the transform, not after it"
+        );
         // And it is skippable, so a scene with bloom off pays for no texture fetch.
-        assert!(BLIT_FS.contains("if (u_bloom_k > 0.0)"), "zero bloom costs nothing");
+        assert!(
+            BLIT_FS.contains("if (u_bloom_k > 0.0)"),
+            "zero bloom costs nothing"
+        );
     }
 
     /// The threshold has a soft KNEE. A hard cutoff makes a contour crawl visibly across a surface
@@ -6716,11 +8049,17 @@ mod bloom_tests {
     #[test]
     fn the_bright_pass_has_a_soft_knee() {
         assert!(BLOOM_PRE_FS.contains("u_knee"), "there is a knee");
-        assert!(BLOOM_PRE_FS.contains("soft * soft"), "…and it is quadratic, not linear");
+        assert!(
+            BLOOM_PRE_FS.contains("soft * soft"),
+            "…and it is quadratic, not linear"
+        );
         // The default is on but gentle: this is a lighting app, so sources should glow by default.
         let d = crate::color::ColorPipeline::default();
         assert!(d.bloom > 0.0 && d.bloom < 0.15, "on, gently: {}", d.bloom);
-        assert_eq!(d.bloom_threshold, 1.0, "only brighter-than-white blooms by default");
+        assert_eq!(
+            d.bloom_threshold, 1.0,
+            "only brighter-than-white blooms by default"
+        );
         // …and the passthrough pipeline, which exists to change nothing, must not bloom.
         assert_eq!(crate::color::ColorPipeline::passthrough().bloom, 0.0);
     }
@@ -6742,7 +8081,12 @@ mod tests {
             ("scene", assemble_scene_fs()),
             ("transp", assemble_transp_fs()),
             ("textured", assemble_tex_fs()),
-            ("blit", BLIT_FS.replace("FOG_GLSL", &fog_glsl()).replace("VIEW_GLSL", crate::color::VIEW_GLSL)),
+            (
+                "blit",
+                BLIT_FS
+                    .replace("FOG_GLSL", &fog_glsl())
+                    .replace("VIEW_GLSL", crate::color::VIEW_GLSL),
+            ),
             ("sky", assemble_sky_fs()),
             ("ssao", SSAO_FS.to_string()),
             ("blur", BLUR_FS.to_string()),
@@ -6753,12 +8097,25 @@ mod tests {
     fn every_shader_placeholder_is_substituted() {
         for (name, src) in assembled() {
             for token in [
-                "SHADOW_GLSL", "SRGB_GLSL", "VIEW_GLSL", "SKY_GLSL", "ENV_BRDF_GLSL",
-                "ALBEDO_OUT_GLSL", "FOG_GLSL", "CASCADE_MAX_GLSL", "BLOOM_CEILING",
+                "SHADOW_GLSL",
+                "SRGB_GLSL",
+                "VIEW_GLSL",
+                "SKY_GLSL",
+                "ENV_BRDF_GLSL",
+                "ALBEDO_OUT_GLSL",
+                "FOG_GLSL",
+                "CASCADE_MAX_GLSL",
+                "BLOOM_CEILING",
             ] {
-                assert!(!src.contains(token), "{name}: `{token}` left unreplaced — the shader would not compile");
+                assert!(
+                    !src.contains(token),
+                    "{name}: `{token}` left unreplaced — the shader would not compile"
+                );
             }
-            assert!(src.starts_with("\n    #version 330 core") || src.contains("#version 330 core"), "{name}: no #version");
+            assert!(
+                src.starts_with("\n    #version 330 core") || src.contains("#version 330 core"),
+                "{name}: no #version"
+            );
             let (open, close) = (src.matches('{').count(), src.matches('}').count());
             assert_eq!(open, close, "{name}: unbalanced braces ({open} vs {close})");
         }
@@ -6775,14 +8132,32 @@ mod tests {
         for (name, src) in assembled() {
             // The post passes write to single-attachment targets and are exempt.
             if matches!(name, "blit" | "ssao" | "blur") {
-                assert!(!src.contains("location=1"), "{name} draws to one target; it must not declare a second");
+                assert!(
+                    !src.contains("location=1"),
+                    "{name} draws to one target; it must not declare a second"
+                );
                 continue;
             }
-            assert!(src.contains("layout(location=0) out"), "{name}: no explicit attachment-0 output");
-            assert!(src.contains("layout(location=1) out"), "{name}: does not write the ambient attachment");
-            assert!(src.contains("amb_out ="), "{name}: declares the ambient output but never assigns it");
-            assert!(src.contains("layout(location=2) out"), "{name}: does not write the albedo attachment");
-            assert!(src.contains("alb_out ="), "{name}: declares the albedo output but never assigns it");
+            assert!(
+                src.contains("layout(location=0) out"),
+                "{name}: no explicit attachment-0 output"
+            );
+            assert!(
+                src.contains("layout(location=1) out"),
+                "{name}: does not write the ambient attachment"
+            );
+            assert!(
+                src.contains("amb_out ="),
+                "{name}: declares the ambient output but never assigns it"
+            );
+            assert!(
+                src.contains("layout(location=2) out"),
+                "{name}: does not write the albedo attachment"
+            );
+            assert!(
+                src.contains("alb_out ="),
+                "{name}: declares the albedo output but never assigns it"
+            );
         }
     }
 
@@ -6820,7 +8195,10 @@ mod tests {
     #[test]
     fn occlusion_only_scales_the_ambient_term() {
         let blit = BLIT_FS.replace("VIEW_GLSL", crate::color::VIEW_GLSL);
-        assert!(blit.contains("c.rgb + a * ao"), "the composite must add direct + ambient·AO:\n{blit}");
+        assert!(
+            blit.contains("c.rgb + a * ao"),
+            "the composite must add direct + ambient·AO:\n{blit}"
+        );
         for (name, src) in assembled() {
             // The composite applies it and the blur produces it; nothing else may touch it.
             if matches!(name, "blit" | "blur") {
@@ -6828,7 +8206,10 @@ mod tests {
             }
             // As a whole token: `u_aomap` (a material's baked AO map) is a different thing and is
             // allowed anywhere.
-            assert!(!src.contains("u_ao;") && !src.contains("u_ao,") && !src.contains("u_ao)"), "{name} must not sample the screen-space occlusion buffer itself");
+            assert!(
+                !src.contains("u_ao;") && !src.contains("u_ao,") && !src.contains("u_ao)"),
+                "{name} must not sample the screen-space occlusion buffer itself"
+            );
         }
     }
 
@@ -6837,8 +8218,23 @@ mod tests {
     #[test]
     fn shader_helpers_are_defined_before_use() {
         for (name, src) in assembled() {
-            for func in ["srgb_to_lin", "shadow_lit", "apply_view", "d_ggx", "v_smith", "f_schlick", "sh_ambient", "sky_radiance", "env_sample", "rel_at", "ssr_world", "ssr_trace"] {
-                let def = src.find(&format!("{func}(")).filter(|_| src.contains(&format!(" {func}(")));
+            for func in [
+                "srgb_to_lin",
+                "shadow_lit",
+                "apply_view",
+                "d_ggx",
+                "v_smith",
+                "f_schlick",
+                "sh_ambient",
+                "sky_radiance",
+                "env_sample",
+                "rel_at",
+                "ssr_world",
+                "ssr_trace",
+            ] {
+                let def = src
+                    .find(&format!("{func}("))
+                    .filter(|_| src.contains(&format!(" {func}(")));
                 // Every return type the helpers actually use — `vec3`/`float` alone missed
                 // `ssr_trace`, which returns a vec4 (rgb + confidence) and so read as undefined.
                 let def_at = ["vec2", "vec3", "vec4", "float", "bool"]
@@ -6846,12 +8242,20 @@ mod tests {
                     .find_map(|ty| src.find(&format!("{ty} {func}(")));
                 let Some(def_at) = def_at else {
                     // Not used by this shader at all is fine; used-but-undefined is not.
-                    assert!(!src.contains(&format!("{func}(")), "{name}: calls `{func}` but never defines it");
+                    assert!(
+                        !src.contains(&format!("{func}(")),
+                        "{name}: calls `{func}` but never defines it"
+                    );
                     continue;
                 };
                 let _ = def;
-                let first_call = src[def_at + 1..].find(&format!("{func}(")).map(|i| i + def_at + 1);
-                assert!(first_call.is_some(), "{name}: `{func}` defined but never called");
+                let first_call = src[def_at + 1..]
+                    .find(&format!("{func}("))
+                    .map(|i| i + def_at + 1);
+                assert!(
+                    first_call.is_some(),
+                    "{name}: `{func}` defined but never called"
+                );
             }
         }
     }
@@ -6864,34 +8268,106 @@ mod tests {
         let tex = format!("{TEX_VS}{}", assemble_tex_fs());
         // Every name the sky/IBL block declares, so `SkyUniforms::locate` cannot go looking for one
         // the surface shader does not have.
-        let sky_names = ["u_perez", "u_perez_norm", "u_zenith_xy", "u_sky_scale", "u_sky_sun", "u_sky_ground", "u_sky_sun_col", "u_sky_on", "u_sh"];
+        let sky_names = [
+            "u_perez",
+            "u_perez_norm",
+            "u_zenith_xy",
+            "u_sky_scale",
+            "u_sky_sun",
+            "u_sky_ground",
+            "u_sky_sun_col",
+            "u_sky_on",
+            "u_sh",
+        ];
         for u in [
-            "u_mvp", "u_img", "u_cam", "u_reflect", "u_proc", "u_col_a", "u_col_b", "u_pscale", "u_detail",
-            "u_prough", "u_pcontrast", "u_ramp", "u_model", "u_sun_on", "u_sun_dir", "u_sun_col", "u_emission",
-            "u_hl", "u_hl_k", "u_nrm", "u_rough", "u_has_nrm", "u_has_rough", "u_rough_base",
-            "u_shadow_on", "u_light_mvp", "u_shadow", "u_clay", "u_metallic", "u_ior",
-            "u_coat", "u_coat_rough", "u_sheen", "u_sheen_tint",
+            "u_mvp",
+            "u_img",
+            "u_cam",
+            "u_reflect",
+            "u_proc",
+            "u_col_a",
+            "u_col_b",
+            "u_pscale",
+            "u_detail",
+            "u_prough",
+            "u_pcontrast",
+            "u_ramp",
+            "u_model",
+            "u_sun_on",
+            "u_sun_dir",
+            "u_sun_col",
+            "u_emission",
+            "u_hl",
+            "u_hl_k",
+            "u_nrm",
+            "u_rough",
+            "u_has_nrm",
+            "u_has_rough",
+            "u_rough_base",
+            "u_shadow_on",
+            "u_light_mvp",
+            "u_shadow",
+            "u_clay",
+            "u_metallic",
+            "u_ior",
+            "u_coat",
+            "u_coat_rough",
+            "u_sheen",
+            "u_sheen_tint",
         ]
         .into_iter()
         .chain(sky_names)
         {
-            assert!(tex.contains(&format!("{u};")) || tex.contains(&format!("{u} ")) || tex.contains(&format!("{u}[")), "textured shader has no `{u}`");
+            assert!(
+                tex.contains(&format!("{u};"))
+                    || tex.contains(&format!("{u} "))
+                    || tex.contains(&format!("{u}[")),
+                "textured shader has no `{u}`"
+            );
         }
         let blit = BLIT_FS
             .replace("FOG_GLSL", &fog_glsl())
             .replace("VIEW_GLSL", crate::color::VIEW_GLSL);
         for u in [
-            "u_tex", "u_view", "u_exposure", "u_look", "u_amb", "u_ao", "u_ao_on",
-            "u_fog_depth", "u_fog_inv_vp", "u_fog_cam", "u_fog_col", "u_fog_density", "u_fog_base",
-            "u_fog_falloff", "u_fog_on",
+            "u_tex",
+            "u_view",
+            "u_exposure",
+            "u_look",
+            "u_amb",
+            "u_ao",
+            "u_ao_on",
+            "u_fog_depth",
+            "u_fog_inv_vp",
+            "u_fog_cam",
+            "u_fog_col",
+            "u_fog_density",
+            "u_fog_base",
+            "u_fog_falloff",
+            "u_fog_on",
         ] {
             assert!(blit.contains(u), "blit shader has no `{u}`");
         }
-        let scene = SCENE_FS.replace("SHADOW_GLSL", &shadow_glsl()).replace("SRGB_GLSL", crate::color::SRGB_GLSL);
-        for u in ["u_mvp", "u_alpha", "u_model", "u_shadow_on", "u_light_mvp", "u_shadow", "u_linearize"] {
-            assert!(scene.contains(u) || SCENE_VS.contains(u), "scene shader has no `{u}`");
+        let scene = SCENE_FS
+            .replace("SHADOW_GLSL", &shadow_glsl())
+            .replace("SRGB_GLSL", crate::color::SRGB_GLSL);
+        for u in [
+            "u_mvp",
+            "u_alpha",
+            "u_model",
+            "u_shadow_on",
+            "u_light_mvp",
+            "u_shadow",
+            "u_linearize",
+        ] {
+            assert!(
+                scene.contains(u) || SCENE_VS.contains(u),
+                "scene shader has no `{u}`"
+            );
         }
-        let sky = format!("{BLIT_VS}{}", SKY_FS.replace("SKY_GLSL", crate::env::SKY_GLSL));
+        let sky = format!(
+            "{BLIT_VS}{}",
+            SKY_FS.replace("SKY_GLSL", crate::env::SKY_GLSL)
+        );
         for u in ["u_inv_vp", "u_cam"].into_iter().chain(sky_names) {
             assert!(sky.contains(u), "sky shader has no `{u}`");
         }
@@ -6901,7 +8377,10 @@ mod tests {
         for u in ["u_depth", "u_vp", "u_inv_vp", "u_radius", "u_strength"] {
             assert!(SSAO_FS.contains(u), "ssao shader has no `{u}`");
         }
-        assert!(!SSAO_FS.contains("u_cam"), "SSAO must not reintroduce an absolute camera position");
+        assert!(
+            !SSAO_FS.contains("u_cam"),
+            "SSAO must not reintroduce an absolute camera position"
+        );
         assert!(BLUR_FS.contains("u_ao"), "blur shader has no `u_ao`");
     }
 
@@ -6914,20 +8393,45 @@ mod tests {
     #[test]
     fn the_clearcoat_is_smooth_over_the_grain_and_pays_for_itself() {
         let fs = assemble_tex_fs();
-        let coat = fs.split("if (u_coat > 0.0)").nth(1).expect("the clearcoat block");
-        assert!(coat.contains("dot(Ng, V)"), "the coat reflects about the GEOMETRIC normal");
-        assert!(coat.contains("reflect(-V, Ng)"), "…including its environment lobe");
-        assert!(!coat.contains("dot(N, Hc)"), "…and never about the bumped one");
+        let coat = fs
+            .split("if (u_coat > 0.0)")
+            .nth(1)
+            .expect("the clearcoat block");
+        assert!(
+            coat.contains("dot(Ng, V)"),
+            "the coat reflects about the GEOMETRIC normal"
+        );
+        assert!(
+            coat.contains("reflect(-V, Ng)"),
+            "…including its environment lobe"
+        );
+        assert!(
+            !coat.contains("dot(N, Hc)"),
+            "…and never about the bumped one"
+        );
         // The attenuation must come BEFORE the coat's own lobes, or it would dim the very
         // reflection it is adding instead of the material underneath.
-        let loss = coat.find("direct *= (1.0 - loss)").expect("the base is attenuated");
-        let add = coat.find("vec3 coat_key = vec3(d_ggx").expect("the coat's sun lobe");
+        let loss = coat
+            .find("direct *= (1.0 - loss)")
+            .expect("the base is attenuated");
+        let add = coat
+            .find("vec3 coat_key = vec3(d_ggx")
+            .expect("the coat's sun lobe");
         assert!(loss < add, "the coat dims itself instead of the base");
         // Both coat lobes are SPECULAR, so both must join `spec` — transmission scales the
         // diffuse away and a lacquered surface still mirrors the room at any transmission.
-        assert!(coat.contains("direct += coat_key; spec += coat_key;"), "the coat's key lobe is specular");
-        assert!(coat.contains("direct += coat_env; spec += coat_env;"), "…and so is its environment lobe");
-        assert!(coat.contains("ambient *= (1.0 - loss)"), "the ambient pays too, not just the direct");
+        assert!(
+            coat.contains("direct += coat_key; spec += coat_key;"),
+            "the coat's key lobe is specular"
+        );
+        assert!(
+            coat.contains("direct += coat_env; spec += coat_env;"),
+            "…and so is its environment lobe"
+        );
+        assert!(
+            coat.contains("ambient *= (1.0 - loss)"),
+            "the ambient pays too, not just the direct"
+        );
     }
 
     /// Sheen must be a GRAZING term, and it must survive when the sun is not the light.
@@ -6937,14 +8441,29 @@ mod tests {
     #[test]
     fn sheen_grazes_and_survives_without_a_sun() {
         let fs = assemble_tex_fs();
-        let sheen = fs.split("if (u_sheen > 0.0)").nth(1).expect("the sheen block");
-        assert!(sheen.contains("pow(clamp(1.0 - max(dot(V, Hs)"), "a Fresnel-shaped rim, not a flat lift");
-        assert!(sheen.contains("ambient += u_sheen_tint"), "…that also shows under sky light alone");
-        assert!(sheen.contains("amb_irr"), "…using the same irradiance the diffuse ambient came from");
+        let sheen = fs
+            .split("if (u_sheen > 0.0)")
+            .nth(1)
+            .expect("the sheen block");
+        assert!(
+            sheen.contains("pow(clamp(1.0 - max(dot(V, Hs)"),
+            "a Fresnel-shaped rim, not a flat lift"
+        );
+        assert!(
+            sheen.contains("ambient += u_sheen_tint"),
+            "…that also shows under sky light alone"
+        );
+        assert!(
+            sheen.contains("amb_irr"),
+            "…using the same irradiance the diffuse ambient came from"
+        );
         // Both branches of the lighting must define what the shared block reads, or the studio
         // path would compile against an uninitialised direction.
         for v in ["Ldir =", "Lrad =", "shf =", "amb_irr ="] {
-            assert!(fs.matches(v).count() >= 2, "`{v}` is not set by both the daylight and studio branches");
+            assert!(
+                fs.matches(v).count() >= 2,
+                "`{v}` is not set by both the daylight and studio branches"
+            );
         }
     }
 
@@ -6952,14 +8471,24 @@ mod tests {
     /// in series is the kind of thing that looks "nearly right" and quietly crushes every midtone.
     #[test]
     fn tone_mapping_happens_only_at_the_composite() {
-        let tex = TEX_FS.replace("SHADOW_GLSL", &shadow_glsl()).replace("SRGB_GLSL", crate::color::SRGB_GLSL);
-        assert!(!tex.contains("exp(-col)"), "the old `1 - exp(-x)` tone-map is still in the surface shader");
-        assert!(!tex.contains("apply_view"), "the surface shader must not run the view transform");
+        let tex = TEX_FS
+            .replace("SHADOW_GLSL", &shadow_glsl())
+            .replace("SRGB_GLSL", crate::color::SRGB_GLSL);
+        assert!(
+            !tex.contains("exp(-col)"),
+            "the old `1 - exp(-x)` tone-map is still in the surface shader"
+        );
+        assert!(
+            !tex.contains("apply_view"),
+            "the surface shader must not run the view transform"
+        );
         let blit = BLIT_FS.replace("VIEW_GLSL", crate::color::VIEW_GLSL);
-        assert!(blit.contains("apply_view"), "the composite must run the view transform");
+        assert!(
+            blit.contains("apply_view"),
+            "the composite must run the view transform"
+        );
     }
 }
-
 
 /// THE VIEWER DRAWS WHAT IT IS GIVEN.
 ///
@@ -7061,9 +8590,16 @@ pub fn push_luminaire_body(
         let col = shade(base, n);
         for p in [a, b, d, a, d, e] {
             out.push(V3 {
-                x: p[0], y: p[1], z: p[2],
-                r: col[0], g: col[1], b: col[2],
-                nx: 0.0, ny: 0.0, nz: 0.0, mode: 0.0,
+                x: p[0],
+                y: p[1],
+                z: p[2],
+                r: col[0],
+                g: col[1],
+                b: col[2],
+                nx: 0.0,
+                ny: 0.0,
+                nz: 0.0,
+                mode: 0.0,
             });
         }
     };
@@ -7076,13 +8612,33 @@ pub fn push_luminaire_body(
                 [q[0], q[1], z]
             };
             // Bottom = the aperture, wound so its normal points DOWN into the room.
-            quad(p(-1.0, -1.0, z0), p(-1.0, 1.0, z0), p(1.0, 1.0, z0), p(1.0, -1.0, z0), LENS);
+            quad(
+                p(-1.0, -1.0, z0),
+                p(-1.0, 1.0, z0),
+                p(1.0, 1.0, z0),
+                p(1.0, -1.0, z0),
+                LENS,
+            );
             // Top and the four sides: the housing.
-            quad(p(-1.0, -1.0, z1), p(1.0, -1.0, z1), p(1.0, 1.0, z1), p(-1.0, 1.0, z1), BODY);
-            for (a, b) in [((-1.0, -1.0), (1.0, -1.0)), ((1.0, -1.0), (1.0, 1.0)),
-                           ((1.0, 1.0), (-1.0, 1.0)), ((-1.0, 1.0), (-1.0, -1.0))] {
+            quad(
+                p(-1.0, -1.0, z1),
+                p(1.0, -1.0, z1),
+                p(1.0, 1.0, z1),
+                p(-1.0, 1.0, z1),
+                BODY,
+            );
+            for (a, b) in [
+                ((-1.0, -1.0), (1.0, -1.0)),
+                ((1.0, -1.0), (1.0, 1.0)),
+                ((1.0, 1.0), (-1.0, 1.0)),
+                ((-1.0, 1.0), (-1.0, -1.0)),
+            ] {
                 quad(
-                    p(a.0, a.1, z0), p(b.0, b.1, z0), p(b.0, b.1, z1), p(a.0, a.1, z1), BODY,
+                    p(a.0, a.1, z0),
+                    p(b.0, b.1, z0),
+                    p(b.0, b.1, z1),
+                    p(a.0, a.1, z1),
+                    BODY,
                 );
             }
         }
@@ -7135,11 +8691,29 @@ mod a_luminaire_is_drawn_at_its_real_size {
     #[test]
     fn a_rectangular_body_has_the_declared_dimensions() {
         let mut v = Vec::new();
-        super::push_luminaire_body(&mut v, [2.0, 5.0, 3.0], Aperture::Rect { l: 1.2, w: 0.3 }, 0.08, 0.0);
+        super::push_luminaire_body(
+            &mut v,
+            [2.0, 5.0, 3.0],
+            Aperture::Rect { l: 1.2, w: 0.3 },
+            0.08,
+            0.0,
+        );
         let (lo, hi) = aabb(&v);
-        assert!((hi[0] - lo[0] - 1.2).abs() < 1e-5, "length {:.4}", hi[0] - lo[0]);
-        assert!((hi[1] - lo[1] - 0.3).abs() < 1e-5, "width {:.4}", hi[1] - lo[1]);
-        assert!((hi[2] - lo[2] - 0.08).abs() < 1e-5, "height {:.4}", hi[2] - lo[2]);
+        assert!(
+            (hi[0] - lo[0] - 1.2).abs() < 1e-5,
+            "length {:.4}",
+            hi[0] - lo[0]
+        );
+        assert!(
+            (hi[1] - lo[1] - 0.3).abs() < 1e-5,
+            "width {:.4}",
+            hi[1] - lo[1]
+        );
+        assert!(
+            (hi[2] - lo[2] - 0.08).abs() < 1e-5,
+            "height {:.4}",
+            hi[2] - lo[2]
+        );
     }
 
     /// It HANGS from the mounting point. `position.z` is where the photometric centre goes, and
@@ -7148,10 +8722,24 @@ mod a_luminaire_is_drawn_at_its_real_size {
     #[test]
     fn the_body_hangs_below_the_mounting_point() {
         let mut v = Vec::new();
-        super::push_luminaire_body(&mut v, [0.0, 0.0, 3.0], Aperture::Rect { l: 1.2, w: 0.3 }, 0.08, 0.0);
+        super::push_luminaire_body(
+            &mut v,
+            [0.0, 0.0, 3.0],
+            Aperture::Rect { l: 1.2, w: 0.3 },
+            0.08,
+            0.0,
+        );
         let (lo, hi) = aabb(&v);
-        assert!((hi[2] - 3.0).abs() < 1e-5, "the top sits at the mounting height, got {:.4}", hi[2]);
-        assert!((lo[2] - 2.92).abs() < 1e-5, "and it hangs down, got {:.4}", lo[2]);
+        assert!(
+            (hi[2] - 3.0).abs() < 1e-5,
+            "the top sits at the mounting height, got {:.4}",
+            hi[2]
+        );
+        assert!(
+            (lo[2] - 2.92).abs() < 1e-5,
+            "and it hangs down, got {:.4}",
+            lo[2]
+        );
     }
 
     /// ROTATION IS APPLIED. This is the test that catches `rotation_deg` being ignored — which it
@@ -7159,29 +8747,64 @@ mod a_luminaire_is_drawn_at_its_real_size {
     #[test]
     fn the_footprint_turns_with_the_fitting() {
         let mut v = Vec::new();
-        super::push_luminaire_body(&mut v, [0.0, 0.0, 3.0], Aperture::Rect { l: 1.2, w: 0.3 }, 0.08, 90.0);
+        super::push_luminaire_body(
+            &mut v,
+            [0.0, 0.0, 3.0],
+            Aperture::Rect { l: 1.2, w: 0.3 },
+            0.08,
+            90.0,
+        );
         let (lo, hi) = aabb(&v);
-        assert!((hi[0] - lo[0] - 0.3).abs() < 1e-5, "turned 90 deg: x is the WIDTH, got {:.4}", hi[0] - lo[0]);
-        assert!((hi[1] - lo[1] - 1.2).abs() < 1e-5, "…and y is the length, got {:.4}", hi[1] - lo[1]);
+        assert!(
+            (hi[0] - lo[0] - 0.3).abs() < 1e-5,
+            "turned 90 deg: x is the WIDTH, got {:.4}",
+            hi[0] - lo[0]
+        );
+        assert!(
+            (hi[1] - lo[1] - 1.2).abs() < 1e-5,
+            "…and y is the length, got {:.4}",
+            hi[1] - lo[1]
+        );
     }
 
     /// A round fitting is a cylinder of the declared diameter, not a box.
     #[test]
     fn a_round_body_is_a_disc_of_the_declared_diameter() {
         let mut v = Vec::new();
-        super::push_luminaire_body(&mut v, [1.0, 1.0, 2.5], Aperture::Round { d: 0.2 }, 0.05, 0.0);
+        super::push_luminaire_body(
+            &mut v,
+            [1.0, 1.0, 2.5],
+            Aperture::Round { d: 0.2 },
+            0.05,
+            0.0,
+        );
         let (lo, hi) = aabb(&v);
         // A 24-gon inscribed in the circle is a hair under the diameter across the flats.
-        assert!((hi[0] - lo[0] - 0.2).abs() < 0.004, "diameter x {:.4}", hi[0] - lo[0]);
-        assert!((hi[1] - lo[1] - 0.2).abs() < 0.004, "diameter y {:.4}", hi[1] - lo[1]);
-        assert!((hi[2] - lo[2] - 0.05).abs() < 1e-5, "height {:.4}", hi[2] - lo[2]);
+        assert!(
+            (hi[0] - lo[0] - 0.2).abs() < 0.004,
+            "diameter x {:.4}",
+            hi[0] - lo[0]
+        );
+        assert!(
+            (hi[1] - lo[1] - 0.2).abs() < 0.004,
+            "diameter y {:.4}",
+            hi[1] - lo[1]
+        );
+        assert!(
+            (hi[2] - lo[2] - 0.05).abs() < 1e-5,
+            "height {:.4}",
+            hi[2] - lo[2]
+        );
     }
 
     /// Every vertex is a whole triangle's worth — a mesh with a partial triangle renders as
     /// garbage, and that is easy to do wrong when hand-winding quads.
     #[test]
     fn the_output_is_whole_triangles() {
-        for shape in [Aperture::Rect { l: 1.2, w: 0.3 }, Aperture::Round { d: 0.2 }] {
+        for shape in [
+            Aperture::Rect { l: 1.2, w: 0.3 },
+            Aperture::Round { d: 0.2 },
+        ] {
             let mut v = Vec::new();
             super::push_luminaire_body(&mut v, [0.0, 0.0, 3.0], shape, 0.08, 17.0);
             assert!(!v.is_empty(), "{shape:?} produced nothing");
@@ -7193,9 +8816,18 @@ mod a_luminaire_is_drawn_at_its_real_size {
     #[test]
     fn a_zero_height_still_draws_something() {
         let mut v = Vec::new();
-        super::push_luminaire_body(&mut v, [0.0, 0.0, 3.0], Aperture::Rect { l: 0.6, w: 0.6 }, 0.0, 0.0);
+        super::push_luminaire_body(
+            &mut v,
+            [0.0, 0.0, 3.0],
+            Aperture::Rect { l: 0.6, w: 0.6 },
+            0.0,
+            0.0,
+        );
         let (lo, hi) = aabb(&v);
-        assert!(hi[2] - lo[2] > 0.0, "a flat fitting must still have some body");
+        assert!(
+            hi[2] - lo[2] > 0.0,
+            "a flat fitting must still have some body"
+        );
     }
 }
 
@@ -7219,7 +8851,9 @@ mod the_restart_reason_names_the_right_input {
             "a section with no name can never be reported",
         );
         assert!(
-            Scene3dRenderer::TAA_SECTION_NAMES.iter().all(|n| !n.is_empty()),
+            Scene3dRenderer::TAA_SECTION_NAMES
+                .iter()
+                .all(|n| !n.is_empty()),
             "an empty name reads as 'no reason given'",
         );
     }
@@ -7250,7 +8884,8 @@ mod the_restart_reason_names_the_right_input {
     fn an_unchanged_frame_gives_no_reason() {
         let same = [1u64, 2, 3, 4, 5, 6, 7];
         assert_eq!(
-            Scene3dRenderer::taa_first_changed(&same, &same), "",
+            Scene3dRenderer::taa_first_changed(&same, &same),
+            "",
             "an unchanged frame named a culprit",
         );
     }
@@ -7277,10 +8912,19 @@ mod the_lux_overlay {
         let mut v = vec![0.0; (nx + 1) * (ny + 1)];
         for j in 0..=ny {
             for i in 0..=nx {
-                v[j * (nx + 1) + i] = if i as f64 >= nx as f64 * 0.5 { 400.0 } else { 0.0 };
+                v[j * (nx + 1) + i] = if i as f64 >= nx as f64 * 0.5 {
+                    400.0
+                } else {
+                    0.0
+                };
             }
         }
-        Field { nx, ny, v, inside: vec![true; nx * ny] }
+        Field {
+            nx,
+            ny,
+            v,
+            inside: vec![true; nx * ny],
+        }
     }
 
     /// THE SHEET SHOWS A BAND EDGE — which the floor's own vertices could not.
@@ -7305,22 +8949,47 @@ mod the_lux_overlay {
                 v[j * (nx + 1) + i] = 400.0 * i as f64 / nx as f64;
             }
         }
-        let f = Field { nx, ny, v, inside: vec![true; nx * ny] };
+        let f = Field {
+            nx,
+            ny,
+            v,
+            inside: vec![true; nx * ny],
+        };
         let p = plane(10.0, 4.0);
         let mut out = Vec::new();
-        let paint = |lux: f64| if lux >= 200.0 { [1.0, 1.0, 1.0] } else { [0.0, 0.0, 0.0] };
+        let paint = |lux: f64| {
+            if lux >= 200.0 {
+                [1.0, 1.0, 1.0]
+            } else {
+                [0.0, 0.0, 0.0]
+            }
+        };
         push_lux_sheet(&mut out, &f, &p, 0.0, &paint);
 
         assert_eq!(out.len(), nx * ny * 6, "one quad — six vertices — per cell");
-        assert!(out.iter().any(|v| v.r > 0.5), "the bright side never got painted");
-        assert!(out.iter().any(|v| v.r < 0.5), "the dark side never got painted");
+        assert!(
+            out.iter().any(|v| v.r > 0.5),
+            "the bright side never got painted"
+        );
+        assert!(
+            out.iter().any(|v| v.r < 0.5),
+            "the dark side never got painted"
+        );
         // One cell is 0.5 m. Outside a cell of the edge, the colour is decided.
         let cell = 10.0 / nx as f32;
         for v in &out {
             if v.x < 5.0 - cell {
-                assert!(v.r < 0.5, "a vertex at x = {:.3} m is bright, well below 200 lx", v.x);
+                assert!(
+                    v.r < 0.5,
+                    "a vertex at x = {:.3} m is bright, well below 200 lx",
+                    v.x
+                );
             } else if v.x > 5.0 + cell {
-                assert!(v.r > 0.5, "a vertex at x = {:.3} m is dark, well above 200 lx", v.x);
+                assert!(
+                    v.r > 0.5,
+                    "a vertex at x = {:.3} m is dark, well above 200 lx",
+                    v.x
+                );
             }
         }
     }
@@ -7340,11 +9009,18 @@ mod the_lux_overlay {
         push_lux_sheet(&mut out, &f, &p, 1.25, &|_| [0.5, 0.5, 0.5]);
         let (mut lo, mut hi) = ((f32::MAX, f32::MAX), (f32::MIN, f32::MIN));
         for v in &out {
-            assert!((v.z - 1.25).abs() < 1e-6, "the sheet left its height: z = {}", v.z);
+            assert!(
+                (v.z - 1.25).abs() < 1e-6,
+                "the sheet left its height: z = {}",
+                v.z
+            );
             lo = (lo.0.min(v.x), lo.1.min(v.y));
             hi = (hi.0.max(v.x), hi.1.max(v.y));
         }
-        assert!((lo.0 - 2.5).abs() < 1e-4 && (lo.1 + 4.0).abs() < 1e-4, "starts at {lo:?}");
+        assert!(
+            (lo.0 - 2.5).abs() < 1e-4 && (lo.1 + 4.0).abs() < 1e-4,
+            "starts at {lo:?}"
+        );
         assert!(
             (hi.0 - (2.5 + 9.58)).abs() < 1e-4 && (hi.1 - (-4.0 + 7.58)).abs() < 1e-4,
             "ends at {hi:?}",
@@ -7364,7 +9040,11 @@ mod the_lux_overlay {
         push_lux_sheet(&mut out, &f, &plane(10.0, 10.0), 0.0, &|_| [1.0, 0.0, 0.0]);
         assert_eq!(out.len(), 10 * 9 * 6, "the masked row was painted anyway");
         for v in &out {
-            assert!(v.y >= 1.0 - 1e-4, "a vertex at y = {:.3} m is in the excluded row", v.y);
+            assert!(
+                v.y >= 1.0 - 1e-4,
+                "a vertex at y = {:.3} m is in the excluded row",
+                v.y
+            );
         }
     }
 
@@ -7381,7 +9061,12 @@ mod the_lux_overlay {
                 v[j * (nx + 1) + i] = 500.0 * i as f64 / nx as f64;
             }
         }
-        let f = Field { nx, ny, v, inside: vec![true; nx * ny] };
+        let f = Field {
+            nx,
+            ny,
+            v,
+            inside: vec![true; nx * ny],
+        };
         let segs = crate::isolux::trace(&f, 300.0);
         assert!(!segs.is_empty());
         let p = plane(10.0, 4.0);
@@ -7407,13 +9092,27 @@ mod the_lux_overlay {
     fn the_overlay_supersamples_the_calculated_grid() {
         // The project this came from: 38 × 30.
         let (nx, ny) = crate::app::CadApp::overlay_res(38, 30);
-        assert!(nx > 38 && ny > 30, "a 38 × 30 grid was drawn at {nx} × {ny} — no finer than itself");
-        assert_eq!((nx % 38, ny % 30), (0, 0), "the supersample must be a whole multiple");
+        assert!(
+            nx > 38 && ny > 30,
+            "a 38 × 30 grid was drawn at {nx} × {ny} — no finer than itself"
+        );
+        assert_eq!(
+            (nx % 38, ny % 30),
+            (0, 0),
+            "the supersample must be a whole multiple"
+        );
         // …AND IT STAYS AFFORDABLE, which is not a nicety: this is rebuilt EVERY FRAME. The
         // 128 × 128 case is the one that caught the real gap — `MAX_GRID_POINTS` is 16,384, so a
         // grid past the budget is reachable on a real project, and the fallback used to hand back
         // the full grid and spend 98,000 vertices a frame on it.
-        for (c, r) in [(38, 30), (128, 128), (16, 8), (200, 80), (128, 128), (16_384, 1)] {
+        for (c, r) in [
+            (38, 30),
+            (128, 128),
+            (16, 8),
+            (200, 80),
+            (128, 128),
+            (16_384, 1),
+        ] {
             let (x, y) = crate::app::CadApp::overlay_res(c, r);
             assert!(
                 x * y <= crate::app::CadApp::OVERLAY_BUDGET,
@@ -7425,12 +9124,18 @@ mod the_lux_overlay {
             // deep, and asserting otherwise would demand the overlay invent detail the
             // calculation does not have.
             if x < c || y < r {
-                assert!(x >= 2 && y >= 2, "a {c} × {r} grid was coarsened to {x} × {y}");
+                assert!(
+                    x >= 2 && y >= 2,
+                    "a {c} × {r} grid was coarsened to {x} × {y}"
+                );
             }
             // Coarsening is only ever a LAST resort — while the budget allows it, the overlay must
             // be at least as fine as the data it is drawing.
             if c * r <= crate::app::CadApp::OVERLAY_BUDGET {
-                assert!(x >= c && y >= r, "a {c} × {r} grid was drawn COARSER, at {x} × {y}");
+                assert!(
+                    x >= c && y >= r,
+                    "a {c} × {r} grid was drawn COARSER, at {x} × {y}"
+                );
             }
         }
     }
@@ -7502,7 +9207,10 @@ mod frustum_culling {
     }
 
     fn cube(c: [f32; 3], r: f32) -> ([f32; 3], [f32; 3]) {
-        ([c[0] - r, c[1] - r, c[2] - r], [c[0] + r, c[1] + r, c[2] + r])
+        (
+            [c[0] - r, c[1] - r, c[2] - r],
+            [c[0] + r, c[1] + r, c[2] + r],
+        )
     }
 
     #[test]
@@ -7520,7 +9228,10 @@ mod frustum_culling {
     #[test]
     fn a_box_the_camera_is_inside_is_kept() {
         let (mn, mx) = cube([0.0, 0.0, 0.0], 100.0);
-        assert!(aabb_in_frustum(&cam(), mn, mx), "the surrounding room must not be culled");
+        assert!(
+            aabb_in_frustum(&cam(), mn, mx),
+            "the surrounding room must not be culled"
+        );
     }
 
     #[test]
@@ -7558,7 +9269,10 @@ mod frustum_culling {
             }
         }
         let at = first_kept.expect("it must be kept by the time it reaches the axis");
-        assert!(at > 1.0, "a box 1 m across must be kept while still off-axis, not only at y=0");
+        assert!(
+            at > 1.0,
+            "a box 1 m across must be kept while still off-axis, not only at y=0"
+        );
     }
 
     /// The parallel projection is the other half of the viewport and has its own clip volume.
@@ -7568,7 +9282,10 @@ mod frustum_culling {
         let (mn, mx) = cube([0.0, 0.0, 0.0], 0.5);
         assert!(aabb_in_frustum(&m, mn, mx), "what it is looking at is kept");
         let (mn, mx) = cube([0.0, 500.0, 0.0], 1.0);
-        assert!(!aabb_in_frustum(&m, mn, mx), "and what is far to the side is not");
+        assert!(
+            !aabb_in_frustum(&m, mn, mx),
+            "and what is far to the side is not"
+        );
     }
 
     /// A DEGENERATE BOX IS STILL A BOX. Assets with no geometry cache `[0,0,0]` bounds, and a
@@ -7598,14 +9315,23 @@ mod frustum_culling {
         // below and the BOTTOM plane. A culler with a dead plane looks perfect until the day
         // something sails through it.
         let (mn, mx) = cube([0.0, 20.0, 0.0], 1.0);
-        assert!(!aabb_in_frustum(&m, mn, mx), "the right plane must cull this");
+        assert!(
+            !aabb_in_frustum(&m, mn, mx),
+            "the right plane must cull this"
+        );
         let (mn, mx) = cube([0.0, -20.0, 0.0], 1.0);
-        assert!(!aabb_in_frustum(&m, mn, mx), "the left plane must cull this");
+        assert!(
+            !aabb_in_frustum(&m, mn, mx),
+            "the left plane must cull this"
+        );
         // The same, turned into the vertical: only TOP/BOTTOM can reject these.
         let (mn, mx) = cube([0.0, 0.0, 20.0], 1.0);
         assert!(!aabb_in_frustum(&m, mn, mx), "the top plane must cull this");
         let (mn, mx) = cube([0.0, 0.0, -20.0], 1.0);
-        assert!(!aabb_in_frustum(&m, mn, mx), "the bottom plane must cull this");
+        assert!(
+            !aabb_in_frustum(&m, mn, mx),
+            "the bottom plane must cull this"
+        );
         // Straight down the view axis, 110 m from the eye and past the 80 m far plane: dead centre
         // of the frame, so only FAR can reject it.
         let (mn, mx) = cube([-100.0, 0.0, 0.0], 1.0);
@@ -7613,7 +9339,10 @@ mod frustum_culling {
         // 40 mm in front of the eye, inside the 100 mm near plane, on the axis and with positive
         // `w` — so the side planes read it as inside and only NEAR can reject it.
         let (mn, mx) = cube([9.96, 0.0, 0.0], 0.01);
-        assert!(!aabb_in_frustum(&m, mn, mx), "the near plane must cull this");
+        assert!(
+            !aabb_in_frustum(&m, mn, mx),
+            "the near plane must cull this"
+        );
     }
 }
 

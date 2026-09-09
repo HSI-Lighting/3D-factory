@@ -149,23 +149,42 @@ pub struct StairPlan {
 /// Validate inputs and compute the [`StairPlan`] without building geometry — the single source of
 /// the step count / riser math for both the live UI readout and [`build_stairs`].
 pub fn plan_stairs(p: &StairParams) -> Result<StairPlan, ArchError> {
-    if p.total_height <= 0.0 { return Err(ArchError::NonPositive("total_height")); }
-    if p.step_width <= 0.0 { return Err(ArchError::NonPositive("step_width")); }
-    if p.step_depth <= 0.0 { return Err(ArchError::NonPositive("step_depth")); }
-    if p.desired_riser_height <= 0.0 { return Err(ArchError::NonPositive("desired_riser_height")); }
-    if p.thickness_tread <= 0.0 { return Err(ArchError::NonPositive("thickness_tread")); }
+    if p.total_height <= 0.0 {
+        return Err(ArchError::NonPositive("total_height"));
+    }
+    if p.step_width <= 0.0 {
+        return Err(ArchError::NonPositive("step_width"));
+    }
+    if p.step_depth <= 0.0 {
+        return Err(ArchError::NonPositive("step_depth"));
+    }
+    if p.desired_riser_height <= 0.0 {
+        return Err(ArchError::NonPositive("desired_riser_height"));
+    }
+    if p.thickness_tread <= 0.0 {
+        return Err(ArchError::NonPositive("thickness_tread"));
+    }
 
     let num_steps = (p.total_height / p.desired_riser_height).ceil().max(1.0) as usize;
-    if num_steps > MAX_STEPS { return Err(ArchError::TooManySteps(num_steps)); }
+    if num_steps > MAX_STEPS {
+        return Err(ArchError::TooManySteps(num_steps));
+    }
     let riser_height = p.total_height / num_steps as f32;
 
     let (flight1_steps, flight2_steps) = match p.layout {
         StairLayout::Straight => (num_steps, 0),
         StairLayout::UShape => {
             if p.landing_depth < p.step_width {
-                return Err(ArchError::LandingTooShort { landing_depth: p.landing_depth, min: p.step_width });
+                return Err(ArchError::LandingTooShort {
+                    landing_depth: p.landing_depth,
+                    min: p.step_width,
+                });
             }
-            if num_steps < 2 { return Err(ArchError::NonPositive("total steps (U-shape needs at least 2)")); }
+            if num_steps < 2 {
+                return Err(ArchError::NonPositive(
+                    "total steps (U-shape needs at least 2)",
+                ));
+            }
             // ceil for the first flight (matches "N1 = ceil(N·ratio)"), clamped so BOTH flights
             // keep at least one step.
             let ratio = p.split_ratio.clamp(0.05, 0.95);
@@ -181,10 +200,19 @@ pub fn plan_stairs(p: &StairParams) -> Result<StairPlan, ArchError> {
     let total_run = match p.layout {
         StairLayout::Straight => num_steps as f32 * p.step_depth,
         // The two flights double back, so the footprint depth is the longer flight + the landing.
-        StairLayout::UShape => flight1_steps.max(flight2_steps) as f32 * p.step_depth + p.landing_depth,
+        StairLayout::UShape => {
+            flight1_steps.max(flight2_steps) as f32 * p.step_depth + p.landing_depth
+        }
     };
 
-    Ok(StairPlan { num_steps, riser_height, total_run, landing_height, flight1_steps, flight2_steps })
+    Ok(StairPlan {
+        num_steps,
+        riser_height,
+        total_run,
+        landing_height,
+        flight1_steps,
+        flight2_steps,
+    })
 }
 
 /// Build the staircase mesh (metres, Z-up), resting on z = 0 with the near end at y = 0.
@@ -201,18 +229,58 @@ pub fn build_stairs(p: &StairParams) -> Result<SolidMesh, ArchError> {
 
     match p.layout {
         StairLayout::Straight => {
-            build_flight(&mut m, p, plan.flight1_steps, riser, 0.0, 0.0, 0.0, 1.0, part);
+            build_flight(
+                &mut m,
+                p,
+                plan.flight1_steps,
+                riser,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                part,
+            );
             if p.has_stringers {
-                add_stringers(&mut m, p, plan.flight1_steps, riser, 0.0, 0.0, 0.0, 1.0, part);
+                add_stringers(
+                    &mut m,
+                    p,
+                    plan.flight1_steps,
+                    riser,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    part,
+                );
             }
             if p.has_handrails {
-                add_handrail(&mut m, p, plan.flight1_steps, riser, 0.0, 0.0, 0.0, 1.0, part);
+                add_handrail(
+                    &mut m,
+                    p,
+                    plan.flight1_steps,
+                    riser,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    part,
+                );
             }
         }
         StairLayout::UShape => {
             let sd = p.step_depth;
             // Flight 1: width lane x∈[0, w], climbing +Y from y = 0, base z = 0.
-            build_flight(&mut m, p, plan.flight1_steps, riser, 0.0, 0.0, 0.0, 1.0, part);
+            build_flight(
+                &mut m,
+                p,
+                plan.flight1_steps,
+                riser,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                part,
+            );
 
             // Landing: a level slab at the top of flight 1, spanning BOTH width lanes so it joins
             // the two flights. Its run-extent starts where flight 1 ends and is `landing_depth` long.
@@ -228,14 +296,64 @@ pub fn build_stairs(p: &StairParams) -> Result<SolidMesh, ArchError> {
             // Flight 2: offset one width in +X (the second lane), starting at the FAR edge of the
             // landing and running back in −Y, climbing from the landing height to the top floor.
             let y2 = y_land0 + p.landing_depth;
-            build_flight(&mut m, p, plan.flight2_steps, riser, w, z_land, y2, -1.0, part);
+            build_flight(
+                &mut m,
+                p,
+                plan.flight2_steps,
+                riser,
+                w,
+                z_land,
+                y2,
+                -1.0,
+                part,
+            );
             if p.has_stringers {
-                add_stringers(&mut m, p, plan.flight1_steps, riser, 0.0, 0.0, 0.0, 1.0, part);
-                add_stringers(&mut m, p, plan.flight2_steps, riser, w, z_land, y2, -1.0, part);
+                add_stringers(
+                    &mut m,
+                    p,
+                    plan.flight1_steps,
+                    riser,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    part,
+                );
+                add_stringers(
+                    &mut m,
+                    p,
+                    plan.flight2_steps,
+                    riser,
+                    w,
+                    z_land,
+                    y2,
+                    -1.0,
+                    part,
+                );
             }
             if p.has_handrails {
-                add_handrail(&mut m, p, plan.flight1_steps, riser, 0.0, 0.0, 0.0, 1.0, part);
-                add_handrail(&mut m, p, plan.flight2_steps, riser, w, z_land, y2, -1.0, part);
+                add_handrail(
+                    &mut m,
+                    p,
+                    plan.flight1_steps,
+                    riser,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    part,
+                );
+                add_handrail(
+                    &mut m,
+                    p,
+                    plan.flight2_steps,
+                    riser,
+                    w,
+                    z_land,
+                    y2,
+                    -1.0,
+                    part,
+                );
             }
         }
     }
@@ -277,11 +395,15 @@ fn build_flight(
             Vec3::new(x0 + w, ya.max(yb), z_top),
         );
         seal_part(m, part); // each tread its own piece
-        // Riser: vertical face at the FRONT edge (the low-run side, `ya`) of each step but the last.
+                            // Riser: vertical face at the FRONT edge (the low-run side, `ya`) of each step but the last.
         if i + 1 < steps {
             let z0 = base_z + i as f32 * riser;
             let front = ya; // nosing edge for this step
-            let (ry0, ry1) = if dir >= 0.0 { (front, front + p.thickness_riser) } else { (front - p.thickness_riser, front) };
+            let (ry0, ry1) = if dir >= 0.0 {
+                (front, front + p.thickness_riser)
+            } else {
+                (front - p.thickness_riser, front)
+            };
             push_aabb(m, Vec3::new(x0, ry0, z0), Vec3::new(x0 + w, ry1, z_top));
             seal_part(m, part); // each riser its own piece
         }
@@ -301,7 +423,9 @@ fn add_stringers(
     dir: f32,
     part: &mut u32,
 ) {
-    if steps == 0 { return; }
+    if steps == 0 {
+        return;
+    }
     let w = p.step_width;
     let run = steps as f32 * p.step_depth;
     let rise = steps as f32 * riser;
@@ -310,11 +434,7 @@ fn add_stringers(
     // Profile in (y, z): the solid triangle under the diagonal, from the near-bottom nosing up to
     // the far-top. `dir` mirrors it for the return flight.
     let y_far = y_start + dir * run;
-    let profile = [
-        [y_start, base_z],
-        [y_far, base_z],
-        [y_far, base_z + rise],
-    ];
+    let profile = [[y_start, base_z], [y_far, base_z], [y_far, base_z + rise]];
     // One stringer flush against each side of the width lane.
     push_prism(m, &profile, x0, x0 + t);
     seal_part(m, part);
@@ -336,7 +456,9 @@ fn add_handrail(
     dir: f32,
     part: &mut u32,
 ) {
-    if steps == 0 { return; }
+    if steps == 0 {
+        return;
+    }
     let w = p.step_width;
     let sd = p.step_depth;
     let hr = p.handrail_height.max(0.3);
@@ -351,7 +473,11 @@ fn add_handrail(
     // The rail runs parallel to the pitch, `hr` above each nosing: from above tread 1 to above the
     // top tread. Linear in y so balusters can find their exact rail height.
     let rail_z = |y: f32| {
-        let f = if run.abs() < 1e-6 { 0.0 } else { (y - y_start) / (dir * run) };
+        let f = if run.abs() < 1e-6 {
+            0.0
+        } else {
+            (y - y_start) / (dir * run)
+        };
         base_z + riser + hr + f * (rise - riser)
     };
 
@@ -385,7 +511,12 @@ fn add_handrail(
             let tread_top = base_z + (i + 1) as f32 * riser;
             let top = rail_z(yb);
             if top - tread_top > bal {
-                push_rod(m, Vec3::new(side, yb, tread_top), Vec3::new(side, yb, top), bal);
+                push_rod(
+                    m,
+                    Vec3::new(side, yb, tread_top),
+                    Vec3::new(side, yb, top),
+                    bal,
+                );
                 seal_part(m, part); // each baluster its own piece
             }
         }
@@ -437,18 +568,36 @@ pub struct SpiralPlan {
 }
 
 pub fn plan_spiral(p: &SpiralParams) -> Result<SpiralPlan, ArchError> {
-    if p.total_height <= 0.0 { return Err(ArchError::NonPositive("total_height")); }
-    if p.step_width <= 0.0 { return Err(ArchError::NonPositive("step_width")); }
-    if p.center_radius < 0.0 { return Err(ArchError::NonPositive("center_radius")); }
-    if p.steps_per_turn < 3 { return Err(ArchError::NonPositive("steps_per_turn (need at least 3)")); }
-    if p.total_turns <= 0.0 { return Err(ArchError::NonPositive("total_turns")); }
-    if p.thickness_tread <= 0.0 { return Err(ArchError::NonPositive("thickness_tread")); }
+    if p.total_height <= 0.0 {
+        return Err(ArchError::NonPositive("total_height"));
+    }
+    if p.step_width <= 0.0 {
+        return Err(ArchError::NonPositive("step_width"));
+    }
+    if p.center_radius < 0.0 {
+        return Err(ArchError::NonPositive("center_radius"));
+    }
+    if p.steps_per_turn < 3 {
+        return Err(ArchError::NonPositive("steps_per_turn (need at least 3)"));
+    }
+    if p.total_turns <= 0.0 {
+        return Err(ArchError::NonPositive("total_turns"));
+    }
+    if p.thickness_tread <= 0.0 {
+        return Err(ArchError::NonPositive("thickness_tread"));
+    }
 
     let num_steps = ((p.steps_per_turn as f32) * p.total_turns).round().max(1.0) as usize;
-    if num_steps > MAX_STEPS { return Err(ArchError::TooManySteps(num_steps)); }
+    if num_steps > MAX_STEPS {
+        return Err(ArchError::TooManySteps(num_steps));
+    }
     let riser_height = p.total_height / num_steps as f32;
     let total_rotation_deg = num_steps as f32 * (360.0 / p.steps_per_turn as f32);
-    Ok(SpiralPlan { num_steps, riser_height, total_rotation_deg })
+    Ok(SpiralPlan {
+        num_steps,
+        riser_height,
+        total_rotation_deg,
+    })
 }
 
 /// Build a spiral stair: wedge-like treads fanned around a central square post, each rotated
@@ -465,7 +614,11 @@ pub fn build_spiral(p: &SpiralParams) -> Result<SolidMesh, ArchError> {
     for k in 0..plan.num_steps {
         let θ = k as f32 * dθ;
         let z_top = (k + 1) as f32 * plan.riser_height;
-        let center = Vec3::new(r_mid * θ.cos(), r_mid * θ.sin(), z_top - p.thickness_tread * 0.5);
+        let center = Vec3::new(
+            r_mid * θ.cos(),
+            r_mid * θ.sin(),
+            z_top - p.thickness_tread * 0.5,
+        );
         let half = Vec3::new(p.step_width * 0.5, tang * 0.5, p.thickness_tread * 0.5);
         push_obb(&mut m, center, half, Mat3::from_rotation_z(θ));
         seal_part(&mut m, part); // each tread its own piece
@@ -518,7 +671,12 @@ pub struct RampParams {
 
 impl Default for RampParams {
     fn default() -> Self {
-        Self { vertical_height: 1.0, horizontal_length: 4.0, width: 1.5, thickness: 0.15 }
+        Self {
+            vertical_height: 1.0,
+            horizontal_length: 4.0,
+            width: 1.5,
+            thickness: 0.15,
+        }
     }
 }
 
@@ -529,10 +687,18 @@ pub fn ramp_slope_deg(p: &RampParams) -> f32 {
 /// Build a ramp: an inclined slab of `thickness` whose walking surface rises from `(y=0, z=0)` to
 /// `(y=horizontal_length, z=vertical_height)`, extruded across `width`. Rests on z = 0.
 pub fn build_ramp(p: &RampParams) -> Result<SolidMesh, ArchError> {
-    if p.vertical_height <= 0.0 { return Err(ArchError::NonPositive("vertical_height")); }
-    if p.horizontal_length <= 0.0 { return Err(ArchError::NonPositive("horizontal_length")); }
-    if p.width <= 0.0 { return Err(ArchError::NonPositive("width")); }
-    if p.thickness <= 0.0 { return Err(ArchError::NonPositive("thickness")); }
+    if p.vertical_height <= 0.0 {
+        return Err(ArchError::NonPositive("vertical_height"));
+    }
+    if p.horizontal_length <= 0.0 {
+        return Err(ArchError::NonPositive("horizontal_length"));
+    }
+    if p.width <= 0.0 {
+        return Err(ArchError::NonPositive("width"));
+    }
+    if p.thickness <= 0.0 {
+        return Err(ArchError::NonPositive("thickness"));
+    }
 
     let (l, h, t) = (p.horizontal_length, p.vertical_height, p.thickness);
     let len = (l * l + h * h).sqrt().max(1e-6);
@@ -547,7 +713,9 @@ pub fn build_ramp(p: &RampParams) -> Result<SolidMesh, ArchError> {
     ];
     // Lift so the lowest point rests on z = 0.
     let min_z = profile.iter().fold(f32::INFINITY, |a, q| a.min(q[1]));
-    for q in &mut profile { q[1] -= min_z; }
+    for q in &mut profile {
+        q[1] -= min_z;
+    }
 
     let mut m = SolidMesh::default();
     push_prism(&mut m, &profile, 0.0, p.width);
@@ -637,13 +805,29 @@ pub struct HelicalRampMetrics {
 }
 
 /// Validate + derive a helical ramp (spec §B2 / §B7). Hard errors → [`ArchError`].
-pub fn plan_helical_ramp(p: &HelicalRampParams) -> Result<(HelicalRampMetrics, Vec<String>), ArchError> {
-    if p.ramp_height <= 0.0 { return Err(ArchError::NonPositive("ramp_height")); }
-    if p.slab_thickness <= 0.0 { return Err(ArchError::NonPositive("slab_thickness")); }
-    if p.turns <= 0.0 { return Err(ArchError::NonPositive("turns")); }
-    if p.r_inner < 0.0 { return Err(ArchError::NonPositive("r_inner")); }
-    if p.r_outer <= p.r_inner { return Err(ArchError::NonPositive("r_outer (must exceed r_inner)")); }
-    if p.rail_height <= p.rail_lowest { return Err(ArchError::NonPositive("rail_height (must exceed rail_lowest)")); }
+pub fn plan_helical_ramp(
+    p: &HelicalRampParams,
+) -> Result<(HelicalRampMetrics, Vec<String>), ArchError> {
+    if p.ramp_height <= 0.0 {
+        return Err(ArchError::NonPositive("ramp_height"));
+    }
+    if p.slab_thickness <= 0.0 {
+        return Err(ArchError::NonPositive("slab_thickness"));
+    }
+    if p.turns <= 0.0 {
+        return Err(ArchError::NonPositive("turns"));
+    }
+    if p.r_inner < 0.0 {
+        return Err(ArchError::NonPositive("r_inner"));
+    }
+    if p.r_outer <= p.r_inner {
+        return Err(ArchError::NonPositive("r_outer (must exceed r_inner)"));
+    }
+    if p.rail_height <= p.rail_lowest {
+        return Err(ArchError::NonPositive(
+            "rail_height (must exceed rail_lowest)",
+        ));
+    }
 
     let sweep = p.direction.signum() * 360.0 * p.turns;
     let sweep_rad = sweep.abs().to_radians();
@@ -652,7 +836,11 @@ pub fn plan_helical_ramp(p: &HelicalRampParams) -> Result<(HelicalRampMetrics, V
     let inner_len = sweep_rad * p.r_inner.max(1e-3);
     let r_out_rail = (p.r_outer - p.rail_inset).max(1e-3);
     let r_in_rail = (p.r_inner + p.rail_inset).max(1e-3);
-    let posts = |r: f32| ((sweep_rad * r) / p.post_spacing.max(1e-3)).round().max(2.0) as usize;
+    let posts = |r: f32| {
+        ((sweep_rad * r) / p.post_spacing.max(1e-3))
+            .round()
+            .max(2.0) as usize
+    };
     let m = HelicalRampMetrics {
         sweep_deg: sweep,
         deck_width: p.r_outer - p.r_inner,
@@ -673,24 +861,42 @@ pub fn plan_helical_ramp(p: &HelicalRampParams) -> Result<(HelicalRampMetrics, V
     let mut warn = Vec::new();
     let one_in = |s: f32| if s > 0.0 { 1.0 / s } else { f32::INFINITY };
     if m.slope_mean > 1.0 / 12.0 {
-        warn.push(format!("slope 1:{:.1} at the mean radius is steeper than the 1:12 accessibility limit", one_in(m.slope_mean)));
+        warn.push(format!(
+            "slope 1:{:.1} at the mean radius is steeper than the 1:12 accessibility limit",
+            one_in(m.slope_mean)
+        ));
     }
     if m.slope_inner > 1.0 / 12.0 {
-        warn.push(format!("slope 1:{:.1} at the INNER edge (the governing figure — people cut the inside)", one_in(m.slope_inner)));
+        warn.push(format!(
+            "slope 1:{:.1} at the INNER edge (the governing figure — people cut the inside)",
+            one_in(m.slope_inner)
+        ));
     }
     if m.headroom < 2.10 {
-        warn.push(format!("headroom {:.2} m is below the 2.10 m walk-under minimum", m.headroom));
+        warn.push(format!(
+            "headroom {:.2} m is below the 2.10 m walk-under minimum",
+            m.headroom
+        ));
     }
     if m.deck_width < 1.20 {
-        warn.push(format!("deck {:.2} m is below the 1.20 m two-way minimum", m.deck_width));
+        warn.push(format!(
+            "deck {:.2} m is below the 1.20 m two-way minimum",
+            m.deck_width
+        ));
     }
     if !(0.90..=1.10).contains(&p.rail_height) {
-        warn.push(format!("rail {:.2} m is outside the usual 0.90–1.10 m", p.rail_height));
+        warn.push(format!(
+            "rail {:.2} m is outside the usual 0.90–1.10 m",
+            p.rail_height
+        ));
     }
     if m.rise_per_turn > 0.75 {
         warn.push(format!("rise/turn {:.2} m — a continuous helix has no landing (most codes require one above 0.75 m)", m.rise_per_turn));
     }
-    warn.push(format!("to reach 1:12 at the mean radius, use {:.2} turns", m.turns_for_1_12));
+    warn.push(format!(
+        "to reach 1:12 at the mean radius, use {:.2} turns",
+        m.turns_for_1_12
+    ));
     Ok((m, warn))
 }
 
@@ -721,10 +927,14 @@ pub fn build_helical_ramp(p: &HelicalRampParams) -> Result<SolidMesh, ArchError>
         let a0 = start + sweep * i as f32 / n as f32;
         let a1 = start + sweep * (i + 1) as f32 / n as f32;
         let (z0, z1) = (ztop(a0), ztop(a1));
-        let it0 = pt(ri, a0, z0); let ot0 = pt(ro, a0, z0);
-        let ib0 = pt(ri, a0, z0 - t); let ob0 = pt(ro, a0, z0 - t);
-        let it1 = pt(ri, a1, z1); let ot1 = pt(ro, a1, z1);
-        let ib1 = pt(ri, a1, z1 - t); let ob1 = pt(ro, a1, z1 - t);
+        let it0 = pt(ri, a0, z0);
+        let ot0 = pt(ro, a0, z0);
+        let ib0 = pt(ri, a0, z0 - t);
+        let ob0 = pt(ro, a0, z0 - t);
+        let it1 = pt(ri, a1, z1);
+        let ot1 = pt(ro, a1, z1);
+        let ib1 = pt(ri, a1, z1 - t);
+        let ob1 = pt(ro, a1, z1 - t);
         push_quad(&mut m, it0, ot0, ot1, it1); // walking surface
         push_quad(&mut m, ib0, ib1, ob1, ob0); // soffit
         push_quad(&mut m, it0, it1, ib1, ib0); // inner fascia
@@ -732,9 +942,22 @@ pub fn build_helical_ramp(p: &HelicalRampParams) -> Result<SolidMesh, ArchError>
     }
     {
         let (a, z) = (start, ztop(start));
-        push_quad(&mut m, pt(ri, a, z), pt(ri, a, z - t), pt(ro, a, z - t), pt(ro, a, z)); // bottom cap
-        let a = start + sweep; let z = ztop(a);
-        push_quad(&mut m, pt(ri, a, z), pt(ro, a, z), pt(ro, a, z - t), pt(ri, a, z - t)); // top cap
+        push_quad(
+            &mut m,
+            pt(ri, a, z),
+            pt(ri, a, z - t),
+            pt(ro, a, z - t),
+            pt(ro, a, z),
+        ); // bottom cap
+        let a = start + sweep;
+        let z = ztop(a);
+        push_quad(
+            &mut m,
+            pt(ri, a, z),
+            pt(ro, a, z),
+            pt(ro, a, z - t),
+            pt(ri, a, z - t),
+        ); // top cap
     }
     seal_part(&mut m, &mut part); // the whole deck is one swept piece
 
@@ -743,16 +966,22 @@ pub fn build_helical_ramp(p: &HelicalRampParams) -> Result<SolidMesh, ArchError>
     let rail_r = p.rail_tube_d * 0.5;
     let post_r = p.post_d * 0.5;
     let rail_off = |k: usize| -> f32 {
-        if p.rail_count <= 1 { p.rail_height } else { p.rail_lowest + (p.rail_height - p.rail_lowest) * k as f32 / (p.rail_count - 1) as f32 }
+        if p.rail_count <= 1 {
+            p.rail_height
+        } else {
+            p.rail_lowest + (p.rail_height - p.rail_lowest) * k as f32 / (p.rail_count - 1) as f32
+        }
     };
     let edges: &[bool] = match p.balustrade_edges {
-        BalustradeEdges::Both => &[true, true],       // [outer, inner]
+        BalustradeEdges::Both => &[true, true], // [outer, inner]
         BalustradeEdges::OuterOnly => &[true, false],
         BalustradeEdges::InnerOnly => &[false, true],
     };
     let edge_r = [(ro - p.rail_inset).max(1e-3), (ri + p.rail_inset).max(1e-3)];
     for (e, &on) in edges.iter().enumerate() {
-        if !on { continue; }
+        if !on {
+            continue;
+        }
         let re = edge_r[e];
         // Rails.
         for k in 0..p.rail_count.max(1) {
@@ -767,7 +996,9 @@ pub fn build_helical_ramp(p: &HelicalRampParams) -> Result<SolidMesh, ArchError>
             seal_part(&mut m, &mut part);
         }
         // Posts — arc-spaced on THIS edge (spec §B6.2). Constant radius → even in angle.
-        let np = ((sweep.abs().to_radians() * re) / p.post_spacing.max(1e-3)).round().max(2.0) as usize;
+        let np = ((sweep.abs().to_radians() * re) / p.post_spacing.max(1e-3))
+            .round()
+            .max(2.0) as usize;
         for j in 0..np {
             let a = start + sweep * j as f32 / np as f32;
             let base = Vec3::from(pt(re, a, ztop(a)));
@@ -811,7 +1042,11 @@ fn seal_part(m: &mut SolidMesh, part: &mut u32) {
 fn push_tri(m: &mut SolidMesh, a: [f32; 3], b: [f32; 3], c: [f32; 3]) {
     let (va, vb, vc) = (Vec3::from(a), Vec3::from(b), Vec3::from(c));
     let n = (vb - va).cross(vc - va).normalize_or_zero();
-    let na = if n.length_squared() < 1e-12 { [0.0, 0.0, 1.0] } else { n.to_array() };
+    let na = if n.length_squared() < 1e-12 {
+        [0.0, 0.0, 1.0]
+    } else {
+        n.to_array()
+    };
     for p in [a, b, c] {
         m.positions.push(p);
         m.normals.push(na);
@@ -829,14 +1064,50 @@ fn push_aabb(m: &mut SolidMesh, mn: Vec3, mx: Vec3) {
     let c = |x: f32, y: f32, z: f32| [x, y, z];
     let (x0, y0, z0, x1, y1, z1) = (mn.x, mn.y, mn.z, mx.x, mx.y, mx.z);
     // bottom / top
-    push_quad(m, c(x0, y0, z0), c(x1, y0, z0), c(x1, y1, z0), c(x0, y1, z0));
-    push_quad(m, c(x0, y0, z1), c(x0, y1, z1), c(x1, y1, z1), c(x1, y0, z1));
+    push_quad(
+        m,
+        c(x0, y0, z0),
+        c(x1, y0, z0),
+        c(x1, y1, z0),
+        c(x0, y1, z0),
+    );
+    push_quad(
+        m,
+        c(x0, y0, z1),
+        c(x0, y1, z1),
+        c(x1, y1, z1),
+        c(x1, y0, z1),
+    );
     // front (y0) / back (y1)
-    push_quad(m, c(x0, y0, z0), c(x0, y0, z1), c(x1, y0, z1), c(x1, y0, z0));
-    push_quad(m, c(x0, y1, z0), c(x1, y1, z0), c(x1, y1, z1), c(x0, y1, z1));
+    push_quad(
+        m,
+        c(x0, y0, z0),
+        c(x0, y0, z1),
+        c(x1, y0, z1),
+        c(x1, y0, z0),
+    );
+    push_quad(
+        m,
+        c(x0, y1, z0),
+        c(x1, y1, z0),
+        c(x1, y1, z1),
+        c(x0, y1, z1),
+    );
     // left (x0) / right (x1)
-    push_quad(m, c(x0, y0, z0), c(x0, y1, z0), c(x0, y1, z1), c(x0, y0, z1));
-    push_quad(m, c(x1, y0, z0), c(x1, y0, z1), c(x1, y1, z1), c(x1, y1, z0));
+    push_quad(
+        m,
+        c(x0, y0, z0),
+        c(x0, y1, z0),
+        c(x0, y1, z1),
+        c(x0, y0, z1),
+    );
+    push_quad(
+        m,
+        c(x1, y0, z0),
+        c(x1, y0, z1),
+        c(x1, y1, z1),
+        c(x1, y1, z0),
+    );
 }
 
 /// Push an oriented box: a box of half-extents `half` centred at `center`, rotated by `rot`.
@@ -895,7 +1166,13 @@ fn push_rod(m: &mut SolidMesh, a: Vec3, b: Vec3, r: f32) {
     let (ra, rb) = (ring(a), ring(b));
     for i in 0..ROD_SEG {
         let j = (i + 1) % ROD_SEG;
-        push_quad(m, ra[i].to_array(), ra[j].to_array(), rb[j].to_array(), rb[i].to_array());
+        push_quad(
+            m,
+            ra[i].to_array(),
+            ra[j].to_array(),
+            rb[j].to_array(),
+            rb[i].to_array(),
+        );
         push_tri(m, a.to_array(), ra[j].to_array(), ra[i].to_array()); // start cap
         push_tri(m, b.to_array(), rb[i].to_array(), rb[j].to_array()); // end cap
     }
@@ -930,13 +1207,29 @@ fn push_polyline_tube(m: &mut SolidMesh, pts: &[Vec3], r: f32) {
     for i in 0..n - 1 {
         for k in 0..ROD_SEG {
             let j = (k + 1) % ROD_SEG;
-            push_quad(m, rings[i][k].to_array(), rings[i][j].to_array(), rings[i + 1][j].to_array(), rings[i + 1][k].to_array());
+            push_quad(
+                m,
+                rings[i][k].to_array(),
+                rings[i][j].to_array(),
+                rings[i + 1][j].to_array(),
+                rings[i + 1][k].to_array(),
+            );
         }
     }
     for k in 0..ROD_SEG {
         let j = (k + 1) % ROD_SEG;
-        push_tri(m, pts[0].to_array(), rings[0][j].to_array(), rings[0][k].to_array());
-        push_tri(m, pts[n - 1].to_array(), rings[n - 1][k].to_array(), rings[n - 1][j].to_array());
+        push_tri(
+            m,
+            pts[0].to_array(),
+            rings[0][j].to_array(),
+            rings[0][k].to_array(),
+        );
+        push_tri(
+            m,
+            pts[n - 1].to_array(),
+            rings[n - 1][k].to_array(),
+            rings[n - 1][j].to_array(),
+        );
     }
 }
 
@@ -970,7 +1263,9 @@ fn push_cylinder(m: &mut SolidMesh, cx: f32, cy: f32, r: f32, z0: f32, z1: f32, 
 /// triangular stringers and the ramp deck.
 fn push_prism(m: &mut SolidMesh, profile: &[[f32; 2]], x_lo: f32, x_hi: f32) {
     let n = profile.len();
-    if n < 3 { return; }
+    if n < 3 {
+        return;
+    }
     let at = |x: f32, q: [f32; 2]| [x, q[0], q[1]];
     // Caps (fan from vertex 0), wound OPPOSITE ways so each faces out of its own end.
     //
@@ -980,8 +1275,18 @@ fn push_prism(m: &mut SolidMesh, profile: &[[f32; 2]], x_lo: f32, x_hi: f32) {
     // caps also leave the prism non-orientable, which is what `meshcut::closure` reports as four
     // unmatched edges on a ramp that looks perfectly closed.
     for k in 1..n - 1 {
-        push_tri(m, at(x_lo, profile[0]), at(x_lo, profile[k + 1]), at(x_lo, profile[k]));
-        push_tri(m, at(x_hi, profile[0]), at(x_hi, profile[k]), at(x_hi, profile[k + 1]));
+        push_tri(
+            m,
+            at(x_lo, profile[0]),
+            at(x_lo, profile[k + 1]),
+            at(x_lo, profile[k]),
+        );
+        push_tri(
+            m,
+            at(x_hi, profile[0]),
+            at(x_hi, profile[k]),
+            at(x_hi, profile[k + 1]),
+        );
     }
     // Side walls.
     for k in 0..n {
@@ -1002,8 +1307,7 @@ pub fn mesh_volume(m: &SolidMesh) -> f32 {
         let a = t[0].map(|x| x as f64);
         let b = t[1].map(|x| x as f64);
         let c = t[2].map(|x| x as f64);
-        v += a[0] * (b[1] * c[2] - b[2] * c[1])
-            - a[1] * (b[0] * c[2] - b[2] * c[0])
+        v += a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
             + a[2] * (b[0] * c[1] - b[1] * c[0]);
     }
     (v / 6.0).abs() as f32
@@ -1017,30 +1321,82 @@ mod tests {
     #[test]
     fn helical_ramp_metrics_match_spec() {
         let (m, _w) = plan_helical_ramp(&HelicalRampParams::default()).unwrap();
-        assert!((m.deck_width - 3.25).abs() < 1e-4, "deck width {}", m.deck_width);
-        assert!((m.radius_ratio - 0.35).abs() < 1e-4, "ratio {}", m.radius_ratio);
+        assert!(
+            (m.deck_width - 3.25).abs() < 1e-4,
+            "deck width {}",
+            m.deck_width
+        );
+        assert!(
+            (m.radius_ratio - 0.35).abs() < 1e-4,
+            "ratio {}",
+            m.radius_ratio
+        );
         assert!((m.sweep_deg - 720.0).abs() < 1e-3, "sweep {}", m.sweep_deg);
-        assert!((m.pitch_m_per_deg - 0.0097222).abs() < 1e-6, "pitch {}", m.pitch_m_per_deg);
-        assert!((m.rise_per_turn - 3.5).abs() < 1e-4, "rise/turn {}", m.rise_per_turn);
-        assert!((m.path_length - 42.4115).abs() < 1e-2, "walked {}", m.path_length);
-        assert!((m.slope_mean - 0.16505).abs() < 1e-4, "slope mean {}", m.slope_mean);
-        assert!((m.slope_inner - 0.31831).abs() < 1e-4, "slope inner {}", m.slope_inner);
+        assert!(
+            (m.pitch_m_per_deg - 0.0097222).abs() < 1e-6,
+            "pitch {}",
+            m.pitch_m_per_deg
+        );
+        assert!(
+            (m.rise_per_turn - 3.5).abs() < 1e-4,
+            "rise/turn {}",
+            m.rise_per_turn
+        );
+        assert!(
+            (m.path_length - 42.4115).abs() < 1e-2,
+            "walked {}",
+            m.path_length
+        );
+        assert!(
+            (m.slope_mean - 0.16505).abs() < 1e-4,
+            "slope mean {}",
+            m.slope_mean
+        );
+        assert!(
+            (m.slope_inner - 0.31831).abs() < 1e-4,
+            "slope inner {}",
+            m.slope_inner
+        );
         assert!((m.headroom - 3.20).abs() < 1e-4, "headroom {}", m.headroom);
         assert!((m.top_of_deck - 7.30).abs() < 1e-4, "top {}", m.top_of_deck);
-        assert!((m.turns_for_1_12 - 3.96).abs() < 0.02, "turns for 1:12 {}", m.turns_for_1_12);
+        assert!(
+            (m.turns_for_1_12 - 3.96).abs() < 0.02,
+            "turns for 1:12 {}",
+            m.turns_for_1_12
+        );
     }
 
     /// Spec §B8 parametric row — `top_of_deck == slab + ramp_height` for several very different
     /// ramps, and reversing `direction` gives identical derived numbers (a mirror image).
     #[test]
     fn helical_ramp_is_parametric_and_mirror_symmetric() {
-        for (h, ri, ro, turns) in [(7.0, 1.75, 5.0, 2.0), (4.2, 3.0, 6.0, 3.0), (2.8, 1.2, 3.0, 1.0)] {
-            let p = HelicalRampParams { ramp_height: h, r_inner: ri, r_outer: ro, turns, ..Default::default() };
+        for (h, ri, ro, turns) in [
+            (7.0, 1.75, 5.0, 2.0),
+            (4.2, 3.0, 6.0, 3.0),
+            (2.8, 1.2, 3.0, 1.0),
+        ] {
+            let p = HelicalRampParams {
+                ramp_height: h,
+                r_inner: ri,
+                r_outer: ro,
+                turns,
+                ..Default::default()
+            };
             let (m, _) = plan_helical_ramp(&p).unwrap();
             assert!((m.top_of_deck - (p.slab_thickness + h)).abs() < 1e-5);
-            let (mr, _) = plan_helical_ramp(&HelicalRampParams { direction: -1.0, ..p }).unwrap();
-            assert!((mr.slope_mean - m.slope_mean).abs() < 1e-6, "mirror keeps the slope");
-            assert!((mr.top_of_deck - m.top_of_deck).abs() < 1e-6, "mirror keeps the top");
+            let (mr, _) = plan_helical_ramp(&HelicalRampParams {
+                direction: -1.0,
+                ..p
+            })
+            .unwrap();
+            assert!(
+                (mr.slope_mean - m.slope_mean).abs() < 1e-6,
+                "mirror keeps the slope"
+            );
+            assert!(
+                (mr.top_of_deck - m.top_of_deck).abs() < 1e-6,
+                "mirror keeps the top"
+            );
         }
     }
 
@@ -1048,30 +1404,64 @@ mod tests {
     /// of the walking surface, and tags many pieces (deck + rails + posts + end rails).
     #[test]
     fn helical_ramp_builds_a_valid_solid() {
-        let p = HelicalRampParams { segments_per_turn: 48, ..Default::default() };
+        let p = HelicalRampParams {
+            segments_per_turn: 48,
+            ..Default::default()
+        };
         let m = build_helical_ramp(&p).unwrap();
         assert!(m.tri_count() > 0);
         assert_eq!(m.face_ids.len(), m.tri_count(), "every triangle tagged");
         let pieces = m.face_ids.iter().copied().max().unwrap() + 1;
-        assert!(pieces > 50, "deck + 8 rails + many posts + end rails, got {pieces}");
+        assert!(
+            pieces > 50,
+            "deck + 8 rails + many posts + end rails, got {pieces}"
+        );
         let (mn, mx) = m.bounds().unwrap();
-        assert!((mx[2] - (p.slab_thickness + p.ramp_height + p.rail_height)).abs() < 0.1, "reaches the top rail");
+        assert!(
+            (mx[2] - (p.slab_thickness + p.ramp_height + p.rail_height)).abs() < 0.1,
+            "reaches the top rail"
+        );
         assert!(mn[2] >= -1e-3, "the soffit rests on z = 0");
         // Spans the full outer diameter.
-        assert!(mx[0] - mn[0] > 2.0 * p.r_outer - 0.5, "spans the outer diameter");
+        assert!(
+            mx[0] - mn[0] > 2.0 * p.r_outer - 0.5,
+            "spans the outer diameter"
+        );
     }
 
     #[test]
     fn helical_ramp_rejects_bad_inputs() {
-        assert!(plan_helical_ramp(&HelicalRampParams { r_outer: 1.0, r_inner: 2.0, ..Default::default() }).is_err());
-        assert!(plan_helical_ramp(&HelicalRampParams { turns: 0.0, ..Default::default() }).is_err());
-        assert!(plan_helical_ramp(&HelicalRampParams { slab_thickness: 0.0, ..Default::default() }).is_err());
-        assert!(plan_helical_ramp(&HelicalRampParams { rail_height: 0.1, rail_lowest: 0.2, ..Default::default() }).is_err());
+        assert!(plan_helical_ramp(&HelicalRampParams {
+            r_outer: 1.0,
+            r_inner: 2.0,
+            ..Default::default()
+        })
+        .is_err());
+        assert!(plan_helical_ramp(&HelicalRampParams {
+            turns: 0.0,
+            ..Default::default()
+        })
+        .is_err());
+        assert!(plan_helical_ramp(&HelicalRampParams {
+            slab_thickness: 0.0,
+            ..Default::default()
+        })
+        .is_err());
+        assert!(plan_helical_ramp(&HelicalRampParams {
+            rail_height: 0.1,
+            rail_lowest: 0.2,
+            ..Default::default()
+        })
+        .is_err());
     }
 
     #[test]
     fn straight_stairs_step_count_and_riser() {
-        let p = StairParams { total_height: 3.0, desired_riser_height: 0.18, ..Default::default() };
+        let p = StairParams {
+            total_height: 3.0,
+            desired_riser_height: 0.18,
+            ..Default::default()
+        };
         let plan = plan_stairs(&p).unwrap();
         // ceil(3.0 / 0.18) = ceil(16.67) = 17
         assert_eq!(plan.num_steps, 17);
@@ -1103,7 +1493,10 @@ mod tests {
         let m = build_stairs(&p).unwrap();
         let (mn, mx) = m.bounds().unwrap();
         // Two width lanes wide, rises to the full height.
-        assert!(mx[0] - mn[0] > 1.9 && mx[0] - mn[0] < 2.1, "spans two widths");
+        assert!(
+            mx[0] - mn[0] > 1.9 && mx[0] - mn[0] < 2.1,
+            "spans two widths"
+        );
         assert!((mx[2] - 3.0).abs() < 1e-3, "reaches floor-to-floor height");
         assert!(mesh_volume(&m) > 0.0);
     }
@@ -1116,37 +1509,63 @@ mod tests {
             landing_depth: 0.5, // < step_width
             ..Default::default()
         };
-        assert!(matches!(plan_stairs(&p), Err(ArchError::LandingTooShort { .. })));
+        assert!(matches!(
+            plan_stairs(&p),
+            Err(ArchError::LandingTooShort { .. })
+        ));
     }
 
     #[test]
     fn tiny_riser_is_capped_not_hung() {
-        let p = StairParams { total_height: 3.0, desired_riser_height: 0.0001, ..Default::default() };
+        let p = StairParams {
+            total_height: 3.0,
+            desired_riser_height: 0.0001,
+            ..Default::default()
+        };
         assert!(matches!(plan_stairs(&p), Err(ArchError::TooManySteps(_))));
     }
 
     #[test]
     fn spiral_steps_rotation_and_solid() {
         // has_handrail off so the top of the mesh is the post, not a rail 0.9 m higher.
-        let p = SpiralParams { steps_per_turn: 12, total_turns: 1.5, has_handrail: false, ..Default::default() };
+        let p = SpiralParams {
+            steps_per_turn: 12,
+            total_turns: 1.5,
+            has_handrail: false,
+            ..Default::default()
+        };
         let plan = plan_spiral(&p).unwrap();
         assert_eq!(plan.num_steps, 18); // 12 * 1.5
         assert!((plan.total_rotation_deg - 540.0).abs() < 1e-3);
         let m = build_spiral(&p).unwrap();
         assert!(m.tri_count() > 0 && mesh_volume(&m) > 0.0);
         let (mn, mx) = m.bounds().unwrap();
-        assert!((mx[2] - mn[2] - p.total_height).abs() < 1e-3, "post spans the height");
+        assert!(
+            (mx[2] - mn[2] - p.total_height).abs() < 1e-3,
+            "post spans the height"
+        );
     }
 
     #[test]
     fn stairs_tag_each_primitive_as_its_own_part() {
         // A straight flight tags every tread/riser/baluster/rail with a distinct face_id, so
         // "select a piece" downstream picks ONE part, not the whole welded run.
-        let p = StairParams { total_height: 2.0, desired_riser_height: 0.2, ..Default::default() };
+        let p = StairParams {
+            total_height: 2.0,
+            desired_riser_height: 0.2,
+            ..Default::default()
+        };
         let m = build_stairs(&p).unwrap();
-        assert_eq!(m.face_ids.len(), m.positions.len() / 3, "one part id per triangle");
+        assert_eq!(
+            m.face_ids.len(),
+            m.positions.len() / 3,
+            "one part id per triangle"
+        );
         let parts = m.face_ids.iter().copied().max().unwrap() + 1;
-        assert!(parts > 10, "many distinct pieces (treads+risers+rails+balusters), got {parts}");
+        assert!(
+            parts > 10,
+            "many distinct pieces (treads+risers+rails+balusters), got {parts}"
+        );
         // No single part covers the whole mesh.
         let ntri = m.positions.len() / 3;
         for pid in 0..parts {
@@ -1158,22 +1577,39 @@ mod tests {
     #[test]
     fn straight_handrail_adds_members_above_the_treads() {
         // Same stair with and without the balustrade: rails must add triangles and raise the top.
-        let bare = StairParams { has_handrails: false, ..Default::default() };
-        let railed = StairParams { has_handrails: true, ..Default::default() };
+        let bare = StairParams {
+            has_handrails: false,
+            ..Default::default()
+        };
+        let railed = StairParams {
+            has_handrails: true,
+            ..Default::default()
+        };
         let mb = build_stairs(&bare).unwrap();
         let mr = build_stairs(&railed).unwrap();
         assert!(mr.tri_count() > mb.tri_count(), "handrail adds geometry");
         let (_, mxb) = mb.bounds().unwrap();
         let (_, mxr) = mr.bounds().unwrap();
         // The rail sits ~handrail_height above the top tread, so the railed mesh is taller.
-        assert!(mxr[2] > mxb[2] + 0.5, "rail rises above the treads ({} vs {})", mxr[2], mxb[2]);
+        assert!(
+            mxr[2] > mxb[2] + 0.5,
+            "rail rises above the treads ({} vs {})",
+            mxr[2],
+            mxb[2]
+        );
         assert!(mesh_volume(&mr) > 0.0);
     }
 
     #[test]
     fn spiral_post_is_round_and_handrail_present() {
-        let bare = SpiralParams { has_handrail: false, ..Default::default() };
-        let railed = SpiralParams { has_handrail: true, ..Default::default() };
+        let bare = SpiralParams {
+            has_handrail: false,
+            ..Default::default()
+        };
+        let railed = SpiralParams {
+            has_handrail: true,
+            ..Default::default()
+        };
         let mb = build_spiral(&bare).unwrap();
         let mr = build_spiral(&railed).unwrap();
         assert!(mr.tri_count() > mb.tri_count(), "handrail adds geometry");
@@ -1186,17 +1622,29 @@ mod tests {
             rx = rx.max(v[0].abs());
             ry = ry.max(v[1].abs());
         }
-        assert!(rx > 1e-3 && (rx - ry).abs() < 0.05 * rx.max(ry), "post is round-ish: rx={rx} ry={ry}");
+        assert!(
+            rx > 1e-3 && (rx - ry).abs() < 0.05 * rx.max(ry),
+            "post is round-ish: rx={rx} ry={ry}"
+        );
     }
 
     /// Vertices of the spiral post's bottom cap (z ≈ 0) — used to check the post is round.
     fn bare_post_ring(m: &SolidMesh) -> Vec<[f32; 3]> {
-        m.positions.iter().cloned().filter(|v| v[2].abs() < 1e-3 && (v[0] * v[0] + v[1] * v[1]).sqrt() < 0.4).collect()
+        m.positions
+            .iter()
+            .cloned()
+            .filter(|v| v[2].abs() < 1e-3 && (v[0] * v[0] + v[1] * v[1]).sqrt() < 0.4)
+            .collect()
     }
 
     #[test]
     fn ramp_slope_and_solid() {
-        let p = RampParams { vertical_height: 1.0, horizontal_length: 4.0, width: 1.5, thickness: 0.15 };
+        let p = RampParams {
+            vertical_height: 1.0,
+            horizontal_length: 4.0,
+            width: 1.5,
+            thickness: 0.15,
+        };
         assert!((ramp_slope_deg(&p) - 14.036).abs() < 0.01);
         let m = build_ramp(&p).unwrap();
         assert!(m.tri_count() > 0 && mesh_volume(&m) > 0.0);

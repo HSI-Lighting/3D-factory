@@ -22,7 +22,11 @@ fn cylinder_model(sides: u32) -> Model {
         BoolOp::Union,
         Plane::default(),
         Placement::default(),
-        Primitive::Cylinder { r: 5.0, h: 3.0, sides },
+        Primitive::Cylinder {
+            r: 5.0,
+            h: 3.0,
+            sides,
+        },
     );
     m
 }
@@ -33,7 +37,10 @@ fn cylinder_model(sides: u32) -> Model {
 #[test]
 fn a_deep_extrusion_evaluates_instead_of_aborting() {
     let mesh = cylinder_model(2048).eval();
-    assert!(mesh.tri_count() > 0, "a 2,048-sided extrusion produced no geometry");
+    assert!(
+        mesh.tri_count() > 0,
+        "a 2,048-sided extrusion produced no geometry"
+    );
 }
 
 /// Deeper still, because the point is that the ceiling moved rather than that one number passes.
@@ -41,7 +48,10 @@ fn a_deep_extrusion_evaluates_instead_of_aborting() {
 #[test]
 fn a_very_deep_extrusion_still_evaluates() {
     let mesh = cylinder_model(4096).eval();
-    assert!(mesh.tri_count() > 0, "a 4,096-sided extrusion produced no geometry");
+    assert!(
+        mesh.tri_count() > 0,
+        "a 4,096-sided extrusion produced no geometry"
+    );
 }
 
 /// A DIFFERENCE against a deep body, which is the shape that actually appears in a drawing: a
@@ -54,10 +64,17 @@ fn cutting_a_deep_body_evaluates() {
         BoolOp::Difference,
         Plane::default(),
         Placement::default(),
-        Primitive::Box { w: 1.0, d: 12.0, h: 1.2 },
+        Primitive::Box {
+            w: 1.0,
+            d: 12.0,
+            h: 1.2,
+        },
     );
     let mesh = m.eval();
-    assert!(mesh.tri_count() > 0, "cutting a deep body produced no geometry");
+    assert!(
+        mesh.tri_count() > 0,
+        "cutting a deep body produced no geometry"
+    );
 }
 
 /// The wrapper must not change the ANSWER, only where it is computed. A shallow model that
@@ -67,7 +84,14 @@ fn the_wrapper_does_not_change_the_result() {
     let m = cylinder_model(16);
     let a = m.eval();
     let b = m.eval();
-    assert_eq!(a.tri_count(), b.tri_count(), "eval is no longer deterministic");
+    assert_eq!(
+        a.tri_count(),
+        b.tri_count(),
+        "eval is no longer deterministic"
+    );
     assert!(a.tri_count() > 0);
-    assert_eq!(a.positions, b.positions, "the same model produced different geometry");
+    assert_eq!(
+        a.positions, b.positions,
+        "the same model produced different geometry"
+    );
 }

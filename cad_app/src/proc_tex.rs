@@ -101,7 +101,10 @@ pub struct ProcSample {
 pub fn field(def: &ProcDef, wp: Vec3) -> f32 {
     let p = wp * Vec3::from(def.scale);
     match def.pattern {
-        ProcPattern::Marble => 0.5 + 0.5 * ((p.x + p.y) * 0.6 + fbm(p, def.detail, def.rough) * std::f32::consts::TAU).sin(),
+        ProcPattern::Marble => {
+            0.5 + 0.5
+                * ((p.x + p.y) * 0.6 + fbm(p, def.detail, def.rough) * std::f32::consts::TAU).sin()
+        }
         ProcPattern::Checker => {
             let c = p.floor();
             (c.x + c.y + c.z).rem_euclid(2.0)
@@ -139,7 +142,11 @@ fn sample_with(def: &ProcDef, wp: Vec3, n: Vec3, fallback_rough: f32, relief: bo
     // Ramp colours are authored sRGB — the same decode the shader does before lighting.
     let a = crate::color::srgb_to_linear3(def.col_a);
     let b = crate::color::srgb_to_linear3(def.col_b);
-    let albedo = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    let albedo = [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+    ];
     let roughness = if def.varies_roughness() {
         def.surf_rough[0] + (def.surf_rough[1] - def.surf_rough[0]) * t
     } else {
@@ -147,7 +154,11 @@ fn sample_with(def: &ProcDef, wp: Vec3, n: Vec3, fallback_rough: f32, relief: bo
     }
     .clamp(0.03, 1.0);
     let normal = if relief { bump(def, wp, n, f) } else { n };
-    ProcSample { albedo, roughness, normal }
+    ProcSample {
+        albedo,
+        roughness,
+        normal,
+    }
 }
 
 /// Tilt `n` by the field's gradient — the shader's `proc_bump`, same step size and same strength.
@@ -184,19 +195,34 @@ mod tests {
         // an integer boundary must differ by no more than the general local variation.
         let step = |x: f32| vnoise(Vec3::new(x, 0.37, -1.21));
         let across = (step(-0.001) - step(0.001)).abs();
-        let typical: f32 = (0..50).map(|i| (step(0.3 + i as f32 * 0.002) - step(0.3 + (i + 1) as f32 * 0.002)).abs()).fold(0.0, f32::max);
-        assert!(across <= typical * 4.0 + 0.02, "seam at the origin: {across} vs typical {typical}");
+        let typical: f32 = (0..50)
+            .map(|i| (step(0.3 + i as f32 * 0.002) - step(0.3 + (i + 1) as f32 * 0.002)).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            across <= typical * 4.0 + 0.02,
+            "seam at the origin: {across} vs typical {typical}"
+        );
     }
 
     /// Every pattern must produce a bounded field, or the ramp maps it somewhere meaningless.
     #[test]
     fn every_pattern_field_is_bounded() {
         for pattern in ProcPattern::ALL {
-            let def = ProcDef { pattern, ..ProcDef::oak() };
+            let def = ProcDef {
+                pattern,
+                ..ProcDef::oak()
+            };
             for i in 0..500 {
-                let p = Vec3::new(i as f32 * 0.031 - 7.0, i as f32 * -0.017 + 3.0, i as f32 * 0.007);
+                let p = Vec3::new(
+                    i as f32 * 0.031 - 7.0,
+                    i as f32 * -0.017 + 3.0,
+                    i as f32 * 0.007,
+                );
                 let f = field(&def, p);
-                assert!(f.is_finite() && (-0.001..=1.001).contains(&f), "{pattern:?} at {p}: {f}");
+                assert!(
+                    f.is_finite() && (-0.001..=1.001).contains(&f),
+                    "{pattern:?} at {p}: {f}"
+                );
             }
         }
     }
@@ -216,7 +242,10 @@ mod tests {
             lo = lo.min(r);
             hi = hi.max(r);
         }
-        assert!(hi - lo > 0.1, "oak's finish must vary with its grain: {lo}..{hi}");
+        assert!(
+            hi - lo > 0.1,
+            "oak's finish must vary with its grain: {lo}..{hi}"
+        );
         assert!(lo >= 0.03 && hi <= 1.0, "and stay in range: {lo}..{hi}");
         // A flat colour does not vary anything, so the material's scalar wins.
         let flat = ProcDef::solid([0.5, 0.4, 0.3]);
@@ -231,7 +260,11 @@ mod tests {
         let d = ProcDef::solid([0.5, 0.5, 0.5]);
         let s = sample(&d, Vec3::ZERO, Vec3::Z, 0.5);
         for c in s.albedo {
-            assert!((c - crate::color::srgb_to_linear(0.5)).abs() < 1e-4, "{:?}", s.albedo);
+            assert!(
+                (c - crate::color::srgb_to_linear(0.5)).abs() < 1e-4,
+                "{:?}",
+                s.albedo
+            );
         }
     }
 
@@ -239,19 +272,34 @@ mod tests {
     /// normal that crosses the tangent plane makes a lit face go black.
     #[test]
     fn bump_tilts_without_flipping() {
-        let oak = ProcDef { bump: 1.0, ..ProcDef::oak() };
+        let oak = ProcDef {
+            bump: 1.0,
+            ..ProcDef::oak()
+        };
         let mut max_tilt: f32 = 0.0;
         for i in 0..400 {
             let p = Vec3::new(i as f32 * 0.011, i as f32 * 0.006, 0.2);
             let n = sample(&oak, p, Vec3::Z, 0.5).normal;
             assert!((n.length() - 1.0).abs() < 1e-4, "not unit at {p}: {n}");
-            assert!(n.z > 0.0, "bump flipped the normal through the surface at {p}: {n}");
+            assert!(
+                n.z > 0.0,
+                "bump flipped the normal through the surface at {p}: {n}"
+            );
             max_tilt = max_tilt.max(n.dot(Vec3::Z).clamp(-1.0, 1.0).acos().to_degrees());
         }
-        assert!(max_tilt > 2.0, "bump should actually do something: max tilt {max_tilt}°");
+        assert!(
+            max_tilt > 2.0,
+            "bump should actually do something: max tilt {max_tilt}°"
+        );
         // …and zero bump is exactly the identity.
-        let flat = ProcDef { bump: 0.0, ..ProcDef::oak() };
-        assert_eq!(sample(&flat, Vec3::new(0.3, 0.2, 0.1), Vec3::Z, 0.5).normal, Vec3::Z);
+        let flat = ProcDef {
+            bump: 0.0,
+            ..ProcDef::oak()
+        };
+        assert_eq!(
+            sample(&flat, Vec3::new(0.3, 0.2, 0.1), Vec3::Z, 0.5).normal,
+            Vec3::Z
+        );
     }
 
     /// The two implementations are separate texts. Pin the constants that would drift: the hash
@@ -259,13 +307,30 @@ mod tests {
     #[test]
     fn matches_the_shader_source() {
         let glsl = crate::light3d::tex_fs_for_test();
-        for c in ["0.3183099", "17.0", "i < 8", "0.35 /", "u_bump * 4.0", "3.0 - 2.0 * f"] {
-            assert!(glsl.contains(c), "the shader no longer contains `{c}` — this copy has drifted");
+        for c in [
+            "0.3183099",
+            "17.0",
+            "i < 8",
+            "0.35 /",
+            "u_bump * 4.0",
+            "3.0 - 2.0 * f",
+        ] {
+            assert!(
+                glsl.contains(c),
+                "the shader no longer contains `{c}` — this copy has drifted"
+            );
         }
         // The ramp is the same shape in both: contrast about the midpoint after a smoothstep.
         assert!(glsl.contains("clamp((t - 0.5) * u_pcontrast + 0.5, 0.0, 1.0)"));
-        let d = ProcDef { ramp: [0.2, 0.8], contrast: 2.0, ..ProcDef::oak() };
-        assert!((ramp_t(&d, 0.5) - 0.5).abs() < 1e-6, "the midpoint is a fixed point of the contrast");
+        let d = ProcDef {
+            ramp: [0.2, 0.8],
+            contrast: 2.0,
+            ..ProcDef::oak()
+        };
+        assert!(
+            (ramp_t(&d, 0.5) - 0.5).abs() < 1e-6,
+            "the midpoint is a fixed point of the contrast"
+        );
         assert_eq!(ramp_t(&d, 0.0), 0.0);
         assert_eq!(ramp_t(&d, 1.0), 1.0);
     }

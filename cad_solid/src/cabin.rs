@@ -228,7 +228,9 @@ pub fn plan(inp: &CabinInput) -> Result<(CabinMetrics, Vec<String>), ArchError> 
         return Err(ArchError::NonPositive("cabinet dimensions"));
     }
     if inp.cols.is_empty() || inp.rows.is_empty() {
-        return Err(ArchError::Invalid("the grid needs at least one column and one row"));
+        return Err(ArchError::Invalid(
+            "the grid needs at least one column and one row",
+        ));
     }
     // §B9 — the layout shape assertion that "fired for real".
     if inp.layout.len() != inp.rows.len() {
@@ -236,21 +238,30 @@ pub fn plan(inp: &CabinInput) -> Result<(CabinMetrics, Vec<String>), ArchError> 
     }
     for r in &inp.layout {
         if r.len() != inp.cols.len() {
-            return Err(ArchError::Invalid("every layout row must have cols.len() cells"));
+            return Err(ArchError::Invalid(
+                "every layout row must have cols.len() cells",
+            ));
         }
     }
     let carcass_depth = inp.depth_nominal - LEAF;
     if carcass_depth <= BOARD + BACK_INSET + BACK_T {
-        return Err(ArchError::Invalid("depth_nominal is too shallow for board + back rebate"));
+        return Err(ArchError::Invalid(
+            "depth_nominal is too shallow for board + back rebate",
+        ));
     }
     if inp.grip == Grip::JGroove && JG_DEPTH_CUT >= carcass_depth {
-        return Err(ArchError::Invalid("J-groove finger channel is deeper than the carcass interior"));
+        return Err(ArchError::Invalid(
+            "J-groove finger channel is deeper than the carcass interior",
+        ));
     }
     if inp.open_deg > 110.0 {
-        return Err(ArchError::Invalid("door angle over 110° exceeds a standard hinge"));
+        return Err(ArchError::Invalid(
+            "door angle over 110° exceeds a standard hinge",
+        ));
     }
 
-    let (mut door_leaves, mut drawer_fronts, mut opens, mut panels, mut shelves) = (0usize, 0, 0, 0, 0);
+    let (mut door_leaves, mut drawer_fronts, mut opens, mut panels, mut shelves) =
+        (0usize, 0, 0, 0, 0);
     for row in &inp.layout {
         for &cell in row {
             match cell {
@@ -305,13 +316,19 @@ pub fn plan(inp: &CabinInput) -> Result<(CabinMetrics, Vec<String>), ArchError> 
                 Cell::Door(n) => {
                     let leaf = cell_w / n.max(1) as f32;
                     if leaf > 0.620 {
-                        warn.push(format!("door leaf {:.0} mm is over 620 mm — will sag and foul; split the bay", leaf * 1000.0));
+                        warn.push(format!(
+                            "door leaf {:.0} mm is over 620 mm — will sag and foul; split the bay",
+                            leaf * 1000.0
+                        ));
                     }
                 }
                 Cell::Drawers(n) => {
                     let front = cell_h / n.max(1) as f32;
                     if front < 0.095 {
-                        warn.push(format!("drawer front {:.0} mm is under 95 mm — too shallow", front * 1000.0));
+                        warn.push(format!(
+                            "drawer front {:.0} mm is under 95 mm — too shallow",
+                            front * 1000.0
+                        ));
                     }
                 }
                 _ => {}
@@ -336,7 +353,16 @@ fn push_box(mesh: &mut SolidMesh, part: u32, x: [f32; 2], y: [f32; 2], z: [f32; 
     if (x1 - x0) < 1e-6 || (y1 - y0) < 1e-6 || (z1 - z0) < 1e-6 {
         return;
     }
-    let c = [[x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0], [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]];
+    let c = [
+        [x0, y0, z0],
+        [x1, y0, z0],
+        [x1, y1, z0],
+        [x0, y1, z0],
+        [x0, y0, z1],
+        [x1, y0, z1],
+        [x1, y1, z1],
+        [x0, y1, z1],
+    ];
     let quads: [([usize; 4], [f32; 3]); 6] = [
         ([0, 3, 2, 1], [0.0, 0.0, -1.0]),
         ([4, 5, 6, 7], [0.0, 0.0, 1.0]),
@@ -391,8 +417,14 @@ fn earclip(poly: &[[f32; 2]]) -> Vec<[usize; 3]> {
         return Vec::new();
     }
     // Work on a CCW index ring.
-    let mut ring: Vec<usize> = if signed_area(poly) < 0.0 { (0..n).rev().collect() } else { (0..n).collect() };
-    let cross = |o: [f32; 2], a: [f32; 2], b: [f32; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let mut ring: Vec<usize> = if signed_area(poly) < 0.0 {
+        (0..n).rev().collect()
+    } else {
+        (0..n).collect()
+    };
+    let cross = |o: [f32; 2], a: [f32; 2], b: [f32; 2]| {
+        (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    };
     let in_tri = |p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]| {
         let d1 = cross(a, b, p);
         let d2 = cross(b, c, p);
@@ -458,11 +490,25 @@ fn push_prism(mesh: &mut SolidMesh, part: u32, poly: &[[f32; 2]], plane: Plane, 
     let centroid = map3(plane, cp / n as f32, cq / n as f32, (a0 + a1) / 2.0);
     let mut tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
         let sub = |p: [f32; 3], q: [f32; 3]| [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
-        let cross = |u: [f32; 3], w: [f32; 3]| [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+        let cross = |u: [f32; 3], w: [f32; 3]| {
+            [
+                u[1] * w[2] - u[2] * w[1],
+                u[2] * w[0] - u[0] * w[2],
+                u[0] * w[1] - u[1] * w[0],
+            ]
+        };
         let dot = |u: [f32; 3], w: [f32; 3]| u[0] * w[0] + u[1] * w[1] + u[2] * w[2];
-        let tc = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0];
+        let tc = [
+            (a[0] + b[0] + c[0]) / 3.0,
+            (a[1] + b[1] + c[1]) / 3.0,
+            (a[2] + b[2] + c[2]) / 3.0,
+        ];
         let out = sub(tc, centroid);
-        let (p, q, r) = if dot(cross(sub(b, a), sub(c, a)), out) < 0.0 { (a, c, b) } else { (a, b, c) };
+        let (p, q, r) = if dot(cross(sub(b, a), sub(c, a)), out) < 0.0 {
+            (a, c, b)
+        } else {
+            (a, b, c)
+        };
         let mut nrm = cross(sub(q, p), sub(r, p));
         let len = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt();
         if len > 1e-9 {
@@ -476,8 +522,16 @@ fn push_prism(mesh: &mut SolidMesh, part: u32, poly: &[[f32; 2]], plane: Plane, 
     };
     for t in earclip(poly) {
         let (i, j, k) = (t[0], t[1], t[2]);
-        tri(map3(plane, poly[i][0], poly[i][1], a1), map3(plane, poly[j][0], poly[j][1], a1), map3(plane, poly[k][0], poly[k][1], a1));
-        tri(map3(plane, poly[i][0], poly[i][1], a0), map3(plane, poly[j][0], poly[j][1], a0), map3(plane, poly[k][0], poly[k][1], a0));
+        tri(
+            map3(plane, poly[i][0], poly[i][1], a1),
+            map3(plane, poly[j][0], poly[j][1], a1),
+            map3(plane, poly[k][0], poly[k][1], a1),
+        );
+        tri(
+            map3(plane, poly[i][0], poly[i][1], a0),
+            map3(plane, poly[j][0], poly[j][1], a0),
+            map3(plane, poly[k][0], poly[k][1], a0),
+        );
     }
     for i in 0..n {
         let j = (i + 1) % n;
@@ -503,7 +557,11 @@ fn push_disc(mesh: &mut SolidMesh, part: u32, uf: f32, vc: f32, zc: f32, r: f32,
         .collect();
     let center = [up, vc, zc];
     for k in 0..8 {
-        let (b, c) = if sign >= 0.0 { (ring[k], ring[(k + 1) % 8]) } else { (ring[(k + 1) % 8], ring[k]) };
+        let (b, c) = if sign >= 0.0 {
+            (ring[k], ring[(k + 1) % 8])
+        } else {
+            (ring[(k + 1) % 8], ring[k])
+        };
         for v in [center, b, c] {
             mesh.positions.push(v);
             mesh.normals.push(nrm);
@@ -531,7 +589,13 @@ fn build_carcass(mesh: &mut SolidMesh, carc: u32, inp: &CabinInput, d: f32) {
         }
     }
     // Back in a rebate — not flush with the rear face.
-    push_box(mesh, carc, [BOARD, w - BOARD], [BACK_INSET, BACK_INSET + BACK_T], [BOARD, h - BOARD]);
+    push_box(
+        mesh,
+        carc,
+        [BOARD, w - BOARD],
+        [BACK_INSET, BACK_INSET + BACK_T],
+        [BOARD, h - BOARD],
+    );
 
     // Dividers on interior column boundaries (centred), full interior height & depth.
     let cx = cumulative(&inp.cols);
@@ -539,13 +603,25 @@ fn build_carcass(mesh: &mut SolidMesh, carc: u32, inp: &CabinInput, d: f32) {
     let (iz0, iz1) = (BOARD, h - BOARD);
     for i in 1..inp.cols.len() {
         let u = iu0 + (iu1 - iu0) * cx[i];
-        push_box(mesh, carc, [u - BOARD / 2.0, u + BOARD / 2.0], [0.0, d], [iz0, iz1]);
+        push_box(
+            mesh,
+            carc,
+            [u - BOARD / 2.0, u + BOARD / 2.0],
+            [0.0, d],
+            [iz0, iz1],
+        );
     }
     // Rails on interior row boundaries (centred), full interior width.
     let rz = cumulative(&inp.rows);
     for i in 1..inp.rows.len() {
         let z = iz1 - (iz1 - iz0) * rz[i]; // rows are TOP-first
-        push_box(mesh, carc, [iu0, iu1], [BACK_INSET + BACK_T, d], [z - BOARD / 2.0, z + BOARD / 2.0]);
+        push_box(
+            mesh,
+            carc,
+            [iu0, iu1],
+            [BACK_INSET + BACK_T, d],
+            [z - BOARD / 2.0, z + BOARD / 2.0],
+        );
     }
 }
 
@@ -570,7 +646,13 @@ fn build_shelves(mesh: &mut SolidMesh, carc: u32, inp: &CabinInput, d: f32) {
             let n = inp.shelves as usize;
             for k in 0..n {
                 let z = zbot + (ztop - zbot) * (k + 1) as f32 / (n + 1) as f32;
-                push_box(mesh, carc, [u0, u1], [BACK_INSET + BACK_T, d - 0.020], [z, z + SHELF_T]);
+                push_box(
+                    mesh,
+                    carc,
+                    [u0, u1],
+                    [BACK_INSET + BACK_T, d - 0.020],
+                    [z, z + SHELF_T],
+                );
             }
         }
     }
@@ -605,16 +687,29 @@ fn build_pins(mesh: &mut SolidMesh, pin: u32, inp: &CabinInput, d: f32) {
 
 /// Append `src` into `dst`, rotated `ang` (rad) about a vertical axis at `pivot=(u,v)` and then
 /// translated `+dv` in v (drawer pull). Remaps part ids. Rigid → winding/normals preserved.
-fn append_posed(dst: &mut SolidMesh, dmats: &mut Vec<Material>, src: &SolidMesh, smats: &[Material], pivot: [f32; 2], ang: f32, dv: f32) {
+fn append_posed(
+    dst: &mut SolidMesh,
+    dmats: &mut Vec<Material>,
+    src: &SolidMesh,
+    smats: &[Material],
+    pivot: [f32; 2],
+    ang: f32,
+    dv: f32,
+) {
     let base = dmats.len() as u32;
     dmats.extend_from_slice(smats);
     let (s, c) = ang.sin_cos();
     for p in &src.positions {
         let (x, y) = (p[0] - pivot[0], p[1] - pivot[1]);
-        dst.positions.push([x * c - y * s + pivot[0], x * s + y * c + pivot[1] + dv, p[2]]);
+        dst.positions.push([
+            x * c - y * s + pivot[0],
+            x * s + y * c + pivot[1] + dv,
+            p[2],
+        ]);
     }
     for n in &src.normals {
-        dst.normals.push([n[0] * c - n[1] * s, n[0] * s + n[1] * c, n[2]]);
+        dst.normals
+            .push([n[0] * c - n[1] * s, n[0] * s + n[1] * c, n[2]]);
     }
     for f in &src.face_ids {
         dst.face_ids.push(f + base);
@@ -624,7 +719,14 @@ fn append_posed(dst: &mut SolidMesh, dmats: &mut Vec<Material>, src: &SolidMesh,
 /// Emit ONE leaf (rectangle `[u0,u1] × [z0,z1]` in the front plane) into a fresh mesh in its own
 /// local frame, with the chosen grip + optional contrast banding. `d` = carcass depth (front back
 /// face). Returns (mesh, mats). Posed by the caller for opening.
-fn leaf_mesh(inp: &CabinInput, u0: f32, u1: f32, z0: f32, z1: f32, d: f32) -> (SolidMesh, Vec<Material>) {
+fn leaf_mesh(
+    inp: &CabinInput,
+    u0: f32,
+    u1: f32,
+    z0: f32,
+    z1: f32,
+    d: f32,
+) -> (SolidMesh, Vec<Material>) {
     let mut mesh = SolidMesh::default();
     let mut mats: Vec<Material> = Vec::new();
     let front = alloc(&mut mats, Material::Front);
@@ -657,15 +759,33 @@ fn leaf_mesh(inp: &CabinInput, u0: f32, u1: f32, z0: f32, z1: f32, d: f32) -> (S
             let metal = alloc(&mut mats, Material::Metal);
             let cu = (u0 + u1) / 2.0;
             let cz = z1 - 0.045;
-            push_box(&mut mesh, metal, [cu - BAR_L / 2.0, cu + BAR_L / 2.0], [v1 + BAR_PROJ - BAR_D, v1 + BAR_PROJ], [cz - BAR_D / 2.0, cz + BAR_D / 2.0]);
+            push_box(
+                &mut mesh,
+                metal,
+                [cu - BAR_L / 2.0, cu + BAR_L / 2.0],
+                [v1 + BAR_PROJ - BAR_D, v1 + BAR_PROJ],
+                [cz - BAR_D / 2.0, cz + BAR_D / 2.0],
+            );
             for su in [cu - BAR_L / 2.0, cu + BAR_L / 2.0 - BAR_D] {
-                push_box(&mut mesh, metal, [su, su + BAR_D], [v1 - OVERLAP, v1 + BAR_PROJ], [cz - BAR_D / 2.0, cz + BAR_D / 2.0]);
+                push_box(
+                    &mut mesh,
+                    metal,
+                    [su, su + BAR_D],
+                    [v1 - OVERLAP, v1 + BAR_PROJ],
+                    [cz - BAR_D / 2.0, cz + BAR_D / 2.0],
+                );
             }
         }
         Grip::Rail => {
             // A recessed channel across the top of the leaf.
             let edge = alloc(&mut mats, Material::Edge);
-            push_box(&mut mesh, edge, [u0 + 0.010, u1 - 0.010], [v1 - RAIL_DEPTH, v1 - OVERLAP], [z1 - RAIL_H, z1 - 0.004]);
+            push_box(
+                &mut mesh,
+                edge,
+                [u0 + 0.010, u1 - 0.010],
+                [v1 - RAIL_DEPTH, v1 - OVERLAP],
+                [z1 - RAIL_H, z1 - 0.004],
+            );
         }
         _ => {}
     }
@@ -685,19 +805,41 @@ fn leaf_mesh(inp: &CabinInput, u0: f32, u1: f32, z0: f32, z1: f32, d: f32) -> (S
 /// Build the fronts for one cell: door leaves (split across u, hinges mirror about the centre) or
 /// drawer fronts (split across z), each posed for the open state.
 #[allow(clippy::too_many_arguments)]
-fn build_cell_fronts(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &CabinInput, cell: Cell, u0: f32, u1: f32, z0: f32, z1: f32, d: f32) {
+fn build_cell_fronts(
+    mesh: &mut SolidMesh,
+    mats: &mut Vec<Material>,
+    inp: &CabinInput,
+    cell: Cell,
+    u0: f32,
+    u1: f32,
+    z0: f32,
+    z1: f32,
+    d: f32,
+) {
     let open = inp.open_deg.to_radians();
     match cell {
         Cell::Door(_) | Cell::Panel => {
-            let n = if let Cell::Door(n) = cell { n.max(1) as usize } else { 1 };
+            let n = if let Cell::Door(n) = cell {
+                n.max(1) as usize
+            } else {
+                1
+            };
             let w = (u1 - u0) / n as f32;
             for k in 0..n {
                 let a = u0 + k as f32 * w + if k > 0 { SHADOW / 2.0 } else { 0.0 };
                 let b = u0 + (k + 1) as f32 * w - if k + 1 < n { SHADOW / 2.0 } else { 0.0 };
                 let (leaf, lmats) = leaf_mesh(inp, a, b, z0, z1, d);
                 // Hinge side mirrors about the cell centre: left half hinges left (+), right half −.
-                let (pivot_u, sign) = if (a + b) / 2.0 < (u0 + u1) / 2.0 { (a, 1.0) } else { (b, -1.0) };
-                let ang = if matches!(cell, Cell::Door(_)) { sign * open } else { 0.0 };
+                let (pivot_u, sign) = if (a + b) / 2.0 < (u0 + u1) / 2.0 {
+                    (a, 1.0)
+                } else {
+                    (b, -1.0)
+                };
+                let ang = if matches!(cell, Cell::Door(_)) {
+                    sign * open
+                } else {
+                    0.0
+                };
                 append_posed(mesh, mats, &leaf, &lmats, [pivot_u, d], ang, 0.0);
             }
         }
@@ -718,10 +860,34 @@ fn build_cell_fronts(mesh: &mut SolidMesh, mats: &mut Vec<Material>, inp: &Cabin
                     let a = z0 + k as f32 * h + 0.02;
                     let vb0 = d - box_d + inp.drawer_out;
                     let vb1 = d + inp.drawer_out - 0.02;
-                    push_box(mesh, carc, [u0 + 0.02, u1 - 0.02], [vb0, vb1], [a, a + 0.012]); // bottom
-                    push_box(mesh, carc, [u0 + 0.02, u0 + 0.032], [vb0, vb1], [a, a + h * 0.6]); // side
-                    push_box(mesh, carc, [u1 - 0.032, u1 - 0.02], [vb0, vb1], [a, a + h * 0.6]); // side
-                    push_box(mesh, carc, [u0 + 0.02, u1 - 0.02], [vb0, vb0 + 0.012], [a, a + h * 0.6]); // back
+                    push_box(
+                        mesh,
+                        carc,
+                        [u0 + 0.02, u1 - 0.02],
+                        [vb0, vb1],
+                        [a, a + 0.012],
+                    ); // bottom
+                    push_box(
+                        mesh,
+                        carc,
+                        [u0 + 0.02, u0 + 0.032],
+                        [vb0, vb1],
+                        [a, a + h * 0.6],
+                    ); // side
+                    push_box(
+                        mesh,
+                        carc,
+                        [u1 - 0.032, u1 - 0.02],
+                        [vb0, vb1],
+                        [a, a + h * 0.6],
+                    ); // side
+                    push_box(
+                        mesh,
+                        carc,
+                        [u0 + 0.02, u1 - 0.02],
+                        [vb0, vb0 + 0.012],
+                        [a, a + h * 0.6],
+                    ); // back
                 }
             }
         }
@@ -827,10 +993,23 @@ mod tests {
         let (m, mesh, mats) = build(&CabinInput::default()).unwrap();
         assert!((m.carcass_depth - (0.300 - LEAF)).abs() < 1e-6);
         let (lo, hi) = bounds(&mesh);
-        assert!((hi[0] - lo[0] - 0.600).abs() < 0.002, "width {}", hi[0] - lo[0]);
-        assert!((hi[2] - lo[2] - 0.780).abs() < 0.002, "height {}", hi[2] - lo[2]);
+        assert!(
+            (hi[0] - lo[0] - 0.600).abs() < 0.002,
+            "width {}",
+            hi[0] - lo[0]
+        );
+        assert!(
+            (hi[2] - lo[2] - 0.780).abs() < 0.002,
+            "height {}",
+            hi[2] - lo[2]
+        );
         // v spans 0 (carcass back) .. depth_nominal (front face).
-        assert!(lo[1].abs() < 1e-4 && (hi[1] - 0.300).abs() < 0.002, "depth {}..{}", lo[1], hi[1]);
+        assert!(
+            lo[1].abs() < 1e-4 && (hi[1] - 0.300).abs() < 0.002,
+            "depth {}..{}",
+            lo[1],
+            hi[1]
+        );
         assert_eq!(mesh.face_ids.len(), mesh.tri_count());
         assert!((*mesh.face_ids.iter().max().unwrap() as usize) < mats.len());
         for p in &mesh.positions {
@@ -869,15 +1048,28 @@ mod tests {
                 }
             }
         }
-        assert!(lo[0] <= 0.0 && hi[0] >= 0.600, "fronts span the width {}..{}", lo[0], hi[0]);
-        assert!(lo[2] <= 0.0 && hi[2] >= 0.780, "fronts span the height {}..{}", lo[2], hi[2]);
+        assert!(
+            lo[0] <= 0.0 && hi[0] >= 0.600,
+            "fronts span the width {}..{}",
+            lo[0],
+            hi[0]
+        );
+        assert!(
+            lo[2] <= 0.0 && hi[2] >= 0.780,
+            "fronts span the height {}..{}",
+            lo[2],
+            hi[2]
+        );
     }
 
     /// J-groove leaf is a real routed section (concave profile) — builds, stays finite, and reaches
     /// back past the carcass front (the finger channel).
     #[test]
     fn j_groove_is_a_section() {
-        let inp = CabinInput { grip: Grip::JGroove, ..Default::default() };
+        let inp = CabinInput {
+            grip: Grip::JGroove,
+            ..Default::default()
+        };
         let (m, mesh, _mats) = build(&inp).unwrap();
         let (lo, _hi) = bounds(&mesh);
         // The channel reaches back to carcass_front − depth_cut + lip.
@@ -913,7 +1105,8 @@ mod tests {
         assert_eq!(m.opens, 1);
         assert!(mesh.tri_count() > 0);
         assert!((*mesh.face_ids.iter().max().unwrap() as usize) < mats.len());
-        let used: std::collections::HashSet<Material> = mesh.face_ids.iter().map(|&id| mats[id as usize]).collect();
+        let used: std::collections::HashSet<Material> =
+            mesh.face_ids.iter().map(|&id| mats[id as usize]).collect();
         assert!(used.contains(&Material::Carcass) && used.contains(&Material::Front));
     }
 
@@ -922,20 +1115,41 @@ mod tests {
     #[test]
     fn open_pose_swings_the_leaf() {
         let closed = build(&CabinInput::default()).unwrap();
-        let open = build(&CabinInput { open_deg: 100.0, ..Default::default() }).unwrap();
+        let open = build(&CabinInput {
+            open_deg: 100.0,
+            ..Default::default()
+        })
+        .unwrap();
         let (_clo, chi) = bounds(&closed.1);
         let (_olo, ohi) = bounds(&open.1);
-        assert!(ohi[1] > chi[1] + 0.05, "an open leaf swings forward past the closed front {} -> {}", chi[1], ohi[1]);
+        assert!(
+            ohi[1] > chi[1] + 0.05,
+            "an open leaf swings forward past the closed front {} -> {}",
+            chi[1],
+            ohi[1]
+        );
     }
 
     #[test]
     fn rejects_bad_inputs() {
         // Layout shape mismatch (spec §B9 — the assertion that fired for real).
-        let bad = CabinInput { rows: vec![1.0, 1.0], layout: vec![vec![Cell::Door(1)]], ..Default::default() };
+        let bad = CabinInput {
+            rows: vec![1.0, 1.0],
+            layout: vec![vec![Cell::Door(1)]],
+            ..Default::default()
+        };
         assert!(plan(&bad).is_err(), "row/layout mismatch rejected");
         // Too shallow for board + back rebate.
-        assert!(plan(&CabinInput { depth_nominal: 0.030, ..Default::default() }).is_err());
+        assert!(plan(&CabinInput {
+            depth_nominal: 0.030,
+            ..Default::default()
+        })
+        .is_err());
         // Hinge angle over 110°.
-        assert!(plan(&CabinInput { open_deg: 130.0, ..Default::default() }).is_err());
+        assert!(plan(&CabinInput {
+            open_deg: 130.0,
+            ..Default::default()
+        })
+        .is_err());
     }
 }
