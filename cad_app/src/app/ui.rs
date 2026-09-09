@@ -724,7 +724,7 @@ pub(super) fn solid_loop_is_fill(loops: &[Vec<Vec2>], i: usize) -> bool {
     loop_depths(loops).get(i).map_or(false, |d| d % 2 == 0)
 }
 
-fn point_in_polygon<I: IntoIterator<Item = Vec2>>(p: Vec2, verts: I) -> bool {
+pub(super) fn point_in_polygon<I: IntoIterator<Item = Vec2>>(p: Vec2, verts: I) -> bool {
     let vs: Vec<Vec2> = verts.into_iter().collect();
     let n = vs.len();
     if n < 3 {
@@ -1156,7 +1156,7 @@ pub(super) enum PlotProp {
 }
 
 impl PlotProp {
-    const ALL: [PlotProp; 12] = [
+    pub(super) const ALL: [PlotProp; 12] = [
         PlotProp::Color,
         PlotProp::Dither,
         PlotProp::Grayscale,
@@ -3295,8 +3295,8 @@ pub(super) enum FlyMenu {
 /// row's ▸; deeper frames by a flyout row's ▸ (§9 nesting).
 #[derive(Clone)]
 pub(super) struct FlyFrame {
-    menu: FlyMenu,
-    anchor: egui::Rect,
+    pub(super) menu: FlyMenu,
+    pub(super) anchor: egui::Rect,
 }
 
 /// The icon slot for a flyout row (§7). `Key` → `icon_for`; `Method` → the
@@ -3813,5 +3813,1811 @@ pub(super) fn icon_for(key: &str) -> MenuIcon<'static> {
         // Formative.
         "formative.dimension" => MenuIcon::Draw("dim"),
         _ => MenuIcon::None,
+    }
+}
+
+// ---- generalized top-level flyouts (§9) + command / tool-button glyphs ----
+
+impl CadApp {
+    /// Open (or re-anchor) a top-level flyout `menu` off `anchor` (§9). Called from a
+    /// menubar row's ▸ hover. If the SAME base menu is already open, only its anchor
+    /// updates (its child submenu is preserved); a different base resets the stack.
+    pub(super) fn open_flyout(&mut self, menu: FlyMenu, anchor: egui::Rect) {
+        match self.menu_flyouts.first() {
+            Some(f) if f.menu == menu => {
+                self.menu_flyouts[0].anchor = anchor;
+            }
+            _ => {
+                self.menu_flyouts = vec![FlyFrame { menu, anchor }];
+            }
+        }
+        self.menu_flyout_hot = true;
+    }
+
+    /// The rows a flyout shows — BUILT FRESH from `&self` each frame (§9) so dynamic
+    /// content (block names, current method/style, toggle state, live labels) is
+    /// always current. Pure data; a click's effect lives in `flyout_activate`.
+    fn flyout_items(&self, menu: &FlyMenu) -> Vec<FlyItem> {
+        let mut_ = crate::theme::color::TEXT_MUTED;
+        match menu {
+            FlyMenu::Method(cmd) => {
+                let cur = self.current_method_key(cmd);
+                rail_flyout_items(cmd)
+                    .into_iter()
+                    .map(|(short, full, key)| {
+                        let is_cur = key == cur; // §5: current method row = cyan
+                        FlyItem::Row {
+                            icon: FlyIcon::Method(cmd.clone(), key.clone()),
+                            name: full,
+                            col: if is_cur { PP_ACCENT } else { PP_TEXT },
+                            code: Some((short, if is_cur { PP_ACCENT } else { mut_ })),
+                            check: None,
+                            submenu: None,
+                            act: Some(FlyAct::Method(cmd.clone(), key)),
+                        }
+                    })
+                    .collect()
+            }
+            FlyMenu::Insert => {
+                let names: Vec<String> = self
+                    .doc
+                    .blocks
+                    .blocks
+                    .iter()
+                    .map(|b| b.name.clone())
+                    .collect();
+                if names.is_empty() {
+                    return vec![FlyItem::Disabled("(no blocks defined)".into())];
+                }
+                names
+                    .into_iter()
+                    .map(|n| {
+                        FlyItem::act(FlyIcon::Key("draw.block"), &n, FlyAct::Insert(n.clone()))
+                    })
+                    .collect()
+            }
+            FlyMenu::Import => vec![
+                FlyItem::act(
+                    FlyIcon::None,
+                    "Image as raster (underlay)…",
+                    FlyAct::Import(true),
+                ),
+                FlyItem::act(
+                    FlyIcon::None,
+                    "Image → vector (trace editor)…",
+                    FlyAct::Import(false),
+                ),
+            ],
+            FlyMenu::Export => vec![
+                FlyItem::act(FlyIcon::None, "PDF…", FlyAct::Export("pdf".into())),
+                FlyItem::act(FlyIcon::None, "SVG…", FlyAct::Export("svg".into())),
+                FlyItem::act(
+                    FlyIcon::None,
+                    "PNG (300 dpi)…",
+                    FlyAct::Export("png".into()),
+                ),
+            ],
+            FlyMenu::PlotStyleTables => {
+                // CTB manager: New / built-ins / saved .pst tables + Plot Style
+                // Table Editor. The saved list is rebuilt every frame from the
+                // app's ctb folder (see `ctb_list`).
+                let saved = ctb_list();
+                let mut items = vec![
+                    FlyItem::Heading("Plot Style Tables".into()),
+                    FlyItem::act(FlyIcon::None, "New CTB…", FlyAct::NewCtb),
+                    FlyItem::act(
+                        FlyIcon::None,
+                        "Edit current table…",
+                        FlyAct::Run("plotstyle".into()),
+                    ),
+                    FlyItem::Divider,
+                ];
+                for (builtin, key) in CTB_BUILTINS.iter().filter_map(|(d, k)| k.map(|k| (d, k))) {
+                    items.push(FlyItem::act(
+                        FlyIcon::None,
+                        builtin,
+                        FlyAct::OpenCtb(key.to_string()),
+                    ));
+                }
+                if !saved.is_empty() {
+                    items.push(FlyItem::Divider);
+                    for (name, path) in &saved {
+                        items.push(FlyItem::act(
+                            FlyIcon::None,
+                            name,
+                            FlyAct::OpenCtbFile(path.clone()),
+                        ));
+                    }
+                }
+                items.push(FlyItem::Divider);
+                items.push(FlyItem::Disabled(
+                    "Delete CTB…  (select a table first)".into(),
+                ));
+                items
+            }
+            FlyMenu::Dimension => vec![
+                FlyItem::act(
+                    FlyIcon::Key("formative.dimension"),
+                    "Dimension  (smart: linear · radius · diameter)",
+                    FlyAct::Run("dim".into()),
+                ),
+                FlyItem::Divider,
+                FlyItem::act(
+                    FlyIcon::None,
+                    "Dimension Style…",
+                    FlyAct::Run("dimstyle".into()),
+                ),
+            ],
+            FlyMenu::Styles => {
+                let dimn = self
+                    .doc
+                    .dim_styles
+                    .styles
+                    .get(self.current_dim_style as usize)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| "STANDARD".into());
+                let walln = self
+                    .doc
+                    .wall_styles
+                    .styles
+                    .get(self.current_wall_style as usize)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| "STANDARD".into());
+                vec![
+                    FlyItem::Heading("Managers".into()),
+                    FlyItem::act(FlyIcon::None, "Text Style…", FlyAct::Run("style".into())),
+                    FlyItem::act(
+                        FlyIcon::None,
+                        "Dimension Style…",
+                        FlyAct::Run("dimstyle".into()),
+                    ),
+                    FlyItem::act(
+                        FlyIcon::None,
+                        "Wall Style…",
+                        FlyAct::Run("wallstyle".into()),
+                    ),
+                    FlyItem::Divider,
+                    FlyItem::Heading("Current".into()),
+                    FlyItem::sub(
+                        FlyIcon::None,
+                        &format!("Dim style:  {}", dimn),
+                        FlyMenu::DimStylePick,
+                    ),
+                    FlyItem::sub(
+                        FlyIcon::None,
+                        &format!("Wall style:  {}", walln),
+                        FlyMenu::WallStylePick,
+                    ),
+                    FlyItem::Divider,
+                    FlyItem::Disabled("Opening Style…  (planned)".into()),
+                ]
+            }
+            FlyMenu::DimStylePick => self
+                .doc
+                .dim_styles
+                .styles
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let cur = i as u32 == self.current_dim_style;
+                    FlyItem::Row {
+                        icon: FlyIcon::None,
+                        name: s.name.clone(),
+                        col: if cur { PP_ACCENT } else { PP_TEXT },
+                        code: None,
+                        check: None,
+                        submenu: None,
+                        act: Some(FlyAct::SetDimStyle(i as u32)),
+                    }
+                })
+                .collect(),
+            FlyMenu::WallStylePick => self
+                .doc
+                .wall_styles
+                .styles
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let cur = i as u32 == self.current_wall_style;
+                    FlyItem::Row {
+                        icon: FlyIcon::None,
+                        name: s.name.clone(),
+                        col: if cur { PP_ACCENT } else { PP_TEXT },
+                        code: None,
+                        check: None,
+                        submenu: None,
+                        act: Some(FlyAct::SetWallStyle(i as u32)),
+                    }
+                })
+                .collect(),
+            FlyMenu::Debug => {
+                let idx_fresh = !(self.index_dirty || self.index.is_none());
+                let idx_label = if idx_fresh {
+                    "Spatial index ✓ (fresh)"
+                } else {
+                    "Rebuild spatial index ⟲"
+                };
+                let click_label = if self.intersect_pending_click {
+                    "∩ click — waiting for click…"
+                } else {
+                    "∩ click — arm for next click"
+                };
+                vec![
+                    FlyItem::toggle(
+                        "Screen Stats",
+                        self.screen_stats_open,
+                        FlyAct::ToggleBool(BoolField::ScreenStats),
+                    ),
+                    FlyItem::toggle(
+                        "Render mode (CPU/GPU + APX)",
+                        self.debug_open,
+                        FlyAct::ToggleBool(BoolField::Debug),
+                    ),
+                    FlyItem::toggle(
+                        "Trim Debug Log",
+                        self.trim_debug_open,
+                        FlyAct::ToggleBool(BoolField::TrimDebug),
+                    ),
+                    FlyItem::toggle(
+                        "Hatch Debug Log",
+                        self.hatch_debug_open,
+                        FlyAct::ToggleBool(BoolField::HatchDebug),
+                    ),
+                    FlyItem::toggle(
+                        "UI inspect (element sizes)",
+                        self.ui_inspect,
+                        FlyAct::ToggleBool(BoolField::UiInspect),
+                    ),
+                    FlyItem::toggle(
+                        "Command registry dump",
+                        self.cmd_dump_open,
+                        FlyAct::ToggleBool(BoolField::CmdDump),
+                    ),
+                    FlyItem::Divider,
+                    FlyItem::act(FlyIcon::None, idx_label, FlyAct::EnsureIndex),
+                    FlyItem::Divider,
+                    FlyItem::Heading("Intersect visualizer".into()),
+                    FlyItem::act(
+                        FlyIcon::None,
+                        "∩ view (whole viewport)",
+                        FlyAct::IntersectView,
+                    ),
+                    FlyItem::act(FlyIcon::None, click_label, FlyAct::IntersectArm),
+                    FlyItem::act(FlyIcon::None, "Clear ∩ overlay", FlyAct::IntersectClear),
+                    FlyItem::Divider,
+                    FlyItem::act(
+                        FlyIcon::None,
+                        "Clear all dobjects (DESTRUCTIVE)",
+                        FlyAct::ClearAll,
+                    ),
+                ]
+            }
+            FlyMenu::Scripts => {
+                // WP-SCRIPT: one row per scripts/*.py (menu access runs without
+                // args — `run <name> [args…]` on the command line passes inputs).
+                if self.py_examples.is_empty() {
+                    vec![
+                        FlyItem::Disabled(
+                            "(no scripts in scripts/ — save one from the Python console)".into(),
+                        ),
+                        FlyItem::Divider,
+                        FlyItem::act(FlyIcon::None, "Script editor…", FlyAct::OpenScriptEditor),
+                        FlyItem::act(FlyIcon::None, "Scripting guide…", FlyAct::OpenScriptingDoc),
+                        FlyItem::act(FlyIcon::None, "Python console", FlyAct::Run("py".into())),
+                        FlyItem::act(FlyIcon::None, "Reload script list", FlyAct::RescanScripts),
+                    ]
+                } else {
+                    let mut items: Vec<FlyItem> = self
+                        .py_examples
+                        .iter()
+                        .map(|(n, _)| FlyItem::act(FlyIcon::None, n, FlyAct::RunScript(n.clone())))
+                        .collect();
+                    items.push(FlyItem::Divider);
+                    items.push(FlyItem::act(
+                        FlyIcon::None,
+                        "Script editor…",
+                        FlyAct::OpenScriptEditor,
+                    ));
+                    items.push(FlyItem::act(
+                        FlyIcon::None,
+                        "Scripting guide…",
+                        FlyAct::OpenScriptingDoc,
+                    ));
+                    items.push(FlyItem::act(
+                        FlyIcon::None,
+                        "Python console",
+                        FlyAct::Run("py".into()),
+                    ));
+                    items.push(FlyItem::act(
+                        FlyIcon::None,
+                        "Reload script list",
+                        FlyAct::RescanScripts,
+                    ));
+                    items
+                }
+            }
+            // Command-bar grip right-click: docked strip, so just Close (reopen
+            // via Tools → Command line).
+            FlyMenu::CommandBar => vec![FlyItem::act(
+                FlyIcon::None,
+                "Close command bar",
+                FlyAct::CloseCommandBar,
+            )],
+        }
+    }
+
+    /// Commit a flyout row's action (§9). Pure dispatch — `&mut self` here, so the
+    /// data-only `FlyAct` resolves against live state.
+    fn flyout_activate(&mut self, act: FlyAct) {
+        match act {
+            FlyAct::Run(cmd) => self.run_command(&cmd),
+            FlyAct::Method(cmd, key) => self.dispatch_method(&cmd, &key),
+            FlyAct::Insert(n) => self.run_command(&format!("insert {}", n)),
+            FlyAct::Import(raster) => self.open_file_dialog(
+                if raster {
+                    FileDialogMode::ImportRaster
+                } else {
+                    FileDialogMode::ImportImage
+                },
+                "",
+            ),
+            FlyAct::Export(fmt) => {
+                // Quick export: whole drawing straight to the Save dialog, then
+                // write + open via the shared run_plot path (same flow as the
+                // Plot dialog's own OK — the dialog's format choice wins, so
+                // the ext is only the default).
+                self.plot_pdf_browse = true;
+                self.plot_run_after_save = true;
+                let ext = match fmt.as_str() {
+                    "svg" => "svg",
+                    "png" => "png",
+                    _ => "pdf",
+                };
+                self.open_file_dialog(FileDialogMode::Save, &format!(".{}", ext));
+            }
+            FlyAct::NewCtb => {
+                let saved = ctb_list();
+                self.new_ctb_name = format!("CTB {}", saved.len() + 1);
+                self.new_ctb_open = true;
+            }
+            FlyAct::OpenCtb(name) => self.ctb_open_builtin(&name),
+            FlyAct::OpenCtbFile(path) => self.ctb_open_editor(&path),
+            FlyAct::SetDimStyle(id) => {
+                let name = self
+                    .doc
+                    .dim_styles
+                    .styles
+                    .get(id as usize)
+                    .map(|s| s.name.clone());
+                self.current_dim_style = id;
+                if let Some(n) = name {
+                    self.history
+                        .push(format!("  dim style: '{}' set current", n));
+                }
+            }
+            FlyAct::SetWallStyle(id) => {
+                // Capture thickness + name in ONE immutable borrow, then mutate env
+                // (the same WlThk sync the Wall Style Manager's Set Current does).
+                let info = self
+                    .doc
+                    .wall_styles
+                    .get(id)
+                    .map(|s| (s.thickness, s.name.clone()));
+                self.current_wall_style = id;
+                if let Some((thk, name)) = info {
+                    self.env.WlThk = thk;
+                    let _ = self.env.save();
+                    self.history
+                        .push(format!("  wall style: '{}' set current", name));
+                }
+            }
+            FlyAct::ToggleBool(f) => {
+                let b = match f {
+                    BoolField::ScreenStats => &mut self.screen_stats_open,
+                    BoolField::Debug => &mut self.debug_open,
+                    BoolField::TrimDebug => &mut self.trim_debug_open,
+                    BoolField::HatchDebug => &mut self.hatch_debug_open,
+                    BoolField::UiInspect => &mut self.ui_inspect,
+                    BoolField::CmdDump => &mut self.cmd_dump_open,
+                };
+                *b = !*b;
+            }
+            FlyAct::EnsureIndex => {
+                self.ensure_index();
+            }
+            FlyAct::IntersectView => self.intersect_view_pending = true,
+            FlyAct::IntersectArm => self.intersect_pending_click = !self.intersect_pending_click,
+            FlyAct::IntersectClear => {
+                self.intersections.clear();
+                self.last_intersect_label.clear();
+            }
+            FlyAct::ClearAll => {
+                self.clear_all();
+                self.history.push("  cleared".into());
+            }
+            FlyAct::RunScript(name) => self.run_script_command(Some(name), Vec::new()),
+            FlyAct::RescanScripts => self.scan_py_examples(),
+            FlyAct::OpenScriptEditor => self.py_editor_open_panel(),
+            FlyAct::OpenScriptingDoc => self.open_scripting_doc(),
+            FlyAct::CloseCommandBar => self.cmd_window_open = false,
+        }
+    }
+
+    /// Render the open flyout STACK at the TOP LEVEL (§9) — independent of the parent
+    /// dropdown so it survives egui auto-closing the dropdown on the ▸, and captures
+    /// its own clicks (no leak to the canvas). Every frame is the SAME custom rows;
+    /// submenu ▸-hover opens a child frame; a click commits + closes; leaving the
+    /// whole stack for `MENU_FLYOUT_CLOSE_DELAY` closes it (travel-tolerant, §2).
+    pub(crate) fn render_menu_flyouts(&mut self, ctx: &egui::Context) {
+        if self.menu_flyouts.is_empty() {
+            self.menu_flyout_hot = false;
+            return;
+        }
+        let frames = self.menu_flyouts.clone();
+        let mut frame_rects: Vec<egui::Rect> = Vec::with_capacity(frames.len());
+        // child[i] = the submenu (menu, anchor) whose ▸ is hovered in frame i.
+        let mut child: Vec<Option<(FlyMenu, egui::Rect)>> = vec![None; frames.len()];
+        let mut action: Option<FlyAct> = None;
+
+        for (i, frame) in frames.iter().enumerate() {
+            let anchor = frame.anchor;
+            let area = egui::Area::new(egui::Id::new(("menu_flyout", i)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(anchor.right() + 2.0, anchor.top()))
+                .constrain(true)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .rounding(egui::Rounding::same(crate::theme::radius::SM))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                            let items = self.flyout_items(&frame.menu);
+                            let rows: Vec<(&str, RowT)> =
+                                items.iter().map(|it| it.meas()).collect();
+                            let (arrow_x, w) = menu_hug_geometry(ui, &rows);
+                            ui.set_width(w);
+                            for it in &items {
+                                match it {
+                                    FlyItem::Divider => menu_divider(ui, w),
+                                    FlyItem::Heading(t) => menu_heading_row(ui, w, t),
+                                    FlyItem::Disabled(t) => {
+                                        let _ = paint_menu_row(
+                                            ui,
+                                            w,
+                                            arrow_x,
+                                            MenuIcon::None,
+                                            t,
+                                            crate::theme::color::TEXT_MUTED,
+                                            RowT::Plain,
+                                        );
+                                    }
+                                    FlyItem::Row {
+                                        icon,
+                                        name,
+                                        col,
+                                        code,
+                                        check,
+                                        submenu,
+                                        act,
+                                    } => {
+                                        let micon = if let Some(on) = check {
+                                            MenuIcon::Check(*on)
+                                        } else {
+                                            match icon {
+                                                FlyIcon::Key(k) => icon_for(k),
+                                                FlyIcon::Method(c, k) => MenuIcon::Method(c, k),
+                                                FlyIcon::None => MenuIcon::None,
+                                            }
+                                        };
+                                        let rowt = match (code, submenu.is_some()) {
+                                            (Some((c, cc)), true) => RowT::CodeArrow(c, *cc),
+                                            (Some((c, cc)), false) => RowT::Code(c, *cc),
+                                            (None, true) => RowT::Arrow,
+                                            (None, false) => RowT::Plain,
+                                        };
+                                        let (clk, ahov, rrect) =
+                                            paint_menu_row(ui, w, arrow_x, micon, name, *col, rowt);
+                                        if let Some(sm) = submenu {
+                                            if ahov {
+                                                child[i] = Some((sm.clone(), rrect));
+                                            }
+                                        }
+                                        if clk {
+                                            if let Some(a) = act {
+                                                if action.is_none() {
+                                                    action = Some(a.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            pp_cap_ui(ui, "menu flyout");
+                        });
+                });
+            frame_rects.push(area.response.rect);
+        }
+
+        let ptr = ctx.pointer_hover_pos();
+        let over_any = ptr.map_or(false, |p| frame_rects.iter().any(|r| r.contains(p)));
+        let arrow_any = child.iter().any(|c| c.is_some());
+
+        // Rebuild the stack from arrow-hovers: keep frame 0 (menubar-spawned), extend
+        // with any hovered submenu child (§9 nesting).
+        let mut new_stack: Vec<FlyFrame> = vec![frames[0].clone()];
+        for i in 0..frames.len() {
+            if i + 1 > new_stack.len() {
+                break;
+            }
+            if let Some((menu, anchor)) = &child[i] {
+                new_stack.truncate(i + 1);
+                new_stack.push(FlyFrame {
+                    menu: menu.clone(),
+                    anchor: *anchor,
+                });
+            }
+        }
+        // Travel tolerance: if no new arrow extended but the pointer is over a deeper
+        // existing frame, keep the deeper frames (don't trim while traversing them).
+        if new_stack.len() < frames.len() {
+            let deeper = ptr.map_or(false, |p| {
+                frame_rects[new_stack.len()..].iter().any(|r| r.contains(p))
+            });
+            if deeper {
+                new_stack = frames.clone();
+            }
+        }
+
+        // Global close: pointer off everything, no top-arrow / submenu-arrow hovered.
+        let mut close_all = false;
+        if self.menu_flyout_hot || over_any || arrow_any {
+            self.menu_flyout_leave_t = None;
+        } else {
+            let now = ctx.input(|i| i.time);
+            match self.menu_flyout_leave_t {
+                Some(t) if now - t >= MENU_FLYOUT_CLOSE_DELAY => close_all = true,
+                _ => {
+                    if self.menu_flyout_leave_t.is_none() {
+                        self.menu_flyout_leave_t = Some(now);
+                    }
+                    ctx.request_repaint_after(std::time::Duration::from_millis(60));
+                }
+            }
+        }
+        self.menu_flyout_hot = false; // re-armed by the menubar each frame
+
+        if let Some(a) = action {
+            self.flyout_activate(a);
+            close_all = true;
+        }
+        if close_all {
+            self.menu_flyouts.clear();
+            self.menu_flyout_leave_t = None;
+        } else {
+            self.menu_flyouts = new_stack;
+        }
+    }
+}
+
+pub(super) fn draw_draw_glyph(
+    p: &egui::Painter,
+    c: egui::Pos2,
+    id: &str,
+    pen: egui::Stroke,
+    dot: impl Fn(egui::Pos2),
+    _ink: egui::Color32,
+    scale: f32,
+) {
+    // `scale` maps the fn's natural box (`GLYPH_BOX_DRAW`) to the caller's icon
+    // box so glyphs are one uniform physical size across surfaces (§4/§7). The
+    // rail passes 1.0 (unchanged); palette/menus pass `icon_box / natural`.
+    use egui::vec2;
+    let v = |x: f32, y: f32| c + vec2(x * scale, y * scale);
+    let poly = |pts: Vec<egui::Pos2>| {
+        p.add(egui::Shape::line(pts, pen));
+    };
+    let ring = |cx: f32, cy: f32, rx: f32, ry: f32, a0: f32, a1: f32| {
+        let n = 22;
+        let mut pts = Vec::with_capacity(n + 1);
+        for i in 0..=n {
+            let t = a0 + (a1 - a0) * (i as f32 / n as f32);
+            pts.push(c + vec2((cx + rx * t.cos()) * scale, (cy - ry * t.sin()) * scale));
+        }
+        p.add(egui::Shape::line(pts, pen));
+    };
+    let tau = std::f32::consts::TAU;
+    let rstroke = |a: egui::Pos2, b: egui::Pos2| {
+        p.rect(
+            egui::Rect::from_two_pos(a, b),
+            0.0,
+            egui::Color32::TRANSPARENT,
+            pen,
+        )
+    };
+    match id {
+        "pointer" => {
+            poly(vec![
+                v(-5.0, -8.0),
+                v(-5.0, 6.0),
+                v(-1.0, 2.0),
+                v(2.0, 8.0),
+                v(4.0, 7.0),
+                v(1.0, 1.0),
+                v(6.0, 1.0),
+                v(-5.0, -8.0),
+            ]);
+        }
+        "line" => {
+            p.line_segment([v(-7.0, 7.0), v(7.0, -7.0)], pen);
+            dot(v(-7.0, 7.0));
+            dot(v(7.0, -7.0));
+        }
+        "pline" => {
+            poly(vec![v(-8.0, 5.0), v(-3.0, -3.0), v(2.0, 3.0), v(8.0, -5.0)]);
+        }
+        "circle" => {
+            p.circle_stroke(c, 8.0 * scale, pen);
+            dot(c);
+        }
+        "arc" => {
+            ring(0.0, 4.0, 9.0, 9.0, 0.06 * tau, 0.44 * tau);
+        }
+        "rect" => {
+            rstroke(v(-8.0, -5.0), v(8.0, 5.0));
+        }
+        "ellipse" => {
+            ring(0.0, 0.0, 9.0, 5.5, 0.0, tau);
+        }
+        "point" => {
+            p.line_segment([v(-6.0, 0.0), v(6.0, 0.0)], pen);
+            p.line_segment([v(0.0, -6.0), v(0.0, 6.0)], pen);
+            dot(c);
+        }
+        "spline" => {
+            let n = 20;
+            let mut pts = Vec::with_capacity(n + 1);
+            for i in 0..=n {
+                let x = -9.0 + 18.0 * (i as f32 / n as f32);
+                let y = 4.5 * (x * 0.55).sin();
+                pts.push(v(x, -y));
+            }
+            poly(pts);
+        }
+        "hatch" => {
+            rstroke(v(-8.0, -6.0), v(8.0, 6.0));
+            for k in -1..=1 {
+                let o = k as f32 * 5.0;
+                p.line_segment([v(o - 1.0, 6.0), v(o + 5.0, -6.0)], pen);
+            }
+        }
+        "text" => {
+            poly(vec![v(-6.0, 8.0), v(0.0, -8.0), v(6.0, 8.0)]);
+            p.line_segment([v(-3.5, 2.0), v(3.5, 2.0)], pen);
+        }
+        "ellarc" => {
+            ring(0.0, 0.0, 9.0, 5.5, 0.12 * tau, 0.66 * tau);
+        }
+        "wall" => {
+            rstroke(v(-9.0, -3.5), v(9.0, 3.5));
+            p.line_segment([v(-9.0, 0.0), v(9.0, 0.0)], pen);
+        }
+        "dim" => {
+            p.line_segment([v(-8.0, 3.0), v(-8.0, -5.0)], pen);
+            p.line_segment([v(8.0, 3.0), v(8.0, -5.0)], pen);
+            p.line_segment([v(-8.0, 0.0), v(8.0, 0.0)], pen);
+            p.line_segment([v(-8.0, 0.0), v(-5.0, -2.0)], pen);
+            p.line_segment([v(-8.0, 0.0), v(-5.0, 2.0)], pen);
+            p.line_segment([v(8.0, 0.0), v(5.0, -2.0)], pen);
+            p.line_segment([v(8.0, 0.0), v(5.0, 2.0)], pen);
+        }
+        _ => {}
+    }
+}
+
+/// Method list for a rail command's ▼ flyout, as `(short, full, key)` triples.
+/// `short` is the compact code shown next to the glyph (e.g. "3P", "TTR"),
+/// `full` is the hover tooltip, `key` is interpreted by `dispatch_method`.
+/// Empty = the command has no methods (no ▼ shown).
+/// Command-palette fuzzy match: `true` if every char of `q` (already lowercased)
+/// appears IN ORDER (subsequence) within `hay` (lowercased `title` + `keywords`).
+/// Substring typing is a subset, so plain queries work too. Empty query matches
+/// all. UI metadata search ONLY — never the parser or parser aliases (D6).
+pub(super) fn palette_fuzzy(q: &str, hay: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    let mut hc = hay.chars();
+    'next: for qc in q.chars() {
+        for c in hc.by_ref() {
+            if c == qc {
+                continue 'next;
+            }
+        }
+        return false; // ran out of haystack before matching qc
+    }
+    true
+}
+
+pub(super) fn rail_flyout_items(cmd: &str) -> Vec<(String, String, String)> {
+    match cmd {
+        "arc" => ALL_ARC_METHODS
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.short().to_string(), m.name().to_string(), i.to_string()))
+            .collect(),
+        "circle" => vec![
+            ("CR".into(), "Center, Radius".into(), "center".into()),
+            ("3P".into(), "3-Point".into(), "3p".into()),
+            ("2P".into(), "2-Point".into(), "2p".into()),
+            ("TTR".into(), "Tan, Tan, Radius".into(), "ttr".into()),
+        ],
+        "fillet" => vec![
+            ("F".into(), "Fillet (pick two)".into(), "run".into()),
+            ("PL".into(), "Polyline (whole)".into(), "poly".into()),
+            ("×N".into(), "Multiple".into(), "multi".into()),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// Draw a SMALL method-specific glyph (for the ▼ flyout rows and for the rail
+/// icon once a method has been used). Compact (~7px) primitives so it reads at
+/// flyout size. `cmd`+`key` select the variant; falls back to nothing if
+/// unknown (caller then draws the base command glyph).
+pub(super) fn draw_method_glyph(
+    p: &egui::Painter,
+    c: egui::Pos2,
+    cmd: &str,
+    key: &str,
+    pen: egui::Stroke,
+    ink: egui::Color32,
+    scale: f32,
+) {
+    // `scale` maps the fn's natural box (`GLYPH_BOX_METHOD`) to the caller's icon
+    // box (§4/§7). Rail passes 1.0; palette/menus pass `icon_box / natural`.
+    use std::f32::consts::{PI, TAU};
+    let v = |dx: f32, dy: f32| egui::pos2(c.x + dx * scale, c.y + dy * scale);
+    let d = |q: egui::Pos2| p.circle_filled(q, 1.5 * scale.max(0.8), ink);
+    match cmd {
+        "circle" => {
+            let r = 7.0;
+            p.circle_stroke(c, r * scale, pen);
+            match key {
+                "3p" => {
+                    for k in 0..3 {
+                        let a = TAU * (k as f32 / 3.0) - PI / 2.0;
+                        d(v(r * a.cos(), r * a.sin()));
+                    }
+                }
+                "2p" => {
+                    p.line_segment([v(-r, 0.0), v(r, 0.0)], pen);
+                    d(v(-r, 0.0));
+                    d(v(r, 0.0));
+                }
+                "ttr" => {
+                    // circle nestled in a right-angle pair of tangents
+                    p.line_segment([v(-9.0, 8.0), v(9.0, 8.0)], pen);
+                    p.line_segment([v(-9.0, 8.0), v(-9.0, -8.0)], pen);
+                }
+                _ => {
+                    d(c);
+                    p.line_segment([c, v(r, 0.0)], pen);
+                } // center+radius
+            }
+        }
+        "arc" => {
+            let n = 18;
+            let pts: Vec<egui::Pos2> = (0..=n)
+                .map(|i| {
+                    let t = PI * (i as f32 / n as f32);
+                    v(-8.0 * t.cos(), -8.0 * t.sin())
+                })
+                .collect();
+            p.add(egui::Shape::line(pts.clone(), pen));
+            match ALL_ARC_METHODS.get(key.parse::<usize>().unwrap_or(0)) {
+                Some(ArcMethod::ThreePoints) => {
+                    d(pts[0]);
+                    d(pts[n / 2]);
+                    d(pts[n]);
+                }
+                Some(ArcMethod::StartCenterEnd) | Some(ArcMethod::CenterStartEnd) => {
+                    d(pts[0]);
+                    d(c);
+                    d(pts[n]);
+                }
+                _ => {
+                    d(pts[0]);
+                    d(pts[n]);
+                }
+            }
+        }
+        "fillet" => {
+            // An L of two segments joined by a quarter-round corner.
+            p.line_segment([v(-8.0, 7.0), v(-1.0, 7.0)], pen);
+            p.line_segment([v(7.0, -8.0), v(7.0, -1.0)], pen);
+            let q: Vec<egui::Pos2> = (0..=6)
+                .map(|i| {
+                    let t = (PI / 2.0) * (i as f32 / 6.0);
+                    v(7.0 - 8.0 * t.cos(), 7.0 - 8.0 * t.sin())
+                })
+                .collect();
+            p.add(egui::Shape::line(q, pen));
+            match key {
+                "poly" => {
+                    d(v(-1.0, 7.0));
+                    d(v(7.0, -1.0));
+                } // emphasise both ends
+                "multi" => {
+                    p.line_segment([v(2.0, -6.0), v(6.0, -2.0)], pen);
+                    p.line_segment([v(6.0, -6.0), v(2.0, -2.0)], pen);
+                } // ×
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Placeholder glyphs for `cmd_button`. Each variant is a few
+/// strokes — gets the idea across; we'll swap to real icons later.
+/// `pub(crate)` so the command registry ([`crate::command::IconId`]) can name it.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum GlyphKind {
+    Move,
+    Copy,
+    Rotate,
+    Scale,
+    Mirror,
+    Stretch,
+    Align,
+    Trim,
+    Extend,
+    Fillet,
+    Chamfer,
+    Offset,
+    Join,
+    Break,
+    Lengthen,
+    Erase,
+    MatchProps,
+    ChangeLayer,
+    ArrayGrid,
+    Reverse,
+    Dist,
+    List,
+    Undo,
+    Redo,
+    Block,
+    Insert,
+    Explode,
+}
+
+pub(super) fn draw_cmd_glyph(
+    p: &egui::Painter,
+    c: egui::Pos2,
+    kind: GlyphKind,
+    pen: egui::Stroke,
+    dot: impl Fn(egui::Pos2),
+    ink: egui::Color32,
+    scale: f32,
+) {
+    // `scale` maps the fn's natural box (`GLYPH_BOX_CMD`) to the caller's icon box
+    // (§4/§7). Rail passes 1.0; palette/menus pass `icon_box / natural`. All the
+    // glyph geometry flows through `v`, so scaling it scales the whole icon.
+    use egui::{vec2, Pos2 as _};
+    let v = |x: f32, y: f32| c + vec2(x * scale, y * scale);
+    match kind {
+        GlyphKind::Move => {
+            // four-headed arrow
+            p.line_segment([v(-10.0, 0.0), v(10.0, 0.0)], pen);
+            p.line_segment([v(0.0, -10.0), v(0.0, 10.0)], pen);
+            for (dx, dy) in [(10.0, 0.0), (-10.0, 0.0), (0.0, 10.0), (0.0, -10.0)] {
+                let tip = v(dx, dy);
+                let (nx, ny) = (-dx * 0.3, -dy * 0.3);
+                p.line_segment([tip, tip + vec2(nx - ny, ny + nx)], pen);
+                p.line_segment([tip, tip + vec2(nx + ny, ny - nx)], pen);
+            }
+        }
+        GlyphKind::Copy => {
+            // two overlapping rectangles
+            p.rect_stroke(
+                egui::Rect::from_min_max(v(-11.0, -8.0), v(3.0, 6.0)),
+                0.0,
+                pen,
+            );
+            p.rect_stroke(
+                egui::Rect::from_min_max(v(-3.0, -2.0), v(11.0, 10.0)),
+                0.0,
+                pen,
+            );
+        }
+        GlyphKind::Rotate => {
+            // 270° arc + arrowhead
+            let r = 11.0;
+            let mut pts = Vec::with_capacity(33);
+            for i in 0..=32 {
+                let t =
+                    -std::f32::consts::FRAC_PI_2 + (i as f32 / 32.0) * std::f32::consts::TAU * 0.78;
+                pts.push(v(r * t.cos(), r * t.sin()));
+            }
+            p.add(egui::Shape::line(pts, pen));
+            let last = v(
+                r * (-std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * 0.78).cos(),
+                r * (-std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * 0.78).sin(),
+            );
+            p.line_segment([last, last + vec2(4.0, 1.0)], pen);
+            p.line_segment([last, last + vec2(1.0, 4.5)], pen);
+            dot(c);
+        }
+        GlyphKind::Scale => {
+            // small rect bottom-left, big rect top-right, diagonal
+            p.rect_stroke(
+                egui::Rect::from_min_max(v(-11.0, 2.0), v(-2.0, 11.0)),
+                0.0,
+                pen,
+            );
+            p.rect_stroke(
+                egui::Rect::from_min_max(v(0.0, -11.0), v(12.0, 1.0)),
+                0.0,
+                pen,
+            );
+            p.line_segment([v(-2.0, 2.0), v(0.0, 1.0)], pen);
+        }
+        GlyphKind::Mirror => {
+            // shape + mirrored shape across vertical axis
+            p.line_segment([v(0.0, -11.0), v(0.0, 11.0)], egui::Stroke::new(0.8, ink));
+            p.line_segment([v(-10.0, 8.0), v(-3.0, -8.0)], pen);
+            p.line_segment([v(3.0, -8.0), v(10.0, 8.0)], pen);
+            p.line_segment([v(-10.0, 8.0), v(-3.0, 8.0)], egui::Stroke::new(0.8, ink));
+            p.line_segment([v(3.0, 8.0), v(10.0, 8.0)], egui::Stroke::new(0.8, ink));
+        }
+        GlyphKind::Stretch => {
+            // dashed rectangle + outward arrow
+            for s in egui::Shape::dashed_line(
+                &[
+                    v(-11.0, -7.0),
+                    v(5.0, -7.0),
+                    v(5.0, 5.0),
+                    v(-11.0, 5.0),
+                    v(-11.0, -7.0),
+                ],
+                egui::Stroke::new(1.0, ink),
+                3.0,
+                2.0,
+            ) {
+                p.add(s);
+            }
+            p.line_segment([v(2.0, -1.0), v(11.0, -1.0)], pen);
+            p.line_segment([v(11.0, -1.0), v(8.0, -4.0)], pen);
+            p.line_segment([v(11.0, -1.0), v(8.0, 2.0)], pen);
+        }
+        GlyphKind::Align => {
+            // two segments aligning to a target line
+            p.line_segment([v(-12.0, 5.0), v(-2.0, -5.0)], pen);
+            p.line_segment([v(4.0, 5.0), v(12.0, -5.0)], pen);
+            p.line_segment([v(-12.0, 8.0), v(12.0, 8.0)], egui::Stroke::new(0.8, ink));
+        }
+        GlyphKind::Trim => {
+            // X over a line — "cut here"
+            p.line_segment([v(-12.0, 5.0), v(12.0, 5.0)], pen);
+            p.line_segment([v(-5.0, -5.0), v(5.0, 5.0)], pen);
+            p.line_segment([v(-5.0, 5.0), v(5.0, -5.0)], pen);
+        }
+        GlyphKind::Extend => {
+            // line + arrow extending to a wall
+            p.line_segment([v(-12.0, 0.0), v(6.0, 0.0)], pen);
+            p.line_segment([v(6.0, 0.0), v(3.0, -3.0)], pen);
+            p.line_segment([v(6.0, 0.0), v(3.0, 3.0)], pen);
+            p.line_segment([v(11.0, -10.0), v(11.0, 10.0)], egui::Stroke::new(2.0, ink));
+        }
+        GlyphKind::Fillet => {
+            // two lines joined by an arc (rounded corner)
+            p.line_segment([v(-11.0, 8.0), v(-4.0, 8.0)], pen);
+            let r = 7.0;
+            let mut pts = Vec::with_capacity(17);
+            for i in 0..=16 {
+                let t =
+                    std::f32::consts::FRAC_PI_2 - (i as f32 / 16.0) * std::f32::consts::FRAC_PI_2;
+                pts.push(v(-4.0 + r * t.sin() - r, 8.0 + r - r * t.cos() - r) + vec2(7.0, 0.0));
+            }
+            // Simpler: draw the arc as a quarter circle joining the two lines
+            let arc_center = v(-4.0, 1.0);
+            let mut pts = Vec::with_capacity(17);
+            for i in 0..=16 {
+                let t =
+                    -std::f32::consts::FRAC_PI_2 + (i as f32 / 16.0) * std::f32::consts::FRAC_PI_2;
+                pts.push(arc_center + vec2(7.0 * t.cos(), 7.0 * t.sin()));
+            }
+            p.add(egui::Shape::line(pts, pen));
+            p.line_segment([v(3.0, 1.0), v(3.0, 10.0)], pen);
+        }
+        GlyphKind::Chamfer => {
+            // two lines joined by a diagonal (beveled corner)
+            p.line_segment([v(-11.0, 8.0), v(-4.0, 8.0)], pen);
+            p.line_segment([v(-4.0, 8.0), v(3.0, 1.0)], pen);
+            p.line_segment([v(3.0, 1.0), v(3.0, 10.0)], pen);
+        }
+        GlyphKind::Offset => {
+            // two parallel arcs
+            let r1 = 9.0;
+            let r2 = 5.0;
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            for i in 0..=24 {
+                let t = -std::f32::consts::FRAC_PI_2 + (i as f32 / 24.0) * std::f32::consts::PI;
+                a.push(v(r1 * t.cos(), r1 * t.sin()));
+                b.push(v(r2 * t.cos(), r2 * t.sin()));
+            }
+            p.add(egui::Shape::line(a, pen));
+            p.add(egui::Shape::line(b, pen));
+        }
+        GlyphKind::Join => {
+            // two arrows pointing at each other meeting at center
+            p.line_segment([v(-12.0, 0.0), v(-2.0, 0.0)], pen);
+            p.line_segment([v(-2.0, 0.0), v(-5.0, -3.0)], pen);
+            p.line_segment([v(-2.0, 0.0), v(-5.0, 3.0)], pen);
+            p.line_segment([v(12.0, 0.0), v(2.0, 0.0)], pen);
+            p.line_segment([v(2.0, 0.0), v(5.0, -3.0)], pen);
+            p.line_segment([v(2.0, 0.0), v(5.0, 3.0)], pen);
+        }
+        GlyphKind::Break => {
+            // line with gap in middle
+            p.line_segment([v(-12.0, 0.0), v(-3.0, 0.0)], pen);
+            p.line_segment([v(3.0, 0.0), v(12.0, 0.0)], pen);
+            p.line_segment([v(-3.0, -5.0), v(-3.0, 5.0)], egui::Stroke::new(0.8, ink));
+            p.line_segment([v(3.0, -5.0), v(3.0, 5.0)], egui::Stroke::new(0.8, ink));
+        }
+        GlyphKind::Lengthen => {
+            // short segment → arrow lengthening
+            p.line_segment([v(-12.0, 0.0), v(-2.0, 0.0)], pen);
+            p.line_segment([v(-12.0, -4.0), v(-12.0, 4.0)], pen);
+            p.line_segment([v(-2.0, 0.0), v(11.0, 0.0)], egui::Stroke::new(1.0, ink));
+            p.line_segment([v(11.0, 0.0), v(8.0, -3.0)], pen);
+            p.line_segment([v(11.0, 0.0), v(8.0, 3.0)], pen);
+        }
+        GlyphKind::Erase => {
+            // pencil eraser block + diagonal
+            p.rect_filled(
+                egui::Rect::from_min_max(v(-10.0, -2.0), v(2.0, 8.0)),
+                3.0,
+                egui::Color32::from_rgb(220, 100, 80),
+            );
+            p.rect_stroke(
+                egui::Rect::from_min_max(v(-10.0, -2.0), v(2.0, 8.0)),
+                3.0,
+                egui::Stroke::new(1.0, ink),
+            );
+            p.line_segment([v(2.0, -2.0), v(11.0, -11.0)], pen);
+            p.line_segment([v(2.0, 8.0), v(11.0, -1.0)], pen);
+        }
+        GlyphKind::MatchProps => {
+            // brush + downward strokes
+            p.rect_stroke(
+                egui::Rect::from_min_max(v(-8.0, -10.0), v(8.0, -2.0)),
+                1.0,
+                pen,
+            );
+            for x in [-6.0, -2.0, 2.0, 6.0] {
+                p.line_segment([v(x, -2.0), v(x, 9.0)], egui::Stroke::new(1.1, ink));
+            }
+        }
+        GlyphKind::ChangeLayer => {
+            // stacked rectangles
+            p.rect_stroke(
+                egui::Rect::from_min_max(v(-11.0, 4.0), v(7.0, 10.0)),
+                1.0,
+                pen,
+            );
+            p.rect_stroke(
+                egui::Rect::from_min_max(v(-8.0, -2.0), v(10.0, 4.0)),
+                1.0,
+                pen,
+            );
+            p.rect_stroke(
+                egui::Rect::from_min_max(v(-5.0, -8.0), v(13.0, -2.0)),
+                1.0,
+                pen,
+            );
+        }
+        GlyphKind::ArrayGrid => {
+            // 3x3 dots
+            for y in [-8.0, 0.0, 8.0] {
+                for x in [-8.0, 0.0, 8.0] {
+                    p.rect_stroke(
+                        egui::Rect::from_min_max(v(x - 3.0, y - 3.0), v(x + 3.0, y + 3.0)),
+                        0.5,
+                        egui::Stroke::new(1.0, ink),
+                    );
+                }
+            }
+        }
+        GlyphKind::Reverse => {
+            // curved arrow flipping direction
+            let mut pts = Vec::with_capacity(20);
+            for i in 0..=19 {
+                let t = std::f32::consts::PI - (i as f32 / 19.0) * std::f32::consts::PI;
+                pts.push(v(10.0 * t.cos(), 5.0 - 5.0 * t.sin()));
+            }
+            p.add(egui::Shape::line(pts, pen));
+            let tip = v(-10.0, 5.0);
+            p.line_segment([tip, tip + vec2(4.0, -3.0)], pen);
+            p.line_segment([tip, tip + vec2(4.0, 3.0)], pen);
+        }
+        GlyphKind::Dist => {
+            // ruler-style: line with tick marks + arrowheads
+            p.line_segment([v(-12.0, 0.0), v(12.0, 0.0)], pen);
+            for x in [-12.0, -6.0, 0.0, 6.0, 12.0] {
+                p.line_segment([v(x, -4.0), v(x, 0.0)], egui::Stroke::new(0.8, ink));
+            }
+            p.line_segment([v(-12.0, 0.0), v(-9.0, -3.0)], pen);
+            p.line_segment([v(-12.0, 0.0), v(-9.0, 3.0)], pen);
+            p.line_segment([v(12.0, 0.0), v(9.0, -3.0)], pen);
+            p.line_segment([v(12.0, 0.0), v(9.0, 3.0)], pen);
+        }
+        GlyphKind::List => {
+            // three lines representing a list
+            for y in [-7.0, 0.0, 7.0] {
+                p.line_segment([v(-10.0, y), v(-6.0, y)], egui::Stroke::new(1.6, ink));
+                p.line_segment([v(-3.0, y), v(11.0, y)], pen);
+            }
+        }
+        GlyphKind::Undo => {
+            // curved arrow ← — arc centered on x=0 (was drawn in the left half,
+            // making the icon look shifted vs its neighbours in the menu column).
+            let mut pts = Vec::with_capacity(17);
+            for i in 0..=16 {
+                let t = (i as f32 / 16.0) * std::f32::consts::PI;
+                pts.push(v(9.0 * t.cos(), -9.0 * t.sin()));
+            }
+            p.add(egui::Shape::line(pts, pen));
+            let tip = v(0.0, 0.0);
+            p.line_segment([tip, tip + vec2(4.0, -3.0)], pen);
+            p.line_segment([tip, tip + vec2(4.0, 3.0)], pen);
+        }
+        GlyphKind::Redo => {
+            // mirror of undo → — arc centered on x=0.
+            let mut pts = Vec::with_capacity(17);
+            for i in 0..=16 {
+                let t = (i as f32 / 16.0) * std::f32::consts::PI;
+                pts.push(v(-9.0 * t.cos(), -9.0 * t.sin()));
+            }
+            p.add(egui::Shape::line(pts, pen));
+            let tip = v(0.0, 0.0);
+            p.line_segment([tip, tip + vec2(-4.0, -3.0)], pen);
+            p.line_segment([tip, tip + vec2(-4.0, 3.0)], pen);
+        }
+        GlyphKind::Block => {
+            // outer frame holding contained geometry + a base-point grip
+            // at the lower-left corner (the handle an instance carries).
+            let thin = egui::Stroke::new(0.9, ink);
+            p.rect_stroke(
+                egui::Rect::from_min_max(v(-10.0, -9.0), v(8.0, 7.0)),
+                1.0,
+                pen,
+            );
+            // contained-geometry hint: a small circle + diagonal line.
+            p.circle_stroke(v(-1.0, -1.0), 4.0, thin);
+            p.line_segment([v(-7.0, 5.0), v(5.0, -6.0)], thin);
+            dot(v(-10.0, 7.0)); // base point grip
+        }
+        GlyphKind::Insert => {
+            // a block (small square) dropping onto an insertion node:
+            // square top-left, arrow down-right to a target dot.
+            p.rect_stroke(
+                egui::Rect::from_min_max(v(-12.0, -11.0), v(-2.0, -1.0)),
+                1.0,
+                pen,
+            );
+            p.line_segment([v(-2.0, -1.0), v(7.0, 8.0)], pen);
+            p.line_segment([v(7.0, 8.0), v(1.0, 7.0)], pen);
+            p.line_segment([v(7.0, 8.0), v(6.0, 2.0)], pen);
+            dot(v(9.0, 10.0)); // insertion point
+        }
+        GlyphKind::Explode => {
+            // a core square bursting into outward shards (scatter).
+            p.rect_stroke(
+                egui::Rect::from_min_max(v(-4.0, -4.0), v(4.0, 4.0)),
+                0.0,
+                pen,
+            );
+            for (dx, dy) in [
+                (1.0, 0.8),
+                (-1.0, 0.8),
+                (1.0, -0.8),
+                (-1.0, -0.8),
+                (0.0, 1.25),
+                (0.0, -1.25),
+            ] {
+                p.line_segment([v(6.0 * dx, 6.0 * dy), v(11.0 * dx, 11.0 * dy)], pen);
+            }
+        }
+    }
+}
+
+/// Command word a draw tool maps to (for the last-command buffer, so an empty
+/// Enter repeats a ribbon/icon command). `None` for the pointer.
+pub(super) fn tool_command_word(t: Tool) -> Option<&'static str> {
+    Some(match t {
+        Tool::Line => "line",
+        Tool::Circle => "circle",
+        Tool::Arc => "arc",
+        Tool::Ellipse => "ellipse",
+        Tool::EllipseArc => "ellipsearc",
+        Tool::Point => "point",
+        Tool::Polyline => "polyline",
+        Tool::Spline => "spline",
+        Tool::Wall => "wall",
+        Tool::Text => "text",
+        Tool::Dim => "dim",
+        Tool::Rectangle => "rec",
+        Tool::None => return None,
+    })
+}
+
+pub(super) fn tool_button(ui: &mut egui::Ui, current: &mut Tool, this: Tool, label: &str) -> bool {
+    let selected = *current == this;
+    let (resp, painter) = ui.allocate_painter(egui::vec2(56.0, 52.0), egui::Sense::click());
+    let rect = resp.rect;
+    let bg = if selected {
+        egui::Color32::from_rgb(60, 110, 175)
+    } else if resp.hovered() {
+        egui::Color32::from_rgb(48, 58, 72)
+    } else {
+        egui::Color32::from_rgb(28, 34, 42)
+    };
+    painter.rect(
+        rect,
+        5.0,
+        bg,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)),
+    );
+
+    let c = rect.center() - egui::vec2(0.0, 4.0);
+    let icon_col = egui::Color32::from_rgb(225, 235, 245);
+    let pen = egui::Stroke::new(1.8, icon_col);
+    let dot = |p: egui::Pos2| painter.circle_filled(p, 1.8, icon_col);
+    match this {
+        Tool::None => {
+            // arrow / pointer
+            painter.line_segment([c + egui::vec2(-8.0, -8.0), c + egui::vec2(6.0, 6.0)], pen);
+            painter.line_segment([c + egui::vec2(-8.0, -8.0), c + egui::vec2(-3.0, 2.0)], pen);
+            painter.line_segment([c + egui::vec2(-8.0, -8.0), c + egui::vec2(2.0, -3.0)], pen);
+        }
+        Tool::Line => {
+            painter.line_segment(
+                [c + egui::vec2(-14.0, 10.0), c + egui::vec2(14.0, -10.0)],
+                pen,
+            );
+            dot(c + egui::vec2(-14.0, 10.0));
+            dot(c + egui::vec2(14.0, -10.0));
+        }
+        Tool::Circle => {
+            painter.circle_stroke(c, 13.0, pen);
+            dot(c);
+        }
+        Tool::Arc => {
+            // half-circle + center dot + two endpoint dots (center-start-end variant)
+            let n = 24;
+            let mut pts = Vec::with_capacity(n + 1);
+            for i in 0..=n {
+                let t = std::f32::consts::PI * (i as f32 / n as f32);
+                pts.push(c + egui::vec2(-13.0 * t.cos(), -13.0 * t.sin()));
+            }
+            painter.add(egui::Shape::line(pts, pen));
+            dot(c);
+            dot(c + egui::vec2(-13.0, 0.0));
+            dot(c + egui::vec2(13.0, 0.0));
+        }
+        Tool::Ellipse => {
+            // squashed ellipse — a 2:1 ratio so it reads distinctly from the circle
+            let n = 32;
+            let mut pts = Vec::with_capacity(n + 1);
+            for i in 0..=n {
+                let t = std::f32::consts::TAU * (i as f32 / n as f32);
+                pts.push(c + egui::vec2(14.0 * t.cos(), 7.0 * t.sin()));
+            }
+            painter.add(egui::Shape::line(pts, pen));
+            dot(c);
+            dot(c + egui::vec2(14.0, 0.0)); // major-end
+            dot(c + egui::vec2(0.0, -7.0)); // minor-end
+        }
+        Tool::EllipseArc => {
+            // top-half of a squashed ellipse — same proportions as the
+            // ellipse icon, but only the upper sweep is drawn.
+            let n = 24;
+            let mut pts = Vec::with_capacity(n + 1);
+            for i in 0..=n {
+                let t = std::f32::consts::PI * (i as f32 / n as f32);
+                pts.push(c + egui::vec2(-14.0 * t.cos(), -7.0 * t.sin()));
+            }
+            painter.add(egui::Shape::line(pts, pen));
+            dot(c);
+            dot(c + egui::vec2(-14.0, 0.0)); // start
+            dot(c + egui::vec2(14.0, 0.0)); // end
+        }
+        Tool::Point => {
+            // a small '+' glyph
+            painter.line_segment([c + egui::vec2(-9.0, 0.0), c + egui::vec2(9.0, 0.0)], pen);
+            painter.line_segment([c + egui::vec2(0.0, -9.0), c + egui::vec2(0.0, 9.0)], pen);
+            dot(c);
+        }
+        Tool::Rectangle => {
+            // a rectangle outline with two opposite-corner dots (the two
+            // clicks the user makes).
+            let r = egui::Rect::from_center_size(c, egui::vec2(26.0, 18.0));
+            painter.rect_stroke(r, 0.0, pen);
+            dot(r.left_top());
+            dot(r.right_bottom());
+        }
+        Tool::Polyline => {
+            // a 3-segment chevron-ish shape with vertex dots
+            let p1 = c + egui::vec2(-14.0, 8.0);
+            let p2 = c + egui::vec2(-4.0, -8.0);
+            let p3 = c + egui::vec2(6.0, 6.0);
+            let p4 = c + egui::vec2(14.0, -4.0);
+            painter.line_segment([p1, p2], pen);
+            painter.line_segment([p2, p3], pen);
+            painter.line_segment([p3, p4], pen);
+            dot(p1);
+            dot(p2);
+            dot(p3);
+            dot(p4);
+        }
+        Tool::Spline => {
+            // Smooth S-curve sampled from a cubic NURBS through 4
+            // control points (rendered AS the icon — eats its own
+            // dogfood). The 4 control dots show where the user clicks
+            // when drafting; the curve shows the result. Hint pens
+            // sketch the control polygon underneath so the icon also
+            // teaches the data model at a glance.
+            let p1 = c + egui::vec2(-14.0, 8.0);
+            let p2 = c + egui::vec2(-5.0, -10.0);
+            let p3 = c + egui::vec2(5.0, 10.0);
+            let p4 = c + egui::vec2(14.0, -8.0);
+            // Faint chord polygon (the "control polygon")
+            let hint = egui::Stroke::new(
+                0.6,
+                egui::Color32::from_rgba_unmultiplied(icon_col.r(), icon_col.g(), icon_col.b(), 90),
+            );
+            painter.line_segment([p1, p2], hint);
+            painter.line_segment([p2, p3], hint);
+            painter.line_segment([p3, p4], hint);
+            // The curve itself — a cubic Bézier sample is close enough
+            // visually to a degree-3 clamped uniform NURBS through 4
+            // control points (which IS a single Bézier in this case).
+            let mut prev = p1;
+            for i in 1..=24 {
+                let t = i as f32 / 24.0;
+                let u = 1.0 - t;
+                let pt = egui::pos2(
+                    u * u * u * p1.x
+                        + 3.0 * u * u * t * p2.x
+                        + 3.0 * u * t * t * p3.x
+                        + t * t * t * p4.x,
+                    u * u * u * p1.y
+                        + 3.0 * u * u * t * p2.y
+                        + 3.0 * u * t * t * p3.y
+                        + t * t * t * p4.y,
+                );
+                painter.line_segment([prev, pt], pen);
+                prev = pt;
+            }
+            // Control-point dots
+            dot(p1);
+            dot(p2);
+            dot(p3);
+            dot(p4);
+        }
+        Tool::Wall => {
+            // Two parallel horizontals — the wall's two side lines.
+            // Endpoint dots show the click anchors (the centerline
+            // endpoints the user actually clicks). The "thickness" is
+            // the gap between the two parallels.
+            painter.line_segment(
+                [c + egui::vec2(-14.0, -4.0), c + egui::vec2(14.0, -4.0)],
+                pen,
+            );
+            painter.line_segment([c + egui::vec2(-14.0, 4.0), c + egui::vec2(14.0, 4.0)], pen);
+            dot(c + egui::vec2(-14.0, 0.0));
+            dot(c + egui::vec2(14.0, 0.0));
+        }
+        Tool::Text => {
+            // Big "A" — universal text icon. Built from 3 line strokes
+            // so it scales with the toolbar text pen.
+            painter.line_segment([c + egui::vec2(-8.0, 8.0), c + egui::vec2(0.0, -10.0)], pen);
+            painter.line_segment([c + egui::vec2(0.0, -10.0), c + egui::vec2(8.0, 8.0)], pen);
+            painter.line_segment([c + egui::vec2(-5.0, 2.0), c + egui::vec2(5.0, 2.0)], pen);
+            dot(c + egui::vec2(0.0, 10.0)); // baseline anchor hint
+        }
+        Tool::Dim => {
+            // Horizontal dim line with two arrows + two extension lines.
+            // Compact CAD-icon language for "dimension".
+            // Dim line
+            painter.line_segment([c + egui::vec2(-10.0, 0.0), c + egui::vec2(10.0, 0.0)], pen);
+            // Left arrowhead
+            painter.line_segment(
+                [c + egui::vec2(-10.0, 0.0), c + egui::vec2(-6.0, -3.0)],
+                pen,
+            );
+            painter.line_segment([c + egui::vec2(-10.0, 0.0), c + egui::vec2(-6.0, 3.0)], pen);
+            // Right arrowhead
+            painter.line_segment([c + egui::vec2(10.0, 0.0), c + egui::vec2(6.0, -3.0)], pen);
+            painter.line_segment([c + egui::vec2(10.0, 0.0), c + egui::vec2(6.0, 3.0)], pen);
+            // Two extension lines
+            painter.line_segment(
+                [c + egui::vec2(-10.0, 8.0), c + egui::vec2(-10.0, -3.0)],
+                pen,
+            );
+            painter.line_segment([c + egui::vec2(10.0, 8.0), c + egui::vec2(10.0, -3.0)], pen);
+        }
+    }
+
+    painter.text(
+        rect.center_bottom() - egui::vec2(0.0, 10.0),
+        egui::Align2::CENTER_BOTTOM,
+        label,
+        egui::FontId::proportional(10.0),
+        icon_col,
+    );
+
+    if resp.clicked() {
+        *current = if selected { Tool::None } else { this };
+        return true;
+    }
+    false
+}
+
+// ---- hatch command button (one-shot — opens dialog) -----------------------
+
+/// Custom-painted Hatch button. Hatch isn't a persistent draw tool
+/// (no `Tool::Hatch` variant), so this lives outside `tool_button` —
+/// click → `run_command("hatch")` → opens the Choose Hatch Attributes
+/// dialog. Icon: a square outline with 45° hatching, corner
+/// registration ticks (so it reads as a "boundary"), and a small
+/// pick-point cursor at the bottom-right (signifying the Pick Point
+/// flow). User reference: the freenom-style "hatch" pictogram with
+/// crosshairs at every corner.
+pub(super) fn hatch_command_button(ui: &mut egui::Ui) -> bool {
+    let (resp, painter) = ui.allocate_painter(egui::vec2(56.0, 52.0), egui::Sense::click());
+    let rect = resp.rect;
+    let bg = if resp.hovered() {
+        egui::Color32::from_rgb(48, 58, 72)
+    } else {
+        egui::Color32::from_rgb(28, 34, 42)
+    };
+    painter.rect(
+        rect,
+        5.0,
+        bg,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)),
+    );
+
+    let c = rect.center() - egui::vec2(0.0, 4.0);
+    let icon_col = egui::Color32::from_rgb(225, 235, 245);
+    let pen = egui::Stroke::new(1.6, icon_col);
+    let thin = egui::Stroke::new(1.0, icon_col);
+
+    // Boundary square
+    let half = 11.0_f32;
+    let sq = egui::Rect::from_center_size(c, egui::vec2(half * 2.0, half * 2.0));
+    painter.rect_stroke(sq, 0.0, pen);
+
+    // Hatching: 5 diagonal lines at 45°, clipped to the square. Drawing
+    // long lines and clipping is simpler than computing exact entry/exit
+    // points per line — egui's `with_clip_rect` does the rest.
+    let inner = painter.with_clip_rect(sq);
+    let span = half * 4.0;
+    let spacing = (half * 2.0) / 4.0; // 5 lines: at -2s, -s, 0, +s, +2s
+    for k in -2..=2 {
+        let off = k as f32 * spacing;
+        let p1 = egui::pos2(c.x - span + off, c.y + span + off);
+        let p2 = egui::pos2(c.x + span + off, c.y - span + off);
+        inner.line_segment([p1, p2], thin);
+    }
+
+    // Corner registration ticks — a short "L" extending outward from
+    // each corner of the boundary. Reads as "this is a boundary I'm
+    // selecting" rather than just an arbitrary outline.
+    let ext = 4.5_f32;
+    for &(corner, dx, dy) in &[
+        (sq.left_top(), -1.0_f32, -1.0_f32),
+        (sq.right_top(), 1.0, -1.0),
+        (sq.left_bottom(), -1.0, 1.0),
+        (sq.right_bottom(), 1.0, 1.0),
+    ] {
+        painter.line_segment([corner, corner + egui::vec2(dx * ext, 0.0)], pen);
+        painter.line_segment([corner, corner + egui::vec2(0.0, dy * ext)], pen);
+    }
+
+    // Pick-point cursor at lower-right: a small offset pickbox + arrow
+    // pointing INTO the main square. Communicates "click inside to
+    // pick the boundary" at a glance.
+    let pb_center = sq.right_bottom() + egui::vec2(3.0, 3.0);
+    let pb_half = 2.5_f32;
+    let pb_rect = egui::Rect::from_center_size(pb_center, egui::vec2(pb_half * 2.0, pb_half * 2.0));
+    painter.rect_stroke(pb_rect, 0.0, pen);
+    // Arrow from pickbox toward sq's center
+    let arrow_tip = pb_center + egui::vec2(-3.0, -3.0);
+    let arrow_tail = pb_center + egui::vec2(-0.5, -0.5);
+    painter.line_segment([arrow_tail, arrow_tip], pen);
+    painter.line_segment([arrow_tip, arrow_tip + egui::vec2(2.5, 0.0)], pen);
+    painter.line_segment([arrow_tip, arrow_tip + egui::vec2(0.0, 2.5)], pen);
+
+    painter.text(
+        rect.center_bottom() - egui::vec2(0.0, 10.0),
+        egui::Align2::CENTER_BOTTOM,
+        "hatch",
+        egui::FontId::proportional(10.0),
+        icon_col,
+    );
+
+    resp.clicked()
+}
+
+// ---- arc tool button (toolbar, one per quick-access method) ---------------
+
+pub(super) fn arc_tool_button(
+    ui: &mut egui::Ui,
+    current_tool: &mut Tool,
+    current_method: &mut ArcMethod,
+    method: ArcMethod,
+    label: &str,
+) -> bool {
+    let selected = *current_tool == Tool::Arc && *current_method == method;
+    let (resp, painter) = ui.allocate_painter(egui::vec2(56.0, 52.0), egui::Sense::click());
+    let rect = resp.rect;
+    let bg = if selected {
+        egui::Color32::from_rgb(60, 110, 175)
+    } else if resp.hovered() {
+        egui::Color32::from_rgb(48, 58, 72)
+    } else {
+        egui::Color32::from_rgb(28, 34, 42)
+    };
+    painter.rect(
+        rect,
+        5.0,
+        bg,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)),
+    );
+
+    let c = rect.center() - egui::vec2(0.0, 4.0);
+    let icon_col = egui::Color32::from_rgb(225, 235, 245);
+    let stroke = egui::Stroke::new(1.6, icon_col);
+    let dot = |pt: egui::Pos2| painter.circle_filled(pt, 2.2, icon_col);
+
+    // shared half-arc
+    let n = 24;
+    let mut pts = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let t = std::f32::consts::PI * (i as f32 / n as f32);
+        pts.push(c + egui::vec2(-13.0 * t.cos(), -13.0 * t.sin()));
+    }
+    painter.add(egui::Shape::line(pts.clone(), stroke));
+
+    // method-specific dots — crucially, ThreePoints has no centre dot
+    match method {
+        ArcMethod::ThreePoints => {
+            dot(pts[0]);
+            dot(pts[n / 2]);
+            dot(pts[n]);
+        }
+        ArcMethod::StartCenterEnd | ArcMethod::CenterStartEnd => {
+            dot(pts[0]);
+            dot(c); // centre
+            dot(pts[n]);
+        }
+        _ => {
+            dot(pts[0]);
+            dot(pts[n]);
+        }
+    }
+
+    painter.text(
+        rect.center_bottom() - egui::vec2(0.0, 10.0),
+        egui::Align2::CENTER_BOTTOM,
+        label,
+        egui::FontId::proportional(10.0),
+        icon_col,
+    );
+
+    if resp.clicked() {
+        *current_tool = Tool::Arc;
+        *current_method = method;
+        return true;
+    }
+    false
+}
+
+// ---- arc method picker row ------------------------------------------------
+//
+// Each row paints a small representative icon on the left and the method name
+// on the right. Selected rows are highlighted; frozen rows are dimmed and not
+// clickable.
+
+pub(super) fn arc_method_row(ui: &mut egui::Ui, current: ArcMethod, this: ArcMethod) -> bool {
+    let enabled = this.enabled();
+    let row_w = ui.available_width().max(280.0);
+    let (resp, painter) = ui.allocate_painter(
+        egui::vec2(row_w, 40.0),
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    let rect = resp.rect;
+    let selected = current == this;
+
+    let bg = if !enabled {
+        egui::Color32::TRANSPARENT
+    } else if selected {
+        egui::Color32::from_rgb(48, 95, 165)
+    } else if resp.hovered() {
+        egui::Color32::from_rgba_unmultiplied(80, 90, 110, 90)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    if bg.a() > 0 {
+        painter.rect(rect, 4.0, bg, egui::Stroke::NONE);
+    }
+    if selected {
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 180, 255)),
+        );
+    }
+
+    // ICON area
+    let icon_c = rect.left_center() + egui::vec2(28.0, 0.0);
+    let line_col = if !enabled {
+        egui::Color32::from_rgb(95, 100, 110)
+    } else if selected {
+        egui::Color32::from_rgb(230, 240, 255)
+    } else {
+        egui::Color32::from_rgb(225, 235, 250)
+    };
+    let dot_col = if !enabled {
+        egui::Color32::from_rgb(110, 118, 130)
+    } else {
+        egui::Color32::from_rgb(80, 160, 250)
+    };
+    paint_arc_method_icon(&painter, icon_c, this, line_col, dot_col);
+
+    // TEXT
+    let text_col = if !enabled {
+        egui::Color32::from_rgb(125, 130, 140)
+    } else if selected {
+        egui::Color32::from_rgb(230, 245, 255)
+    } else {
+        egui::Color32::from_rgb(225, 232, 245)
+    };
+    painter.text(
+        egui::pos2(rect.left() + 62.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        this.name(),
+        egui::FontId::proportional(13.5),
+        text_col,
+    );
+
+    if !enabled {
+        painter.text(
+            egui::pos2(rect.right() - 8.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            "frozen",
+            egui::FontId::proportional(10.0),
+            egui::Color32::from_rgb(130, 135, 150),
+        );
+    }
+
+    enabled && resp.clicked()
+}
+
+pub(super) fn paint_arc_method_icon(
+    p: &egui::Painter,
+    c: egui::Pos2,
+    m: ArcMethod,
+    line_col: egui::Color32,
+    dot_col: egui::Color32,
+) {
+    use std::f32::consts::FRAC_PI_2;
+    let stroke = egui::Stroke::new(1.5, line_col);
+    let thin = egui::Stroke::new(1.0, line_col);
+    let dot = |pt: egui::Pos2| p.circle_filled(pt, 3.0, dot_col);
+
+    // shared quarter-arc going from (-r, 0) to (0, -r) in icon-space
+    let r = 16.0;
+    let n = 20;
+    let arc_pts: Vec<egui::Pos2> = (0..=n)
+        .map(|i| {
+            let t = FRAC_PI_2 * (i as f32 / n as f32);
+            c + egui::vec2(-r * t.cos(), -r * t.sin() + 6.0)
+        })
+        .collect();
+    p.add(egui::Shape::line(arc_pts.clone(), stroke));
+
+    let start = arc_pts[0];
+    let mid = arc_pts[n / 2];
+    let end = arc_pts[n];
+    let center = c + egui::vec2(0.0, 6.0);
+
+    // small arrow helper (a short segment with a chevron)
+    let arrow = |p: &egui::Painter, from: egui::Pos2, to: egui::Pos2| {
+        p.line_segment([from, to], thin);
+        let dir = (to - from).normalized();
+        let perp = egui::vec2(-dir.y, dir.x);
+        let tip = to;
+        let back = tip - dir * 4.0;
+        p.line_segment([tip, back + perp * 2.0], thin);
+        p.line_segment([tip, back - perp * 2.0], thin);
+    };
+
+    match m {
+        ArcMethod::ThreePoints => {
+            dot(start);
+            dot(mid);
+            dot(end);
+        }
+        ArcMethod::StartCenterEnd => {
+            dot(start);
+            dot(end);
+            dot(center);
+            p.line_segment([center, start], thin);
+        }
+        ArcMethod::CenterStartEnd => {
+            dot(center);
+            dot(start);
+            dot(end);
+            arrow(p, center, end - egui::vec2(2.0, 0.0));
+        }
+        ArcMethod::StartCenterAngle => {
+            dot(start);
+            dot(center);
+            arrow(
+                p,
+                center + egui::vec2(8.0, 0.0),
+                center + egui::vec2(8.0, -8.0),
+            );
+        }
+        ArcMethod::StartCenterLength => {
+            dot(start);
+            dot(center);
+            p.line_segment(
+                [start, start + egui::vec2(14.0, -6.0)],
+                egui::Stroke::new(1.0, dot_col),
+            );
+        }
+        ArcMethod::StartEndAngle => {
+            dot(start);
+            dot(end);
+            arrow(p, c + egui::vec2(-6.0, -4.0), c + egui::vec2(2.0, -10.0));
+        }
+        ArcMethod::StartEndDirection => {
+            dot(start);
+            dot(end);
+            arrow(p, start, start + egui::vec2(0.0, -12.0));
+        }
+        ArcMethod::StartEndRadius => {
+            dot(start);
+            dot(end);
+            arrow(p, c + egui::vec2(2.0, 4.0), start + egui::vec2(2.0, 0.0));
+        }
+        ArcMethod::CenterStartAngle => {
+            dot(center);
+            dot(start);
+            arrow(
+                p,
+                center + egui::vec2(6.0, 0.0),
+                center + egui::vec2(6.0, -10.0),
+            );
+        }
+        ArcMethod::CenterStartLength => {
+            dot(center);
+            dot(start);
+            arrow(p, start, end);
+        }
+        ArcMethod::Continue => {
+            // arrow tail merging into the arc start
+            arrow(p, start - egui::vec2(8.0, -4.0), start);
+        }
     }
 }

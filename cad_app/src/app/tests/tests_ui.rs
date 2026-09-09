@@ -417,7 +417,7 @@ mod the_toolbars_wrap_and_do_not_hover_switch {
     /// the one handed back to the caller, which still needs its hover for tooltips.
     #[test]
     fn the_gate_is_on_the_response_egui_reads() {
-        let src = include_str!("../mod.rs");
+        let src = include_str!("../ui.rs");
         let a = src
             .find("pub(crate) fn click_menu_button")
             .expect("the helper");
