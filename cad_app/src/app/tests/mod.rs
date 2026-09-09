@@ -9,3 +9,6 @@
 
 #[cfg(test)]
 mod tests_scripts;
+
+#[cfg(test)]
+mod tests_commands;
