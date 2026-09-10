@@ -1,0 +1,19 @@
+[package]
+name = "cad_text"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+cad_kernel = { path = "../cad_kernel" }
+# P1 engine:
+#   ttf-parser  — glyph outlines + font name/metric tables
+#   rustybuzz   — HarfBuzz-port shaping (ligatures, Arabic joining, kerning)
+#   unicode-bidi— bidirectional run reordering (Arabic/Hebrew mixed with Latin)
+#   lyon        — path fill tessellation (NonZero winding = the TrueType rule)
+ttf-parser = "0.25"
+rustybuzz = "0.20"
+unicode-bidi = "0.3"
+lyon = "1.0"

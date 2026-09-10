@@ -22,17 +22,17 @@ use cad_kernel::color::aci_palette;
 use eframe::egui;
 
 // ---- layout constants — keep in lock-step with the HTML reference -------
-const CIRCLE_RADIUS:   f32 = 8.0;
-const RADIAL_GAP:      f32 = 3.0;
-const TANGENTIAL_GAP:  f32 = 3.0;
+const CIRCLE_RADIUS: f32 = 8.0;
+const RADIAL_GAP: f32 = 3.0;
+const TANGENTIAL_GAP: f32 = 3.0;
 
 /// ACI indices kept OUT of the polar wheel — they're surfaced as
 /// excluded-row swatches instead.
-pub const EXCLUDED_NAMED:     std::ops::RangeInclusive<u8> = 1..=9;
-pub const EXCLUDED_GRAY:      std::ops::RangeInclusive<u8> = 250..=255;
+pub const EXCLUDED_NAMED: std::ops::RangeInclusive<u8> = 1..=9;
+pub const EXCLUDED_GRAY: std::ops::RangeInclusive<u8> = 250..=255;
 /// Number of ACI bytes that live on the main wheel after exclusions.
 /// (256 − 9 − 6 = 241.)
-pub const WHEEL_SLOT_COUNT:   usize = 256 - 9 - 6;
+pub const WHEEL_SLOT_COUNT: usize = 256 - 9 - 6;
 
 #[derive(Clone, Copy)]
 struct Slot {
@@ -46,24 +46,29 @@ struct Slot {
 pub struct AciPickerState {
     /// Slot positions in widget-local coords. Length is exactly
     /// `WHEEL_SLOT_COUNT`. slot 0 = center.
-    slots:                 Vec<Slot>,
+    slots: Vec<Slot>,
     /// position → ACI byte. `mapping[slot_idx]` is the ACI shown at that
     /// wheel slot. The factory default is computed once and re-used by
     /// Reset. Length is exactly `WHEEL_SLOT_COUNT`.
-    pub mapping:           Vec<u8>,
-    default_mapping:       Vec<u8>,
+    pub mapping: Vec<u8>,
+    default_mapping: Vec<u8>,
     /// Swap-mode lets the user click two slots to swap the ACI bytes at
     /// those positions (used to tune the wheel to taste; persisted via
     /// `save_mapping`). Swap mode applies only to the wheel — excluded
     /// rows are fixed.
-    pub swap_mode:         bool,
+    pub swap_mode: bool,
     /// First slot picked in swap mode; None means awaiting the first.
-    selected_for_swap:     Option<usize>,
+    selected_for_swap: Option<usize>,
     /// Hovered ACI (whether from wheel or excluded rows), for the
     /// readout line. Recomputed each frame.
-    pub hovered_aci:       Option<u8>,
+    pub hovered_aci: Option<u8>,
+    /// PENDING selection — the color the user has clicked but NOT yet
+    /// confirmed. The picker window applies it to its target only when
+    /// the dialog's **Set** button is clicked (and closes); Cancel / ×
+    /// discards it. Reset to None whenever the picker is closed.
+    pub selected: Option<u8>,
     /// Manual-entry buffer for the "ACI #" text box.
-    pub manual_entry:      String,
+    pub manual_entry: String,
 }
 
 impl Default for AciPickerState {
@@ -76,6 +81,7 @@ impl Default for AciPickerState {
             swap_mode: false,
             selected_for_swap: None,
             hovered_aci: None,
+            selected: None,
             manual_entry: String::new(),
         }
     }
@@ -87,24 +93,36 @@ impl AciPickerState {
     /// length, or contains an excluded ACI — the picker falls back to
     /// the deterministic default layout.
     pub fn try_load_mapping(&mut self, path: &std::path::Path) {
-        let Ok(bytes) = std::fs::read(path) else { return };
-        let Ok(text) = std::str::from_utf8(&bytes) else { return };
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return;
+        };
         let trimmed = text.trim().trim_start_matches('[').trim_end_matches(']');
         let mut out: Vec<u8> = Vec::with_capacity(WHEEL_SLOT_COUNT);
         for tok in trimmed.split(',') {
             let tok = tok.trim();
-            if tok.is_empty() { continue; }
+            if tok.is_empty() {
+                continue;
+            }
             let Ok(n) = tok.parse::<u16>() else { return };
-            if n > 255 { return; }
+            if n > 255 {
+                return;
+            }
             let n = n as u8;
             if EXCLUDED_NAMED.contains(&n) || EXCLUDED_GRAY.contains(&n) {
                 // Saved file is from before the exclusion refactor.
                 return;
             }
             out.push(n);
-            if out.len() > WHEEL_SLOT_COUNT { return; }
+            if out.len() > WHEEL_SLOT_COUNT {
+                return;
+            }
         }
-        if out.len() == WHEEL_SLOT_COUNT { self.mapping = out; }
+        if out.len() == WHEEL_SLOT_COUNT {
+            self.mapping = out;
+        }
     }
 
     /// Persist current mapping as a JSON array `[n, n, ...]`.
@@ -112,7 +130,9 @@ impl AciPickerState {
         let mut s = String::with_capacity(WHEEL_SLOT_COUNT * 4 + 4);
         s.push('[');
         for (i, v) in self.mapping.iter().enumerate() {
-            if i > 0 { s.push(','); }
+            if i > 0 {
+                s.push(',');
+            }
             s.push_str(&v.to_string());
         }
         s.push(']');
@@ -130,14 +150,15 @@ impl AciPickerState {
     pub fn wheel_ui(&mut self, ui: &mut egui::Ui) -> Option<u8> {
         // Allocate a square area large enough for all rings + padding.
         let size = self.required_size();
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(size, size), egui::Sense::click()
-        );
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
         let painter = ui.painter_at(rect);
         let center = rect.center();
 
-        painter.rect_filled(rect, rect.width() * 0.5,
-            egui::Color32::from_rgb(40, 44, 52));
+        painter.rect_filled(
+            rect,
+            rect.width() * 0.5,
+            egui::Color32::from_rgb(40, 44, 52),
+        );
 
         // Hover detection.
         let mut hovered_slot: Option<usize> = None;
@@ -146,7 +167,8 @@ impl AciPickerState {
             for (i, slot) in self.slots.iter().enumerate() {
                 let cx = center.x + slot.dx;
                 let cy = center.y + slot.dy;
-                let dx = p.x - cx; let dy = p.y - cy;
+                let dx = p.x - cx;
+                let dy = p.y - cy;
                 if dx * dx + dy * dy <= r2 {
                     hovered_slot = Some(i);
                     break;
@@ -161,10 +183,12 @@ impl AciPickerState {
         for (i, slot) in self.slots.iter().enumerate() {
             let (r, g, b) = aci_palette(self.mapping[i]);
             let pos = egui::pos2(center.x + slot.dx, center.y + slot.dy);
-            painter.circle_filled(pos, CIRCLE_RADIUS,
-                egui::Color32::from_rgb(r, g, b));
-            painter.circle_stroke(pos, CIRCLE_RADIUS,
-                egui::Stroke::new(0.6, egui::Color32::from_rgb(110, 120, 135)));
+            painter.circle_filled(pos, CIRCLE_RADIUS, egui::Color32::from_rgb(r, g, b));
+            painter.circle_stroke(
+                pos,
+                CIRCLE_RADIUS,
+                egui::Stroke::new(0.6, egui::Color32::from_rgb(110, 120, 135)),
+            );
         }
 
         // Highlight selected (swap mode) — orange ring.
@@ -172,8 +196,11 @@ impl AciPickerState {
             if let Some(i) = self.selected_for_swap {
                 if let Some(slot) = self.slots.get(i) {
                     let pos = egui::pos2(center.x + slot.dx, center.y + slot.dy);
-                    painter.circle_stroke(pos, CIRCLE_RADIUS + 3.5,
-                        egui::Stroke::new(2.5, egui::Color32::from_rgb(245, 165, 35)));
+                    painter.circle_stroke(
+                        pos,
+                        CIRCLE_RADIUS + 3.5,
+                        egui::Stroke::new(2.5, egui::Color32::from_rgb(245, 165, 35)),
+                    );
                 }
             }
         }
@@ -181,8 +208,11 @@ impl AciPickerState {
         if let Some(i) = hovered_slot {
             if let Some(slot) = self.slots.get(i) {
                 let pos = egui::pos2(center.x + slot.dx, center.y + slot.dy);
-                painter.circle_stroke(pos, CIRCLE_RADIUS + 2.0,
-                    egui::Stroke::new(1.5, egui::Color32::from_rgb(230, 235, 245)));
+                painter.circle_stroke(
+                    pos,
+                    CIRCLE_RADIUS + 2.0,
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(230, 235, 245)),
+                );
             }
         }
 
@@ -191,7 +221,9 @@ impl AciPickerState {
             if let Some(i) = hovered_slot {
                 if self.swap_mode {
                     match self.selected_for_swap {
-                        None    => { self.selected_for_swap = Some(i); }
+                        None => {
+                            self.selected_for_swap = Some(i);
+                        }
                         Some(a) => {
                             self.mapping.swap(a, i);
                             self.selected_for_swap = None;
@@ -219,13 +251,15 @@ impl AciPickerState {
             for aci in acis {
                 let (r, g, b) = aci_palette(aci);
                 ui.vertical(|ui| {
-                    let (rect, resp) = ui.allocate_exact_size(
-                        egui::vec2(28.0, 22.0), egui::Sense::click());
-                    ui.painter().rect_filled(
-                        rect, 3.0, egui::Color32::from_rgb(r, g, b));
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(28.0, 22.0), egui::Sense::click());
+                    ui.painter()
+                        .rect_filled(rect, 3.0, egui::Color32::from_rgb(r, g, b));
                     ui.painter().rect_stroke(
-                        rect, 3.0,
-                        egui::Stroke::new(0.7, egui::Color32::from_rgb(110, 120, 135)));
+                        rect,
+                        3.0,
+                        egui::Stroke::new(0.7, egui::Color32::from_rgb(110, 120, 135)),
+                    );
                     if resp.hovered() {
                         self.hovered_aci = Some(aci);
                     }
@@ -245,7 +279,9 @@ impl AciPickerState {
         let mut max_r = 0.0_f32;
         for s in &self.slots {
             let r = (s.dx * s.dx + s.dy * s.dy).sqrt();
-            if r > max_r { max_r = r; }
+            if r > max_r {
+                max_r = r;
+            }
         }
         (max_r + CIRCLE_RADIUS) * 2.0 + 12.0
     }
@@ -261,11 +297,15 @@ fn build_layout_and_default_mapping() -> (Vec<Slot>, Vec<u8>) {
     let mut indices: Vec<u8> = (0..=255_u8)
         .filter(|i| !EXCLUDED_NAMED.contains(i) && !EXCLUDED_GRAY.contains(i))
         .collect();
-    assert_eq!(indices.len(), WHEEL_SLOT_COUNT,
+    assert_eq!(
+        indices.len(),
+        WHEEL_SLOT_COUNT,
         "wheel should hold exactly {} colors (256 minus excluded bands)",
-        WHEEL_SLOT_COUNT);
+        WHEEL_SLOT_COUNT
+    );
     indices.sort_by(|a, b| {
-        luminance(aci_palette(*b)).partial_cmp(&luminance(aci_palette(*a)))
+        luminance(aci_palette(*b))
+            .partial_cmp(&luminance(aci_palette(*a)))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let center_aci = indices.remove(0);
@@ -286,7 +326,9 @@ fn build_layout_and_default_mapping() -> (Vec<Slot>, Vec<u8>) {
         rings.push((radius, take));
         remaining = remaining.saturating_sub(take);
         ring_i += 1;
-        if ring_i > 64 { break; }   // safety
+        if ring_i > 64 {
+            break;
+        } // safety
     }
 
     // 3. Walk the luminance-sorted indices, slice into rings, then within
@@ -300,10 +342,11 @@ fn build_layout_and_default_mapping() -> (Vec<Slot>, Vec<u8>) {
 
     let mut head = 0_usize;
     for (radius, cap) in &rings {
-        let chunk = &indices[head .. head + *cap];
+        let chunk = &indices[head..head + *cap];
         head += *cap;
 
-        let mut by_angle: Vec<(u8, f32)> = chunk.iter()
+        let mut by_angle: Vec<(u8, f32)> = chunk
+            .iter()
             .map(|aci| (*aci, ideal_angle_for(aci_palette(*aci))))
             .collect();
         by_angle.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -333,7 +376,9 @@ fn luminance((r, g, b): (u8, u8, u8)) -> f32 {
 /// arrangement matches the reference (red ~0°, yellow ~315°, green
 /// ~210°, blue ~120°, magenta ~45°).
 fn ideal_angle_for(rgb: (u8, u8, u8)) -> f32 {
-    let r = rgb.0 as f32; let g = rgb.1 as f32; let b = rgb.2 as f32;
+    let r = rgb.0 as f32;
+    let g = rgb.1 as f32;
+    let b = rgb.2 as f32;
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let l = (max + min) * 0.5;
@@ -341,14 +386,20 @@ fn ideal_angle_for(rgb: (u8, u8, u8)) -> f32 {
     let s = if max < 1.0 { 0.0 } else { d / max };
 
     if s < 0.12 {
-        return if l > 160.0 { 270.0_f32.to_radians() } else { 90.0_f32.to_radians() };
+        return if l > 160.0 {
+            270.0_f32.to_radians()
+        } else {
+            90.0_f32.to_radians()
+        };
     }
 
     let mut h = if max == min {
         0.0
     } else if max == r {
         let mut h = (g - b) / d;
-        if g < b { h += 6.0; }
+        if g < b {
+            h += 6.0;
+        }
         h
     } else if max == g {
         (b - r) / d + 2.0
@@ -359,9 +410,17 @@ fn ideal_angle_for(rgb: (u8, u8, u8)) -> f32 {
     h *= 360.0;
 
     const HUE_MAP: &[(f32, f32)] = &[
-        (0.0,   0.0),  (30.0,  315.0), (60.0,  240.0), (90.0,  210.0),
-        (120.0, 180.0),(180.0, 150.0), (240.0, 120.0), (260.0, 100.0),
-        (280.0,  80.0),(300.0,  45.0), (360.0,   0.0),
+        (0.0, 0.0),
+        (30.0, 315.0),
+        (60.0, 240.0),
+        (90.0, 210.0),
+        (120.0, 180.0),
+        (180.0, 150.0),
+        (240.0, 120.0),
+        (260.0, 100.0),
+        (280.0, 80.0),
+        (300.0, 45.0),
+        (360.0, 0.0),
     ];
     let mut deg = 0.0_f32;
     for w in HUE_MAP.windows(2) {
@@ -391,9 +450,21 @@ mod tests {
         // Every wheel ACI appears exactly once; no excluded ACI sneaks in.
         let mut seen = [false; 256];
         for v in mapping.iter() {
-            assert!(!EXCLUDED_NAMED.contains(v), "ACI {} is excluded but appeared on the wheel", v);
-            assert!(!EXCLUDED_GRAY.contains(v),  "ACI {} is excluded but appeared on the wheel", v);
-            assert!(!seen[*v as usize], "ACI {} appears more than once on the wheel", v);
+            assert!(
+                !EXCLUDED_NAMED.contains(v),
+                "ACI {} is excluded but appeared on the wheel",
+                v
+            );
+            assert!(
+                !EXCLUDED_GRAY.contains(v),
+                "ACI {} is excluded but appeared on the wheel",
+                v
+            );
+            assert!(
+                !seen[*v as usize],
+                "ACI {} appears more than once on the wheel",
+                v
+            );
             seen[*v as usize] = true;
         }
         // Conversely, every non-excluded ACI must appear.
@@ -436,8 +507,10 @@ mod tests {
         let path = std::env::temp_dir().join("rust_cad_aci_picker_bad.json");
 
         // Wrong length (256, like the pre-exclusion file format).
-        let too_long: String = (0..=255_u8).map(|i| i.to_string())
-            .collect::<Vec<_>>().join(",");
+        let too_long: String = (0..=255_u8)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         std::fs::write(&path, format!("[{}]", too_long)).unwrap();
         a.try_load_mapping(&path);
         assert_eq!(a.mapping, orig, "pre-exclusion file must be rejected");
@@ -445,8 +518,11 @@ mod tests {
         // Right length but contains an excluded ACI (5).
         let mut bad = orig.clone();
         bad[10] = 5;
-        let s: String = bad.iter().map(|i| i.to_string())
-            .collect::<Vec<_>>().join(",");
+        let s: String = bad
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         std::fs::write(&path, format!("[{}]", s)).unwrap();
         a.try_load_mapping(&path);
         assert_eq!(a.mapping, orig, "file with excluded ACI must be rejected");

@@ -15,21 +15,39 @@ fn main() {
     let l1 = s.add_line(p1, p2);
     let l2 = s.add_line(p2, p3);
     let l3 = s.add_line(p3, p0);
-    s.add(Constraint::Fixed { p: p0, x: 0.0, y: 0.0 });
+    s.add(Constraint::Fixed {
+        p: p0,
+        x: 0.0,
+        y: 0.0,
+    });
     s.add(Constraint::Horizontal { line: l0 });
     s.add(Constraint::Vertical { line: l1 });
     s.add(Constraint::Horizontal { line: l2 });
     s.add(Constraint::Vertical { line: l3 });
-    s.add(Constraint::Distance { p: p0, q: p1, d: 10.0 });
-    s.add(Constraint::Distance { p: p1, q: p2, d: 5.0 });
+    s.add(Constraint::Distance {
+        p: p0,
+        q: p1,
+        d: 10.0,
+    });
+    s.add(Constraint::Distance {
+        p: p1,
+        q: p2,
+        d: 5.0,
+    });
 
     println!("before: {:?}", s.points);
-    println!("dof = {}  ({} points, {} residuals)",
-             s.dof(), s.points.len(), s.residual_dim());
+    println!(
+        "dof = {}  ({} points, {} residuals)",
+        s.dof(),
+        s.points.len(),
+        s.residual_dim()
+    );
 
     let rep = solve(&mut s);
-    println!("\nsolve: converged={} iters={} rms={:.2e} dof={}",
-             rep.converged, rep.iterations, rep.residual, rep.dof);
+    println!(
+        "\nsolve: converged={} iters={} rms={:.2e} dof={}",
+        rep.converged, rep.iterations, rep.residual, rep.dof
+    );
     for (i, p) in s.points.iter().enumerate() {
         println!("  p{i} = ({:.4}, {:.4})", p.x, p.y);
     }
@@ -37,6 +55,10 @@ fn main() {
     // .rsmp round-trip
     let text = write_rsmp(&s);
     let back = read_rsmp(&text).expect("rsmp round-trip");
-    println!("\n.rsmp round-trip: {} pts, {} lines, {} constraints",
-             back.points.len(), back.lines.len(), back.constraints.len());
+    println!(
+        "\n.rsmp round-trip: {} pts, {} lines, {} constraints",
+        back.points.len(),
+        back.lines.len(),
+        back.constraints.len()
+    );
 }

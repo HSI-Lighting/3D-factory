@@ -20,7 +20,9 @@ pub enum Lineweight {
 }
 
 impl Default for Lineweight {
-    fn default() -> Self { Lineweight::ByLayer }
+    fn default() -> Self {
+        Lineweight::ByLayer
+    }
 }
 
 /// Document default — what `Lineweight::Default` resolves to.
@@ -31,14 +33,15 @@ pub const DEFAULT_LINEWEIGHT_MM: f32 = 0.25;
 pub fn resolve_lineweight(lw: Lineweight, layer_id: u32, layers: &LayerTable) -> f32 {
     match lw {
         Lineweight::Custom(mm) => mm,
-        Lineweight::Default    => DEFAULT_LINEWEIGHT_MM,
+        Lineweight::Default => DEFAULT_LINEWEIGHT_MM,
         Lineweight::ByLayer | Lineweight::ByBlock => {
-            let lyr_lw = layers.get(layer_id)
+            let lyr_lw = layers
+                .get(layer_id)
                 .map(|l| l.lineweight)
                 .unwrap_or(Lineweight::Default);
             match lyr_lw {
                 Lineweight::Custom(mm) => mm,
-                _                      => DEFAULT_LINEWEIGHT_MM,
+                _ => DEFAULT_LINEWEIGHT_MM,
             }
         }
     }
@@ -60,11 +63,15 @@ mod tests {
     fn resolve_bylayer_reads_layer() {
         let mut t = LayerTable::with_defaults();
         let id = t.add(Layer {
-            name:       "HEAVY".into(),
-            color:      Color::ByLayer,
-            linetype:   0,
+            name: "HEAVY".into(),
+            color: Color::ByLayer,
+            linetype: 0,
             lineweight: Lineweight::Custom(1.0),
-            visible:    true, locked: false, frozen: false, plottable: true,
+            visible: true,
+            locked: false,
+            frozen: false,
+            plottable: true,
+            order: 0,
         });
         assert_eq!(resolve_lineweight(Lineweight::ByLayer, id, &t), 1.0);
     }

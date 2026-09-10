@@ -72,7 +72,7 @@ pub struct UserEnv {
     /// Default text height for the `text` drafting command, in world
     /// units. Persists across sessions (mirrors WlThk/OfsDis). Initial
     /// 0.25 — a sensible default for typical drawings.
-    pub TxHt:  f64,
+    pub TxHt: f64,
     /// Wall Centerline visible. Renders the implicit centerline of
     /// every `Geom::Wall` as a dashed half-alpha overlay on top of
     /// the two solid side lines. Useful while developing the wall-
@@ -95,7 +95,7 @@ pub struct UserEnv {
     /// Show toolbar/ribbon tooltips on hover.
     pub TltEnb: bool,
     /// Tooltips on dobject rollover (hover over a dobject in the canvas).
-    pub RllTp:  bool,
+    pub RllTp: bool,
     /// Preview-highlight a dobject when the cursor is over it (before click).
     pub SelPrv: bool,
     /// Highlight selected dobjects with a distinct color.
@@ -113,7 +113,7 @@ pub struct UserEnv {
     /// Selected (hot) grip colour (RGB packed).
     pub GrClrS: u32,
     /// Grip size in pixels.
-    pub GrpSz:  u8,
+    pub GrpSz: u8,
     /// Grip HOVER + GRAB radius in screen pixels. When a dobject is
     /// selected and the cursor comes within this many pixels of one
     /// of its grip points, that grip highlights (preview = "this is
@@ -144,6 +144,21 @@ pub struct UserEnv {
     /// written before the rename used the key `OrtEnb`; the loader still
     /// accepts it (the one permitted occurrence of the legacy name).
     pub CrdEnb: bool,
+
+    // ---- POLAR tracking (AutoCAD POLAR / POLARMODE) ----
+    /// Polar tracking ON/OFF. When ON and a "from" anchor exists, the
+    /// cursor direction from the anchor snaps to the nearest multiple of
+    /// `PolAng` (plus the `PolAdA` list) within the snap aperture. Osnap
+    /// wins over polar; polar wins over CARD. Toggle: F10.
+    pub PolMod: bool,
+    /// Polar angle increment in DEGREES (default 90 — like CARD but at
+    /// arbitrary multiples).
+    pub PolAng: i64,
+    /// Additional polar angles in degrees, comma-separated ("15,30,45").
+    pub PolAdA: String,
+    /// Polar snap distance (world units); 0 = distance not snapped
+    /// (AutoCAD POLARDIST = 0 disables distance snapping).
+    pub PolDst: f64,
 
     // ---- UCS indicator (origin marker) ----
     /// User Coordinate System indicator on/off (AutoCAD `UCSICON`).
@@ -190,6 +205,49 @@ pub struct UserEnv {
     pub XrLdMd: u8,
     /// Path for temporary xref copies (empty → system temp dir).
     pub XrTmpP: String,
+
+    // ---- canvas rails (floating icon-rails, CANVAS_RAIL_MENTOR) ----
+    /// Zoom rail visible (Tools → "Zoom rail"). The first canvas icon-rail.
+    pub ZmRail: bool,
+    /// Remembered Zoom-rail screen position (logical px). `-1` on either
+    /// axis = "unset". (Legacy — the rails now dock, position is derived.)
+    pub ZmRlX: f32,
+    pub ZmRlY: f32,
+    /// Dimension rail visible (Tools → "Dimension rail"). Second canvas rail.
+    pub DmRail: bool,
+    /// Canvas-rail dock order (comma-separated rail keys, e.g. "dim,zoom").
+    /// Empty → canonical default order. Reordered by dragging rails in the dock.
+    pub CnvRlO: String,
+    /// Draw-rail tool order (comma-separated command ids, e.g. "draw.line,…").
+    /// Empty → the DRAW_RAIL_MENTOR §3 default. Edited by add / remove / reorder /
+    /// reset in the vertical Draw rail.
+    pub DrwRlO: String,
+    /// Modify-rail tool order (same encoding as `DrwRlO`, `modify.*` ids). Empty
+    /// → the MODIFY_CMDS default order.
+    pub ModRlO: String,
+    /// Command-bar (bottom) panel height in logical px. `0` = unset → the
+    /// computed default (3 history lines + input pill). Set when the user
+    /// drags the bar's top resize handle and restored on the next launch.
+    pub CmdBarH: f32,
+    // ---- toolbar docking (Draw / Modify / Zoom / Dimension rails) ----
+    /// Dock byte for the Draw rail: 0=left, 1=right, 2=top, 3=bottom,
+    /// 4=floating-vertical, 5=floating-horizontal.
+    pub DrwDk: u8,
+    /// Floating position of the Draw rail (logical px; 0 when docked).
+    pub DrwDkX: f32,
+    pub DrwDkY: f32,
+    /// Dock byte for the Modify rail (same encoding as `DrwDk`).
+    pub ModDk: u8,
+    pub ModDkX: f32,
+    pub ModDkY: f32,
+    /// Dock byte for the Zoom rail (same encoding as `DrwDk`).
+    pub ZmDk: u8,
+    pub ZmDkX: f32,
+    pub ZmDkY: f32,
+    /// Dock byte for the Dimension rail (same encoding as `DrwDk`).
+    pub DmDk: u8,
+    pub DmDkX: f32,
+    pub DmDkY: f32,
 }
 
 impl Default for UserEnv {
@@ -207,34 +265,58 @@ impl Default for UserEnv {
             ChmDs1: 0.0,
             ChmDs2: 0.0,
             OfsDis: 1.0,
-            WlThk:  0.20,
-            TxHt:   0.25,
-            WlCnL:  true,
+            WlThk: 0.20,
+            TxHt: 0.25,
+            WlCnL: true,
             TrmMd: true,
             DrDspM: 2,
             MnuBar: false,
             TltEnb: true,
-            RllTp:  true,
+            RllTp: true,
             SelPrv: true,
             HltSel: true,
             WpFrmM: 2,
             GrpEnb: true,
             GrpBlk: false,
-            GrClrU: 0x4099FF,    // light blue
-            GrClrS: 0xFF6464,    // red-pink
-            GrpSz:  4,
+            GrClrU: 0x4099FF, // light blue
+            GrClrS: 0xFF6464, // red-pink
+            GrpSz: 4,
             GrpHvR: 25,
             GrdEnb: true,
             GrdSnp: false,
             GrdSpc: 10.0,
             CrdEnb: false,
+            PolMod: false,
+            PolAng: 90,
+            PolAdA: String::new(),
+            PolDst: 0.0,
             UcsIcn: true,
-            UcsMod: 0,                  // corner by default
+            UcsMod: 0, // corner by default
             UcsAvP: String::new(),
             SelDmTm: 250,
             LodAnc: 0,
             XrLdMd: 2,
             XrTmpP: String::new(),
+            ZmRail: true, // first rail — default on so it's visible
+            ZmRlX: -1.0,  // unset → default anchor
+            ZmRlY: -1.0,
+            DmRail: true,          // second rail — default on so it's visible
+            CnvRlO: String::new(), // empty → canonical default order
+            DrwRlO: String::new(), // empty → DRAW_RAIL §3 default order
+            ModRlO: String::new(), // empty → MODIFY_CMDS default order
+            CmdBarH: 0.0,          // 0 → computed default height
+            DrwDk: 0,              // Draw rail: docked LEFT (vertical)
+            DrwDkX: 0.0,
+            DrwDkY: 0.0,
+            ModDk: 0, // Modify rail: docked LEFT (vertical)
+            ModDkX: 0.0,
+            ModDkY: 0.0,
+            ZmDk: 2, // Zoom rail: docked TOP (horizontal)
+            ZmDkX: 0.0,
+            ZmDkY: 0.0,
+            DmDk: 2, // Dimension rail: docked TOP (horizontal)
+            DmDkX: 0.0,
+            DmDkY: 0.0,
         }
     }
 }
@@ -245,16 +327,31 @@ impl UserEnv {
         Some(PathBuf::from(home).join(".config/rust_cad/user_env.txt"))
     }
 
+    /// Where the command-line calculator's user variables live — the same
+    /// config directory as `user_env.txt`, so variables survive a restart.
+    pub fn calc_vars_path() -> Option<PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        Some(PathBuf::from(home).join(".config/rust_cad/calc_vars.txt"))
+    }
+
     /// Load from disk, or fall back to `Default::default()` if the file
     /// is missing, unreadable, or malformed.
     pub fn load() -> Self {
         let mut env = Self::default();
-        let Some(path) = Self::config_path() else { return env; };
-        let Ok(text) = fs::read_to_string(&path) else { return env; };
+        let Some(path) = Self::config_path() else {
+            return env;
+        };
+        let Ok(text) = fs::read_to_string(&path) else {
+            return env;
+        };
         for line in text.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') { continue; }
-            let Some((k, v)) = line.split_once('=') else { continue; };
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
             env.set(k.trim(), v.trim());
         }
         env
@@ -273,10 +370,11 @@ impl UserEnv {
         s.push_str("# RUST_CAD User-Environment Settings\n");
         s.push_str("# Cryptic short names — see source / settings window for the plain-English description.\n\n");
         // Order matches the struct so the file reads top-down by section.
-        let push_u8   = |s: &mut String, k: &str, v: u8| s.push_str(&format!("{} = {}\n", k, v));
-        let push_u32  = |s: &mut String, k: &str, v: u32| s.push_str(&format!("{} = 0x{:06X}\n", k, v));
+        let push_u8 = |s: &mut String, k: &str, v: u8| s.push_str(&format!("{} = {}\n", k, v));
+        let push_u32 =
+            |s: &mut String, k: &str, v: u32| s.push_str(&format!("{} = 0x{:06X}\n", k, v));
         let push_bool = |s: &mut String, k: &str, v: bool| s.push_str(&format!("{} = {}\n", k, v));
-        let push_str  = |s: &mut String, k: &str, v: &str| s.push_str(&format!("{} = {}\n", k, v));
+        let push_str = |s: &mut String, k: &str, v: &str| s.push_str(&format!("{} = {}\n", k, v));
         push_u8(&mut s, "SpTGSZ", self.SpTGSZ);
         push_u8(&mut s, "PkBxSz", self.PkBxSz);
         push_u8(&mut s, "CrsHrS", self.CrsHrS);
@@ -290,14 +388,14 @@ impl UserEnv {
         push_f64(&mut s, "ChmDs1", self.ChmDs1);
         push_f64(&mut s, "ChmDs2", self.ChmDs2);
         push_f64(&mut s, "OfsDis", self.OfsDis);
-        push_f64(&mut s, "WlThk",  self.WlThk);
-        push_f64(&mut s, "TxHt",   self.TxHt);
+        push_f64(&mut s, "WlThk", self.WlThk);
+        push_f64(&mut s, "TxHt", self.TxHt);
         push_bool(&mut s, "WlCnL", self.WlCnL);
         push_bool(&mut s, "TrmMd", self.TrmMd);
         push_u8(&mut s, "DrDspM", self.DrDspM);
         push_bool(&mut s, "MnuBar", self.MnuBar);
         push_bool(&mut s, "TltEnb", self.TltEnb);
-        push_bool(&mut s, "RllTp",  self.RllTp);
+        push_bool(&mut s, "RllTp", self.RllTp);
         push_bool(&mut s, "SelPrv", self.SelPrv);
         push_bool(&mut s, "HltSel", self.HltSel);
         push_u8(&mut s, "WpFrmM", self.WpFrmM);
@@ -305,13 +403,20 @@ impl UserEnv {
         push_bool(&mut s, "GrpBlk", self.GrpBlk);
         push_u32(&mut s, "GrClrU", self.GrClrU);
         push_u32(&mut s, "GrClrS", self.GrClrS);
-        push_u8(&mut s, "GrpSz",  self.GrpSz);
+        push_u8(&mut s, "GrpSz", self.GrpSz);
         push_u8(&mut s, "GrpHvR", self.GrpHvR);
         push_bool(&mut s, "GrdEnb", self.GrdEnb);
         push_bool(&mut s, "GrdSnp", self.GrdSnp);
         push_f64(&mut s, "GrdSpc", self.GrdSpc);
         push_bool(&mut s, "CrdEnb", self.CrdEnb);
-        let push_u16_dec = |s: &mut String, k: &str, v: u16| s.push_str(&format!("{} = {}\n", k, v));
+        push_bool(&mut s, "PolMod", self.PolMod);
+        let push_i64_dec =
+            |s: &mut String, k: &str, v: i64| s.push_str(&format!("{} = {}\n", k, v));
+        push_i64_dec(&mut s, "PolAng", self.PolAng);
+        push_str(&mut s, "PolAdA", &self.PolAdA);
+        push_f64(&mut s, "PolDst", self.PolDst);
+        let push_u16_dec =
+            |s: &mut String, k: &str, v: u16| s.push_str(&format!("{} = {}\n", k, v));
         push_bool(&mut s, "UcsIcn", self.UcsIcn);
         push_u8(&mut s, "UcsMod", self.UcsMod);
         push_str(&mut s, "UcsAvP", &self.UcsAvP);
@@ -319,6 +424,27 @@ impl UserEnv {
         push_u8(&mut s, "LodAnc", self.LodAnc);
         push_u8(&mut s, "XrLdMd", self.XrLdMd);
         push_str(&mut s, "XrTmpP", &self.XrTmpP);
+        let push_f32 = |s: &mut String, k: &str, v: f32| s.push_str(&format!("{} = {}\n", k, v));
+        push_bool(&mut s, "ZmRail", self.ZmRail);
+        push_f32(&mut s, "ZmRlX", self.ZmRlX);
+        push_f32(&mut s, "ZmRlY", self.ZmRlY);
+        push_bool(&mut s, "DmRail", self.DmRail);
+        push_str(&mut s, "CnvRlO", &self.CnvRlO);
+        push_str(&mut s, "DrwRlO", &self.DrwRlO);
+        push_str(&mut s, "ModRlO", &self.ModRlO);
+        push_f32(&mut s, "CmdBarH", self.CmdBarH);
+        push_u8(&mut s, "DrwDk", self.DrwDk);
+        push_f32(&mut s, "DrwDkX", self.DrwDkX);
+        push_f32(&mut s, "DrwDkY", self.DrwDkY);
+        push_u8(&mut s, "ModDk", self.ModDk);
+        push_f32(&mut s, "ModDkX", self.ModDkX);
+        push_f32(&mut s, "ModDkY", self.ModDkY);
+        push_u8(&mut s, "ZmDk", self.ZmDk);
+        push_f32(&mut s, "ZmDkX", self.ZmDkX);
+        push_f32(&mut s, "ZmDkY", self.ZmDkY);
+        push_u8(&mut s, "DmDk", self.DmDk);
+        push_f32(&mut s, "DmDkX", self.DmDkX);
+        push_f32(&mut s, "DmDkY", self.DmDkY);
         fs::write(&path, s)
     }
 
@@ -328,8 +454,8 @@ impl UserEnv {
     fn set(&mut self, key: &str, val: &str) {
         let parse_bool = |s: &str| -> Option<bool> {
             match s.to_ascii_lowercase().as_str() {
-                "true" | "1" | "on" | "yes"  => Some(true),
-                "false"| "0" | "off"| "no"   => Some(false),
+                "true" | "1" | "on" | "yes" => Some(true),
+                "false" | "0" | "off" | "no" => Some(false),
                 _ => None,
             }
         };
@@ -341,49 +467,305 @@ impl UserEnv {
             }
         };
         match key {
-            "SpTGSZ" => if let Ok(v) = val.parse() { self.SpTGSZ = v; }
-            "PkBxSz" => if let Ok(v) = val.parse() { self.PkBxSz = v; }
-            "CrsHrS" => if let Ok(v) = val.parse() { self.CrsHrS = v; }
-            "AtDlgM" => if let Some(v) = parse_bool(val) { self.AtDlgM = v; }
-            "AtPrmM" => if let Some(v) = parse_bool(val) { self.AtPrmM = v; }
-            "CmDlgM" => if let Some(v) = parse_bool(val) { self.CmDlgM = v; }
-            "FlDlgM" => if let Some(v) = parse_bool(val) { self.FlDlgM = v; }
-            "EdgMod" => if let Some(v) = parse_bool(val) { self.EdgMod = v; }
-            "FltRad" => if let Ok(v) = val.parse() { self.FltRad = v; }
-            "ChmDs1" => if let Ok(v) = val.parse() { self.ChmDs1 = v; }
-            "ChmDs2" => if let Ok(v) = val.parse() { self.ChmDs2 = v; }
-            "OfsDis" => if let Ok(v) = val.parse() { self.OfsDis = v; }
-            "WlThk"  => if let Ok(v) = val.parse() { self.WlThk  = v; }
-            "TxHt"   => if let Ok(v) = val.parse() { self.TxHt   = v; }
-            "WlCnL"  => if let Some(v) = parse_bool(val) { self.WlCnL = v; }
-            "TrmMd"  => if let Some(v) = parse_bool(val) { self.TrmMd = v; }
-            "DrDspM" => if let Ok(v) = val.parse() { self.DrDspM = v; }
-            "MnuBar" => if let Some(v) = parse_bool(val) { self.MnuBar = v; }
-            "TltEnb" => if let Some(v) = parse_bool(val) { self.TltEnb = v; }
-            "RllTp"  => if let Some(v) = parse_bool(val) { self.RllTp  = v; }
-            "SelPrv" => if let Some(v) = parse_bool(val) { self.SelPrv = v; }
-            "HltSel" => if let Some(v) = parse_bool(val) { self.HltSel = v; }
-            "WpFrmM" => if let Ok(v) = val.parse() { self.WpFrmM = v; }
-            "GrpEnb" => if let Some(v) = parse_bool(val) { self.GrpEnb = v; }
-            "GrpBlk" => if let Some(v) = parse_bool(val) { self.GrpBlk = v; }
-            "GrClrU" => if let Some(v) = parse_u32(val) { self.GrClrU = v; }
-            "GrClrS" => if let Some(v) = parse_u32(val) { self.GrClrS = v; }
-            "GrpSz"  => if let Ok(v) = val.parse() { self.GrpSz = v; }
-            "GrpHvR" => if let Ok(v) = val.parse() { self.GrpHvR = v; }
-            "GrdEnb" => if let Some(v) = parse_bool(val) { self.GrdEnb = v; }
-            "GrdSnp" => if let Some(v) = parse_bool(val) { self.GrdSnp = v; }
-            "GrdSpc" => if let Ok(v) = val.parse() { self.GrdSpc = v; }
+            "SpTGSZ" => {
+                if let Ok(v) = val.parse() {
+                    self.SpTGSZ = v;
+                }
+            }
+            "PkBxSz" => {
+                if let Ok(v) = val.parse() {
+                    self.PkBxSz = v;
+                }
+            }
+            "CrsHrS" => {
+                if let Ok(v) = val.parse() {
+                    self.CrsHrS = v;
+                }
+            }
+            "AtDlgM" => {
+                if let Some(v) = parse_bool(val) {
+                    self.AtDlgM = v;
+                }
+            }
+            "AtPrmM" => {
+                if let Some(v) = parse_bool(val) {
+                    self.AtPrmM = v;
+                }
+            }
+            "CmDlgM" => {
+                if let Some(v) = parse_bool(val) {
+                    self.CmDlgM = v;
+                }
+            }
+            "FlDlgM" => {
+                if let Some(v) = parse_bool(val) {
+                    self.FlDlgM = v;
+                }
+            }
+            "EdgMod" => {
+                if let Some(v) = parse_bool(val) {
+                    self.EdgMod = v;
+                }
+            }
+            "FltRad" => {
+                if let Ok(v) = val.parse() {
+                    self.FltRad = v;
+                }
+            }
+            "ChmDs1" => {
+                if let Ok(v) = val.parse() {
+                    self.ChmDs1 = v;
+                }
+            }
+            "ChmDs2" => {
+                if let Ok(v) = val.parse() {
+                    self.ChmDs2 = v;
+                }
+            }
+            "OfsDis" => {
+                if let Ok(v) = val.parse() {
+                    self.OfsDis = v;
+                }
+            }
+            "WlThk" => {
+                if let Ok(v) = val.parse() {
+                    self.WlThk = v;
+                }
+            }
+            "TxHt" => {
+                if let Ok(v) = val.parse() {
+                    self.TxHt = v;
+                }
+            }
+            "WlCnL" => {
+                if let Some(v) = parse_bool(val) {
+                    self.WlCnL = v;
+                }
+            }
+            "TrmMd" => {
+                if let Some(v) = parse_bool(val) {
+                    self.TrmMd = v;
+                }
+            }
+            "DrDspM" => {
+                if let Ok(v) = val.parse() {
+                    self.DrDspM = v;
+                }
+            }
+            "MnuBar" => {
+                if let Some(v) = parse_bool(val) {
+                    self.MnuBar = v;
+                }
+            }
+            "TltEnb" => {
+                if let Some(v) = parse_bool(val) {
+                    self.TltEnb = v;
+                }
+            }
+            "RllTp" => {
+                if let Some(v) = parse_bool(val) {
+                    self.RllTp = v;
+                }
+            }
+            "SelPrv" => {
+                if let Some(v) = parse_bool(val) {
+                    self.SelPrv = v;
+                }
+            }
+            "HltSel" => {
+                if let Some(v) = parse_bool(val) {
+                    self.HltSel = v;
+                }
+            }
+            "WpFrmM" => {
+                if let Ok(v) = val.parse() {
+                    self.WpFrmM = v;
+                }
+            }
+            "GrpEnb" => {
+                if let Some(v) = parse_bool(val) {
+                    self.GrpEnb = v;
+                }
+            }
+            "GrpBlk" => {
+                if let Some(v) = parse_bool(val) {
+                    self.GrpBlk = v;
+                }
+            }
+            "GrClrU" => {
+                if let Some(v) = parse_u32(val) {
+                    self.GrClrU = v;
+                }
+            }
+            "GrClrS" => {
+                if let Some(v) = parse_u32(val) {
+                    self.GrClrS = v;
+                }
+            }
+            "GrpSz" => {
+                if let Ok(v) = val.parse() {
+                    self.GrpSz = v;
+                }
+            }
+            "GrpHvR" => {
+                if let Ok(v) = val.parse() {
+                    self.GrpHvR = v;
+                }
+            }
+            "GrdEnb" => {
+                if let Some(v) = parse_bool(val) {
+                    self.GrdEnb = v;
+                }
+            }
+            "GrdSnp" => {
+                if let Some(v) = parse_bool(val) {
+                    self.GrdSnp = v;
+                }
+            }
+            "GrdSpc" => {
+                if let Ok(v) = val.parse() {
+                    self.GrdSpc = v;
+                }
+            }
             // "OrtEnb" = legacy key from before the CARD rename — still
             // accepted so old user_env.txt files keep their setting.
-            "CrdEnb" | "OrtEnb" => if let Some(v) = parse_bool(val) { self.CrdEnb = v; }
-            "UcsIcn" => if let Some(v) = parse_bool(val) { self.UcsIcn = v; }
-            "UcsMod" => if let Ok(v) = val.parse() { self.UcsMod = v; }
+            "CrdEnb" | "OrtEnb" => {
+                if let Some(v) = parse_bool(val) {
+                    self.CrdEnb = v;
+                }
+            }
+            "PolMod" => {
+                if let Some(v) = parse_bool(val) {
+                    self.PolMod = v;
+                }
+            }
+            "PolAng" => {
+                if let Ok(v) = val.parse() {
+                    self.PolAng = v;
+                }
+            }
+            "PolAdA" => self.PolAdA = val.to_string(),
+            "PolDst" => {
+                if let Ok(v) = val.parse() {
+                    self.PolDst = v;
+                }
+            }
+            "UcsIcn" => {
+                if let Some(v) = parse_bool(val) {
+                    self.UcsIcn = v;
+                }
+            }
+            "UcsMod" => {
+                if let Ok(v) = val.parse() {
+                    self.UcsMod = v;
+                }
+            }
             "UcsAvP" => self.UcsAvP = val.to_string(),
-            "SelDmTm" => if let Ok(v) = val.parse() { self.SelDmTm = v; }
-            "LodAnc" => if let Ok(v) = val.parse() { self.LodAnc = v; }
-            "XrLdMd" => if let Ok(v) = val.parse() { self.XrLdMd = v; }
+            "SelDmTm" => {
+                if let Ok(v) = val.parse() {
+                    self.SelDmTm = v;
+                }
+            }
+            "LodAnc" => {
+                if let Ok(v) = val.parse() {
+                    self.LodAnc = v;
+                }
+            }
+            "XrLdMd" => {
+                if let Ok(v) = val.parse() {
+                    self.XrLdMd = v;
+                }
+            }
             "XrTmpP" => self.XrTmpP = val.to_string(),
-            _ => {}     // unknown — forward-compatible
+            "ZmRail" => {
+                if let Some(v) = parse_bool(val) {
+                    self.ZmRail = v;
+                }
+            }
+            "ZmRlX" => {
+                if let Ok(v) = val.parse() {
+                    self.ZmRlX = v;
+                }
+            }
+            "ZmRlY" => {
+                if let Ok(v) = val.parse() {
+                    self.ZmRlY = v;
+                }
+            }
+            "DmRail" => {
+                if let Some(v) = parse_bool(val) {
+                    self.DmRail = v;
+                }
+            }
+            "CnvRlO" => self.CnvRlO = val.to_string(),
+            "DrwRlO" => self.DrwRlO = val.to_string(),
+            "ModRlO" => self.ModRlO = val.to_string(),
+            "CmdBarH" => {
+                if let Ok(v) = val.parse() {
+                    self.CmdBarH = v;
+                }
+            }
+            "DrwDk" => {
+                if let Ok(v) = val.parse() {
+                    self.DrwDk = v;
+                }
+            }
+            "DrwDkX" => {
+                if let Ok(v) = val.parse() {
+                    self.DrwDkX = v;
+                }
+            }
+            "DrwDkY" => {
+                if let Ok(v) = val.parse() {
+                    self.DrwDkY = v;
+                }
+            }
+            "ModDk" => {
+                if let Ok(v) = val.parse() {
+                    self.ModDk = v;
+                }
+            }
+            "ModDkX" => {
+                if let Ok(v) = val.parse() {
+                    self.ModDkX = v;
+                }
+            }
+            "ModDkY" => {
+                if let Ok(v) = val.parse() {
+                    self.ModDkY = v;
+                }
+            }
+            "ZmDk" => {
+                if let Ok(v) = val.parse() {
+                    self.ZmDk = v;
+                }
+            }
+            "ZmDkX" => {
+                if let Ok(v) = val.parse() {
+                    self.ZmDkX = v;
+                }
+            }
+            "ZmDkY" => {
+                if let Ok(v) = val.parse() {
+                    self.ZmDkY = v;
+                }
+            }
+            "DmDk" => {
+                if let Ok(v) = val.parse() {
+                    self.DmDk = v;
+                }
+            }
+            "DmDkX" => {
+                if let Ok(v) = val.parse() {
+                    self.DmDkX = v;
+                }
+            }
+            "DmDkY" => {
+                if let Ok(v) = val.parse() {
+                    self.DmDkY = v;
+                }
+            }
+            _ => {} // unknown — forward-compatible
         }
     }
 }

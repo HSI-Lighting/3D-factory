@@ -22,10 +22,17 @@ fn main() {
     });
     let rect: Vec<PolyVertex> = [(0.0, 0.0), (8.0, 0.0), (8.0, 5.0), (0.0, 5.0)]
         .iter()
-        .map(|&(x, y)| PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 })
+        .map(|&(x, y)| PolyVertex {
+            pos: Vec2::new(x, y),
+            bulge: 0.0,
+        })
         .collect();
     doc.push(DObject::with_style(
-        Geom::Polyline(Polyline { vertices: rect, closed: true, widths: Vec::new() }),
+        Geom::Polyline(Polyline {
+            vertices: rect,
+            closed: true,
+            widths: Vec::new(),
+        }),
         Style::on_layer(walls),
     ));
 
@@ -36,7 +43,10 @@ fn main() {
         ..Layer::layer_zero()
     });
     doc.push(DObject::with_style(
-        Geom::Line(Line { a: Vec2::new(5.0, 0.0), b: Vec2::new(5.0, 3.2) }),
+        Geom::Line(Line {
+            a: Vec2::new(5.0, 0.0),
+            b: Vec2::new(5.0, 3.2),
+        }),
         Style::on_layer(part),
     ));
 

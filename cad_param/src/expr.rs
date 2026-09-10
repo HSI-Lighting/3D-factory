@@ -36,7 +36,10 @@ impl VarTable {
         if let Some(v) = self.vars.iter_mut().find(|v| v.name == name) {
             v.expr = expr.to_string();
         } else {
-            self.vars.push(Var { name: name.to_string(), expr: expr.to_string() });
+            self.vars.push(Var {
+                name: name.to_string(),
+                expr: expr.to_string(),
+            });
         }
     }
 
@@ -75,7 +78,10 @@ impl VarTable {
                     .filter(|v| !env.contains_key(&v.name))
                     .map(|v| v.name.as_str())
                     .collect();
-                return Err(format!("unresolved or cyclic variables: {}", missing.join(", ")));
+                return Err(format!(
+                    "unresolved or cyclic variables: {}",
+                    missing.join(", ")
+                ));
             }
         }
         Ok(env)
@@ -90,7 +96,11 @@ pub fn eval(src: &str, env: &HashMap<String, f64>) -> Result<f64, String> {
         return Ok(0.0);
     }
     let toks = tokenize(s)?;
-    let mut p = Parser { toks: &toks, pos: 0, env };
+    let mut p = Parser {
+        toks: &toks,
+        pos: 0,
+        env,
+    };
     let v = p.expr()?;
     if p.pos != p.toks.len() {
         return Err(format!("unexpected trailing input at token {}", p.pos));
@@ -119,24 +129,53 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
         let c = b[i] as char;
         match c {
             ' ' | '\t' => i += 1,
-            '+' => { out.push(Tok::Plus); i += 1; }
-            '-' => { out.push(Tok::Minus); i += 1; }
-            '*' => { out.push(Tok::Star); i += 1; }
-            '/' => { out.push(Tok::Slash); i += 1; }
-            '^' => { out.push(Tok::Caret); i += 1; }
-            '(' => { out.push(Tok::LParen); i += 1; }
-            ')' => { out.push(Tok::RParen); i += 1; }
+            '+' => {
+                out.push(Tok::Plus);
+                i += 1;
+            }
+            '-' => {
+                out.push(Tok::Minus);
+                i += 1;
+            }
+            '*' => {
+                out.push(Tok::Star);
+                i += 1;
+            }
+            '/' => {
+                out.push(Tok::Slash);
+                i += 1;
+            }
+            '^' => {
+                out.push(Tok::Caret);
+                i += 1;
+            }
+            '(' => {
+                out.push(Tok::LParen);
+                i += 1;
+            }
+            ')' => {
+                out.push(Tok::RParen);
+                i += 1;
+            }
             _ if c.is_ascii_digit() || c == '.' => {
                 let start = i;
                 while i < b.len() && {
                     let d = b[i] as char;
-                    d.is_ascii_digit() || d == '.' || d == 'e' || d == 'E'
-                        || ((d == '+' || d == '-') && i > start && matches!(b[i - 1] as char, 'e' | 'E'))
+                    d.is_ascii_digit()
+                        || d == '.'
+                        || d == 'e'
+                        || d == 'E'
+                        || ((d == '+' || d == '-')
+                            && i > start
+                            && matches!(b[i - 1] as char, 'e' | 'E'))
                 } {
                     i += 1;
                 }
                 let num = &s[start..i];
-                out.push(Tok::Num(num.parse::<f64>().map_err(|e| format!("bad number `{num}`: {e}"))?));
+                out.push(Tok::Num(
+                    num.parse::<f64>()
+                        .map_err(|e| format!("bad number `{num}`: {e}"))?,
+                ));
             }
             _ if c.is_ascii_alphabetic() || c == '_' => {
                 let start = i;
@@ -169,8 +208,14 @@ impl<'a> Parser<'a> {
         let mut v = self.term()?;
         while let Some(t) = self.peek() {
             match t {
-                Tok::Plus => { self.pos += 1; v += self.term()?; }
-                Tok::Minus => { self.pos += 1; v -= self.term()?; }
+                Tok::Plus => {
+                    self.pos += 1;
+                    v += self.term()?;
+                }
+                Tok::Minus => {
+                    self.pos += 1;
+                    v -= self.term()?;
+                }
                 _ => break,
             }
         }
@@ -181,7 +226,10 @@ impl<'a> Parser<'a> {
         let mut v = self.unary()?;
         while let Some(t) = self.peek() {
             match t {
-                Tok::Star => { self.pos += 1; v *= self.unary()?; }
+                Tok::Star => {
+                    self.pos += 1;
+                    v *= self.unary()?;
+                }
                 Tok::Slash => {
                     self.pos += 1;
                     let d = self.unary()?;
@@ -199,8 +247,14 @@ impl<'a> Parser<'a> {
     // Unary minus binds LOOSER than exponentiation, so `-2^2` = −(2²) = −4.
     fn unary(&mut self) -> Result<f64, String> {
         match self.peek() {
-            Some(Tok::Minus) => { self.pos += 1; Ok(-self.unary()?) }
-            Some(Tok::Plus) => { self.pos += 1; self.unary() }
+            Some(Tok::Minus) => {
+                self.pos += 1;
+                Ok(-self.unary()?)
+            }
+            Some(Tok::Plus) => {
+                self.pos += 1;
+                self.unary()
+            }
             _ => self.power(),
         }
     }
@@ -218,12 +272,18 @@ impl<'a> Parser<'a> {
 
     fn primary(&mut self) -> Result<f64, String> {
         match self.peek().cloned() {
-            Some(Tok::Num(n)) => { self.pos += 1; Ok(n) }
+            Some(Tok::Num(n)) => {
+                self.pos += 1;
+                Ok(n)
+            }
             Some(Tok::LParen) => {
                 self.pos += 1;
                 let v = self.expr()?;
                 match self.peek() {
-                    Some(Tok::RParen) => { self.pos += 1; Ok(v) }
+                    Some(Tok::RParen) => {
+                        self.pos += 1;
+                        Ok(v)
+                    }
                     _ => Err("expected `)`".into()),
                 }
             }

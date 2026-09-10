@@ -31,19 +31,19 @@ use crate::math::Vec2;
 pub const MAX_BLOCK_PARAMS: usize = 8;
 
 /// A placed instance of a block definition.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct BlockRef {
     /// Id into `Document.blocks`.
-    pub block:    u32,
+    pub block: u32,
     /// World-space insertion point (where the definition's base lands).
-    pub insert:   Vec2,
+    pub insert: Vec2,
     /// X-axis scale MAGNITUDE (> 0). A reflected instance keeps a positive
     /// scale and sets `mirror_x` instead (so circles/arcs stay correct).
-    pub scale:    f64,
+    pub scale: f64,
     /// Y-axis scale MAGNITUDE (> 0). Equals `scale` for a uniform instance;
     /// when it differs (a stretched block) circles/arcs become ellipses on
     /// insert/explode. From DXF group 42.
-    pub scale_y:  f64,
+    pub scale_y: f64,
     /// Rotation in radians, CCW.
     pub rotation: f64,
     /// Mirrored: reflect the definition across its local Y axis (through the
@@ -53,9 +53,14 @@ pub struct BlockRef {
     pub mirror_x: bool,
     /// Per-instance values for the block's parametric `params` (parallel by
     /// index; unused slots ignored). Empty/non-parametric blocks ignore
-    /// this. Fixed array so `BlockRef` stays `Copy`. Defaults to 0.0;
-    /// the inserter sets each to the param's `source_value`.
+    /// this. Fixed array so the render/explode hot paths stay cheap.
+    /// Defaults to 0.0; the inserter sets each to the param's `source_value`.
     pub param_values: [f64; MAX_BLOCK_PARAMS],
+    /// Per-instance attribute VALUES, parallel by index to the definition's
+    /// `AttrDef` dobjects (in definition order). A block without attributes
+    /// keeps this empty. Grows with the definition's attr count at insert;
+    /// ATTEDIT rewrites entries in place.
+    pub attr_values: Vec<String>,
 }
 
 /// One MODIFIER VECTOR of a parametric block — a stretch window + a unit
@@ -70,12 +75,12 @@ pub struct ParamVector {
     pub win_min: Vec2,
     pub win_max: Vec2,
     /// Unit direction of the displacement.
-    pub dir:     Vec2,
+    pub dir: Vec2,
     /// How much this vector moves per unit of `(value - original)`.
     /// 1.0 = moves the full amount (one-sided opening); 0.5 = half (a
     /// symmetric/centered opening where each side takes half the change).
     /// This is what makes several linked vectors CORRELATE to one value.
-    pub gain:    f64,
+    pub gain: f64,
 }
 
 /// One named parametric VARIABLE of a (semi-smart) block — e.g. `width`.
@@ -84,11 +89,52 @@ pub struct ParamVector {
 /// value `V` and every linked vector displaces by `dir * (V - original)`.
 #[derive(Clone, Debug)]
 pub struct BlockParam {
-    pub name:     String,
+    pub name: String,
     /// The value the SOURCE block represents (displacement 0 here).
     pub original: f64,
     /// The modifier vectors this variable drives together (≥1).
-    pub vectors:  Vec<ParamVector>,
+    pub vectors: Vec<ParamVector>,
+}
+
+/// One attribute DEFINITION slot (AutoCAD ATTDEF). Lives as a `Geom::AttrDef`
+/// inside a block definition's dobjects (definition space). At INSERT the app
+/// prompts for a value per tag and stores it in the instance's
+/// `BlockRef.attr_values` (parallel by index); rendering replaces the tag
+/// with the VALUE at the def's position/height/angle.
+#[derive(Clone, Debug)]
+pub struct AttrDef {
+    /// The tag name (the slot key the value is stored under).
+    pub tag: String,
+    /// Prompt text shown at insert time (AutoCAD group 3).
+    pub prompt: String,
+    /// Default value used when the user accepts without typing.
+    pub default: String,
+    /// Position in definition space (where the value renders).
+    pub position: crate::math::Vec2,
+    /// Cap height in world units (like `Text.height`).
+    pub height: f64,
+    /// Rotation in radians CCW (like `Text.angle`).
+    pub angle: f64,
+    /// Index into `Document.text_styles`.
+    pub style: u32,
+    /// Whether the attribute is visible at render time.
+    pub visible: bool,
+}
+
+impl AttrDef {
+    /// Empty def at origin with sensible defaults for interactive prompts.
+    pub fn empty() -> Self {
+        Self {
+            tag: String::new(),
+            prompt: String::new(),
+            default: String::new(),
+            position: crate::math::Vec2::ZERO,
+            height: 1.0,
+            angle: 0.0,
+            style: crate::text::TextStyleTable::STANDARD,
+            visible: true,
+        }
+    }
 }
 
 impl BlockRef {
@@ -121,9 +167,9 @@ impl BlockRef {
 /// the instance's color at render time.
 #[derive(Clone, Debug)]
 pub struct Block {
-    pub name:     String,
+    pub name: String,
     /// Base point in definition space (the "grip" the instance carries).
-    pub base:     Vec2,
+    pub base: Vec2,
     pub dobjects: Vec<DObject>,
     /// Smart-block marker. When true the definition is intended to be
     /// re-derived by a (forthcoming) smart-block algorithm rather than
@@ -131,12 +177,12 @@ pub struct Block {
     /// flag is carried so the editor/UI can mark it and the algorithm can
     /// hook in later. NOT yet persisted to RSM (reader defaults it false,
     /// like the dim/wall style tables — see rsm.rs).
-    pub smart:    bool,
+    pub smart: bool,
     /// Parametric parameters (named modifier vectors). Empty = a plain
     /// static block. Populated by the block-diff "Set parameters" flow;
     /// each instance carries values in `BlockRef.param_values`. NOT yet
     /// persisted to RSM (reader defaults it empty).
-    pub params:   Vec<BlockParam>,
+    pub params: Vec<BlockParam>,
     /// Indices (into `dobjects`) of the edges that bound an OPENING this block
     /// cuts into host geometry on insert — e.g. a door/window's two jambs.
     /// On insert the region enclosed by these (derived + transformed) edges is
@@ -165,11 +211,17 @@ impl BlockTable {
         id
     }
     pub fn find(&self, name: &str) -> Option<u32> {
-        self.blocks.iter().position(|b| b.name.eq_ignore_ascii_case(name))
+        self.blocks
+            .iter()
+            .position(|b| b.name.eq_ignore_ascii_case(name))
             .map(|i| i as u32)
     }
-    pub fn len(&self) -> usize { self.blocks.len() }
-    pub fn is_empty(&self) -> bool { self.blocks.is_empty() }
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -177,24 +229,38 @@ mod tests {
     use super::*;
     use crate::geom::{Circle, Line};
 
-    fn close(p: Vec2, q: Vec2) -> bool { (p - q).len() < 1e-9 }
+    fn close(p: Vec2, q: Vec2) -> bool {
+        (p - q).len() < 1e-9
+    }
+
+    fn test_blockref(block: u32, insert: Vec2, scale: f64, scale_y: f64) -> BlockRef {
+        BlockRef {
+            block,
+            insert,
+            scale,
+            scale_y,
+            rotation: 0.0,
+            mirror_x: false,
+            param_values: [0.0; MAX_BLOCK_PARAMS],
+            attr_values: Vec::new(),
+        }
+    }
 
     #[test]
     fn transform_geom_composes_scale_rotate_translate() {
         // Definition: line (1,0)→(2,0), base (1,0). Instance at (10,10),
         // scale 2, rotation 90° CCW. Expected: start lands ON the insert
         // point; end = insert + R90·2·(1,0) = (10,12).
-        let br = BlockRef {
-            block: 0,
-            insert: Vec2::new(10.0, 10.0),
-            scale: 2.0, scale_y: 2.0,
-            rotation: std::f64::consts::FRAC_PI_2,
-            mirror_x: false,
-            param_values: [0.0; MAX_BLOCK_PARAMS],
-        };
-        let g = Geom::Line(Line { a: Vec2::new(1.0, 0.0), b: Vec2::new(2.0, 0.0) });
+        let mut br = test_blockref(0, Vec2::new(10.0, 10.0), 2.0, 2.0);
+        br.rotation = std::f64::consts::FRAC_PI_2;
+        let g = Geom::Line(Line {
+            a: Vec2::new(1.0, 0.0),
+            b: Vec2::new(2.0, 0.0),
+        });
         let out = br.transform_geom(&g, Vec2::new(1.0, 0.0));
-        let Geom::Line(l) = out else { panic!("expected line") };
+        let Geom::Line(l) = out else {
+            panic!("expected line")
+        };
         assert!(close(l.a, Vec2::new(10.0, 10.0)), "a={:?}", l.a);
         assert!(close(l.b, Vec2::new(10.0, 12.0)), "b={:?}", l.b);
     }
@@ -205,14 +271,21 @@ mod tests {
         let br = BlockRef {
             block: 0,
             insert: Vec2::new(5.0, 0.0),
-            scale: 3.0, scale_y: 3.0,
+            scale: 3.0,
+            scale_y: 3.0,
             rotation: 1.234,
             mirror_x: false,
             param_values: [0.0; MAX_BLOCK_PARAMS],
+            attr_values: Vec::new(),
         };
-        let g = Geom::Circle(Circle { center: Vec2::new(0.0, 0.0), radius: 2.0 });
+        let g = Geom::Circle(Circle {
+            center: Vec2::new(0.0, 0.0),
+            radius: 2.0,
+        });
         let out = br.transform_geom(&g, Vec2::new(0.0, 0.0));
-        let Geom::Circle(c) = out else { panic!("expected circle") };
+        let Geom::Circle(c) = out else {
+            panic!("expected circle")
+        };
         assert!(close(c.center, Vec2::new(5.0, 0.0)));
         assert!((c.radius - 6.0).abs() < 1e-9);
     }
@@ -223,11 +296,22 @@ mod tests {
         // base BEFORE scale/rotation. base=(0,0), no scale/rotation/insert:
         // line (1,0)→(2,0) ⇒ (-1,0)→(-2,0).
         let br = BlockRef {
-            block: 0, insert: Vec2::new(0.0, 0.0), scale: 1.0, scale_y: 1.0, rotation: 0.0,
-            mirror_x: true, param_values: [0.0; MAX_BLOCK_PARAMS],
+            block: 0,
+            insert: Vec2::new(0.0, 0.0),
+            scale: 1.0,
+            scale_y: 1.0,
+            rotation: 0.0,
+            mirror_x: true,
+            param_values: [0.0; MAX_BLOCK_PARAMS],
+            attr_values: Vec::new(),
         };
-        let g = Geom::Line(Line { a: Vec2::new(1.0, 0.0), b: Vec2::new(2.0, 0.0) });
-        let Geom::Line(l) = br.transform_geom(&g, Vec2::new(0.0, 0.0)) else { panic!() };
+        let g = Geom::Line(Line {
+            a: Vec2::new(1.0, 0.0),
+            b: Vec2::new(2.0, 0.0),
+        });
+        let Geom::Line(l) = br.transform_geom(&g, Vec2::new(0.0, 0.0)) else {
+            panic!()
+        };
         assert!(close(l.a, Vec2::new(-1.0, 0.0)), "a={:?}", l.a);
         assert!(close(l.b, Vec2::new(-2.0, 0.0)), "b={:?}", l.b);
     }
@@ -237,15 +321,28 @@ mod tests {
         // A block inserted with scale (2,1) stretches a unit circle into an
         // ellipse: semi-major 2 along x, ratio 0.5 (LibreCAD parity).
         let br = BlockRef {
-            block: 0, insert: Vec2::new(0.0, 0.0), scale: 2.0, scale_y: 1.0,
-            rotation: 0.0, mirror_x: false, param_values: [0.0; MAX_BLOCK_PARAMS],
+            block: 0,
+            insert: Vec2::new(0.0, 0.0),
+            scale: 2.0,
+            scale_y: 1.0,
+            rotation: 0.0,
+            mirror_x: false,
+            param_values: [0.0; MAX_BLOCK_PARAMS],
+            attr_values: Vec::new(),
         };
-        let g = Geom::Circle(Circle { center: Vec2::new(0.0, 0.0), radius: 1.0 });
+        let g = Geom::Circle(Circle {
+            center: Vec2::new(0.0, 0.0),
+            radius: 1.0,
+        });
         match br.transform_geom(&g, Vec2::new(0.0, 0.0)) {
             Geom::Ellipse(e) => {
                 assert!((e.major.len() - 2.0).abs() < 1e-9, "major={:?}", e.major);
                 assert!((e.ratio - 0.5).abs() < 1e-9, "ratio={}", e.ratio);
-                assert!(e.major.y.abs() < 1e-9, "major should lie on x: {:?}", e.major);
+                assert!(
+                    e.major.y.abs() < 1e-9,
+                    "major should lie on x: {:?}",
+                    e.major
+                );
             }
             other => panic!("expected ellipse, got {other:?}"),
         }

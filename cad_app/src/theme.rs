@@ -18,27 +18,27 @@ pub mod color {
     pub const SURFACE_1: Color32 = Color32::from_rgb(0x1a, 0x24, 0x30); // panel
     pub const SURFACE_2: Color32 = Color32::from_rgb(0x22, 0x2b, 0x34); // raised control
     pub const SURFACE_3: Color32 = Color32::from_rgb(0x2a, 0x37, 0x44); // popover / menu
-    pub const CHROME:    Color32 = Color32::from_rgb(0x22, 0x30, 0x40); // header / footer band
-    pub const FIELD:     Color32 = Color32::from_rgb(0x14, 0x1c, 0x25); // input fill (= surface-0)
-    pub const BORDER:    Color32 = Color32::from_rgb(0x34, 0x41, 0x4b);
+    pub const CHROME: Color32 = Color32::from_rgb(0x22, 0x30, 0x40); // header / footer band
+    pub const FIELD: Color32 = Color32::from_rgb(0x14, 0x1c, 0x25); // input fill (= surface-0)
+    pub const BORDER: Color32 = Color32::from_rgb(0x34, 0x41, 0x4b);
 
     // ── Accent ─────────────────────────────────────────────────────────
-    pub const ACCENT:    Color32 = Color32::from_rgb(0x00, 0xe5, 0xff);
+    pub const ACCENT: Color32 = Color32::from_rgb(0x00, 0xe5, 0xff);
     pub const ON_ACCENT: Color32 = Color32::from_rgb(0x06, 0x3b, 0x45); // text on the cyan fill
 
     // ── Text ───────────────────────────────────────────────────────────
-    pub const TEXT_PRIMARY:   Color32 = Color32::from_rgb(0xda, 0xe3, 0xef);
+    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xda, 0xe3, 0xef);
     pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0xae, 0xb9, 0xc4);
-    pub const TEXT_MUTED:     Color32 = Color32::from_rgb(0x93, 0xa1, 0xac); // labels, placeholders
-    pub const TEXT_DISABLED:  Color32 = Color32::from_rgb(0x5c, 0x69, 0x75);
+    pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x93, 0xa1, 0xac); // labels, placeholders
+    pub const TEXT_DISABLED: Color32 = Color32::from_rgb(0x5c, 0x69, 0x75);
     /// Coordinate column headers (Start/End, X/Y) — dimmer than muted, 11/400.
     /// INSPECTOR_DESIGN_MENTOR §1/§5.1.
-    pub const COLUMN_HEADER:  Color32 = Color32::from_rgb(0x66, 0x70, 0x7a);
+    pub const COLUMN_HEADER: Color32 = Color32::from_rgb(0x66, 0x70, 0x7a);
 
     // ── Semantic (no `info` — cyan carries it) ─────────────────────────
     pub const SUCCESS: Color32 = Color32::from_rgb(0x34, 0xd3, 0x99);
     pub const WARNING: Color32 = Color32::from_rgb(0xf2, 0xb5, 0x3d);
-    pub const DANGER:  Color32 = Color32::from_rgb(0xe5, 0x48, 0x4d);
+    pub const DANGER: Color32 = Color32::from_rgb(0xe5, 0x48, 0x4d);
 
     // ── State overlays (apply over any surface) ────────────────────────
     /// Hover lift — white at ~6%.
@@ -52,11 +52,11 @@ pub mod color {
 /// Spacing scale (4px base). See THEME_SYSTEM §5.1.
 pub mod space {
     pub const XXS: f32 = 2.0;
-    pub const XS:  f32 = 4.0;
-    pub const SM:  f32 = 8.0;
-    pub const MD:  f32 = 12.0;
-    pub const LG:  f32 = 16.0;
-    pub const XL:  f32 = 24.0;
+    pub const XS: f32 = 4.0;
+    pub const SM: f32 = 8.0;
+    pub const MD: f32 = 12.0;
+    pub const LG: f32 = 16.0;
+    pub const XL: f32 = 24.0;
     pub const XXL: f32 = 32.0;
 
     /// Uniform control / field / row height.
@@ -72,15 +72,15 @@ pub mod space {
     // ── Relationship spacings (THEME_SYSTEM §5.1, finalized compact scale) ──
     /// Horizontal label → input gap, and the inside-field edge → text padding.
     pub const LABEL_INPUT: f32 = 8.0;
-    pub const INPUT_PAD:   f32 = 8.0;
+    pub const INPUT_PAD: f32 = 8.0;
     /// Section header → its first content row.
     pub const SECTION_GAP: f32 = 12.0;
     /// Gap between property groups / sections.
-    pub const GROUP_GAP:   f32 = 12.0;
+    pub const GROUP_GAP: f32 = 12.0;
     /// Start ↔ End (coordinate) column gap (INSPECTOR_DESIGN_MENTOR §5.1).
-    pub const COLUMN_GAP:  f32 = 8.0;
+    pub const COLUMN_GAP: f32 = 8.0;
     /// Panel inner edge padding.
-    pub const PANEL_EDGE:  f32 = 16.0;
+    pub const PANEL_EDGE: f32 = 16.0;
     /// Panel header band → first content.
     pub const PANEL_HEADER: f32 = 24.0;
 
@@ -95,10 +95,10 @@ pub mod space {
 
 /// Corner-radius scale. See THEME_SYSTEM §5.2.
 pub mod radius {
-    pub const XS:   f32 = 2.0;  // swatches, micro chips
-    pub const SM:   f32 = 4.0;  // inputs, value boxes
-    pub const MD:   f32 = 8.0;  // buttons, icon buttons, dropdowns
-    pub const LG:   f32 = 12.0; // cards, panels, menus
+    pub const XS: f32 = 2.0; // swatches, micro chips
+    pub const SM: f32 = 4.0; // inputs, value boxes
+    pub const MD: f32 = 8.0; // buttons, icon buttons, dropdowns
+    pub const LG: f32 = 12.0; // cards, panels, menus
     pub const FULL: f32 = 9999.0; // pills, toggles
 }
 
@@ -119,10 +119,14 @@ pub fn install_fonts(ctx: &egui::Context) {
     use egui::{FontData, FontDefinitions, FontFamily};
     use std::sync::Arc;
 
-    const GEIST: &[u8] =
-        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/Geist-Regular.ttf"));
-    const GEIST_MEDIUM: &[u8] =
-        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/Geist-Medium.ttf"));
+    const GEIST: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/fonts/Geist-Regular.ttf"
+    ));
+    const GEIST_MEDIUM: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/fonts/Geist-Medium.ttf"
+    ));
     const JETBRAINS_MONO: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/assets/fonts/JetBrainsMono-Regular.ttf"
@@ -153,6 +157,26 @@ pub fn install_fonts(ctx: &egui::Context) {
         .entry(FontFamily::Monospace)
         .or_default()
         .insert(0, "JetBrainsMono".to_owned());
+
+    // RTL glyph fallback: the cad_text engine's embedded DejaVu Sans carries
+    // the Arabic + Hebrew blocks. Register it at the END of the fallback chain
+    // so Arabic/Persian font names + text typed in dialog boxes show real
+    // glyphs (egui does no bidi shaping, but the shapes are correct).
+    let rtl_fallback: &[u8] = cad_text::rtl_fallback_font_bytes();
+    fonts.font_data.insert(
+        "DejaVuSansRtl".to_owned(),
+        Arc::new(FontData::from_static(rtl_fallback)),
+    );
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .push("DejaVuSansRtl".to_owned());
+    fonts
+        .families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .push("DejaVuSansRtl".to_owned());
 
     // Medium is a *separate named family* (egui has no weight axis). Its fallback
     // chain = GeistMedium, then whatever Proportional resolves to (Geist Regular +
@@ -229,8 +253,8 @@ pub fn apply(ctx: &egui::Context) {
     v.window_fill = c::SURFACE_3;
     v.window_stroke = Stroke::new(1.0, c::BORDER);
     v.window_rounding = Rounding::same(radius::LG);
-    v.menu_rounding = Rounding::ZERO;                 // square menus (kept)
-    v.extreme_bg_color = c::SURFACE_0;                // text-field / scroll bg
+    v.menu_rounding = Rounding::ZERO; // square menus (kept)
+    v.extreme_bg_color = c::SURFACE_0; // text-field / scroll bg
     v.faint_bg_color = c::SURFACE_2;
     v.hyperlink_color = c::ACCENT;
     v.selection.bg_fill = Color32::from_rgba_unmultiplied(0x00, 0xe5, 0xff, 60);

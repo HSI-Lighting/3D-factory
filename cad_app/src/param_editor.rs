@@ -60,7 +60,9 @@ impl CRef {
     /// whose geometry has been deleted).
     pub fn handles(&self) -> Vec<Handle> {
         match *self {
-            CRef::Horizontal(h) | CRef::Vertical(h) | CRef::Length(h, _) | CRef::Radius(h, _) => vec![h],
+            CRef::Horizontal(h) | CRef::Vertical(h) | CRef::Length(h, _) | CRef::Radius(h, _) => {
+                vec![h]
+            }
             CRef::Parallel(a, b)
             | CRef::Perpendicular(a, b)
             | CRef::Collinear(a, b)
@@ -239,7 +241,7 @@ struct DocMap {
     walls: Vec<(usize, usize, usize)>,
     /// per collected circle: (dobject idx, center point id, radius scalar id)
     circles: Vec<(usize, usize, usize)>,
-    line_id: HashMap<Handle, usize>,   // handle → sketch line id (lines AND walls)
+    line_id: HashMap<Handle, usize>, // handle → sketch line id (lines AND walls)
     circle_id: HashMap<Handle, usize>, // handle → sketch circle id
     /// handle → its parameter indices in the flat unknown vector (for colouring)
     handle_params: HashMap<Handle, Vec<usize>>,
@@ -331,7 +333,15 @@ fn build_doc_map(doc: &Document) -> DocMap {
         handle_params.insert(*h, vec![2 * c, 2 * c + 1, 2 * np + s]);
     }
 
-    DocMap { sk, lines, walls, circles, line_id, circle_id, handle_params }
+    DocMap {
+        sk,
+        lines,
+        walls,
+        circles,
+        line_id,
+        circle_id,
+        handle_params,
+    }
 }
 
 /// Translate the session's handle-based constraints into the sketch. Returns how
@@ -346,7 +356,11 @@ fn apply_constraints(
     drivers: &HashSet<Handle>,
 ) -> usize {
     if let Some(p0) = map.sk.points.first().copied() {
-        map.sk.add(Constraint::Fixed { p: 0, x: p0.x, y: p0.y });
+        map.sk.add(Constraint::Fixed {
+            p: 0,
+            x: p0.x,
+            y: p0.y,
+        });
     }
     // Pin driver entities (the ones the user just moved) — their points become
     // hard-fixed at their current spots, so the solver adjusts everything else.
@@ -354,43 +368,91 @@ fn apply_constraints(
         if let Some(&l) = map.line_id.get(h) {
             let ln = map.sk.lines[l];
             let (pa, pb) = (map.sk.points[ln.a], map.sk.points[ln.b]);
-            map.sk.add(Constraint::Fixed { p: ln.a, x: pa.x, y: pa.y });
-            map.sk.add(Constraint::Fixed { p: ln.b, x: pb.x, y: pb.y });
+            map.sk.add(Constraint::Fixed {
+                p: ln.a,
+                x: pa.x,
+                y: pa.y,
+            });
+            map.sk.add(Constraint::Fixed {
+                p: ln.b,
+                x: pb.x,
+                y: pb.y,
+            });
         } else if let Some(&c) = map.circle_id.get(h) {
             let circ = map.sk.circles[c];
             let cen = map.sk.points[circ.center];
-            map.sk.add(Constraint::Fixed { p: circ.center, x: cen.x, y: cen.y });
+            map.sk.add(Constraint::Fixed {
+                p: circ.center,
+                x: cen.x,
+                y: cen.y,
+            });
         }
     }
     let _ = doc; // doc kept for future kind lookups beyond the maps
     let mut resolved = 0usize;
     for c in &session.constraints {
-        let added = match *c {
-            CRef::Horizontal(h) => map.line_id.get(&h).map(|&l| Constraint::Horizontal { line: l }),
-            CRef::Vertical(h) => map.line_id.get(&h).map(|&l| Constraint::Vertical { line: l }),
-            CRef::Parallel(a, b) => pair(&map.line_id, a, b).map(|(la, lb)| Constraint::Parallel { a: la, b: lb }),
-            CRef::Perpendicular(a, b) => pair(&map.line_id, a, b).map(|(la, lb)| Constraint::Perpendicular { a: la, b: lb }),
-            CRef::Collinear(a, b) => pair(&map.line_id, a, b).map(|(la, lb)| Constraint::Collinear { a: la, b: lb }),
-            CRef::Equal(a, b) => pair(&map.line_id, a, b).map(|(la, lb)| Constraint::EqualLength { a: la, b: lb }),
-            CRef::Angle(a, b, d) => pair(&map.line_id, a, b).map(|(la, lb)| Constraint::Angle { a: la, b: lb, radians: d }),
-            CRef::Length(h, d) => map.line_id.get(&h).map(|&l| {
-                let ln = map.sk.lines[l];
-                Constraint::Distance { p: ln.a, q: ln.b, d }
-            }),
-            CRef::Radius(h, r) => map.circle_id.get(&h).map(|&c| Constraint::Radius { circle: c, r }),
-            CRef::Concentric(a, b) => pair(&map.circle_id, a, b).map(|(ca, cb)| Constraint::Concentric { a: ca, b: cb }),
-            CRef::EqualRadius(a, b) => pair(&map.circle_id, a, b).map(|(ca, cb)| Constraint::EqualRadius { a: ca, b: cb }),
-            CRef::Tangent(a, b) => {
-                let (la, ca) = (map.line_id.get(&a).copied(), map.circle_id.get(&a).copied());
-                let (lb, cb) = (map.line_id.get(&b).copied(), map.circle_id.get(&b).copied());
-                match (la, ca, lb, cb) {
-                    (Some(l), _, _, Some(c)) => Some(Constraint::TangentLineCircle { line: l, circle: c }),
-                    (_, Some(c), Some(l), _) => Some(Constraint::TangentLineCircle { line: l, circle: c }),
-                    (_, Some(x), _, Some(y)) => Some(Constraint::TangentCircleCircle { a: x, b: y, internal: false }),
-                    _ => None,
+        let added =
+            match *c {
+                CRef::Horizontal(h) => map
+                    .line_id
+                    .get(&h)
+                    .map(|&l| Constraint::Horizontal { line: l }),
+                CRef::Vertical(h) => map
+                    .line_id
+                    .get(&h)
+                    .map(|&l| Constraint::Vertical { line: l }),
+                CRef::Parallel(a, b) => {
+                    pair(&map.line_id, a, b).map(|(la, lb)| Constraint::Parallel { a: la, b: lb })
                 }
-            }
-        };
+                CRef::Perpendicular(a, b) => pair(&map.line_id, a, b)
+                    .map(|(la, lb)| Constraint::Perpendicular { a: la, b: lb }),
+                CRef::Collinear(a, b) => {
+                    pair(&map.line_id, a, b).map(|(la, lb)| Constraint::Collinear { a: la, b: lb })
+                }
+                CRef::Equal(a, b) => pair(&map.line_id, a, b)
+                    .map(|(la, lb)| Constraint::EqualLength { a: la, b: lb }),
+                CRef::Angle(a, b, d) => {
+                    pair(&map.line_id, a, b).map(|(la, lb)| Constraint::Angle {
+                        a: la,
+                        b: lb,
+                        radians: d,
+                    })
+                }
+                CRef::Length(h, d) => map.line_id.get(&h).map(|&l| {
+                    let ln = map.sk.lines[l];
+                    Constraint::Distance {
+                        p: ln.a,
+                        q: ln.b,
+                        d,
+                    }
+                }),
+                CRef::Radius(h, r) => map
+                    .circle_id
+                    .get(&h)
+                    .map(|&c| Constraint::Radius { circle: c, r }),
+                CRef::Concentric(a, b) => pair(&map.circle_id, a, b)
+                    .map(|(ca, cb)| Constraint::Concentric { a: ca, b: cb }),
+                CRef::EqualRadius(a, b) => pair(&map.circle_id, a, b)
+                    .map(|(ca, cb)| Constraint::EqualRadius { a: ca, b: cb }),
+                CRef::Tangent(a, b) => {
+                    let (la, ca) = (map.line_id.get(&a).copied(), map.circle_id.get(&a).copied());
+                    let (lb, cb) = (map.line_id.get(&b).copied(), map.circle_id.get(&b).copied());
+                    match (la, ca, lb, cb) {
+                        (Some(l), _, _, Some(c)) => {
+                            Some(Constraint::TangentLineCircle { line: l, circle: c })
+                        }
+                        (_, Some(c), Some(l), _) => {
+                            Some(Constraint::TangentLineCircle { line: l, circle: c })
+                        }
+                        (_, Some(x), _, Some(y)) => Some(Constraint::TangentCircleCircle {
+                            a: x,
+                            b: y,
+                            internal: false,
+                        }),
+                        _ => None,
+                    }
+                }
+            };
         if let Some(con) = added {
             map.sk.add(con);
             resolved += 1;
@@ -416,28 +478,48 @@ pub fn geom_signature(doc: &Document) -> u64 {
     let mut acc: u64 = 0xcbf29ce484222325;
     for d in &doc.dobjects {
         match &d.geom {
-            Geom::Line(l) => { mix(&mut acc, l.a.x); mix(&mut acc, l.a.y); mix(&mut acc, l.b.x); mix(&mut acc, l.b.y); }
-            Geom::Circle(c) => { mix(&mut acc, c.center.x); mix(&mut acc, c.center.y); mix(&mut acc, c.radius); }
-            _ => if let Some((s, e)) = straight_wall(&d.geom) {
-                mix(&mut acc, s.x); mix(&mut acc, s.y); mix(&mut acc, e.x); mix(&mut acc, e.y);
-            },
+            Geom::Line(l) => {
+                mix(&mut acc, l.a.x);
+                mix(&mut acc, l.a.y);
+                mix(&mut acc, l.b.x);
+                mix(&mut acc, l.b.y);
+            }
+            Geom::Circle(c) => {
+                mix(&mut acc, c.center.x);
+                mix(&mut acc, c.center.y);
+                mix(&mut acc, c.radius);
+            }
+            _ => {
+                if let Some((s, e)) = straight_wall(&d.geom) {
+                    mix(&mut acc, s.x);
+                    mix(&mut acc, s.y);
+                    mix(&mut acc, e.x);
+                    mix(&mut acc, e.y);
+                }
+            }
         }
     }
     acc
 }
 
 fn handle_line_ends(doc: &Document, h: Handle) -> Option<(Vec2, Vec2)> {
-    doc.dobjects.iter().find(|d| d.handle == h).and_then(|d| match &d.geom {
-        Geom::Line(l) => Some((l.a, l.b)),
-        Geom::Wall(w) => Some((w.start, w.end)),
-        _ => None,
-    })
+    doc.dobjects
+        .iter()
+        .find(|d| d.handle == h)
+        .and_then(|d| match &d.geom {
+            Geom::Line(l) => Some((l.a, l.b)),
+            Geom::Wall(w) => Some((w.start, w.end)),
+            _ => None,
+        })
 }
 fn handle_circle(doc: &Document, h: Handle) -> Option<(Vec2, f64)> {
-    doc.dobjects.iter().find(|d| d.handle == h).and_then(|d| match &d.geom {
-        Geom::Circle(c) => Some((c.center, c.radius)),
-        _ => None,
-    })
+    doc.dobjects
+        .iter()
+        .find(|d| d.handle == h)
+        .and_then(|d| match &d.geom {
+            Geom::Circle(c) => Some((c.center, c.radius)),
+            _ => None,
+        })
 }
 
 /// Geometric error of one constraint on the CURRENT doc geometry — the "math"
@@ -448,7 +530,11 @@ fn cref_report(doc: &Document, c: &CRef) -> String {
         let (a, b) = handle_line_ends(doc, h1)?;
         let (p, q) = handle_line_ends(doc, h2)?;
         let (u, v) = (b - a, q - p);
-        Some((u.x * v.y - u.y * v.x).atan2(u.x * v.x + u.y * v.y).to_degrees())
+        Some(
+            (u.x * v.y - u.y * v.x)
+                .atan2(u.x * v.x + u.y * v.y)
+                .to_degrees(),
+        )
     };
     match *c {
         CRef::Horizontal(h) => match handle_line_ends(doc, h) {
@@ -460,7 +546,13 @@ fn cref_report(doc: &Document, c: &CRef) -> String {
             None => "vertical: (geometry gone)".into(),
         },
         CRef::Parallel(a, b) => match ang(a, b) {
-            Some(d) => { let dev = { let x = d.abs(); x.min(180.0 - x) }; format!("parallel: {:.4}° off", dev) }
+            Some(d) => {
+                let dev = {
+                    let x = d.abs();
+                    x.min(180.0 - x)
+                };
+                format!("parallel: {:.4}° off", dev)
+            }
             None => "parallel: (geometry gone)".into(),
         },
         CRef::Perpendicular(a, b) => match ang(a, b) {
@@ -468,11 +560,20 @@ fn cref_report(doc: &Document, c: &CRef) -> String {
             None => "perpendicular: (geometry gone)".into(),
         },
         CRef::Collinear(a, b) => match ang(a, b) {
-            Some(d) => { let dev = { let x = d.abs(); x.min(180.0 - x) }; format!("collinear: {:.4}° off", dev) }
+            Some(d) => {
+                let dev = {
+                    let x = d.abs();
+                    x.min(180.0 - x)
+                };
+                format!("collinear: {:.4}° off", dev)
+            }
             None => "collinear: (geometry gone)".into(),
         },
         CRef::Equal(a, b) => match (handle_line_ends(doc, a), handle_line_ends(doc, b)) {
-            (Some((a0, a1)), Some((b0, b1))) => format!("equal len: Δ = {:.4}", ((a1 - a0).len() - (b1 - b0).len()).abs()),
+            (Some((a0, a1)), Some((b0, b1))) => format!(
+                "equal len: Δ = {:.4}",
+                ((a1 - a0).len() - (b1 - b0).len()).abs()
+            ),
             _ => "equal len: (geometry gone)".into(),
         },
         CRef::Angle(a, b, want) => match ang(a, b) {
@@ -488,7 +589,9 @@ fn cref_report(doc: &Document, c: &CRef) -> String {
             None => "radius: (geometry gone)".into(),
         },
         CRef::Concentric(a, b) => match (handle_circle(doc, a), handle_circle(doc, b)) {
-            (Some((ca, _)), Some((cb, _))) => format!("concentric: centres {:.4} apart", (ca - cb).len()),
+            (Some((ca, _)), Some((cb, _))) => {
+                format!("concentric: centres {:.4} apart", (ca - cb).len())
+            }
             _ => "concentric: (geometry gone)".into(),
         },
         CRef::EqualRadius(a, b) => match (handle_circle(doc, a), handle_circle(doc, b)) {
@@ -506,11 +609,30 @@ fn doc_geom_lines(doc: &Document) -> Vec<String> {
     let mut out = Vec::new();
     for d in &doc.dobjects {
         match &d.geom {
-            Geom::Line(l) => out.push(format!("  h={:?} line   {} → {}  len={:.3}", d.handle, fv(l.a), fv(l.b), (l.b - l.a).len())),
-            Geom::Circle(c) => out.push(format!("  h={:?} circle c={} r={:.3}", d.handle, fv(c.center), c.radius)),
-            _ => if let Some((s, e)) = straight_wall(&d.geom) {
-                out.push(format!("  h={:?} wall   {} → {}  len={:.3}", d.handle, fv(s), fv(e), (e - s).len()));
-            },
+            Geom::Line(l) => out.push(format!(
+                "  h={:?} line   {} → {}  len={:.3}",
+                d.handle,
+                fv(l.a),
+                fv(l.b),
+                (l.b - l.a).len()
+            )),
+            Geom::Circle(c) => out.push(format!(
+                "  h={:?} circle c={} r={:.3}",
+                d.handle,
+                fv(c.center),
+                c.radius
+            )),
+            _ => {
+                if let Some((s, e)) = straight_wall(&d.geom) {
+                    out.push(format!(
+                        "  h={:?} wall   {} → {}  len={:.3}",
+                        d.handle,
+                        fv(s),
+                        fv(e),
+                        (e - s).len()
+                    ));
+                }
+            }
         }
     }
     out
@@ -557,16 +679,28 @@ pub fn solve_doc_driven(
         }
     };
     for c in &session.constraints {
-        for h in c.handles() { note_involved(&map, h, &mut involved); }
+        for h in c.handles() {
+            note_involved(&map, h, &mut involved);
+        }
     }
-    for h in drivers { note_involved(&map, *h, &mut involved); }
-    let to_pin: Vec<(usize, Vec2)> = map.sk.points.iter().enumerate()
+    for h in drivers {
+        note_involved(&map, *h, &mut involved);
+    }
+    let to_pin: Vec<(usize, Vec2)> = map
+        .sk
+        .points
+        .iter()
+        .enumerate()
         .filter(|(i, _)| !involved.contains(i))
         .map(|(i, p)| (i, *p))
         .collect();
     let pinned = to_pin.len();
     for (i, p) in to_pin {
-        map.sk.add(Constraint::Fixed { p: i, x: p.x, y: p.y });
+        map.sk.add(Constraint::Fixed {
+            p: i,
+            x: p.x,
+            y: p.y,
+        });
     }
 
     // ---- record MATH INPUT (the exact cad_param sketch the solver sees) ----
@@ -578,13 +712,20 @@ pub fn solve_doc_driven(
         math_in.push(format!("  p{i} = {}", fmt_v(*p)));
     }
     if !map.sk.scalars.is_empty() {
-        math_in.push(format!("scalars ({}): {:?}", map.sk.scalars.len(), map.sk.scalars));
+        math_in.push(format!(
+            "scalars ({}): {:?}",
+            map.sk.scalars.len(),
+            map.sk.scalars
+        ));
     }
     for (i, l) in map.sk.lines.iter().enumerate() {
         math_in.push(format!("  L{i} = p{}→p{}", l.a, l.b));
     }
     for (i, c) in map.sk.circles.iter().enumerate() {
-        math_in.push(format!("  C{i} = centre p{} radius s{}", c.center, c.radius));
+        math_in.push(format!(
+            "  C{i} = centre p{} radius s{}",
+            c.center, c.radius
+        ));
     }
     let res_in = cad_param::residual_breakdown(&map.sk);
 
@@ -593,7 +734,9 @@ pub fn solve_doc_driven(
     let init_rms = cad_param::current_rms(&map.sk);
     let rep = solve(&mut map.sk);
     let res_out = cad_param::residual_breakdown(&map.sk);
-    let max_disp = init_pts.iter().zip(&map.sk.points)
+    let max_disp = init_pts
+        .iter()
+        .zip(&map.sk.points)
         .map(|(a, b)| (*b - *a).len())
         .fold(0.0_f64, f64::max);
 
@@ -634,7 +777,11 @@ pub fn solve_doc_driven(
         resolved,
         total,
         rep.residual,
-        if rep.converged { "" } else { "  (NOT converged)" }
+        if rep.converged {
+            ""
+        } else {
+            "  (NOT converged)"
+        }
     );
 
     let output_geom = doc_geom_lines(doc); // doc now holds solved geometry
@@ -644,28 +791,47 @@ pub fn solve_doc_driven(
     t.push("════════ PARAMETRIC SOLVE ════════".into());
     let drv: Vec<String> = drivers.iter().map(|h| format!("{h:?}")).collect();
     t.push(format!("drivers (pinned as moved): [{}]", drv.join(", ")));
-    t.push(format!("user constraints: {} ({} resolved)", total, resolved));
+    t.push(format!(
+        "user constraints: {} ({} resolved)",
+        total, resolved
+    ));
     t.push("── INPUT geometry ──".into());
     t.extend(input_geom);
     t.push("── MATH INPUT (cad_param sketch) ──".into());
     t.extend(math_in);
-    t.push(format!("── CONSTRAINTS (sketch, {} eqs) · residual in → out ──", map.sk.constraints.len()));
+    t.push(format!(
+        "── CONSTRAINTS (sketch, {} eqs) · residual in → out ──",
+        map.sk.constraints.len()
+    ));
     let mut nfixed = 0usize;
     for (i, c) in map.sk.constraints.iter().enumerate() {
-        if matches!(c, Constraint::Fixed { .. }) { nfixed += 1; continue; }
+        if matches!(c, Constraint::Fixed { .. }) {
+            nfixed += 1;
+            continue;
+        }
         t.push(format!(
             "  {:?}   r {:.2e} → {:.2e}",
-            c, res_in.get(i).copied().unwrap_or(0.0), res_out.get(i).copied().unwrap_or(0.0)
+            c,
+            res_in.get(i).copied().unwrap_or(0.0),
+            res_out.get(i).copied().unwrap_or(0.0)
         ));
     }
     t.push(format!("  (+ {nfixed} Fixed anchors/pins)"));
     t.push("── SOLVE ──".into());
     t.push(format!(
         "  rms {:.3e} → {:.3e}   {} iters   {}",
-        init_rms, rep.residual, rep.iterations,
-        if rep.converged { "✓ CONVERGED" } else { "✗ DIVERGED / not converged" }
+        init_rms,
+        rep.residual,
+        rep.iterations,
+        if rep.converged {
+            "✓ CONVERGED"
+        } else {
+            "✗ DIVERGED / not converged"
+        }
     ));
-    t.push(format!("  unrelated points pinned: {pinned}   largest point move: {max_disp:.3}"));
+    t.push(format!(
+        "  unrelated points pinned: {pinned}   largest point move: {max_disp:.3}"
+    ));
     t.push("── OUTPUT geometry ──".into());
     t.extend(output_geom);
     if !session.constraints.is_empty() {
@@ -676,7 +842,11 @@ pub fn solve_doc_driven(
     }
     t.push("══════════════════════════════════".into());
 
-    SolveOutcome { msg, converged: rep.converged, trace: SolveTrace { lines: t } }
+    SolveOutcome {
+        msg,
+        converged: rep.converged,
+        trace: SolveTrace { lines: t },
+    }
 }
 
 /// Compute the degrees-of-freedom diagnosis WITHOUT moving geometry, plus a
@@ -688,7 +858,9 @@ pub fn analyze_doc(doc: &Document, session: &ParamSession) -> (DofReport, HashMa
     let rep = dof_analysis(&map.sk);
     let mut defined = HashMap::new();
     for (h, params) in &map.handle_params {
-        let all_locked = params.iter().all(|&i| !rep.param_free.get(i).copied().unwrap_or(true));
+        let all_locked = params
+            .iter()
+            .all(|&i| !rep.param_free.get(i).copied().unwrap_or(true));
         defined.insert(*h, all_locked);
     }
     (rep, defined)
@@ -713,12 +885,25 @@ pub fn inspect_handle(doc: &Document, session: &ParamSession, h: Handle) -> Opti
 
     if let Some(&lid) = map.line_id.get(&h) {
         let ln = map.sk.lines[lid];
-        let is_wall = matches!(doc.dobjects.iter().find(|d| d.handle == h).map(|d| &d.geom), Some(Geom::Wall(_)));
-        out.push(format!("handle {:?}  ({}, sketch L{lid})", h, if is_wall { "wall" } else { "line" }));
+        let is_wall = matches!(
+            doc.dobjects.iter().find(|d| d.handle == h).map(|d| &d.geom),
+            Some(Geom::Wall(_))
+        );
+        out.push(format!(
+            "handle {:?}  ({}, sketch L{lid})",
+            h,
+            if is_wall { "wall" } else { "line" }
+        ));
         for pid in [ln.a, ln.b] {
             let (fx, fy) = (free(2 * pid), free(2 * pid + 1));
             let p = map.sk.points[pid];
-            out.push(format!("  p{pid} = ({:.3}, {:.3})    x:{}  y:{}", p.x, p.y, yn(fx), yn(fy)));
+            out.push(format!(
+                "  p{pid} = ({:.3}, {:.3})    x:{}  y:{}",
+                p.x,
+                p.y,
+                yn(fx),
+                yn(fy)
+            ));
             local_total += 2;
             local_free += fx as usize + fy as usize;
         }
@@ -727,18 +912,37 @@ pub fn inspect_handle(doc: &Document, session: &ParamSession, h: Handle) -> Opti
         out.push(format!("handle {:?}  (circle, sketch C{cid})", h));
         let (fx, fy) = (free(2 * c.center), free(2 * c.center + 1));
         let p = map.sk.points[c.center];
-        out.push(format!("  centre p{} = ({:.3}, {:.3})    x:{}  y:{}", c.center, p.x, p.y, yn(fx), yn(fy)));
+        out.push(format!(
+            "  centre p{} = ({:.3}, {:.3})    x:{}  y:{}",
+            c.center,
+            p.x,
+            p.y,
+            yn(fx),
+            yn(fy)
+        ));
         let sidx = 2 * np + c.radius;
         let fr = free(sidx);
-        out.push(format!("  radius s{} = {:.3}    {}", c.radius, map.sk.scalars[c.radius], yn(fr)));
+        out.push(format!(
+            "  radius s{} = {:.3}    {}",
+            c.radius,
+            map.sk.scalars[c.radius],
+            yn(fr)
+        ));
         local_total += 3;
         local_free += fx as usize + fy as usize + fr as usize;
     } else {
         return None;
     }
 
-    out.push(format!("  local DOF: {local_free}/{local_total} params free  ·  sketch total {} DOF", rep.dof));
-    let touching: Vec<&CRef> = session.constraints.iter().filter(|c| c.handles().contains(&h)).collect();
+    out.push(format!(
+        "  local DOF: {local_free}/{local_total} params free  ·  sketch total {} DOF",
+        rep.dof
+    ));
+    let touching: Vec<&CRef> = session
+        .constraints
+        .iter()
+        .filter(|c| c.handles().contains(&h))
+        .collect();
     if touching.is_empty() {
         out.push("  ⚠ no constraint references this entity".into());
     } else {
@@ -762,14 +966,22 @@ mod tests {
         h
     }
     fn add_circle(doc: &mut Document, c: Vec2, r: f64) -> Handle {
-        let d = DObject::new(Geom::Circle(Circle { center: c, radius: r }));
+        let d = DObject::new(Geom::Circle(Circle {
+            center: c,
+            radius: r,
+        }));
         let h = d.handle;
         doc.dobjects.push(d);
         h
     }
     fn add_wall(doc: &mut Document, s: Vec2, e: Vec2) -> Handle {
         let d = DObject::new(Geom::Wall(cad_kernel::Wall {
-            start: s, end: e, thickness: 4.0, style: 0, bulge: 0.0 }));
+            start: s,
+            end: e,
+            thickness: 4.0,
+            style: 0,
+            bulge: 0.0,
+        }));
         let h = d.handle;
         doc.dobjects.push(d);
         h
@@ -782,8 +994,14 @@ mod tests {
         let mut sess = ParamSession::new();
         sess.constraints.push(CRef::Horizontal(h0));
         let out = solve_doc(&mut doc, &sess);
-        let Geom::Wall(w) = &doc.dobjects[0].geom else { panic!() };
-        assert!((w.start.y - w.end.y).abs() < 1e-6, "wall not horizontal ({})", out.msg);
+        let Geom::Wall(w) = &doc.dobjects[0].geom else {
+            panic!()
+        };
+        assert!(
+            (w.start.y - w.end.y).abs() < 1e-6,
+            "wall not horizontal ({})",
+            out.msg
+        );
     }
 
     #[test]
@@ -796,8 +1014,12 @@ mod tests {
         let mut sess = ParamSession::new();
         sess.constraints.push(CRef::Perpendicular(hw, hl));
         let _ = solve_doc(&mut doc, &sess);
-        let Geom::Wall(w) = &doc.dobjects[0].geom else { panic!() };
-        let Geom::Line(l) = &doc.dobjects[1].geom else { panic!() };
+        let Geom::Wall(w) = &doc.dobjects[0].geom else {
+            panic!()
+        };
+        let Geom::Line(l) = &doc.dobjects[1].geom else {
+            panic!()
+        };
         let u = w.end - w.start;
         let v = l.b - l.a;
         assert!(u.dot(v).abs() < 1e-5, "dot={}", u.dot(v));
@@ -810,7 +1032,9 @@ mod tests {
         let mut sess = ParamSession::new();
         sess.constraints.push(CRef::Horizontal(h0));
         let out = solve_doc(&mut doc, &sess);
-        let Geom::Line(l) = &doc.dobjects[0].geom else { panic!() };
+        let Geom::Line(l) = &doc.dobjects[0].geom else {
+            panic!()
+        };
         assert!((l.a.y - l.b.y).abs() < 1e-6, "not horizontal ({})", out.msg);
     }
 
@@ -851,8 +1075,12 @@ mod tests {
         let mut sess = ParamSession::new();
         sess.constraints.push(CRef::Perpendicular(h0, h1));
         let _ = solve_doc(&mut doc, &sess);
-        let Geom::Line(l0) = &doc.dobjects[0].geom else { panic!() };
-        let Geom::Line(l1) = &doc.dobjects[1].geom else { panic!() };
+        let Geom::Line(l0) = &doc.dobjects[0].geom else {
+            panic!()
+        };
+        let Geom::Line(l1) = &doc.dobjects[1].geom else {
+            panic!()
+        };
         let u = l0.b - l0.a;
         let v = l1.b - l1.a;
         assert!(u.dot(v).abs() < 1e-5, "dot={}", u.dot(v));
@@ -865,7 +1093,9 @@ mod tests {
         let mut sess = ParamSession::new();
         sess.constraints.push(CRef::Radius(h, 9.0));
         let _ = solve_doc(&mut doc, &sess);
-        let Geom::Circle(c) = &doc.dobjects[0].geom else { panic!() };
+        let Geom::Circle(c) = &doc.dobjects[0].geom else {
+            panic!()
+        };
         assert!((c.radius - 9.0).abs() < 1e-6, "r={}", c.radius);
     }
 
@@ -878,8 +1108,12 @@ mod tests {
         sess.constraints.push(CRef::Concentric(h0, h1));
         sess.constraints.push(CRef::EqualRadius(h0, h1));
         let _ = solve_doc(&mut doc, &sess);
-        let Geom::Circle(c0) = &doc.dobjects[0].geom else { panic!() };
-        let Geom::Circle(c1) = &doc.dobjects[1].geom else { panic!() };
+        let Geom::Circle(c0) = &doc.dobjects[0].geom else {
+            panic!()
+        };
+        let Geom::Circle(c1) = &doc.dobjects[1].geom else {
+            panic!()
+        };
         assert!((c0.center - c1.center).len() < 1e-5, "centers differ");
         assert!((c0.radius - c1.radius).abs() < 1e-5, "radii differ");
     }
@@ -921,18 +1155,34 @@ mod tests {
         for dobj in &doc.dobjects {
             if let Geom::Line(l) = &dobj.geom {
                 for p in [l.a, l.b] {
-                    assert!(p.x.abs() < 20_000.0 && p.y.abs() < 20_000.0, "exploded: {:?}", p);
+                    assert!(
+                        p.x.abs() < 20_000.0 && p.y.abs() < 20_000.0,
+                        "exploded: {:?}",
+                        p
+                    );
                 }
             }
         }
         // #6 (untouched by any constraint) stayed put
-        let Geom::Line(l6) = &doc.dobjects[3].geom else { panic!() };
-        assert!((l6.a - d).len() < 1e-6 && (l6.b - e).len() < 1e-6, "untouched edge moved");
+        let Geom::Line(l6) = &doc.dobjects[3].geom else {
+            panic!()
+        };
+        assert!(
+            (l6.a - d).len() < 1e-6 && (l6.b - e).len() < 1e-6,
+            "untouched edge moved"
+        );
         // #3 ∥ #4
-        let Geom::Line(l3) = &doc.dobjects[0].geom else { panic!() };
-        let Geom::Line(l4) = &doc.dobjects[1].geom else { panic!() };
+        let Geom::Line(l3) = &doc.dobjects[0].geom else {
+            panic!()
+        };
+        let Geom::Line(l4) = &doc.dobjects[1].geom else {
+            panic!()
+        };
         let (u, v) = (l3.b - l3.a, l4.b - l4.a);
-        assert!((u.x * v.y - u.y * v.x).abs() / (u.len() * v.len()) < 1e-5, "not parallel");
+        assert!(
+            (u.x * v.y - u.y * v.x).abs() / (u.len() * v.len()) < 1e-5,
+            "not parallel"
+        );
     }
 
     #[test]
@@ -946,16 +1196,29 @@ mod tests {
         sess.constraints.push(CRef::Parallel(ha, hb));
         let _ = solve_doc(&mut doc, &sess);
         // user tilts A's far endpoint
-        if let Geom::Line(l) = &mut doc.dobjects[0].geom { l.b = Vec2::new(10.0, 4.0); }
+        if let Geom::Line(l) = &mut doc.dobjects[0].geom {
+            l.b = Vec2::new(10.0, 4.0);
+        }
         let drivers: HashSet<Handle> = [ha].into_iter().collect();
         let _ = solve_doc_driven(&mut doc, &sess, &drivers);
-        let Geom::Line(a) = &doc.dobjects[0].geom else { panic!() };
-        let Geom::Line(b) = &doc.dobjects[1].geom else { panic!() };
+        let Geom::Line(a) = &doc.dobjects[0].geom else {
+            panic!()
+        };
+        let Geom::Line(b) = &doc.dobjects[1].geom else {
+            panic!()
+        };
         // A stayed where the user put it
-        assert!((a.b - Vec2::new(10.0, 4.0)).len() < 1e-6, "driver moved: {:?}", a.b);
+        assert!(
+            (a.b - Vec2::new(10.0, 4.0)).len() < 1e-6,
+            "driver moved: {:?}",
+            a.b
+        );
         // B followed — now parallel to A
         let (u, v) = (a.b - a.a, b.b - b.a);
-        assert!((u.x * v.y - u.y * v.x).abs() < 1e-5, "B not parallel after drag");
+        assert!(
+            (u.x * v.y - u.y * v.x).abs() < 1e-5,
+            "B not parallel after drag"
+        );
     }
 
     #[test]
@@ -971,9 +1234,17 @@ mod tests {
         sess.constraints.push(CRef::Equal(h0, h2));
         let out = solve_doc(&mut doc, &sess);
         assert!(out.converged, "{}", out.msg);
-        let len = |i: usize| { let Geom::Line(l) = &doc.dobjects[i].geom else { panic!() }; (l.b - l.a).len() };
+        let len = |i: usize| {
+            let Geom::Line(l) = &doc.dobjects[i].geom else {
+                panic!()
+            };
+            (l.b - l.a).len()
+        };
         let (a, b, c) = (len(0), len(1), len(2));
-        assert!((a - b).abs() < 1e-5 && (a - c).abs() < 1e-5, "not all equal: {a}, {b}, {c}");
+        assert!(
+            (a - b).abs() < 1e-5 && (a - c).abs() < 1e-5,
+            "not all equal: {a}, {b}, {c}"
+        );
     }
 
     #[test]
@@ -985,9 +1256,16 @@ mod tests {
         let report = inspect_handle(&doc, &sess, h).expect("inspect");
         // mentions the constraint touching it and the cad_param sketch line id
         assert!(report.iter().any(|l| l.contains("horizontal")));
-        assert!(report.iter().any(|l| l.contains("L0") || l.contains("line")));
+        assert!(report
+            .iter()
+            .any(|l| l.contains("L0") || l.contains("line")));
         // a non-existent handle returns None
-        assert!(inspect_handle(&doc, &sess, add_circle(&mut Document::default(), Vec2::new(0.0,0.0), 1.0)).is_none());
+        assert!(inspect_handle(
+            &doc,
+            &sess,
+            add_circle(&mut Document::default(), Vec2::new(0.0, 0.0), 1.0)
+        )
+        .is_none());
     }
 
     #[test]
@@ -995,8 +1273,13 @@ mod tests {
         let mut doc = Document::default();
         let a = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0));
         let b = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(0.0, 1.0));
-        assert!(matches!(PendingKind::Parallel.to_cref(a, b), CRef::Parallel(x, y) if x == a && y == b));
-        assert!(matches!(PendingKind::Tangent.to_cref(a, b), CRef::Tangent(..)));
+        assert!(
+            matches!(PendingKind::Parallel.to_cref(a, b), CRef::Parallel(x, y) if x == a && y == b)
+        );
+        assert!(matches!(
+            PendingKind::Tangent.to_cref(a, b),
+            CRef::Tangent(..)
+        ));
         assert!(!PendingKind::Parallel.target_is_circle());
         assert!(PendingKind::Concentric.target_is_circle());
         assert!(PendingKind::EqualRadius.target_is_circle());

@@ -75,7 +75,9 @@ pub fn parse_pat(text: &str) -> PatParse {
         let lineno = i + 1;
         // Strip `;` comments and surrounding whitespace.
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
 
         if let Some(rest) = line.strip_prefix('*') {
             let (name, description) = match rest.split_once(',') {
@@ -83,10 +85,15 @@ pub fn parse_pat(text: &str) -> PatParse {
                 None => (rest.trim().to_string(), String::new()),
             };
             if name.is_empty() {
-                out.warnings.push(format!("line {lineno}: pattern header with no name"));
+                out.warnings
+                    .push(format!("line {lineno}: pattern header with no name"));
                 continue;
             }
-            out.patterns.push(PatPattern { name, description, lines: Vec::new() });
+            out.patterns.push(PatPattern {
+                name,
+                description,
+                lines: Vec::new(),
+            });
             continue;
         }
 
@@ -95,15 +102,21 @@ pub fn parse_pat(text: &str) -> PatParse {
         let mut bad = false;
         for tok in line.split(',') {
             let t = tok.trim();
-            if t.is_empty() { continue; }
+            if t.is_empty() {
+                continue;
+            }
             match t.parse::<f64>() {
                 Ok(n) if n.is_finite() => nums.push(n),
-                _ => { bad = true; break; }
+                _ => {
+                    bad = true;
+                    break;
+                }
             }
         }
         if bad || nums.len() < 5 {
             out.warnings.push(format!(
-                "line {lineno}: expected `angle,x,y,dx,dy[,dashes…]`, got `{line}`"));
+                "line {lineno}: expected `angle,x,y,dx,dy[,dashes…]`, got `{line}`"
+            ));
             continue;
         }
         let fam = PatLine {
@@ -115,7 +128,8 @@ pub fn parse_pat(text: &str) -> PatParse {
         match out.patterns.last_mut() {
             Some(p) => p.lines.push(fam),
             None => out.warnings.push(format!(
-                "line {lineno}: line family before any `*pattern` header")),
+                "line {lineno}: line family before any `*pattern` header"
+            )),
         }
     }
     out
@@ -153,7 +167,7 @@ mod tests {
         assert!(!dash.is_solid_lines());
 
         let brick = &r.patterns[2];
-        assert_eq!(brick.lines.len(), 2);                 // two families
+        assert_eq!(brick.lines.len(), 2); // two families
         assert_eq!(brick.lines[1].base, (0.0, 0.0));
         assert_eq!(brick.lines[1].offset, (0.25, 0.5));
     }
@@ -169,9 +183,9 @@ mod tests {
 ";
         let r = parse_pat(src);
         assert_eq!(r.patterns.len(), 3);
-        assert_eq!(r.usable_count(), 1);                  // only GOOD has a family
-        assert!(!r.patterns[1].is_usable());              // BADFAM family was skipped
-        assert!(!r.patterns[2].is_usable());              // EMPTY has none
+        assert_eq!(r.usable_count(), 1); // only GOOD has a family
+        assert!(!r.patterns[1].is_usable()); // BADFAM family was skipped
+        assert!(!r.patterns[2].is_usable()); // EMPTY has none
         assert_eq!(r.warnings.len(), 1);
     }
 }

@@ -58,6 +58,15 @@ pub enum Command {
     /// selection basket. Distinct from `SelectPrevious` (which re-adds
     /// the whole last-finalised selection).
     SelectLast,
+    /// Arm fence-selection: the next two clicks define a line segment; any
+    /// dobject the line crosses joins the basket. Selection mode only.
+    SelectFence,
+    /// WPOLYGON — polygonal window selection: click vertices, Enter
+    /// finishes; only dobjects FULLY inside the polygon are added.
+    SelectWindowPolygon,
+    /// CPOLYGON — polygonal crossing: same click flow; any dobject
+    /// touching the polygon boundary (or inside) is added.
+    SelectCrossingPolygon,
     /// Translate the current selection by the vector (end - base). The app
     /// captures the two clicks interactively.
     Move,
@@ -74,7 +83,11 @@ pub enum Command {
     /// default to 1.0 and 0.0 when not supplied. The app collects
     /// every closed polyline in the selection as boundary loops of
     /// ONE Hatch dobject (even-odd islands).
-    Hatch { pattern: Option<String>, scale: f64, angle_deg: f64 },
+    Hatch {
+        pattern: Option<String>,
+        scale: f64,
+        angle_deg: f64,
+    },
     /// Delete every dobject in the current selection.
     DeleteSelected,
     /// Undo the most recent editing operation.
@@ -88,6 +101,9 @@ pub enum Command {
     Reverse,
     /// Bulk-set every selected dobject's `style.layer` to the active layer.
     ChangeLayer,
+    /// Open the Layer Properties Manager panel (AutoCAD `LAYER` / `LA`).
+    /// Pure UI toggle — the app sets `layer_panel_open`.
+    Layers,
     /// Offset every selected dobject by a distance. App captures a side click.
     /// `None` means "use the persistent default" (`env.OfsDis`); the app
     /// resolves it. Matches the fillet pattern (radius optional).
@@ -132,6 +148,134 @@ pub enum Command {
     /// click target (circle/arc → radius; key 'D' → diameter; point
     /// → linear, ortho inferred from the dimline drag direction).
     Dim,
+    /// DIMCONTINUE — chain a linear dim from the last linear dim's
+    /// second extension origin, at the same dim-line offset.
+    DimContinue,
+    /// DIMBASELINE — chain a linear dim from the last linear dim's
+    /// FIRST extension origin (the baseline), same dim-line offset.
+    DimBaseline,
+    /// DIMANGULAR — 4-click angular dim: vertex → point on ray 1 →
+    /// point on ray 2 → arc position.
+    DimAngular,
+    /// CENTERMARK — click a circle/arc to place a center mark at its
+    /// centre (sized to the entity), or click empty space for a default
+    /// size at that point. Typed form: `centermark x,y [size]`.
+    CenterMark(Option<f64>),
+    /// XLINE — infinite construction line: click base, then a direction
+    /// point (or H/V/A/Off). The line passes through the base along the
+    /// direction and is clipped to the viewport when drawn.
+    Xline,
+    /// RAY — semi-infinite construction line: click base, then a
+    /// direction point (or H/V/A). The ray extends forward from the base
+    /// only, clipped to the viewport when drawn.
+    Ray,
+    /// DONUT — filled ring: click center, then outer radius, then inner
+    /// radius; place-multiple until Esc/Enter. Typed radii are not in v1
+    /// (the click flow sizes both).
+    Donut,
+    /// WIPEOUT — opaque paper-colored mask: two corner clicks define the
+    /// rectangle. Drawn on top of geometry, hiding what is behind it.
+    Wipeout,
+    /// SKETCH — press-drag freehand sampling; the stroke commits as an
+    /// open Polyline on release. Enter/Esc exits the command.
+    Sketch,
+    /// BLEND — click two open curves; a tangent-continuous cubic spline
+    /// connects their nearest endpoints (like AutoCAD BLEND's "Continuity
+    /// = Tangent").
+    Blend,
+    /// MLINE — click start then end; two parallel open polylines ±0.5
+    /// around the segment (v1: fixed half-width, no style).
+    Mline,
+    /// REGION — convert every closed curve in the selection (circle,
+    /// ellipse, closed polyline, closed spline) into a filled Region.
+    /// Select-first flow with QueuedOp::Region.
+    Region,
+    /// DIMARC — arc-length dimension: click an arc, then the leader end.
+    DimArcLen,
+    /// DIMORDINATE — X/Y ordinate dimension: datum → point → leader end.
+    DimOrdinate,
+    /// DIMJOGGED — jogged radius dimension: arc/circle → leader end → jog.
+    DimJogged,
+    /// QDIM — quick dimensioning: batch linear dims over the selection.
+    QDim,
+    /// MINSERT — array-insert a block in a rows×columns grid.
+    MInsert,
+    /// LAYISO — freeze every layer except the picked dobject's layer.
+    LayIso,
+    /// LAYFRZ — freeze the picked dobject's layer.
+    LayFrz,
+    /// LAYOFF — turn off the picked dobject's layer.
+    LayOff,
+    /// LAYON — turn every layer back on (visible + thawed).
+    LayOn,
+    /// LAYWALK — floating layer preview dialog (isolate-by-row).
+    LayWalk,
+    /// PUBLISH — batch-plot every layout + the model to PDF.
+    Publish,
+    /// ETRANSMIT — bundle the drawing + its xrefs into a transfer folder.
+    ETransmit,
+    /// MEASUREGEOM — combined inquiry hub (distance/radius/angle/area).
+    MeasureGeom,
+    /// QUICKCALC — in-app calculator panel.
+    QuickCalc,
+    /// FIND — find text strings in text dobjects (selects the matches).
+    Find(Vec<String>),
+    /// REPLACE — find + replace text in text dobjects.
+    Replace(Vec<String>),
+    /// ID — click any point to report its coordinates (world + current
+    /// UCS). Pure inquiry; no document change.
+    Id,
+    /// OOPS — restore the last-erased dobjects (independent of undo).
+    Oops,
+    /// RENAME — rename a named table entry: `rename <type> <old> <new>`
+    /// where type ∈ layer|block|linetype|textstyle|dimstyle|wallstyle.
+    Rename(Vec<String>),
+    /// SETBYLAYER — force color/linetype/lineweight back to ByLayer for
+    /// the selected dobjects.
+    SetByLayer,
+    /// REVCLOUD — click two corners of a rectangle; the command emits a
+    /// closed scalloped-arc polyline (revision cloud) around it. Arc length
+    /// adjustable via `a<len>` while waiting for the first corner.
+    RevCloud,
+    /// AREA — click a closed object to report its area + perimeter, or pick
+    /// points to measure a polygon. `a`/`s` add/subtract regions to a total.
+    Area,
+    /// OVERKILL — remove duplicate/overlapping dobjects (selected set, or
+    /// the whole drawing when nothing is selected). Keeps the first
+    /// occurrence of each coincident group.
+    Overkill,
+    /// PURGE — remove unreferenced layers, linetypes, text/dim/wall styles
+    /// and block definitions (AutoCAD PURGE).
+    Purge,
+    /// QSELECT — open the filter-based selection dialog (type/layer/color/
+    /// linetype, include/exclude). Builds a selection set from the matches.
+    QSelect,
+    /// UCS — user coordinate systems: `ucs` (list), `ucs world`, `ucs NAME`
+    /// (set), `ucs save NAME`, `ucs origin X,Y [rot]`, `ucs delete NAME`,
+    /// `ucs rename OLD NEW`.
+    Ucs(Vec<String>),
+    /// PAGESETUP — open the page-setup dialog (paper size, orientation,
+    /// margins, plot scale) saved into the document for model-space plots.
+    PageSetup,
+    /// TABLE — open the table dialog (rows/cols/sizes + cell text), then
+    /// click to place the grid.
+    Table,
+    /// XREF — external references: `xref attach <path>` (loads the file,
+    /// then click to place), `xref list`, `xref detach <name>`,
+    /// `xref reload <name>`.
+    Xref(Vec<String>),
+    /// LAYERSTATE — save/restore/delete/rename named layer-state snapshots:
+    /// `layerstate save NAME`, `layerstate NAME` (restore), `layerstate
+    /// delete NAME`, `layerstate rename OLD NEW`, `layerstate ?` (list).
+    LayerState(Vec<String>),
+    /// WBLOCK — write the selected dobjects to their OWN .rsm/.dxf file
+    /// (a reusable fixture/part library). Empty selection → whole drawing
+    /// (AutoCAD WBLOCK writes the full document when nothing is selected).
+    WBlock,
+    /// BOUNDARY / BPOLY — click a point inside a closed region; the app
+    /// traces its boundary (the same algorithm as hatch pick-point) and
+    /// emits it as a closed Polyline dobject (outer loop + islands).
+    Boundary,
     /// Open the Dim Style dialog. Bare `dimstyle` opens it for a NEW
     /// style; `dimstyle <name>` opens it on the existing style
     /// (case-insensitive). Mirrors AutoCAD DDIM / DIMSTYLE.
@@ -139,6 +283,9 @@ pub enum Command {
     /// Open the Wall Style Manager (Dry Wall / Structural / …). With a name,
     /// pre-select / edit that wall style.
     WallStyle(Option<String>),
+    /// Issue #16 — join wall centerlines whose ends were drawn near each
+    /// other so their faces miter at render.
+    WallCleanup,
     /// Create a block definition from the current selection: `block <name>`.
     /// App flow: select (universal model) → click base point → definition
     /// stored + selection replaced by one BlockRef instance.
@@ -164,11 +311,52 @@ pub enum Command {
     /// `card on` / `card off` set explicitly. Also on F8 and the
     /// status-strip badge.
     Card(Option<bool>),
+    /// UNITS — declare what one drawing unit is worth in the real world, which is what lets
+    /// the 3D side scale a plan correctly instead of reading millimetres as metres.
+    /// `units` alone reports the current setting; `units mm` (etc.) sets it.
+    /// `None` = report only.
+    ///
+    /// The `bool` is the RESCALE opt-in (`units mm rescale`): also scale the 3D model that is
+    /// ALREADY built, for a project made before its unit was known. Off by default —
+    /// declaring a unit must never move geometry on its own.
+    Units(Option<f64>, bool),
+    /// REPAIRCUTS — re-measure openings that were cut by the broken thickness probe and never
+    /// reached the far face. Undoable.
+    RepairCuts,
+    /// STRAYLIGHTS -- report fittings that stand nowhere near the building, and remove them on
+    /// `straylights purge`. Undoable.
+    StrayLights(bool),
+    /// SCENE — capture the whole 3D scene (world coordinates, cut depths, materials, furniture,
+    /// render passes, camera) into the session recorder and the history panel. Read-only.
+    ///
+    /// The command to run when something RENDERS wrong. Frame times and a 2D geometry list — all
+    /// a dump used to carry — describe none of it.
+    Scene,
+    /// DEDUPE — delete solids that are an exact copy of another (same shape, same plane, same
+    /// placement). Two solids in one place have no depth bias to separate them, so they flicker
+    /// as the camera moves. Undoable.
+    Dedupe,
+    /// DIAG — report what the 3D model is actually made of: overlapping / duplicated solids
+    /// and coplanar faces, which are what make surfaces flicker and interleave as the camera
+    /// moves. Read-only; changes nothing.
+    Diag,
     /// Lengthen every selected Line / Arc / EllipseArc by a signed delta.
     /// App captures a click on the end to extend.
     Lengthen(f64),
     /// Split a single selected dobject at the next click point.
     Break,
+    /// DIVIDE — place points that split a picked curve into N equal-length
+    /// segments. App drives the object pick + segment-count entry.
+    Divide,
+    /// MEASURE — place points at a fixed length along a picked curve. App
+    /// drives the object pick + length entry.
+    Measure,
+    /// PLOTSTYLE — open the Plot Style Table Editor (the CTB color→pen editor).
+    /// App-driven dialog; no geometry.
+    PlotStyle,
+    /// PLOT / PRINT — open the Plot dialog (paper/area/scale + table → PDF).
+    /// App-driven dialog; no geometry.
+    Plot,
     /// Align: 4 clicks (2 source + 2 target). Translate + rotate.
     Align,
     /// Stretch: crossing window + 2 clicks (base + dest). Vertices inside
@@ -202,6 +390,20 @@ pub enum Command {
     /// NO coordinate arguments. The app sets self.tool to the matching
     /// variant and the user proceeds with clicks.
     SetTool(ToolKind),
+    /// Python scripting (WP-SCRIPT). `py`/`python` with an inline expression
+    /// runs it on the script worker; bare `py` toggles the Python console
+    /// panel. Grammar only — all execution lives in `cad_script` + `cad_app`.
+    Python(Option<String>),
+    /// `pyfile <path>` — run a `.py` file on the script worker.
+    PythonFile(String),
+    /// Run a named script from the scripts folder: `run <name> [args…]`.
+    /// Bare `run` (no name) opens the script picker. Args pass through to
+    /// the script as `rasm.args` / `sys.argv` (grammar only — execution
+    /// lives in `cad_script` + `cad_app`/`cad_cli`).
+    Script(Option<String>, Vec<String>),
+    /// Show the full Python scripting API reference (the AI-agent document).
+    /// Display lives in `cad_app` (a floating window) / `cad_cli` (stdout).
+    PyApiDoc,
 }
 
 impl Command {
@@ -211,64 +413,127 @@ impl Command {
     /// `o` → "Offset", etc.).
     pub fn canonical_name(&self) -> &'static str {
         match self {
-            Command::Add(_)             => "Add",
-            Command::Delete(_)          => "Delete",
-            Command::Clear              => "Clear",
-            Command::Help               => "Help",
-            Command::GripsToggle        => "GripsToggle",
-            Command::SnapOverride(_)    => "SnapOverride",
-            Command::List               => "List",
-            Command::Select             => "Select",
-            Command::SelectAll          => "SelectAll",
-            Command::SelectPrevious     => "SelectPrevious",
-            Command::SelectNone         => "SelectNone",
-            Command::SelectRemoveMode   => "SelectRemoveMode",
-            Command::SelectAddMode      => "SelectAddMode",
-            Command::SelectWindow       => "SelectWindow",
-            Command::SelectCrossing     => "SelectCrossing",
-            Command::SelectLast         => "SelectLast",
-            Command::Move               => "Move",
-            Command::Copy               => "Copy",
-            Command::Rotate             => "Rotate",
-            Command::Scale              => "Scale",
-            Command::Mirror             => "Mirror",
-            Command::Hatch { .. }       => "Hatch",
-            Command::DeleteSelected     => "DeleteSelected",
-            Command::Undo               => "Undo",
-            Command::Redo               => "Redo",
-            Command::MatchProps         => "MatchProps",
-            Command::Reverse            => "Reverse",
-            Command::ChangeLayer        => "ChangeLayer",
-            Command::Offset(_)          => "Offset",
-            Command::Wall(_)            => "Wall",
-            Command::Text(_)            => "Text",
-            Command::TextStyle(_)       => "TextStyle",
-            Command::Dim                => "Dim",
-            Command::DimStyle(_)        => "DimStyle",
-            Command::WallStyle(_)       => "WallStyle",
-            Command::BlockDef(_)        => "BlockDef",
-            Command::Insert(_)          => "Insert",
-            Command::Explode            => "Explode",
-            Command::BlockDiff(_)       => "BlockDiff",
-            Command::BlockTaskRecorder  => "BlockTaskRecorder",
-            Command::BlockTaskFinish    => "BlockTaskFinish",
-            Command::Card(_)            => "Card",
-            Command::DbgRecorder        => "DbgRecorder",
-            Command::Linetype(_)        => "Linetype",
-            Command::ChProp(_)          => "ChProp",
-            Command::Lengthen(_)        => "Lengthen",
-            Command::Break              => "Break",
-            Command::Align              => "Align",
-            Command::Stretch            => "Stretch",
-            Command::Trim               => "Trim",
-            Command::Extend             => "Extend",
-            Command::Fillet(_)          => "Fillet",
-            Command::Chamfer(_)         => "Chamfer",
-            Command::Join               => "Join",
-            Command::Dist               => "Dist",
-            Command::Open(_)            => "Open",
-            Command::SaveAs(_)          => "SaveAs",
-            Command::SetTool(_)         => "SetTool",
+            Command::Add(_) => "Add",
+            Command::Delete(_) => "Delete",
+            Command::Clear => "Clear",
+            Command::Help => "Help",
+            Command::GripsToggle => "GripsToggle",
+            Command::SnapOverride(_) => "SnapOverride",
+            Command::List => "List",
+            Command::Select => "Select",
+            Command::SelectAll => "SelectAll",
+            Command::SelectPrevious => "SelectPrevious",
+            Command::SelectNone => "SelectNone",
+            Command::SelectRemoveMode => "SelectRemoveMode",
+            Command::SelectAddMode => "SelectAddMode",
+            Command::SelectWindow => "SelectWindow",
+            Command::SelectCrossing => "SelectCrossing",
+            Command::SelectLast => "SelectLast",
+            Command::SelectFence => "SelectFence",
+            Command::SelectWindowPolygon => "SelectWindowPolygon",
+            Command::SelectCrossingPolygon => "SelectCrossingPolygon",
+            Command::Move => "Move",
+            Command::Copy => "Copy",
+            Command::Rotate => "Rotate",
+            Command::Scale => "Scale",
+            Command::Mirror => "Mirror",
+            Command::Hatch { .. } => "Hatch",
+            Command::DeleteSelected => "DeleteSelected",
+            Command::Undo => "Undo",
+            Command::Redo => "Redo",
+            Command::MatchProps => "MatchProps",
+            Command::Reverse => "Reverse",
+            Command::ChangeLayer => "ChangeLayer",
+            Command::Layers => "Layers",
+            Command::Offset(_) => "Offset",
+            Command::Wall(_) => "Wall",
+            Command::Text(_) => "Text",
+            Command::TextStyle(_) => "TextStyle",
+            Command::Dim => "Dim",
+            Command::DimContinue => "DimContinue",
+            Command::DimBaseline => "DimBaseline",
+            Command::DimAngular => "DimAngular",
+            Command::CenterMark(_) => "CenterMark",
+            Command::Xline => "Xline",
+            Command::Ray => "Ray",
+            Command::Donut => "Donut",
+            Command::Wipeout => "Wipeout",
+            Command::Sketch => "Sketch",
+            Command::Blend => "Blend",
+            Command::Mline => "Mline",
+            Command::Region => "Region",
+            Command::DimArcLen => "DimArcLen",
+            Command::DimOrdinate => "DimOrdinate",
+            Command::DimJogged => "DimJogged",
+            Command::QDim => "QDim",
+            Command::MInsert => "MInsert",
+            Command::LayIso => "LayIso",
+            Command::LayFrz => "LayFrz",
+            Command::LayOff => "LayOff",
+            Command::LayOn => "LayOn",
+            Command::LayWalk => "LayWalk",
+            Command::Publish => "Publish",
+            Command::ETransmit => "ETransmit",
+            Command::MeasureGeom => "MeasureGeom",
+            Command::QuickCalc => "QuickCalc",
+            Command::Find(_) => "Find",
+            Command::Replace(_) => "Replace",
+            Command::Id => "Id",
+            Command::Oops => "Oops",
+            Command::Rename(_) => "Rename",
+            Command::SetByLayer => "SetByLayer",
+            Command::RevCloud => "RevCloud",
+            Command::Area => "Area",
+            Command::Overkill => "Overkill",
+            Command::Purge => "Purge",
+            Command::LayerState(_) => "LayerState",
+            Command::QSelect => "QSelect",
+            Command::Ucs(_) => "Ucs",
+            Command::PageSetup => "PageSetup",
+            Command::Table => "Table",
+            Command::Xref(_) => "Xref",
+            Command::WBlock => "WBlock",
+            Command::Boundary => "Boundary",
+            Command::DimStyle(_) => "DimStyle",
+            Command::WallStyle(_) => "WallStyle",
+            Command::WallCleanup => "WallCleanup",
+            Command::BlockDef(_) => "BlockDef",
+            Command::Insert(_) => "Insert",
+            Command::Explode => "Explode",
+            Command::BlockDiff(_) => "BlockDiff",
+            Command::BlockTaskRecorder => "BlockTaskRecorder",
+            Command::BlockTaskFinish => "BlockTaskFinish",
+            Command::Card(_) => "Card",
+            Command::Units(..) => "Units",
+            Command::Diag => "Diag",
+            Command::Dedupe => "Dedupe",
+            Command::RepairCuts => "RepairCuts",
+            Command::StrayLights(_) => "StrayLights",
+            Command::Scene => "Scene",
+            Command::DbgRecorder => "DbgRecorder",
+            Command::Linetype(_) => "Linetype",
+            Command::ChProp(_) => "ChProp",
+            Command::Lengthen(_) => "Lengthen",
+            Command::Break => "Break",
+            Command::Divide => "Divide",
+            Command::Measure => "Measure",
+            Command::PlotStyle => "PlotStyle",
+            Command::Plot => "Plot",
+            Command::Align => "Align",
+            Command::Stretch => "Stretch",
+            Command::Trim => "Trim",
+            Command::Extend => "Extend",
+            Command::Fillet(_) => "Fillet",
+            Command::Chamfer(_) => "Chamfer",
+            Command::Join => "Join",
+            Command::Dist => "Dist",
+            Command::Open(_) => "Open",
+            Command::SaveAs(_) => "SaveAs",
+            Command::SetTool(_) => "SetTool",
+            Command::Python(_) => "Python",
+            Command::PythonFile(_) => "PythonFile",
+            Command::Script(..) => "Script",
+            Command::PyApiDoc => "PyApiDoc",
         }
     }
 }
@@ -285,6 +550,10 @@ pub enum ToolKind {
     Point,
     Polyline,
     Spline,
+    /// Quadratic Bézier (AutoCAD-style QB): the spline tool driven at
+    /// degree 2 — three control clicks (P0, P1, P2), then Enter commits
+    /// a quadratic B-spline. Shares the Spline tool's click flow.
+    QuadBezier,
     Wall,
     Text,
     /// Axis-aligned rectangle. The app captures two opposite corners by
@@ -292,6 +561,20 @@ pub enum ToolKind {
     /// (signed; negatives extend left/down). Committed as a CLOSED 4-vertex
     /// Polyline (one LWPOLYLINE, matching AutoCAD RECTANG).
     Rectangle,
+    /// Regular N-gon (AutoCAD POLYGON). The app prompts for the side count, then
+    /// a centre + Inscribed/Circumscribed radius, or an Edge (two points).
+    /// Committed as a CLOSED N-vertex Polyline (one LWPOLYLINE).
+    Polygon,
+    /// Multi-leader callout (AutoCAD MLEADER). The app captures an arrow
+    /// point, then a landing/text position; the label is typed after.
+    /// Committed as `Geom::Leader`.
+    Leader,
+    /// Attribute DEFINITION (AutoCAD ATTDEF). Click to place a tagged
+    /// text slot; the app prompts for tag/prompt/default.
+    AttrDef,
+    /// Attribute EDIT (AutoCAD ATTEDIT). Pick a block insert to edit its
+    /// attribute values in a dialog.
+    AttEdit,
 }
 
 pub fn parse(line: &str) -> Result<Command, String> {
@@ -309,7 +592,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
     }
 
     match head.as_str() {
-        "line"   | "l"  => parse_line(&toks[1..]),
+        "line" | "l" => parse_line(&toks[1..]),
         "circle" | "ci" => parse_circle(&toks[1..]),
         "ellipse" | "el" => parse_ellipse(&toks[1..]),
         // Elliptical arc has no typed-coordinate form — it's a 5-click
@@ -317,68 +600,88 @@ pub fn parse(line: &str) -> Result<Command, String> {
         // command rail ("ellipsearc") and by repeat-last (`tool_command_word`
         // returns "ellipsearc" for Tool::EllipseArc). Without this arm those
         // all failed with "unknown command 'ellipsearc'".
-        "ellipsearc" | "ellipticalarc" | "ellarc" | "ea"
-            => Ok(Command::SetTool(ToolKind::EllipseArc)),
-        "point"   | "po" => parse_point(&toks[1..]),
+        "ellipsearc" | "ellipticalarc" | "ellarc" | "ea" => {
+            Ok(Command::SetTool(ToolKind::EllipseArc))
+        }
+        "point" | "po" => parse_point(&toks[1..]),
         "polyline" | "pl" | "pline" => parse_polyline(&toks[1..]),
-        "spline"   | "spl"          => Ok(Command::SetTool(ToolKind::Spline)),
+        "spline" | "spl" => Ok(Command::SetTool(ToolKind::Spline)),
+        "qb" | "quadbezier" | "quadratic" => Ok(Command::SetTool(ToolKind::QuadBezier)),
         "rectangle" | "rectang" | "rec" => Ok(Command::SetTool(ToolKind::Rectangle)),
-        "arc"    | "a"  => parse_arc(&toks[1..]),
-        "arc3p"         => parse_arc_3p(&toks[1..]),
-        "arcse"         => parse_arc_se(&toks[1..]),
-        "arccr"         => parse_arc_cr(&toks[1..]),
-        "arccl"         => parse_arc_cl(&toks[1..]),
-        "del"    | "d"  => {
-            let n: usize = toks.get(1)
+        "polygon" | "pol" => Ok(Command::SetTool(ToolKind::Polygon)),
+        "mleader" | "leader" | "mld" => Ok(Command::SetTool(ToolKind::Leader)),
+        "attdef" | "atd" => Ok(Command::SetTool(ToolKind::AttrDef)),
+        "attedit" | "ate" => Ok(Command::SetTool(ToolKind::AttEdit)),
+        "arc" | "a" => parse_arc(&toks[1..]),
+        "arc3p" => parse_arc_3p(&toks[1..]),
+        "arcse" => parse_arc_se(&toks[1..]),
+        "arccr" => parse_arc_cr(&toks[1..]),
+        "arccl" => parse_arc_cl(&toks[1..]),
+        "del" | "d" => {
+            let n: usize = toks
+                .get(1)
                 .ok_or("del N")?
                 .parse()
                 .map_err(|_| "bad index".to_string())?;
             Ok(Command::Delete(n))
         }
-        "clear"          => Ok(Command::Clear),
-        "help"  | "?"    => Ok(Command::Help),
+        "clear" => Ok(Command::Clear),
+        "help" | "?" => Ok(Command::Help),
         "grips" | "grip" => Ok(Command::GripsToggle),
-        "list"  | "ls"   => Ok(Command::List),
+        "list" | "ls" => Ok(Command::List),
         "select" | "sel" => Ok(Command::Select),
         // Selection sub-commands — only meaningful while a select session is
         // active. Outside of one the app responds with a hint.
-        "all"             => Ok(Command::SelectAll),
+        "all" => Ok(Command::SelectAll),
         "prev" | "previous" | "before" => Ok(Command::SelectPrevious),
         "none" | "deselect" => Ok(Command::SelectNone),
-        "rem"  | "remove"  => Ok(Command::SelectRemoveMode),
+        "rem" | "remove" => Ok(Command::SelectRemoveMode),
         "addmode" | "amode" => Ok(Command::SelectAddMode),
         "window" | "win" => Ok(Command::SelectWindow),
-        "crossing"       => Ok(Command::SelectCrossing),
-        "last"           => Ok(Command::SelectLast),
-        "move" | "m"      => Ok(Command::Move),
+        "crossing" | "cross" => Ok(Command::SelectCrossing),
+        // Fence: select-session sub-command only (gated in the app). NOTE: no
+        // `f` alias — `f` is Fillet (a main command); the "Fence" chip sends the
+        // full word `fence`, so the two never collide.
+        "fence" => Ok(Command::SelectFence),
+        "wp" | "wpolygon" => Ok(Command::SelectWindowPolygon),
+        "cpol" | "cpolygon" => Ok(Command::SelectCrossingPolygon),
+        "last" => Ok(Command::SelectLast),
+        "move" | "m" => Ok(Command::Move),
         "copy" | "c" | "cp" | "co" => Ok(Command::Copy),
-        "rotate" | "ro"   => Ok(Command::Rotate),
-        "scale" | "sc"    => Ok(Command::Scale),
-        "mirror" | "mi"   => Ok(Command::Mirror),
+        "rotate" | "ro" => Ok(Command::Rotate),
+        "scale" | "sc" => Ok(Command::Scale),
+        "mirror" | "mi" => Ok(Command::Mirror),
         "hatch" | "h" | "bhatch" => {
             // Optional args:  hatch [NAME] [scale] [angle_deg]
             // Bare `hatch` = solid; bare `hatch ANSI31` = pattern with
             // defaults; `hatch ANSI31 2.0 30` = scale 2x at +30°.
             let pattern = toks.get(1).map(|s| s.to_string());
-            let scale     = toks.get(2).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+            let scale = toks.get(2).and_then(|s| s.parse().ok()).unwrap_or(1.0);
             let angle_deg = toks.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            Ok(Command::Hatch { pattern, scale, angle_deg })
+            Ok(Command::Hatch {
+                pattern,
+                scale,
+                angle_deg,
+            })
         }
         "delete" | "erase" | "e" => Ok(Command::DeleteSelected),
-        "undo" | "u"      => Ok(Command::Undo),
-        "redo" | "y"      => Ok(Command::Redo),
+        "undo" | "u" => Ok(Command::Undo),
+        "redo" | "y" => Ok(Command::Redo),
         "matchprop" | "mp" => Ok(Command::MatchProps),
         "reverse" | "rev" => Ok(Command::Reverse),
-        "chlayer" | "cl"  => Ok(Command::ChangeLayer),
-        "offset" | "o"    => {
+        "chlayer" | "cl" => Ok(Command::ChangeLayer),
+        "layer" | "la" | "layers" => Ok(Command::Layers),
+        "offset" | "o" => {
             // Bare `offset` → use env.OfsDis (the app resolves None).
             // `offset <d>` → use that distance and overwrite OfsDis on
             // successful apply.
             match toks.get(1) {
-                None    => Ok(Command::Offset(None)),
+                None => Ok(Command::Offset(None)),
                 Some(s) => {
                     let d: f64 = s.parse().map_err(|_| "bad distance".to_string())?;
-                    if d.abs() < 1e-12 { return Err("offset distance must be non-zero".into()); }
+                    if d.abs() < 1e-12 {
+                        return Err("offset distance must be non-zero".into());
+                    }
                     Ok(Command::Offset(Some(d)))
                 }
             }
@@ -390,17 +693,26 @@ pub fn parse(line: &str) -> Result<Command, String> {
             // `chprop linetype Dashed`→ set linetype
             match (toks.get(1), toks.get(2)) {
                 (None, _) => Ok(Command::ChProp(None)),
-                (Some(_), None) => Err("chprop: usage — chprop <layer|color|linetype> <value>".into()),
+                (Some(_), None) => {
+                    Err("chprop: usage — chprop <layer|color|linetype> <value>".into())
+                }
                 (Some(what), Some(val)) => {
                     let what_lc = what.to_ascii_lowercase();
                     let what_norm = match what_lc.as_str() {
-                        "layer" | "la" | "l"      => "layer",
-                        "color" | "col" | "c"     => "color",
+                        "layer" | "la" | "l" => "layer",
+                        "color" | "col" | "c" => "color",
                         "linetype" | "ltype" | "lt" => "linetype",
-                        other => return Err(format!(
-                            "chprop: unknown property '{}' (try layer / color / linetype)", other)),
+                        other => {
+                            return Err(format!(
+                                "chprop: unknown property '{}' (try layer / color / linetype)",
+                                other
+                            ))
+                        }
                     };
-                    Ok(Command::ChProp(Some((what_norm.to_string(), (*val).to_string()))))
+                    Ok(Command::ChProp(Some((
+                        what_norm.to_string(),
+                        (*val).to_string(),
+                    ))))
                 }
             }
         }
@@ -409,7 +721,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
             // linetype. Multiple-word names not supported (the catalog
             // uses single tokens like "Continuous", "Dashed", "DashDot").
             match toks.get(1) {
-                None    => Ok(Command::Linetype(None)),
+                None => Ok(Command::Linetype(None)),
                 Some(s) => Ok(Command::Linetype(Some((*s).to_string()))),
             }
         }
@@ -426,26 +738,83 @@ pub fn parse(line: &str) -> Result<Command, String> {
             // 2/3-click flow; sub-kind decided at first click.
             Ok(Command::Dim)
         }
+        "dimcontinue" | "dimcont" | "dimcon" => Ok(Command::DimContinue),
+        "dimbaseline" | "dimbase" => Ok(Command::DimBaseline),
+        "dimangular" | "dimang" | "dan" => Ok(Command::DimAngular),
+        // CENTERMARK — optional size arg. The app click flow sizes to the
+        // picked circle/arc; a typed size overrides that default.
+        "centermark" | "cenm" => {
+            let size = toks.get(1).and_then(|t| t.parse::<f64>().ok());
+            Ok(Command::CenterMark(size))
+        }
+        "xline" | "xl" => Ok(Command::Xline),
+        "ray" => Ok(Command::Ray),
+        "donut" | "doughnut" => Ok(Command::Donut),
+        "wipeout" | "wi" => Ok(Command::Wipeout),
+        "sketch" | "sk" => Ok(Command::Sketch),
+        "blend" => Ok(Command::Blend),
+        "mline" | "ml" => Ok(Command::Mline),
+        "region" | "reg" => Ok(Command::Region),
+        "dimarc" | "dar" => Ok(Command::DimArcLen),
+        "dimordinate" | "dimord" | "dor" => Ok(Command::DimOrdinate),
+        "dimjogged" | "dimjog" | "djo" => Ok(Command::DimJogged),
+        "qdim" | "qd" => Ok(Command::QDim),
+        "minsert" | "mi" => Ok(Command::MInsert),
+        "layiso" | "li" => Ok(Command::LayIso),
+        "layfrz" => Ok(Command::LayFrz),
+        "layoff" => Ok(Command::LayOff),
+        "layon" => Ok(Command::LayOn),
+        "laywalk" => Ok(Command::LayWalk),
+        "publish" | "pub" => Ok(Command::Publish),
+        "etransmit" | "et" => Ok(Command::ETransmit),
+        "measuregeom" | "meas" => Ok(Command::MeasureGeom),
+        "quickcalc" | "qc" => Ok(Command::QuickCalc),
+        "find" | "findtext" => Ok(Command::Find(
+            toks.iter().skip(1).map(|s| (*s).to_string()).collect(),
+        )),
+        "replace" | "findreplace" => Ok(Command::Replace(
+            toks.iter().skip(1).map(|s| (*s).to_string()).collect(),
+        )),
+        "id" | "pip" => Ok(Command::Id),
+        "oops" => Ok(Command::Oops),
+        "setbylayer" | "sbl" => Ok(Command::SetByLayer),
+        "rename" | "ren" => Ok(Command::Rename(
+            toks.iter().skip(1).map(|s| (*s).to_string()).collect(),
+        )),
+        "revcloud" | "revc" => Ok(Command::RevCloud),
+        "area" | "aa" => Ok(Command::Area),
+        "overkill" | "ovk" => Ok(Command::Overkill),
+        "purge" | "pu" => Ok(Command::Purge),
+        "qselect" | "qs" => Ok(Command::QSelect),
+        "pagesetup" | "ps" => Ok(Command::PageSetup),
+        "table" | "tb" => Ok(Command::Table),
+        "xref" | "xr" => Ok(Command::Xref(
+            toks.iter().skip(1).map(|s| (*s).to_string()).collect(),
+        )),
+        "ucs" => Ok(Command::Ucs(
+            toks.iter().skip(1).map(|s| (*s).to_string()).collect(),
+        )),
+        "layerstate" | "layst" => Ok(Command::LayerState(
+            toks.iter().skip(1).map(|s| (*s).to_string()).collect(),
+        )),
+        "wblock" | "wb" => Ok(Command::WBlock),
+        "boundary" | "bpoly" | "bp" => Ok(Command::Boundary),
         "dimstyle" | "ddim" => {
             // `dimstyle`        → open dialog for a NEW dim style
             // `dimstyle <name>` → open dialog editing the named style
             Ok(Command::DimStyle(toks.get(1).map(|s| (*s).to_string())))
         }
-        "wallstyle" | "wstyle" => {
-            Ok(Command::WallStyle(toks.get(1).map(|s| (*s).to_string())))
-        }
-        "block" | "b" => {
-            Ok(Command::BlockDef(toks.get(1).map(|s| (*s).to_string())))
-        }
-        "insert" | "i" => {
-            Ok(Command::Insert(toks.get(1).map(|s| (*s).to_string())))
-        }
+        "wallstyle" | "wstyle" => Ok(Command::WallStyle(toks.get(1).map(|s| (*s).to_string()))),
+        "block" | "b" => Ok(Command::BlockDef(toks.get(1).map(|s| (*s).to_string()))),
+        "insert" | "i" => Ok(Command::Insert(toks.get(1).map(|s| (*s).to_string()))),
         "explode" | "xp" => Ok(Command::Explode),
         "blockdiff" | "bdiff" => {
             match (toks.get(1), toks.get(2)) {
-                (Some(a), Some(b)) =>
-                    Ok(Command::BlockDiff(Some(((*a).to_string(), (*b).to_string())))),
-                (None, None) => Ok(Command::BlockDiff(None)),   // pick on screen
+                (Some(a), Some(b)) => Ok(Command::BlockDiff(Some((
+                    (*a).to_string(),
+                    (*b).to_string(),
+                )))),
+                (None, None) => Ok(Command::BlockDiff(None)), // pick on screen
                 _ => Err("usage: blockdiff   (pick on screen)   OR   blockdiff <A> <B>".into()),
             }
         }
@@ -454,11 +823,52 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "card" => {
             // `card` → toggle; `card on` / `card off` → set.
             match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
-                None         => Ok(Command::Card(None)),
-                Some("on")  | Some("1") => Ok(Command::Card(Some(true))),
+                None => Ok(Command::Card(None)),
+                Some("on") | Some("1") => Ok(Command::Card(Some(true))),
                 Some("off") | Some("0") => Ok(Command::Card(Some(false))),
-                Some(other) => Err(format!(
-                    "card: expected `on` or `off`, got '{}'", other)),
+                Some(other) => Err(format!("card: expected `on` or `off`, got '{}'", other)),
+            }
+        }
+        "diag" | "diagnose" => Ok(Command::Diag),
+        "dedupe" | "dedup" => Ok(Command::Dedupe),
+        "repaircuts" | "repaircut" | "fixcuts" => Ok(Command::RepairCuts),
+        // ONE WORD FOR EACH, because the command line cannot take a space: reported as "straylights
+        // pruge command cant be typed because space cant be entered". A command whose only
+        // destructive form needs an argument the prompt will not accept is a command that does not
+        // exist. `straylights purge` still parses where a space CAN be typed -- a script, a macro,
+        // a future prompt -- so nothing that worked stops working.
+        "straylights" | "strays" | "orphanlights" => {
+            let purge = toks.iter().skip(1).any(|t| t.eq_ignore_ascii_case("purge"));
+            Ok(Command::StrayLights(purge))
+        }
+        "straypurge" | "purgestrays" | "purgelights" => Ok(Command::StrayLights(true)),
+        "scene" | "scenedump" | "3dstate" => Ok(Command::Scene),
+        "units" | "unit" | "insunits" => {
+            // `units` → report. `units mm|cm|m|in|ft` → set. A bare number is accepted as
+            // metres-per-unit for anything non-standard (`units 0.001` == `units mm`).
+            // A trailing `rescale` also resizes the 3D model already built.
+            let rescale = toks.iter().skip(2).any(|t| {
+                let t = t.to_ascii_lowercase();
+                t == "rescale" || t == "r"
+            });
+            let unit = |v: f64| Ok(Command::Units(Some(v), rescale));
+            match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+                None => Ok(Command::Units(None, false)),
+                Some("mm") | Some("millimetre") | Some("millimeter") | Some("millimetres")
+                | Some("millimeters") => unit(0.001),
+                Some("cm") | Some("centimetre") | Some("centimeter") => unit(0.01),
+                Some("m") | Some("metre") | Some("meter") | Some("metres") | Some("meters") => {
+                    unit(1.0)
+                }
+                Some("in") | Some("inch") | Some("inches") => unit(0.0254),
+                Some("ft") | Some("foot") | Some("feet") => unit(0.3048),
+                Some(other) => match other.parse::<f64>() {
+                    Ok(v) if v > 0.0 => unit(v),
+                    _ => Err(format!(
+                        "units: expected mm / cm / m / in / ft, or a positive metres-per-unit \
+                         number, got '{other}'"
+                    )),
+                },
             }
         }
         "text" | "tx" => {
@@ -472,46 +882,80 @@ pub fn parse(line: &str) -> Result<Command, String> {
                 None => Ok(Command::Text(None)),
                 Some(_) => {
                     let joined = toks[1..].join(" ");
-                    let cleaned = if joined.starts_with('"') && joined.ends_with('"')
-                        && joined.len() >= 2
-                    {
-                        joined[1..joined.len()-1].to_string()
-                    } else { joined };
+                    let cleaned =
+                        if joined.starts_with('"') && joined.ends_with('"') && joined.len() >= 2 {
+                            joined[1..joined.len() - 1].to_string()
+                        } else {
+                            joined
+                        };
                     Ok(Command::Text(Some(cleaned)))
                 }
             }
         }
-        "wall" | "w"      => {
+        "wall" | "w" => {
             // Bare `wall` → use env.WlThk (the app resolves None).
             // `wall <t>` → use that thickness AND persist it. Same
             // shape as `offset` for muscle-memory consistency.
             match toks.get(1) {
-                None    => Ok(Command::Wall(None)),
+                None => Ok(Command::Wall(None)),
                 Some(s) => {
                     let t: f64 = s.parse().map_err(|_| "bad thickness".to_string())?;
-                    if t <= 1e-12 { return Err("wall thickness must be positive".into()); }
+                    if t <= 1e-12 {
+                        return Err("wall thickness must be positive".into());
+                    }
                     Ok(Command::Wall(Some(t)))
                 }
             }
         }
+        "wallcleanup" | "wcleanup" => Ok(Command::WallCleanup),
         "lengthen" | "len" => {
-            let d: f64 = toks.get(1).ok_or("usage: lengthen <delta>")?
-                .parse().map_err(|_| "bad delta".to_string())?;
+            let d: f64 = toks
+                .get(1)
+                .ok_or("usage: lengthen <delta>")?
+                .parse()
+                .map_err(|_| "bad delta".to_string())?;
             Ok(Command::Lengthen(d))
         }
-        "break" | "br"    => Ok(Command::Break),
-        "align"           => Ok(Command::Align),
-        "stretch" | "st" | "s"   => Ok(Command::Stretch),
-        "trim" | "tr"     => Ok(Command::Trim),
-        "extend" | "ex"   => Ok(Command::Extend),
+        "break" | "br" | "breakatpoint" | "brp" => Ok(Command::Break),
+        "divide" | "div" => Ok(Command::Divide),
+        "measure" | "me" => Ok(Command::Measure),
+        "plotstyle" | "pst" | "stylesmanager" => Ok(Command::PlotStyle),
+        "plot" | "print" => Ok(Command::Plot),
+        // Python scripting (WP-SCRIPT). `py <expr>` keeps the whole remainder
+        // (expressions contain spaces); bare `py` toggles the console.
+        "py" | "python" => match line.splitn(2, char::is_whitespace).nth(1).map(str::trim) {
+            None | Some("") => Ok(Command::Python(None)),
+            Some(expr) => Ok(Command::Python(Some(expr.to_string()))),
+        },
+        "pyfile" => {
+            let path = toks.get(1).ok_or("usage: pyfile <path.py>")?.to_string();
+            Ok(Command::PythonFile(path))
+        }
+        // WP-SCRIPT slice 5: `run <name> [args…]` executes scripts/<name>.py
+        // with the args exposed to the script; bare `run` opens the picker.
+        "run" | "script" => match toks.get(1) {
+            None => Ok(Command::Script(None, Vec::new())),
+            Some(name) => Ok(Command::Script(
+                Some(name.to_string()),
+                toks[2..].iter().map(|s| s.to_string()).collect(),
+            )),
+        },
+        // WP-SCRIPT: the full scripting API reference (AI-agent document).
+        "pyhelp" | "rasmhelp" => Ok(Command::PyApiDoc),
+        "align" => Ok(Command::Align),
+        "stretch" | "st" | "s" => Ok(Command::Stretch),
+        "trim" | "tr" => Ok(Command::Trim),
+        "extend" | "ex" => Ok(Command::Extend),
         "fillet" | "flt" | "f" => {
             // `fillet` alone → use default radius from UserEnv.
             // `fillet <r>`    → use this radius (and update UserEnv default).
             match toks.get(1) {
-                None    => Ok(Command::Fillet(None)),
+                None => Ok(Command::Fillet(None)),
                 Some(s) => {
                     let r: f64 = s.parse().map_err(|_| "bad radius".to_string())?;
-                    if r < 0.0 { return Err("fillet radius must be >= 0".into()); }
+                    if r < 0.0 {
+                        return Err("fillet radius must be >= 0".into());
+                    }
                     Ok(Command::Fillet(Some(r)))
                 }
             }
@@ -524,7 +968,9 @@ pub fn parse(line: &str) -> Result<Command, String> {
                 (None, _) => Ok(Command::Chamfer(None)),
                 (Some(s1), None) => {
                     let d: f64 = s1.parse().map_err(|_| "bad distance".to_string())?;
-                    if d < 0.0 { return Err("chamfer distance must be >= 0".into()); }
+                    if d < 0.0 {
+                        return Err("chamfer distance must be >= 0".into());
+                    }
                     Ok(Command::Chamfer(Some((d, None))))
                 }
                 (Some(s1), Some(s2)) => {
@@ -537,31 +983,202 @@ pub fn parse(line: &str) -> Result<Command, String> {
                 }
             }
         }
-        "join" | "j"      => Ok(Command::Join),
-        "dist" | "di"     => Ok(Command::Dist),
-        "open"            => {
-            let path = toks.get(1)
+        "join" | "j" => Ok(Command::Join),
+        "dist" | "di" => Ok(Command::Dist),
+        "open" => {
+            let path = toks
+                .get(1)
                 .ok_or("usage: open <path.dxf|path.rsm>")?
                 .to_string();
             Ok(Command::Open(path))
         }
         "save" | "saveas" => {
-            let path = toks.get(1)
+            let path = toks
+                .get(1)
                 .ok_or("usage: save <path.dxf|path.rsm>")?
                 .to_string();
             Ok(Command::SaveAs(path))
         }
-        other            => Err(format!("unknown command '{}'", other)),
+        other => Err(format!("unknown command '{}'", other)),
     }
 }
 
-fn parse_pt(s: &str) -> Result<Vec2, String> {
+/// Canonical command words for Tab-completion in the command line. One
+/// representative (primary) token per parser arm + the common aliases.
+pub fn command_words() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = vec![
+        "line",
+        "l",
+        "pline",
+        "pl",
+        "arc",
+        "a",
+        "circle",
+        "c",
+        "rectangle",
+        "rec",
+        "polygon",
+        "poly",
+        "ellipse",
+        "el",
+        "ellipsearc",
+        "point",
+        "po",
+        "spline",
+        "spl",
+        "wall",
+        "w",
+        "hatch",
+        "h",
+        "text",
+        "t",
+        "mtext",
+        "dim",
+        "dimcontinue",
+        "dimbaseline",
+        "dimangular",
+        "dimstyle",
+        "leader",
+        "mleader",
+        "centermark",
+        "xline",
+        "xl",
+        "ray",
+        "revcloud",
+        "revc",
+        "donut",
+        "doughnut",
+        "wipeout",
+        "wi",
+        "sketch",
+        "sk",
+        "blend",
+        "mline",
+        "ml",
+        "region",
+        "reg",
+        "table",
+        "tb",
+        "wblock",
+        "block",
+        "insert",
+        "i",
+        "xref",
+        "xr",
+        "boundary",
+        "bpoly",
+        "explode",
+        "x",
+        "move",
+        "m",
+        "copy",
+        "c",
+        "cp",
+        "rotate",
+        "ro",
+        "scale",
+        "sc",
+        "mirror",
+        "mi",
+        "stretch",
+        "s",
+        "trim",
+        "tr",
+        "extend",
+        "ex",
+        "offset",
+        "o",
+        "fillet",
+        "f",
+        "chamfer",
+        "cha",
+        "join",
+        "j",
+        "break",
+        "br",
+        "breakatpoint",
+        "align",
+        "al",
+        "lengthen",
+        "len",
+        "divide",
+        "measure",
+        "reverse",
+        "matchprop",
+        "chprop",
+        "chlayer",
+        "setbylayer",
+        "overkill",
+        "purge",
+        "rename",
+        "layers",
+        "layer",
+        "layerstate",
+        "qselect",
+        "ucs",
+        "list",
+        "ls",
+        "dist",
+        "area",
+        "id",
+        "oops",
+        "undo",
+        "redo",
+        "erase",
+        "delete",
+        "select",
+        "window",
+        "crossing",
+        "fence",
+        "wpolygon",
+        "cpolygon",
+        "zoom",
+        "pan",
+        "grid",
+        "snap",
+        "osnap",
+        "ortho",
+        "polar",
+        "setvar",
+        "plot",
+        "pagesetup",
+        "plotstyle",
+        "export",
+        "import",
+        "save",
+        "open",
+        "new",
+        "clear",
+        "help",
+        "preview",
+        "script",
+        "py",
+        "python",
+        "style",
+        "textstyle",
+        "dimstyle",
+        "wallstyle",
+        "linetype",
+        "ltscale",
+    ];
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+pub fn parse_pt(s: &str) -> Result<Vec2, String> {
     let parts: Vec<&str> = s.split(',').collect();
     if parts.len() != 2 {
         return Err(format!("expected x,y, got '{}'", s));
     }
-    let x: f64 = parts[0].trim().parse().map_err(|_| format!("bad x: '{}'", parts[0]))?;
-    let y: f64 = parts[1].trim().parse().map_err(|_| format!("bad y: '{}'", parts[1]))?;
+    let x: f64 = parts[0]
+        .trim()
+        .parse()
+        .map_err(|_| format!("bad x: '{}'", parts[0]))?;
+    let y: f64 = parts[1]
+        .trim()
+        .parse()
+        .map_err(|_| format!("bad y: '{}'", parts[1]))?;
     Ok(Vec2::new(x, y))
 }
 
@@ -580,13 +1197,18 @@ fn parse_line(args: &[&str]) -> Result<Command, String> {
 }
 
 fn parse_point(args: &[&str]) -> Result<Command, String> {
+    // Bare `point` / `po` → enter the interactive Point tool (click to place,
+    // stamping the current style/size). With a coordinate, add immediately.
+    if args.is_empty() {
+        return Ok(Command::SetTool(ToolKind::Point));
+    }
     if args.len() != 1 {
-        return Err("usage: point x,y".into());
+        return Err("usage: point  OR  point x,y".into());
     }
     Ok(Command::Add(Geom::Point(Point {
         location: parse_pt(args[0])?,
-        style:    0,
-        size:     0.0,
+        style: 0,
+        size: 0.0,
     })))
 }
 
@@ -601,14 +1223,21 @@ fn parse_polyline(args: &[&str]) -> Result<Command, String> {
         return Err("usage: polyline  OR  polyline x1,y1 x2,y2 [x3,y3 …] [close]".into());
     }
     let (vert_args, closed) = match args.last().map(|s| s.to_ascii_lowercase()) {
-        Some(ref s) if s == "close" || s == "closed" => (&args[..args.len()-1], true),
+        Some(ref s) if s == "close" || s == "closed" => (&args[..args.len() - 1], true),
         _ => (args, false),
     };
     let mut vertices = Vec::with_capacity(vert_args.len());
     for tok in vert_args {
-        vertices.push(PolyVertex { pos: parse_pt(tok)?, bulge: 0.0 });
+        vertices.push(PolyVertex {
+            pos: parse_pt(tok)?,
+            bulge: 0.0,
+        });
     }
-    Ok(Command::Add(Geom::Polyline(Polyline { vertices, closed, widths: Vec::new() })))
+    Ok(Command::Add(Geom::Polyline(Polyline {
+        vertices,
+        closed,
+        widths: Vec::new(),
+    })))
 }
 
 fn parse_circle(args: &[&str]) -> Result<Command, String> {
@@ -644,7 +1273,9 @@ fn parse_ellipse(args: &[&str]) -> Result<Command, String> {
     }
     let center = parse_pt(args[0])?;
     let major_end = parse_pt(args[1])?;
-    let minor: f64 = args[2].parse().map_err(|_| "bad minor length".to_string())?;
+    let minor: f64 = args[2]
+        .parse()
+        .map_err(|_| "bad minor length".to_string())?;
     construct::ellipse_center_major_minor(center, major_end, minor)
         .map(|e| Command::Add(Geom::Ellipse(e)))
         .ok_or_else(|| "degenerate inputs (zero major or minor)".into())
@@ -661,9 +1292,9 @@ fn parse_arc(args: &[&str]) -> Result<Command, String> {
     if args.len() != 4 {
         return Err("usage: arc  OR  arc cx,cy r start_deg end_deg".into());
     }
-    let r:   f64 = args[1].parse().map_err(|_| "bad radius".to_string())?;
-    let sd:  f64 = args[2].parse().map_err(|_| "bad start angle".to_string())?;
-    let ed:  f64 = args[3].parse().map_err(|_| "bad end angle".to_string())?;
+    let r: f64 = args[1].parse().map_err(|_| "bad radius".to_string())?;
+    let sd: f64 = args[2].parse().map_err(|_| "bad start angle".to_string())?;
+    let ed: f64 = args[3].parse().map_err(|_| "bad end angle".to_string())?;
     if r <= 0.0 {
         return Err("radius must be > 0".into());
     }
@@ -737,4 +1368,108 @@ fn parse_arc_cl(args: &[&str]) -> Result<Command, String> {
     let arc = construct::arc_chord_length(s, e, length, flip)
         .ok_or_else(|| "chord longer than arc length, or degenerate".to_string())?;
     Ok(Command::Add(Geom::Arc(arc)))
+}
+
+/// "STRAYLIGHTS PRUGE COMMAND CANT BE TYPED BECAUSE SPACE CANT BE ENTERED."
+///
+/// A command whose only destructive form needs an argument the prompt will not accept is a command
+/// that does not exist. Every action reachable from the command line has to be reachable in ONE
+/// token; the spaced form stays parseable for anywhere a space can be typed.
+#[cfg(test)]
+mod every_action_is_one_word {
+    use super::*;
+
+    #[test]
+    fn the_purge_is_reachable_without_a_space() {
+        for w in ["straypurge", "purgestrays", "purgelights"] {
+            assert!(
+                matches!(parse(w), Ok(Command::StrayLights(true))),
+                "`{w}` must purge — the prompt cannot take `straylights purge`",
+            );
+        }
+    }
+
+    /// AND THE REPORT FORM IS STILL ONE WORD TOO, and still does not delete. Somebody looking must
+    /// not lose fittings by looking.
+    #[test]
+    fn the_report_form_is_one_word_and_harmless() {
+        for w in ["straylights", "strays", "orphanlights"] {
+            assert!(
+                matches!(parse(w), Ok(Command::StrayLights(false))),
+                "`{w}` must REPORT, not purge",
+            );
+        }
+    }
+
+    /// THE SPACED FORM STILL PARSES, so nothing that worked stops working where a space can be
+    /// typed — a script, a macro, a prompt that grows the ability later.
+    #[test]
+    fn the_spaced_form_still_works() {
+        assert!(matches!(
+            parse("straylights purge"),
+            Ok(Command::StrayLights(true))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod script_command_tests {
+    use super::*;
+
+    #[test]
+    fn py_expression_keeps_full_remainder() {
+        // Expressions contain spaces — the whole remainder is the code.
+        assert!(matches!(parse("py 1 + 1"), Ok(Command::Python(Some(s))) if s == "1 + 1"));
+        assert!(matches!(parse("python print('hi')"),
+            Ok(Command::Python(Some(s))) if s == "print('hi')"));
+    }
+
+    #[test]
+    fn bare_py_is_console_toggle() {
+        assert!(matches!(parse("py"), Ok(Command::Python(None))));
+        assert!(matches!(parse("python   "), Ok(Command::Python(None))));
+    }
+
+    #[test]
+    fn pyfile_takes_a_path() {
+        assert!(matches!(parse("pyfile demo.py"), Ok(Command::PythonFile(s)) if s == "demo.py"));
+        assert!(parse("pyfile").is_err());
+    }
+
+    #[test]
+    fn run_script_with_args() {
+        assert!(matches!(
+            parse("run grid 8 6"),
+            Ok(Command::Script(Some(n), a)) if n == "grid" && a == ["8", "6"]
+        ));
+        assert!(matches!(
+            parse("script grid 8 6 10"),
+            Ok(Command::Script(Some(n), a)) if n == "grid" && a == ["8", "6", "10"]
+        ));
+        assert!(matches!(
+            parse("run hello"),
+            Ok(Command::Script(Some(n), a)) if n == "hello" && a.is_empty()
+        ));
+    }
+
+    #[test]
+    fn bare_run_opens_picker() {
+        assert!(matches!(parse("run"), Ok(Command::Script(None, a)) if a.is_empty()));
+        assert!(matches!(parse("script   "), Ok(Command::Script(None, _))));
+    }
+
+    #[test]
+    fn pyhelp_opens_the_api_reference() {
+        assert!(matches!(parse("pyhelp"), Ok(Command::PyApiDoc)));
+        assert!(matches!(parse("rasmhelp"), Ok(Command::PyApiDoc)));
+    }
+
+    #[test]
+    fn command_names_present() {
+        assert_eq!(Command::Python(None).canonical_name(), "Python");
+        assert_eq!(
+            Command::PythonFile(String::new()).canonical_name(),
+            "PythonFile"
+        );
+    }
 }

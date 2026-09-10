@@ -1,0 +1,372 @@
+{
+  "schema": 1,
+  "generator": "handles_v1.py",
+  "source": "door handles_/Untitled.fbx",
+  "units": "m",
+  "frame": {
+    "origin": "spindle centre, on the door face",
+    "x": "the direction the lever points",
+    "y": "up the door",
+    "z": "out of the door face"
+  },
+  "handles": [
+    {
+      "id": "lever_rose_black",
+      "name": "Slim lever, round rose",
+      "style": "contemporary",
+      "mount": "round",
+      "source_node": "Paddle Door Handle",
+      "source_mirrored": false,
+      "bbox_mm": {
+        "min": [
+          -21.17,
+          -21.17,
+          0.0
+        ],
+        "max": [
+          120.71,
+          21.17,
+          72.49
+        ]
+      },
+      "projection_mm": 72.49,
+      "lever_reach_mm": 120.71,
+      "min_backset_mm": 29.2,
+      "default_handle_height_mm": 1050.0,
+      "mirrorable": true,
+      "finishes": [
+        "gloss_black",
+        "matt_black",
+        "satin_chrome",
+        "brushed_steel"
+      ],
+      "default_finish": "gloss_black",
+      "parts": [
+        "Rose",
+        "Neck",
+        "Lever"
+      ],
+      "faces": 742,
+      "mesh": "meshes/lever_rose_black.fbx",
+      "preview": "previews/lever_rose_black.png",
+      "preview_face": "previews/lever_rose_black_face.png",
+      "parameters": {
+        "finish": "gloss_black",
+        "rose_d": 42.34,
+        "rose_t": 6.95,
+        "rose_edge": 4.4,
+        "neck_d_base": 19.95,
+        "neck_d_top": 18.9,
+        "neck_top": 50.0,
+        "lever_reach": 120.71,
+        "lever_back": -21.17,
+        "lever_cz": 57.7,
+        "lever_hy": 4.005,
+        "lever_hz": 14.79
+      }
+    },
+    {
+      "id": "lever_rose_chrome",
+      "name": "Spoon lever, shaped rose",
+      "style": "traditional",
+      "mount": "shaped",
+      "source_node": "Door handle",
+      "source_mirrored": false,
+      "bbox_mm": {
+        "min": [
+          -27.64,
+          -42.6,
+          0.0
+        ],
+        "max": [
+          99.84,
+          42.6,
+          54.55
+        ]
+      },
+      "projection_mm": 54.55,
+      "lever_reach_mm": 99.84,
+      "min_backset_mm": 35.6,
+      "default_handle_height_mm": 1050.0,
+      "mirrorable": true,
+      "finishes": [
+        "satin_chrome",
+        "polished_chrome",
+        "brass",
+        "matt_black"
+      ],
+      "default_finish": "satin_chrome",
+      "parts": [
+        "Rose",
+        "Rose_field",
+        "Screw_lo",
+        "Screw_hi",
+        "Neck",
+        "Lever"
+      ],
+      "faces": 1006,
+      "mesh": "meshes/lever_rose_chrome.fbx",
+      "preview": "previews/lever_rose_chrome.png",
+      "preview_face": "previews/lever_rose_chrome_face.png",
+      "parameters": {
+        "finish": "satin_chrome",
+        "rose_w": 55.28,
+        "rose_h": 85.2,
+        "rose_t": 7.04,
+        "rose_step": 2.22,
+        "rose_border": 3.2,
+        "screw_pitch": 29.28,
+        "screw_d": 10.87,
+        "screw_h": 4.87,
+        "neck_d_base": 21.08,
+        "neck_d_top": 18.64,
+        "neck_top": 33.0,
+        "bulb_d": 30.7,
+        "bulb_cz": 39.5,
+        "bulb_x": 2.0,
+        "lever_reach": 99.84
+      }
+    },
+    {
+      "id": "gothic_backplate",
+      "name": "Gothic lever, ornate backplate",
+      "style": "period",
+      "mount": "backplate",
+      "source_node": "LeftSteel",
+      "source_mirrored": true,
+      "bbox_mm": {
+        "min": [
+          -28.72,
+          -137.02,
+          0.0
+        ],
+        "max": [
+          177.77,
+          64.0,
+          39.74
+        ]
+      },
+      "projection_mm": 39.74,
+      "lever_reach_mm": 177.77,
+      "min_backset_mm": 36.7,
+      "default_handle_height_mm": 1050.0,
+      "mirrorable": true,
+      "finishes": [
+        "antique_iron",
+        "brushed_steel",
+        "matt_black"
+      ],
+      "default_finish": "antique_iron",
+      "parts": [
+        "Backplate",
+        "Backplate_rim",
+        "Boss_foot",
+        "Boss",
+        "Boss_cap",
+        "Spindle_knob",
+        "Lever"
+      ],
+      "faces": 546,
+      "mesh": "meshes/gothic_backplate.fbx",
+      "preview": "previews/gothic_backplate.png",
+      "preview_face": "previews/gothic_backplate_face.png",
+      "parameters": {
+        "finish": "antique_iron",
+        "plate_t": 2.02,
+        "plate_rim": 3.69,
+        "plate_cx": -1.81,
+        "plate_cy": -36.51,
+        "boss_w": 38.0,
+        "boss_h": 35.3,
+        "boss_z0": 2.02,
+        "boss_z1": 29.5,
+        "knob_w": 9.69,
+        "knob_z": 39.74,
+        "lever_reach": 177.77,
+        "lever_droop": 25.7,
+        "lever_cz": 18.77
+      }
+    },
+    {
+      "id": "lever_backplate_euro",
+      "name": "Flat lever, euro backplate",
+      "style": "contemporary",
+      "mount": "backplate_euro",
+      "source_node": "Lever Handle",
+      "source_mirrored": false,
+      "bbox_mm": {
+        "min": [
+          -25.0,
+          -165.0,
+          0.0
+        ],
+        "max": [
+          127.48,
+          75.0,
+          51.15
+        ]
+      },
+      "projection_mm": 51.15,
+      "lever_reach_mm": 127.48,
+      "min_backset_mm": 33.0,
+      "default_handle_height_mm": 1050.0,
+      "mirrorable": true,
+      "finishes": [
+        "brushed_steel",
+        "satin_chrome",
+        "matt_black",
+        "brass"
+      ],
+      "default_finish": "brushed_steel",
+      "parts": [
+        "Backplate",
+        "Backplate_face",
+        "Spindle_ring",
+        "Cylinder",
+        "Neck",
+        "Lever"
+      ],
+      "faces": 729,
+      "mesh": "meshes/lever_backplate_euro.fbx",
+      "preview": "previews/lever_backplate_euro.png",
+      "preview_face": "previews/lever_backplate_euro_face.png",
+      "parameters": {
+        "finish": "brushed_steel",
+        "plate_w": 50.0,
+        "plate_h": 240.0,
+        "plate_t": 9.28,
+        "plate_r": 4.0,
+        "plate_cy": -45.0,
+        "ring_d": 44.0,
+        "ring_t": 10.11,
+        "cyl_centres": 87.42,
+        "cyl_d": 17.17,
+        "cyl_drop": 27.26,
+        "neck_w": 17.0,
+        "neck_h": 16.6,
+        "neck_x0": -8.5,
+        "neck_x1": 16.0,
+        "lever_reach": 127.48,
+        "lever_cz": 41.05
+      }
+    },
+    {
+      "id": "smartlock_keypad",
+      "name": "Smart lock, keypad + fingerprint",
+      "style": "smart",
+      "mount": "backplate_smart",
+      "source_node": "Electric door handle",
+      "source_mirrored": false,
+      "bbox_mm": {
+        "min": [
+          -33.16,
+          -131.7,
+          0.0
+        ],
+        "max": [
+          166.75,
+          168.74,
+          86.61
+        ]
+      },
+      "projection_mm": 86.61,
+      "lever_reach_mm": 166.75,
+      "min_backset_mm": 41.2,
+      "default_handle_height_mm": 1050.0,
+      "mirrorable": true,
+      "finishes": [
+        "graphite",
+        "matt_black",
+        "brushed_steel"
+      ],
+      "default_finish": "graphite",
+      "parts": [
+        "Body",
+        "Panel",
+        "Panel_cap",
+        "Key_0_0",
+        "Legend_0_0",
+        "Key_0_1",
+        "Legend_0_1",
+        "Key_0_2",
+        "Legend_0_2",
+        "Key_1_0",
+        "Legend_1_0",
+        "Key_1_1",
+        "Legend_1_1",
+        "Key_1_2",
+        "Legend_1_2",
+        "Key_2_0",
+        "Legend_2_0",
+        "Key_2_1",
+        "Legend_2_1",
+        "Key_2_2",
+        "Legend_2_2",
+        "Key_3_0",
+        "Legend_3_0",
+        "Key_3_1",
+        "Legend_3_1",
+        "Key_3_2",
+        "Legend_3_2",
+        "Slot",
+        "Card_reader",
+        "Boss",
+        "Neck",
+        "Lever",
+        "Fingerprint",
+        "Thumbturn_base",
+        "Thumbturn_grip"
+      ],
+      "faces": 2649,
+      "mesh": "meshes/smartlock_keypad.fbx",
+      "preview": "previews/smartlock_keypad.png",
+      "preview_face": "previews/smartlock_keypad_face.png",
+      "parameters": {
+        "finish": "graphite",
+        "body_w": 66.31,
+        "body_h": 300.44,
+        "body_t": 24.02,
+        "body_r": 20.0,
+        "body_cy": 18.52,
+        "panel_inset": 1.5,
+        "panel_z0": 16.32,
+        "panel_z1": 30.0,
+        "panel_top": 31.1,
+        "boss_d": 57.59,
+        "boss_z0": 26.33,
+        "neck_d": 28.0,
+        "lever_z0": 74.54,
+        "lever_z1": 86.26,
+        "lever_reach": 166.75,
+        "lever_back": 20.09,
+        "lever_hy": 20.09,
+        "sensor_d": 26.0,
+        "sensor_z": 86.61,
+        "turn_cy": -70.05,
+        "turn_d": 45.58,
+        "turn_z0": 31.0,
+        "turn_z1": 36.5,
+        "grip_w": 17.44,
+        "grip_h": 44.99,
+        "grip_z": 48.46,
+        "keys_cy": 121.0,
+        "keys_cols": 3,
+        "keys_rows": 4,
+        "keys_pitch_x": 20.0,
+        "keys_pitch_y": 15.7,
+        "key_w": 15.0,
+        "key_h": 12.0,
+        "key_t": 0.6,
+        "key_legend": "123456789*0#",
+        "key_glyph": 6.6,
+        "key_glyph_t": 0.3,
+        "slot_cy": 160.0,
+        "slot_w": 20.0,
+        "slot_h": 3.0,
+        "card_cy": 53.0,
+        "card_w": 44.0,
+        "card_h": 14.0
+      }
+    }
+  ]
+}

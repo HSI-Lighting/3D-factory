@@ -80,7 +80,11 @@ fn main() -> Result<(), eframe::Error> {
             .with_title("SIMLUX — 3D Solid Sandbox"),
         ..Default::default()
     };
-    eframe::run_native("cad_solid_sandbox", options, Box::new(|_cc| Ok(Box::new(Sandbox::new()))))
+    eframe::run_native(
+        "cad_solid_sandbox",
+        options,
+        Box::new(|_cc| Ok(Box::new(Sandbox::new()))),
+    )
 }
 
 /// Standard camera views for the corner navigator.
@@ -142,7 +146,13 @@ enum FlatOp {
 }
 
 impl FlatOp {
-    const ALL: [FlatOp; 5] = [FlatOp::Move, FlatOp::Copy, FlatOp::Rotate, FlatOp::Scale, FlatOp::Mirror];
+    const ALL: [FlatOp; 5] = [
+        FlatOp::Move,
+        FlatOp::Copy,
+        FlatOp::Rotate,
+        FlatOp::Scale,
+        FlatOp::Mirror,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -182,12 +192,24 @@ struct FlatMod {
 /// `chamfer_geoms`). Values (distance/radius) come from the command line; objects and
 /// points come from clicks.
 enum FlatEdit {
-    Offset { dist: Option<f64>, obj: Option<usize> },
+    Offset {
+        dist: Option<f64>,
+        obj: Option<usize>,
+    },
     Trim,
     Extend,
-    Fillet { radius: Option<f64>, first: Option<(usize, Vec2)> },
-    Chamfer { dist: Option<f64>, first: Option<(usize, Vec2)> },
-    Break { obj: Option<usize>, p1: Option<Vec2> },
+    Fillet {
+        radius: Option<f64>,
+        first: Option<(usize, Vec2)>,
+    },
+    Chamfer {
+        dist: Option<f64>,
+        first: Option<(usize, Vec2)>,
+    },
+    Break {
+        obj: Option<usize>,
+        p1: Option<Vec2>,
+    },
 }
 
 /// 3D viewport display mode — the standard CAD wireframe / shaded / shaded-with-edges
@@ -200,7 +222,11 @@ enum DisplayMode {
 }
 
 impl DisplayMode {
-    const ALL: [DisplayMode; 3] = [DisplayMode::Shaded, DisplayMode::ShadedEdges, DisplayMode::Wireframe];
+    const ALL: [DisplayMode; 3] = [
+        DisplayMode::Shaded,
+        DisplayMode::ShadedEdges,
+        DisplayMode::Wireframe,
+    ];
     fn label(self) -> &'static str {
         match self {
             DisplayMode::Shaded => "Shaded",
@@ -219,7 +245,7 @@ struct Sandbox {
     dirty: bool,
     display: DisplayMode,
     recaptured: bool, // set right after an edit re-evals + re-centres, so the next
-                      // frame logs each object's new screen-space 8-corner box
+    // frame logs each object's new screen-space 8-corner box
 
     // camera (orbit). `cam_target` is STORED, not recomputed from bounds each
     // frame — otherwise adding/moving an object shifts the bounds centre and the
@@ -240,10 +266,10 @@ struct Sandbox {
     // active). app w2s = center + (world + offset)*scale, Y-down.
     sketch_scale: f32,
     sketch_offset: egui::Vec2,
-    snap_enabled: SnapSet,      // osnap running set (END/MID/CEN/QUA by default)
+    snap_enabled: SnapSet, // osnap running set (END/MID/CEN/QUA by default)
     snap_override: Option<SnapKind>, // one-shot inline snap override (typed END/MID/…)
-    sketch_sel: Vec<usize>,     // selected dobject indices in the active sketch's doc
-    flat_mod: Option<FlatMod>,  // in-flight 2D move/copy on the sketch
+    sketch_sel: Vec<usize>, // selected dobject indices in the active sketch's doc
+    flat_mod: Option<FlatMod>, // in-flight 2D move/copy on the sketch
     flat_edit: Option<FlatEdit>, // in-flight 2D edit (offset/trim/extend/fillet/…)
     // command-driven select-first: a queued command gathering its selection
     cmd: String,
@@ -272,17 +298,41 @@ struct Sandbox {
 impl Sandbox {
     fn new() -> Self {
         let mut model = Model::default();
-        model.push(BoolOp::Union, Plane::default(), Placement::default(), Primitive::Box { w: 2.0, d: 2.0, h: 1.0 });
+        model.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement::default(),
+            Primitive::Box {
+                w: 2.0,
+                d: 2.0,
+                h: 1.0,
+            },
+        );
         model.push(
             BoolOp::Difference,
             Plane::default(),
-            Placement { u: 0.0, v: 0.0, lift: -0.3, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
-            Primitive::Cylinder { r: 0.55, h: 1.6, sides: 32 },
+            Placement {
+                u: 0.0,
+                v: 0.0,
+                lift: -0.3,
+                spin_deg: 0.0,
+                pitch_deg: 0.0,
+                roll_deg: 0.0,
+            },
+            Primitive::Cylinder {
+                r: 0.55,
+                h: 1.6,
+                sides: 32,
+            },
         );
         let cached = model.eval();
         let solid_verts = mesh_verts(&cached);
         let cam_target = match cached.bounds() {
-            Some((mn, mx)) => Vec3::new((mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, (mn[2] + mx[2]) * 0.5),
+            Some((mn, mx)) => Vec3::new(
+                (mn[0] + mx[0]) * 0.5,
+                (mn[1] + mx[1]) * 0.5,
+                (mn[2] + mx[2]) * 0.5,
+            ),
             None => Vec3::ZERO,
         };
         let mut dbg = DbgRecorder::default();
@@ -349,9 +399,17 @@ impl Sandbox {
 
     fn next_primitive(&self) -> Primitive {
         if self.prim_is_box {
-            Primitive::Box { w: self.box_wdh[0], d: self.box_wdh[1], h: self.box_wdh[2] }
+            Primitive::Box {
+                w: self.box_wdh[0],
+                d: self.box_wdh[1],
+                h: self.box_wdh[2],
+            }
         } else {
-            Primitive::Cylinder { r: self.cyl_rh[0], h: self.cyl_rh[1], sides: self.cyl_sides }
+            Primitive::Cylinder {
+                r: self.cyl_rh[0],
+                h: self.cyl_rh[1],
+                sides: self.cyl_sides,
+            }
         }
     }
 
@@ -368,7 +426,11 @@ impl Sandbox {
 
     fn target(&self) -> Vec3 {
         match self.cached.bounds() {
-            Some((mn, mx)) => Vec3::new((mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, (mn[2] + mx[2]) * 0.5),
+            Some((mn, mx)) => Vec3::new(
+                (mn[0] + mx[0]) * 0.5,
+                (mn[1] + mx[1]) * 0.5,
+                (mn[2] + mx[2]) * 0.5,
+            ),
             None => Vec3::ZERO,
         }
     }
@@ -419,7 +481,12 @@ impl Sandbox {
         // we fall through to parse `v` as a new command (which then overrides).
         if let Some(mut md) = self.modify.take() {
             if let Some(f) = md.type_value(&v, &self.plane, &mut self.model) {
-                self.note(format!("  {} typed '{v}' [{}] → {:?}", md.op.label(), md.pick_name(), f));
+                self.note(format!(
+                    "  {} typed '{v}' [{}] → {:?}",
+                    md.op.label(),
+                    md.pick_name(),
+                    f
+                ));
                 match f {
                     Feed::NeedMore => {
                         self.status = md.prompt();
@@ -489,7 +556,10 @@ impl Sandbox {
                 self.note(format!("snap override → {}", k.name()));
                 return true;
             }
-            let last = self.sketch.as_ref().and_then(|s| s.draw.pending.last().copied());
+            let last = self
+                .sketch
+                .as_ref()
+                .and_then(|s| s.draw.pending.last().copied());
             if let Some(uv) = resolve_point(t, last) {
                 self.draw_click(uv);
                 self.note(format!("cmd point ({:.3},{:.3})", uv.x, uv.y));
@@ -499,7 +569,9 @@ impl Sandbox {
                 match o {
                     CmdOutcome::Committed(g) => {
                         let kind = geom_kind(&g);
-                        self.model.sketches[idx].doc.push(cad_kernel::DObject::new(g));
+                        self.model.sketches[idx]
+                            .doc
+                            .push(cad_kernel::DObject::new(g));
                         self.note(format!("draw ✓ option '{t}' → {kind} committed"));
                     }
                     CmdOutcome::Consumed => self.note(format!("draw · option '{t}' applied")),
@@ -512,8 +584,22 @@ impl Sandbox {
         let first = t.split_whitespace().next().unwrap_or("").to_lowercase();
         let is_draw = matches!(
             first.as_str(),
-            "line" | "l" | "pline" | "pl" | "polyline" | "rect" | "rec" | "rectangle"
-                | "circle" | "ci" | "arc" | "ellipse" | "el" | "ellip" | "point" | "po"
+            "line"
+                | "l"
+                | "pline"
+                | "pl"
+                | "polyline"
+                | "rect"
+                | "rec"
+                | "rectangle"
+                | "circle"
+                | "ci"
+                | "arc"
+                | "ellipse"
+                | "el"
+                | "ellip"
+                | "point"
+                | "po"
         );
         if is_draw {
             // commit-on-interrupt: keep the in-progress polyline's picked points.
@@ -605,7 +691,11 @@ impl Sandbox {
     /// Start a 2D modifier on the sketch (select-first, like the app).
     fn start_flat_mod(&mut self, op: FlatOp) {
         if self.sketch_sel.is_empty() {
-            self.status = format!("{}: select object(s) first, then run {} again", op.label(), op.label());
+            self.status = format!(
+                "{}: select object(s) first, then run {} again",
+                op.label(),
+                op.label()
+            );
         } else {
             self.flat_mod = Some(FlatMod { op, base: None });
             self.status = format!("{}: pick {}", op.label(), op.base_name());
@@ -647,7 +737,11 @@ impl Sandbox {
             }
         };
         let duplicate = |doc: &mut cad_kernel::Document, f: &dyn Fn(&DObject) -> DObject| {
-            let copies: Vec<DObject> = sel.iter().filter_map(|&i| doc.dobjects.get(i).cloned()).map(|d| f(&d)).collect();
+            let copies: Vec<DObject> = sel
+                .iter()
+                .filter_map(|&i| doc.dobjects.get(i).cloned())
+                .map(|d| f(&d))
+                .collect();
             for c in copies {
                 doc.push(c);
             }
@@ -738,8 +832,12 @@ impl Sandbox {
             FlatEdit::Offset { .. } => "offset: type distance".into(),
             FlatEdit::Fillet { .. } => "fillet: type radius".into(),
             FlatEdit::Chamfer { .. } => "chamfer: type distance".into(),
-            FlatEdit::Trim => "trim: click the part of an object to cut (others = cutters) · Esc ends".into(),
-            FlatEdit::Extend => "extend: click an object end (others = boundaries) · Esc ends".into(),
+            FlatEdit::Trim => {
+                "trim: click the part of an object to cut (others = cutters) · Esc ends".into()
+            }
+            FlatEdit::Extend => {
+                "extend: click an object end (others = boundaries) · Esc ends".into()
+            }
             FlatEdit::Break { .. } => "break: pick the object".into(),
         };
         self.flat_edit = Some(e);
@@ -781,14 +879,28 @@ impl Sandbox {
             None => return,
         };
         match edit {
-            FlatEdit::Offset { dist: Some(d), obj: None } => match hit {
+            FlatEdit::Offset {
+                dist: Some(d),
+                obj: None,
+            } => match hit {
                 Some(oi) => {
-                    self.flat_edit = Some(FlatEdit::Offset { dist: Some(d), obj: Some(oi) });
+                    self.flat_edit = Some(FlatEdit::Offset {
+                        dist: Some(d),
+                        obj: Some(oi),
+                    });
                     self.status = "offset: pick side".into();
                 }
-                None => self.flat_edit = Some(FlatEdit::Offset { dist: Some(d), obj: None }),
+                None => {
+                    self.flat_edit = Some(FlatEdit::Offset {
+                        dist: Some(d),
+                        obj: None,
+                    })
+                }
             },
-            FlatEdit::Offset { dist: Some(d), obj: Some(oi) } => {
+            FlatEdit::Offset {
+                dist: Some(d),
+                obj: Some(oi),
+            } => {
                 let doc = &mut self.model.sketches[idx].doc;
                 if let Some(dobj) = doc.dobjects.get(oi).cloned() {
                     match dobj.geom.offset(d, ku) {
@@ -804,8 +916,13 @@ impl Sandbox {
             FlatEdit::Trim => {
                 if let Some(oi) = hit {
                     let doc = &mut self.model.sketches[idx].doc;
-                    let cutters: Vec<cad_kernel::Geom> =
-                        doc.dobjects.iter().enumerate().filter(|(i, _)| *i != oi).map(|(_, d)| d.geom.clone()).collect();
+                    let cutters: Vec<cad_kernel::Geom> = doc
+                        .dobjects
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != oi)
+                        .map(|(_, d)| d.geom.clone())
+                        .collect();
                     let target = doc.dobjects[oi].clone();
                     match target.geom.trim_at(&cutters, ku, false) {
                         Ok(survivors) => {
@@ -823,8 +940,13 @@ impl Sandbox {
             FlatEdit::Extend => {
                 if let Some(oi) = hit {
                     let doc = &mut self.model.sketches[idx].doc;
-                    let boundaries: Vec<cad_kernel::Geom> =
-                        doc.dobjects.iter().enumerate().filter(|(i, _)| *i != oi).map(|(_, d)| d.geom.clone()).collect();
+                    let boundaries: Vec<cad_kernel::Geom> = doc
+                        .dobjects
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != oi)
+                        .map(|(_, d)| d.geom.clone())
+                        .collect();
                     let target = doc.dobjects[oi].geom.clone();
                     match target.extend_to(&boundaries, ku, false) {
                         Ok(g) => {
@@ -836,27 +958,55 @@ impl Sandbox {
                 }
                 self.flat_edit = Some(FlatEdit::Extend);
             }
-            FlatEdit::Fillet { radius: Some(r), first: None } => match hit {
+            FlatEdit::Fillet {
+                radius: Some(r),
+                first: None,
+            } => match hit {
                 Some(i1) => {
-                    self.flat_edit = Some(FlatEdit::Fillet { radius: Some(r), first: Some((i1, uv)) });
+                    self.flat_edit = Some(FlatEdit::Fillet {
+                        radius: Some(r),
+                        first: Some((i1, uv)),
+                    });
                     self.status = "fillet: pick SECOND object".into();
                 }
-                None => self.flat_edit = Some(FlatEdit::Fillet { radius: Some(r), first: None }),
+                None => {
+                    self.flat_edit = Some(FlatEdit::Fillet {
+                        radius: Some(r),
+                        first: None,
+                    })
+                }
             },
-            FlatEdit::Fillet { radius: Some(r), first: Some((i1, p1)) } => {
+            FlatEdit::Fillet {
+                radius: Some(r),
+                first: Some((i1, p1)),
+            } => {
                 if let Some(i2) = hit {
                     self.apply_fillet_chamfer(idx, i1, p1, i2, uv, Some(r), None);
                 }
                 self.flat_edit = None;
             }
-            FlatEdit::Chamfer { dist: Some(d), first: None } => match hit {
+            FlatEdit::Chamfer {
+                dist: Some(d),
+                first: None,
+            } => match hit {
                 Some(i1) => {
-                    self.flat_edit = Some(FlatEdit::Chamfer { dist: Some(d), first: Some((i1, uv)) });
+                    self.flat_edit = Some(FlatEdit::Chamfer {
+                        dist: Some(d),
+                        first: Some((i1, uv)),
+                    });
                     self.status = "chamfer: pick SECOND object".into();
                 }
-                None => self.flat_edit = Some(FlatEdit::Chamfer { dist: Some(d), first: None }),
+                None => {
+                    self.flat_edit = Some(FlatEdit::Chamfer {
+                        dist: Some(d),
+                        first: None,
+                    })
+                }
             },
-            FlatEdit::Chamfer { dist: Some(d), first: Some((i1, p1)) } => {
+            FlatEdit::Chamfer {
+                dist: Some(d),
+                first: Some((i1, p1)),
+            } => {
                 if let Some(i2) = hit {
                     self.apply_fillet_chamfer(idx, i1, p1, i2, uv, None, Some(d));
                 }
@@ -864,16 +1014,33 @@ impl Sandbox {
             }
             FlatEdit::Break { obj: None, .. } => match hit {
                 Some(oi) => {
-                    self.flat_edit = Some(FlatEdit::Break { obj: Some(oi), p1: None });
+                    self.flat_edit = Some(FlatEdit::Break {
+                        obj: Some(oi),
+                        p1: None,
+                    });
                     self.status = "break: pick FIRST break point".into();
                 }
-                None => self.flat_edit = Some(FlatEdit::Break { obj: None, p1: None }),
+                None => {
+                    self.flat_edit = Some(FlatEdit::Break {
+                        obj: None,
+                        p1: None,
+                    })
+                }
             },
-            FlatEdit::Break { obj: Some(oi), p1: None } => {
-                self.flat_edit = Some(FlatEdit::Break { obj: Some(oi), p1: Some(uv) });
+            FlatEdit::Break {
+                obj: Some(oi),
+                p1: None,
+            } => {
+                self.flat_edit = Some(FlatEdit::Break {
+                    obj: Some(oi),
+                    p1: Some(uv),
+                });
                 self.status = "break: pick SECOND break point".into();
             }
-            FlatEdit::Break { obj: Some(oi), p1: Some(p1) } => {
+            FlatEdit::Break {
+                obj: Some(oi),
+                p1: Some(p1),
+            } => {
                 let doc = &mut self.model.sketches[idx].doc;
                 if let Some(dobj) = doc.dobjects.get(oi).cloned() {
                     let kp1 = cad_kernel::Vec2::new(p1.x as f64, p1.y as f64);
@@ -894,7 +1061,16 @@ impl Sandbox {
     }
 
     /// Apply a fillet (radius) or chamfer (distance) between two picked objects.
-    fn apply_fillet_chamfer(&mut self, idx: usize, i1: usize, p1: Vec2, i2: usize, p2: Vec2, radius: Option<f64>, cham: Option<f64>) {
+    fn apply_fillet_chamfer(
+        &mut self,
+        idx: usize,
+        i1: usize,
+        p1: Vec2,
+        i2: usize,
+        p2: Vec2,
+        radius: Option<f64>,
+        cham: Option<f64>,
+    ) {
         let kp1 = cad_kernel::Vec2::new(p1.x as f64, p1.y as f64);
         let kp2 = cad_kernel::Vec2::new(p2.x as f64, p2.y as f64);
         let doc = &mut self.model.sketches[idx].doc;
@@ -919,7 +1095,9 @@ impl Sandbox {
                 Ok(out) => {
                     doc.dobjects[i1].geom = out.g1_new;
                     doc.dobjects[i2].geom = out.g2_new;
-                    doc.push(DObject::new(out.bridge));
+                    if let Some(bridge_geom) = out.bridge {
+                        doc.push(DObject::new(bridge_geom));
+                    }
                     self.note("flat chamfer ✓".into());
                 }
                 Err(e) => self.status = format!("chamfer: {e}"),
@@ -941,8 +1119,10 @@ impl Sandbox {
         sel.sort_unstable();
         sel.dedup();
         let doc = &mut self.model.sketches[idx].doc;
-        let input: Vec<(usize, cad_kernel::Geom)> =
-            sel.iter().filter_map(|&i| doc.dobjects.get(i).map(|d| (i, d.geom.clone()))).collect();
+        let input: Vec<(usize, cad_kernel::Geom)> = sel
+            .iter()
+            .filter_map(|&i| doc.dobjects.get(i).map(|d| (i, d.geom.clone())))
+            .collect();
         let out = cad_kernel::join_geoms(&input);
         if out.merged.is_empty() {
             self.status = "join: nothing merged (objects must touch end-to-end)".into();
@@ -968,21 +1148,26 @@ impl Sandbox {
     /// format. `#[track_caller]` so `Location::caller()` points at the call site.
     #[track_caller]
     fn note(&mut self, message: String) {
-        self.dbg.push(DbgEvent::Note { message }, std::panic::Location::caller());
+        self.dbg
+            .push(DbgEvent::Note { message }, std::panic::Location::caller());
     }
 
     /// Print the session recorder to STDERR (identical format to RUST_CAD; also
     /// mirrored live to /tmp/rust_cad_session.log). Paste it into chat to debug.
     fn dump_session(&mut self) {
         eprint!("{}", self.dbg.dump_text());
-        self.status = format!("dumped {} events to the terminal (stderr)", self.dbg.events.len());
+        self.status = format!(
+            "dumped {} events to the terminal (stderr)",
+            self.dbg.events.len()
+        );
     }
 
     #[track_caller]
     fn dbg_snap(&mut self, reason: &str) {
         let loc = std::panic::Location::caller();
         if let Some(idx) = self.sketch.as_ref().map(|s| s.idx) {
-            self.dbg.take_snapshot(&self.model.sketches[idx].doc, reason, 0, 0, loc);
+            self.dbg
+                .take_snapshot(&self.model.sketches[idx].doc, reason, 0, 0, loc);
         } else {
             let doc = cad_kernel::Document::default();
             self.dbg.take_snapshot(&doc, reason, 0, 0, loc);
@@ -1016,21 +1201,29 @@ impl Sandbox {
             .show(ctx, |ui| {
                 let is_recording = self.dbg.recording;
                 ui.horizontal(|ui| {
-                    let start_btn = egui::Button::new(egui::RichText::new("▶ Start").strong().color(egui::Color32::WHITE))
-                        .fill(if is_recording {
-                            egui::Color32::from_rgb(50, 90, 50)
-                        } else {
-                            egui::Color32::from_rgb(40, 130, 50)
-                        });
+                    let start_btn = egui::Button::new(
+                        egui::RichText::new("▶ Start")
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(if is_recording {
+                        egui::Color32::from_rgb(50, 90, 50)
+                    } else {
+                        egui::Color32::from_rgb(40, 130, 50)
+                    });
                     if ui.add_enabled(!is_recording, start_btn).clicked() {
                         self.dbg_start();
                     }
-                    let stop_btn = egui::Button::new(egui::RichText::new("■ Stop").strong().color(egui::Color32::WHITE))
-                        .fill(if is_recording {
-                            egui::Color32::from_rgb(160, 50, 50)
-                        } else {
-                            egui::Color32::from_rgb(80, 50, 50)
-                        });
+                    let stop_btn = egui::Button::new(
+                        egui::RichText::new("■ Stop")
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(if is_recording {
+                        egui::Color32::from_rgb(160, 50, 50)
+                    } else {
+                        egui::Color32::from_rgb(80, 50, 50)
+                    });
                     if ui.add_enabled(is_recording, stop_btn).clicked() {
                         self.dbg_stop();
                     }
@@ -1045,7 +1238,11 @@ impl Sandbox {
                 ui.add_space(4.0);
                 ui.label(format!(
                     "Status: {}  ·  {} events  ·  {} snapshots",
-                    if is_recording { "🔴 RECORDING" } else { "⚪ idle" },
+                    if is_recording {
+                        "🔴 RECORDING"
+                    } else {
+                        "⚪ idle"
+                    },
                     self.dbg.events.len(),
                     self.dbg.snapshots.len()
                 ));
@@ -1095,11 +1292,18 @@ impl Sandbox {
     /// the selection-gathering phase and remember what to do (the 2D `QueuedOp` +
     /// `begin_selection`). Enter later finalises → `begin_queued`.
     fn run_queued(&mut self, q: Queued) {
-        self.note(format!("run {} (selection={})", q.label(), self.selection.len()));
+        self.note(format!(
+            "run {} (selection={})",
+            q.label(),
+            self.selection.len()
+        ));
         if self.selection.is_empty() {
             self.selecting = true;
             self.queued = Some(q);
-            self.status = format!("{}: select objects, Enter to continue [Esc cancels]", q.label());
+            self.status = format!(
+                "{}: select objects, Enter to continue [Esc cancels]",
+                q.label()
+            );
         } else {
             self.begin_queued(q);
         }
@@ -1109,7 +1313,12 @@ impl Sandbox {
     fn begin_queued(&mut self, q: Queued) {
         // §8: record WHAT is highlighted (the actual handles), not just a count, so a
         // dump alone reconstructs the run.
-        self.note(format!("begin {} on {} object(s) — sel={:?}", q.label(), self.selection.len(), self.selection));
+        self.note(format!(
+            "begin {} on {} object(s) — sel={:?}",
+            q.label(),
+            self.selection.len(),
+            self.selection
+        ));
         match q {
             Queued::Erase => {
                 for id in std::mem::take(&mut self.selection) {
@@ -1128,7 +1337,12 @@ impl Sandbox {
 
     /// Unproject `cursor` (in `rect`) to a ray, intersect the active construction
     /// plane. `None` if the ray is parallel to or points away from the plane.
-    fn cursor_on_plane(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<Vec3> {
+    fn cursor_on_plane(
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+    ) -> Option<Vec3> {
         let (near, dir) = self.ray(cursor, rect, mvp);
         let n = self.plane.normal();
         let denom = dir.dot(n);
@@ -1170,7 +1384,12 @@ impl Sandbox {
 
     /// Ray-pick the front-most solid SURFACE under the cursor → (hit point, face
     /// normal), testing every triangle of the evaluated mesh.
-    fn pick_face(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<(Vec3, Vec3)> {
+    fn pick_face(
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+    ) -> Option<(Vec3, Vec3)> {
         let (orig, dir) = self.ray(cursor, rect, mvp);
         let mut best: Option<(f32, Vec3, Vec3)> = None;
         for tri in self.cached.positions.chunks_exact(3) {
@@ -1186,7 +1405,12 @@ impl Sandbox {
     }
 
     /// Ray-pick the front-most surface triangle index (for face selection).
-    fn pick_triangle(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<usize> {
+    fn pick_triangle(
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+    ) -> Option<usize> {
         let (orig, dir) = self.ray(cursor, rect, mvp);
         let mut best: Option<(f32, usize)> = None;
         for (i, tri) in self.cached.positions.chunks_exact(3).enumerate() {
@@ -1236,7 +1460,12 @@ impl Sandbox {
     /// 3D vertex osnap for modifier base/destination picks — the nearest solid
     /// mesh vertex whose screen projection is within the aperture. Returns its
     /// world position (so copy/move snap to the solid's corners).
-    fn snap_3d(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<(Vec3, egui::Pos2)> {
+    fn snap_3d(
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+    ) -> Option<(Vec3, egui::Pos2)> {
         let m = Mat4::from_cols_array(mvp);
         let aperture = 12.0f32;
         let mut best: Option<(f32, Vec3, egui::Pos2)> = None;
@@ -1257,7 +1486,12 @@ impl Sandbox {
     }
 
     /// Cursor → point on the ACTIVE SKETCH frame's plane.
-    fn cursor_on_sketch(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<Vec3> {
+    fn cursor_on_sketch(
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+    ) -> Option<Vec3> {
         let sm = self.sketch.as_ref()?;
         let fr = self.model.sketches.get(sm.idx)?.frame;
         let (near, dir) = self.ray(cursor, rect, mvp);
@@ -1283,7 +1517,11 @@ impl Sandbox {
             let sm = self.sketch.as_ref().unwrap();
             sm.draw.tool == DrawTool::Polyline
                 && sm.draw.pending.len() >= 3
-                && sm.draw.pending.first().map_or(false, |v0| (uv - *v0).length() < 8.0 / self.sketch_scale)
+                && sm
+                    .draw
+                    .pending
+                    .first()
+                    .map_or(false, |v0| (uv - *v0).length() < 8.0 / self.sketch_scale)
         };
         if auto_close {
             self.flat_close_polyline();
@@ -1299,9 +1537,14 @@ impl Sandbox {
         match geom {
             Some(g) => {
                 let kind = geom_kind(&g);
-                self.model.sketches[idx].doc.push(cad_kernel::DObject::new(g));
+                self.model.sketches[idx]
+                    .doc
+                    .push(cad_kernel::DObject::new(g));
                 let n = self.model.sketches[idx].doc.dobjects.len();
-                self.note(format!("draw ✓ {kind} committed (#{n} in sketch) @ pick ({:.3},{:.3})", uv.x, uv.y));
+                self.note(format!(
+                    "draw ✓ {kind} committed (#{n} in sketch) @ pick ({:.3},{:.3})",
+                    uv.x, uv.y
+                ));
             }
             None => self.note(format!("draw · pick ({:.3},{:.3}) — {prompt}", uv.x, uv.y)),
         }
@@ -1317,7 +1560,9 @@ impl Sandbox {
         let geom = self.sketch.as_mut().unwrap().draw.finish();
         if let Some(g) = geom {
             let kind = geom_kind(&g);
-            self.model.sketches[idx].doc.push(cad_kernel::DObject::new(g));
+            self.model.sketches[idx]
+                .doc
+                .push(cad_kernel::DObject::new(g));
             let n = self.model.sketches[idx].doc.dobjects.len();
             self.note(format!("draw ✓ finish → {kind} committed (#{n} in sketch)"));
         } else {
@@ -1363,7 +1608,10 @@ impl Sandbox {
                 return;
             }
             // a typed coordinate is a point answer (absolute / @relative / @polar)
-            let last = self.sketch.as_ref().and_then(|s| s.draw.pending.last().copied());
+            let last = self
+                .sketch
+                .as_ref()
+                .and_then(|s| s.draw.pending.last().copied());
             if let Some(uv) = resolve_point(&t, last) {
                 self.draw_click(uv);
                 return;
@@ -1374,7 +1622,9 @@ impl Sandbox {
                 match o {
                     CmdOutcome::Committed(g) => {
                         let kind = geom_kind(&g);
-                        self.model.sketches[idx].doc.push(cad_kernel::DObject::new(g));
+                        self.model.sketches[idx]
+                            .doc
+                            .push(cad_kernel::DObject::new(g));
                         self.note(format!("draw ✓ option '{t}' → {kind} committed"));
                     }
                     CmdOutcome::Consumed => self.note(format!("draw · option '{t}' applied")),
@@ -1410,12 +1660,24 @@ impl Sandbox {
             "rotate" | "ro" => self.start_flat_mod(FlatOp::Rotate),
             "scale" | "sc" => self.start_flat_mod(FlatOp::Scale),
             "mirror" | "mi" => self.start_flat_mod(FlatOp::Mirror),
-            "offset" | "o" => self.start_flat_edit(FlatEdit::Offset { dist: None, obj: None }),
+            "offset" | "o" => self.start_flat_edit(FlatEdit::Offset {
+                dist: None,
+                obj: None,
+            }),
             "trim" | "tr" => self.start_flat_edit(FlatEdit::Trim),
             "extend" | "ex" => self.start_flat_edit(FlatEdit::Extend),
-            "fillet" | "f" => self.start_flat_edit(FlatEdit::Fillet { radius: None, first: None }),
-            "chamfer" | "cha" => self.start_flat_edit(FlatEdit::Chamfer { dist: None, first: None }),
-            "break" | "br" => self.start_flat_edit(FlatEdit::Break { obj: None, p1: None }),
+            "fillet" | "f" => self.start_flat_edit(FlatEdit::Fillet {
+                radius: None,
+                first: None,
+            }),
+            "chamfer" | "cha" => self.start_flat_edit(FlatEdit::Chamfer {
+                dist: None,
+                first: None,
+            }),
+            "break" | "br" => self.start_flat_edit(FlatEdit::Break {
+                obj: None,
+                p1: None,
+            }),
             "join" | "j" => self.flat_join(),
             "erase" | "e" | "delete" => self.flat_erase(),
             other => self.status = format!("unknown: {other}"),
@@ -1433,7 +1695,11 @@ impl Sandbox {
 
     /// Push the active draw tool's prompt into the status line.
     fn sync_flat_prompt(&mut self) {
-        self.status = self.sketch.as_ref().map(|s| s.draw.prompt()).unwrap_or_default();
+        self.status = self
+            .sketch
+            .as_ref()
+            .map(|s| s.draw.prompt())
+            .unwrap_or_default();
     }
 
     /// C: commit the in-progress polyline as a CLOSED loop.
@@ -1445,7 +1711,9 @@ impl Sandbox {
         let geom = self.sketch.as_mut().unwrap().draw.close();
         if let Some(g) = geom {
             let kind = geom_kind(&g);
-            self.model.sketches[idx].doc.push(cad_kernel::DObject::new(g));
+            self.model.sketches[idx]
+                .doc
+                .push(cad_kernel::DObject::new(g));
             self.note(format!("draw ✓ close → {kind} committed"));
         }
     }
@@ -1472,7 +1740,9 @@ impl eframe::App for Sandbox {
                 && self.sketch.is_none()
                 && !self.selecting
                 && !self.selection.is_empty()
-                && ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
+                && ctx.input(|i| {
+                    i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
+                })
             {
                 for id in std::mem::take(&mut self.selection) {
                     self.model.remove(id);
@@ -1717,9 +1987,16 @@ impl Sandbox {
         {
             let f = &mut self.model.features[idx];
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("bool").color(theme::TEXT_MUTED).size(11.0));
+                ui.label(
+                    egui::RichText::new("bool")
+                        .color(theme::TEXT_MUTED)
+                        .size(11.0),
+                );
                 for op in BoolOp::ALL {
-                    if ui.selectable_label(f.op == op, format!("{} {}", op.glyph(), op.label())).clicked() {
+                    if ui
+                        .selectable_label(f.op == op, format!("{} {}", op.glyph(), op.label()))
+                        .clicked()
+                    {
                         f.op = op;
                         changed = true;
                     }
@@ -1727,29 +2004,47 @@ impl Sandbox {
             });
             ui.horizontal(|ui| {
                 ui.label("move u/v");
-                changed |= ui.add(egui::DragValue::new(&mut f.placement.u).speed(0.05)).changed();
-                changed |= ui.add(egui::DragValue::new(&mut f.placement.v).speed(0.05)).changed();
+                changed |= ui
+                    .add(egui::DragValue::new(&mut f.placement.u).speed(0.05))
+                    .changed();
+                changed |= ui
+                    .add(egui::DragValue::new(&mut f.placement.v).speed(0.05))
+                    .changed();
                 ui.label("lift");
-                changed |= ui.add(egui::DragValue::new(&mut f.placement.lift).speed(0.05)).changed();
+                changed |= ui
+                    .add(egui::DragValue::new(&mut f.placement.lift).speed(0.05))
+                    .changed();
             });
             ui.horizontal(|ui| {
                 ui.label("rotate");
-                changed |= ui.add(egui::DragValue::new(&mut f.placement.spin_deg).speed(1.0).suffix("°")).changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut f.placement.spin_deg)
+                            .speed(1.0)
+                            .suffix("°"),
+                    )
+                    .changed();
             });
             match &mut f.primitive {
                 Primitive::Box { w, d, h } => {
                     ui.horizontal(|ui| {
                         ui.label("size");
                         for c in [w, d, h] {
-                            changed |= ui.add(egui::DragValue::new(c).speed(0.02).range(0.02..=1000.0)).changed();
+                            changed |= ui
+                                .add(egui::DragValue::new(c).speed(0.02).range(0.02..=1000.0))
+                                .changed();
                         }
                     });
                 }
                 Primitive::Cylinder { r, h, sides } => {
                     ui.horizontal(|ui| {
                         ui.label("r/h");
-                        changed |= ui.add(egui::DragValue::new(r).speed(0.02).range(0.02..=1000.0)).changed();
-                        changed |= ui.add(egui::DragValue::new(h).speed(0.02).range(0.02..=1000.0)).changed();
+                        changed |= ui
+                            .add(egui::DragValue::new(r).speed(0.02).range(0.02..=1000.0))
+                            .changed();
+                        changed |= ui
+                            .add(egui::DragValue::new(h).speed(0.02).range(0.02..=1000.0))
+                            .changed();
                         changed |= ui.add(egui::DragValue::new(sides).range(3..=128)).changed();
                     });
                 }
@@ -1770,7 +2065,10 @@ impl Sandbox {
             }
         }
         if ui
-            .add_sized([ui.available_width(), 24.0], egui::Button::new(egui::RichText::new("🗑 Delete").color(theme::DANGER)))
+            .add_sized(
+                [ui.available_width(), 24.0],
+                egui::Button::new(egui::RichText::new("🗑 Delete").color(theme::DANGER)),
+            )
             .clicked()
         {
             delete = true;
@@ -1821,9 +2119,7 @@ impl Sandbox {
     fn cmd_submit(ui: &egui::Ui, r: &egui::Response, buf: &mut String, in_text_body: bool) -> bool {
         let enter =
             (r.lost_focus() || r.has_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        let space = r.has_focus()
-            && !in_text_body
-            && ui.input(|i| i.key_pressed(egui::Key::Space));
+        let space = r.has_focus() && !in_text_body && ui.input(|i| i.key_pressed(egui::Key::Space));
         if space {
             *buf = buf.trim_end_matches(' ').to_string();
         }
@@ -1839,7 +2135,9 @@ impl Sandbox {
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut self.cmd)
                             .desired_width(300.0)
-                            .hint_text("3D: move·copy·rotate·scale·mirror·erase  (Space or ⏎ submits)"),
+                            .hint_text(
+                                "3D: move·copy·rotate·scale·mirror·erase  (Space or ⏎ submits)",
+                            ),
                     );
                     let itb = self.in_text_body();
                     if Self::cmd_submit(ui, &r, &mut self.cmd, itb) {
@@ -1858,7 +2156,11 @@ impl Sandbox {
                         r.request_focus();
                     }
                     if !self.status.is_empty() {
-                        ui.label(egui::RichText::new(&self.status).color(theme::ACCENT).size(13.0));
+                        ui.label(
+                            egui::RichText::new(&self.status)
+                                .color(theme::ACCENT)
+                                .size(13.0),
+                        );
                     }
                 });
             });
@@ -2165,27 +2467,65 @@ impl Sandbox {
         egui::Area::new(egui::Id::new("viewcube"))
             .anchor(egui::Align2::LEFT_TOP, egui::vec2(316.0, 16.0))
             .show(ctx, |ui| {
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(112.0, 150.0), egui::Sense::click());
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(112.0, 150.0), egui::Sense::click());
                 let p = ui.painter();
                 let c = rect.center_top() + egui::vec2(0.0, 56.0);
                 let radius = 50.0;
-                p.circle_filled(c, radius, egui::Color32::from_rgba_unmultiplied(0x1a, 0x24, 0x30, 220));
+                p.circle_filled(
+                    c,
+                    radius,
+                    egui::Color32::from_rgba_unmultiplied(0x1a, 0x24, 0x30, 220),
+                );
                 p.circle_stroke(c, radius, egui::Stroke::new(1.0, theme::BORDER));
                 let sq = egui::Rect::from_center_size(c, egui::vec2(34.0, 34.0));
                 p.rect_filled(sq, egui::Rounding::same(6.0), theme::SURFACE_3);
-                p.rect_stroke(sq, egui::Rounding::same(6.0), egui::Stroke::new(1.0, theme::BORDER));
+                p.rect_stroke(
+                    sq,
+                    egui::Rounding::same(6.0),
+                    egui::Stroke::new(1.0, theme::BORDER),
+                );
                 let f = egui::FontId::proportional(12.0);
-                p.text(c, egui::Align2::CENTER_CENTER, "TOP", f.clone(), theme::TEXT_PRIMARY);
-                for (t, dir) in [("N", egui::vec2(0.0, -1.0)), ("E", egui::vec2(1.0, 0.0)), ("S", egui::vec2(0.0, 1.0)), ("W", egui::vec2(-1.0, 0.0))] {
-                    p.text(c + dir * (radius - 12.0), egui::Align2::CENTER_CENTER, t, f.clone(), theme::ACCENT);
+                p.text(
+                    c,
+                    egui::Align2::CENTER_CENTER,
+                    "TOP",
+                    f.clone(),
+                    theme::TEXT_PRIMARY,
+                );
+                for (t, dir) in [
+                    ("N", egui::vec2(0.0, -1.0)),
+                    ("E", egui::vec2(1.0, 0.0)),
+                    ("S", egui::vec2(0.0, 1.0)),
+                    ("W", egui::vec2(-1.0, 0.0)),
+                ] {
+                    p.text(
+                        c + dir * (radius - 12.0),
+                        egui::Align2::CENTER_CENTER,
+                        t,
+                        f.clone(),
+                        theme::ACCENT,
+                    );
                 }
                 let by = rect.top() + 122.0;
-                let btm = egui::Rect::from_min_size(egui::pos2(c.x - 52.0, by), egui::vec2(50.0, 22.0));
-                let iso = egui::Rect::from_min_size(egui::pos2(c.x + 2.0, by), egui::vec2(50.0, 22.0));
+                let btm =
+                    egui::Rect::from_min_size(egui::pos2(c.x - 52.0, by), egui::vec2(50.0, 22.0));
+                let iso =
+                    egui::Rect::from_min_size(egui::pos2(c.x + 2.0, by), egui::vec2(50.0, 22.0));
                 for (r, t) in [(btm, "Bottom"), (iso, "Iso")] {
                     p.rect_filled(r, egui::Rounding::same(6.0), theme::SURFACE_2);
-                    p.rect_stroke(r, egui::Rounding::same(6.0), egui::Stroke::new(1.0, theme::BORDER));
-                    p.text(r.center(), egui::Align2::CENTER_CENTER, t, egui::FontId::proportional(11.0), theme::TEXT_PRIMARY);
+                    p.rect_stroke(
+                        r,
+                        egui::Rounding::same(6.0),
+                        egui::Stroke::new(1.0, theme::BORDER),
+                    );
+                    p.text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        t,
+                        egui::FontId::proportional(11.0),
+                        theme::TEXT_PRIMARY,
+                    );
                 }
                 if resp.clicked() {
                     if let Some(pos) = resp.interact_pointer_pos() {
@@ -2198,9 +2538,17 @@ impl Sandbox {
                         } else if (pos - c).length() <= radius {
                             let d = pos - c;
                             if d.x.abs() > d.y.abs() {
-                                Some(if d.x > 0.0 { ViewPreset::Right } else { ViewPreset::Left })
+                                Some(if d.x > 0.0 {
+                                    ViewPreset::Right
+                                } else {
+                                    ViewPreset::Left
+                                })
                             } else {
-                                Some(if d.y > 0.0 { ViewPreset::Front } else { ViewPreset::Back })
+                                Some(if d.y > 0.0 {
+                                    ViewPreset::Front
+                                } else {
+                                    ViewPreset::Back
+                                })
                             }
                         } else {
                             None
@@ -2226,10 +2574,20 @@ impl Sandbox {
         // REUSE the sketch already on this plane — a sketch is a GROUP of 2D geometry
         // LINKED to its plane, so re-entering the same plane must show the same
         // drawing (not spawn a fresh empty sketch each time). Match by canonical frame.
-        if let Some(idx) = self.model.sketches.iter().position(|s| same_plane(&s.frame, &frame)) {
+        if let Some(idx) = self
+            .model
+            .sketches
+            .iter()
+            .position(|s| same_plane(&s.frame, &frame))
+        {
             let n = self.model.sketches[idx].doc.dobjects.len();
-            self.sketch = Some(SketchMode { idx, draw: Draw::new() });
-            self.note(format!("re-entered sketch #{idx} on this plane ({n} object(s))"));
+            self.sketch = Some(SketchMode {
+                idx,
+                draw: Draw::new(),
+            });
+            self.note(format!(
+                "re-entered sketch #{idx} on this plane ({n} object(s))"
+            ));
             self.status = format!("sketch #{idx} — {n} object(s); pick a draw tool (Esc = finish)");
             return;
         }
@@ -2237,7 +2595,10 @@ impl Sandbox {
         let mut sk = Sketch::new(frame);
         sk.reference = reference;
         self.model.sketches.push(sk);
-        self.sketch = Some(SketchMode { idx, draw: Draw::new() });
+        self.sketch = Some(SketchMode {
+            idx,
+            draw: Draw::new(),
+        });
         self.note(format!("new sketch #{idx} on this plane"));
         self.status = "sketch active — pick a draw tool (Esc = finish)".to_string();
     }
@@ -2248,10 +2609,15 @@ impl Sandbox {
         use std::collections::HashMap;
         let pos = &self.cached.positions;
         let key = |p: [f32; 3]| -> (i64, i64, i64) {
-            ((p[0] as f64 * 1e4).round() as i64, (p[1] as f64 * 1e4).round() as i64, (p[2] as f64 * 1e4).round() as i64)
+            (
+                (p[0] as f64 * 1e4).round() as i64,
+                (p[1] as f64 * 1e4).round() as i64,
+                (p[2] as f64 * 1e4).round() as i64,
+            )
         };
         // undirected edge → (count, world endpoints); boundary edges appear once
-        let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), (u32, [Vec3; 2])> = HashMap::new();
+        let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), (u32, [Vec3; 2])> =
+            HashMap::new();
         for &t in face_tris {
             for e in 0..3 {
                 let (pa, pb) = (pos[3 * t + e], pos[3 * t + (e + 1) % 3]);
@@ -2279,7 +2645,11 @@ impl Sandbox {
 
     /// Run the SHARED osnap engine (`cad_kernel::find_snap`) over the flat sketch —
     /// its drawn geometry + the face reference — at the cursor. Identical to the app.
-    fn compute_flat_snap(&self, resp: &egui::Response, rect: egui::Rect) -> Option<cad_kernel::SnapHit> {
+    fn compute_flat_snap(
+        &self,
+        resp: &egui::Response,
+        rect: egui::Rect,
+    ) -> Option<cad_kernel::SnapHit> {
         let sm = self.sketch.as_ref()?;
         let hp = resp.hover_pos()?;
         let cursor = self.s2w_flat(hp, rect);
@@ -2296,9 +2666,16 @@ impl Sandbox {
             let g = if pts.len() >= 2 {
                 let verts = pts
                     .iter()
-                    .map(|p| cad_kernel::PolyVertex { pos: cad_kernel::Vec2::new(p.x as f64, p.y as f64), bulge: 0.0 })
+                    .map(|p| cad_kernel::PolyVertex {
+                        pos: cad_kernel::Vec2::new(p.x as f64, p.y as f64),
+                        bulge: 0.0,
+                    })
                     .collect();
-                cad_kernel::Geom::Polyline(cad_kernel::Polyline { vertices: verts, closed: false, widths: Vec::new() })
+                cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+                    vertices: verts,
+                    closed: false,
+                    widths: Vec::new(),
+                })
             } else {
                 cad_kernel::Geom::Point(cad_kernel::Point {
                     location: cad_kernel::Vec2::new(pts[0].x as f64, pts[0].y as f64),
@@ -2356,12 +2733,18 @@ impl Sandbox {
         for x in x0..=x1 {
             let a = self.w2s_flat(Vec2::new(x as f32, y0 as f32), rect);
             let b = self.w2s_flat(Vec2::new(x as f32, y1 as f32), rect);
-            painter.line_segment([a, b], egui::Stroke::new(1.0, if x == 0 { axis } else { col }));
+            painter.line_segment(
+                [a, b],
+                egui::Stroke::new(1.0, if x == 0 { axis } else { col }),
+            );
         }
         for y in y0..=y1 {
             let a = self.w2s_flat(Vec2::new(x0 as f32, y as f32), rect);
             let b = self.w2s_flat(Vec2::new(x1 as f32, y as f32), rect);
-            painter.line_segment([a, b], egui::Stroke::new(1.0, if y == 0 { axis } else { col }));
+            painter.line_segment(
+                [a, b],
+                egui::Stroke::new(1.0, if y == 0 { axis } else { col }),
+            );
         }
     }
 
@@ -2771,11 +3154,18 @@ fn snap_kind_from(t: &str) -> Option<SnapKind> {
 
 /// Parse a typed `x,y` (comma- or space-separated) into a sketch-frame `(u,v)` point.
 fn parse_point_uv(s: &str) -> Option<Vec2> {
-    let parts: Vec<&str> = s.trim().split(|c| c == ',' || c == ' ').filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = s
+        .trim()
+        .split(|c| c == ',' || c == ' ')
+        .filter(|p| !p.is_empty())
+        .collect();
     if parts.len() != 2 {
         return None;
     }
-    Some(Vec2::new(parts[0].parse::<f32>().ok()?, parts[1].parse::<f32>().ok()?))
+    Some(Vec2::new(
+        parts[0].parse::<f32>().ok()?,
+        parts[1].parse::<f32>().ok()?,
+    ))
 }
 
 /// Resolve a typed coordinate answer (AutoCAD modes): absolute `x,y`, RELATIVE
@@ -2809,7 +3199,12 @@ fn toggle_select(sel: &mut Vec<u32>, id: u32, add: bool) {
 }
 
 fn section(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).color(theme::TEXT_MUTED).size(11.0).strong());
+    ui.label(
+        egui::RichText::new(text)
+            .color(theme::TEXT_MUTED)
+            .size(11.0)
+            .strong(),
+    );
     ui.add_space(4.0);
 }
 
@@ -2849,7 +3244,14 @@ fn mesh_verts(m: &SolidMesh) -> Vec<V3> {
         let k = 0.35 + 0.65 * n.dot(light_dir()).abs();
         let col = [base[0] * k, base[1] * k, base[2] * k];
         for pt in [a, b, c] {
-            out.push(V3 { x: pt.x, y: pt.y, z: pt.z, r: col[0], g: col[1], b: col[2] });
+            out.push(V3 {
+                x: pt.x,
+                y: pt.y,
+                z: pt.z,
+                r: col[0],
+                g: col[1],
+                b: col[2],
+            });
         }
     }
     out
@@ -2867,8 +3269,18 @@ fn plane_grid(plane: &Plane) -> Vec<V3> {
     let mut out = Vec::new();
     for i in 0..=n {
         let t = -h + i as f32 * step;
-        seg(&mut out, o + u * t - v * h, o + u * t + v * h, if t.abs() < 1e-4 { axis_v } else { faint });
-        seg(&mut out, o + v * t - u * h, o + v * t + u * h, if t.abs() < 1e-4 { axis_u } else { faint });
+        seg(
+            &mut out,
+            o + u * t - v * h,
+            o + u * t + v * h,
+            if t.abs() < 1e-4 { axis_v } else { faint },
+        );
+        seg(
+            &mut out,
+            o + v * t - u * h,
+            o + v * t + u * h,
+            if t.abs() < 1e-4 { axis_u } else { faint },
+        );
     }
     out
 }
@@ -2921,8 +3333,22 @@ fn aabb_lines(out: &mut Vec<V3>, mn: Vec3, mx: Vec3, c: [f32; 3]) {
 }
 
 fn seg(out: &mut Vec<V3>, a: Vec3, b: Vec3, c: [f32; 3]) {
-    out.push(V3 { x: a.x, y: a.y, z: a.z, r: c[0], g: c[1], b: c[2] });
-    out.push(V3 { x: b.x, y: b.y, z: b.z, r: c[0], g: c[1], b: c[2] });
+    out.push(V3 {
+        x: a.x,
+        y: a.y,
+        z: a.z,
+        r: c[0],
+        g: c[1],
+        b: c[2],
+    });
+    out.push(V3 {
+        x: b.x,
+        y: b.y,
+        z: b.z,
+        r: c[0],
+        g: c[1],
+        b: c[2],
+    });
 }
 
 /// The 8 corners of an axis-aligned box (min/max) — for a transformed ghost.
@@ -2977,7 +3403,10 @@ fn draw_snap_glyph(p: &egui::Painter, c: egui::Pos2, k: SnapKind, col: egui::Col
     let stroke = egui::Stroke::new(1.6, col);
     match k {
         SnapKind::End => {
-            let r = egui::Rect::from_min_max(egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s));
+            let r = egui::Rect::from_min_max(
+                egui::pos2(c.x - s, c.y - s),
+                egui::pos2(c.x + s, c.y + s),
+            );
             p.rect_stroke(r, 0.0, stroke);
         }
         SnapKind::Mid => {
@@ -3004,12 +3433,21 @@ fn draw_snap_glyph(p: &egui::Painter, c: egui::Pos2, k: SnapKind, col: egui::Col
             p.add(egui::Shape::line(pts, stroke));
         }
         SnapKind::Int => {
-            p.line_segment([egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)], stroke);
-            p.line_segment([egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y - s)], stroke);
+            p.line_segment(
+                [egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)],
+                stroke,
+            );
+            p.line_segment(
+                [egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y - s)],
+                stroke,
+            );
         }
         SnapKind::Per => {
             p.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
-            p.line_segment([egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y + s)], stroke);
+            p.line_segment(
+                [egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y + s)],
+                stroke,
+            );
         }
         SnapKind::Tan => {
             p.circle_stroke(c, s * 0.75, stroke);
@@ -3035,7 +3473,12 @@ fn mvp(yaw: f32, pitch: f32, dist: f32, target: [f32; 3], aspect: f32) -> [f32; 
     let (cy, sy) = (yaw.cos(), yaw.sin());
     let eye = t + Vec3::new(cp * cy, cp * sy, sp) * dist.max(0.1);
     let view = Mat4::look_at_rh(eye, t, Vec3::Z);
-    let proj = Mat4::perspective_rh_gl(45f32.to_radians(), aspect.max(0.01), 0.05, (dist * 8.0).max(120.0));
+    let proj = Mat4::perspective_rh_gl(
+        45f32.to_radians(),
+        aspect.max(0.01),
+        0.05,
+        (dist * 8.0).max(120.0),
+    );
     (proj * view).to_cols_array()
 }
 
@@ -3152,13 +3595,36 @@ impl SceneRenderer {
         let color = gl.create_texture().unwrap();
         gl.bind_texture(glow::TEXTURE_2D, Some(color));
         gl.tex_image_2d(
-            glow::TEXTURE_2D, 0, glow::RGBA8 as i32, w, h, 0,
-            glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None),
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA8 as i32,
+            w,
+            h,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(None),
         );
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_S,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_T,
+            glow::CLAMP_TO_EDGE as i32,
+        );
 
         let depth = gl.create_renderbuffer().unwrap();
         gl.bind_renderbuffer(glow::RENDERBUFFER, Some(depth));
@@ -3166,8 +3632,19 @@ impl SceneRenderer {
 
         let fbo = gl.create_framebuffer().unwrap();
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-        gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(color), 0);
-        gl.framebuffer_renderbuffer(glow::FRAMEBUFFER, glow::DEPTH_ATTACHMENT, glow::RENDERBUFFER, Some(depth));
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(color),
+            0,
+        );
+        gl.framebuffer_renderbuffer(
+            glow::FRAMEBUFFER,
+            glow::DEPTH_ATTACHMENT,
+            glow::RENDERBUFFER,
+            Some(depth),
+        );
 
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         gl.bind_texture(glow::TEXTURE_2D, None);
@@ -3208,7 +3685,9 @@ impl SceneRenderer {
             gl.clear_color(0.055, 0.07, 0.093, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
 
-            if let (Some(prog), Some(vao), Some(vbo)) = (self.scene_prog, self.scene_vao, self.scene_vbo) {
+            if let (Some(prog), Some(vao), Some(vbo)) =
+                (self.scene_prog, self.scene_vao, self.scene_vbo)
+            {
                 gl.use_program(Some(prog));
                 if let Some(loc) = &self.u_mvp {
                     gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
@@ -3239,8 +3718,8 @@ impl SceneRenderer {
             let y0 = 2.0 * vp_from_bottom as f32 / sh - 1.0;
             let y1 = 2.0 * (vp_from_bottom + vp_h) as f32 / sh - 1.0;
             let quad: [f32; 24] = [
-                x0, y0, 0.0, 0.0, x1, y0, 1.0, 0.0, x1, y1, 1.0, 1.0,
-                x0, y0, 0.0, 0.0, x1, y1, 1.0, 1.0, x0, y1, 0.0, 1.0,
+                x0, y0, 0.0, 0.0, x1, y0, 1.0, 0.0, x1, y1, 1.0, 1.0, x0, y0, 0.0, 0.0, x1, y1,
+                1.0, 1.0, x0, y1, 0.0, 1.0,
             ];
             if let (Some(prog), Some(vao), Some(vbo), Some(color)) =
                 (self.blit_prog, self.blit_vao, self.blit_vbo, self.color)
@@ -3271,7 +3750,10 @@ unsafe fn compile(gl: &glow::Context, vs: &str, fs: &str) -> glow::Program {
         gl.shader_source(s, src);
         gl.compile_shader(s);
         if !gl.get_shader_compile_status(s) {
-            panic!("sandbox shader compile failed:\n{}", gl.get_shader_info_log(s));
+            panic!(
+                "sandbox shader compile failed:\n{}",
+                gl.get_shader_info_log(s)
+            );
         }
         s
     };
@@ -3281,7 +3763,10 @@ unsafe fn compile(gl: &glow::Context, vs: &str, fs: &str) -> glow::Program {
     gl.attach_shader(program, f);
     gl.link_program(program);
     if !gl.get_program_link_status(program) {
-        panic!("sandbox program link failed:\n{}", gl.get_program_info_log(program));
+        panic!(
+            "sandbox program link failed:\n{}",
+            gl.get_program_info_log(program)
+        );
     }
     gl.delete_shader(v);
     gl.delete_shader(f);

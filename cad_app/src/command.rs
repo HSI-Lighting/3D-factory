@@ -65,11 +65,15 @@ pub struct Ctx {
 /// Default visibility predicate — the command always appears. Most commands
 /// point at this (Phase 6b: ALL do, so the app is unchanged). A `fn` POINTER,
 /// never a capturing closure (D7 — no hidden state).
-pub fn always_visible(_ctx: &Ctx) -> bool { true }
+pub fn always_visible(_ctx: &Ctx) -> bool {
+    true
+}
 
 /// Default enabled predicate — the command is always clickable. Most commands
 /// point at this (Phase 6b: ALL do). A `fn` pointer, never a capturing closure.
-pub fn always_enabled(_ctx: &Ctx) -> bool { true }
+pub fn always_enabled(_ctx: &Ctx) -> bool {
+    true
+}
 
 /// Metadata that DESCRIBES a command — never how it executes.
 ///
@@ -127,7 +131,10 @@ pub struct CommandRegistry {
 impl CommandRegistry {
     /// A new, empty registry.
     pub fn new() -> Self {
-        Self { commands: HashMap::new(), order: Vec::new() }
+        Self {
+            commands: HashMap::new(),
+            order: Vec::new(),
+        }
     }
 
     /// Defensive lookup by id — `None` for a stale / unknown id (never panics).
@@ -165,45 +172,70 @@ fn derive_title(tooltip: &str) -> String {
 fn keywords_for(dispatch: &str) -> &'static [&'static str] {
     match dispatch {
         // ── Draw ─────────────────────────────────────────────────────────
-        "pointer"    => &["select", "selection", "pick", "escape"],
-        "line"       => &["segment", "straight", "edge", "draw"],
-        "pline"      => &["polyline", "connected", "chain", "multi-segment"],
-        "circle"     => &["round", "ring", "radius", "diameter"],
-        "arc"        => &["curve", "bend", "segment"],
-        "rectangle"  => &["rect", "box", "square"],
-        "ellipse"    => &["oval", "elliptical"],
+        "pointer" => &["select", "selection", "pick", "escape"],
+        "line" => &["segment", "straight", "edge", "draw"],
+        "pline" => &["polyline", "connected", "chain", "multi-segment"],
+        "circle" => &["round", "ring", "radius", "diameter"],
+        "arc" => &["curve", "bend", "segment"],
+        "rectangle" => &["rect", "box", "square"],
+        "ellipse" => &["oval", "elliptical"],
         "ellipsearc" => &["oval", "elliptical", "arc", "curve"],
-        "point"      => &["node", "dot", "vertex", "marker"],
-        "spline"     => &["curve", "nurbs", "freeform", "bezier"],
-        "wall"       => &["partition", "architectural", "double-line"],
-        "text"       => &["label", "annotation", "note", "mtext"],
-        "dim"        => &["dimension", "measure", "distance"],
-        "hatch"      => &["fill", "pattern", "shade", "crosshatch"],
+        "point" => &["node", "dot", "vertex", "marker"],
+        "spline" => &["curve", "nurbs", "freeform", "bezier"],
+        "wall" => &["partition", "architectural", "double-line"],
+        "text" => &["label", "annotation", "note", "mtext"],
+        "dim" => &["dimension", "measure", "distance"],
+        "dimcontinue" => &["chain", "dimension", "continue"],
+        "dimbaseline" => &["chain", "dimension", "baseline", "stack"],
+        "dimangular" => &["angle", "dimension", "arc"],
+        "centermark" => &["center", "mark", "centre", "cross"],
+        "wblock" => &["write", "block", "save", "export", "library", "part"],
+        "boundary" => &["bpoly", "region", "loop", "outline", "trace"],
+        "xline" => &["construction", "infinite", "guide", "ray"],
+        "revcloud" => &["revision", "cloud", "scallop", "markup"],
+        "area" => &["measure", "surface", "polygon", "sq"],
+        "overkill" => &["duplicate", "dedupe", "cleanup", "overlap"],
+        "purge" => &["cleanup", "unused", "layers", "styles", "blocks"],
+        "layerstate" => &["layer", "state", "save", "restore", "snapshot"],
+        "qselect" => &["quick", "select", "filter", "selection set"],
+        "ucs" => &["coordinate", "system", "origin", "rotate", "world"],
+        "pagesetup" => &["page", "setup", "paper", "orientation", "scale"],
+        "table" => &["grid", "rows", "cols", "cells", "schedule"],
+        "xref" => &["external", "reference", "attach", "link"],
+        "hatch" => &["fill", "pattern", "shade", "crosshatch"],
+        "mleader" => &["leader", "callout", "annotation", "arrow"],
+        "attdef" => &["attribute", "definition", "tag", "block data"],
+        "attedit" => &["attribute", "edit", "block data", "values"],
         // ── Modify ───────────────────────────────────────────────────────
-        "move"       => &["translate", "shift", "relocate"],
-        "copy"       => &["duplicate", "clone"],
-        "rotate"     => &["turn", "spin", "angle"],
-        "scale"      => &["resize", "size"],
-        "mirror"     => &["flip", "reflect", "symmetry"],
-        "stretch"    => &["extend", "resize", "deform"],
-        "align"      => &["arrange", "line up"],
-        "trim"       => &["cut", "clip", "shorten"],
-        "extend"     => &["lengthen", "grow", "reach"],
-        "fillet"     => &["round", "corner", "radius"],
-        "chamfer"    => &["bevel", "corner", "angle"],
-        "offset"     => &["parallel", "duplicate", "spacing"],
-        "join"       => &["merge", "connect", "weld"],
-        "break"      => &["split", "cut", "divide"],
+        "move" => &["translate", "shift", "relocate"],
+        "copy" => &["duplicate", "clone"],
+        "rotate" => &["turn", "spin", "angle"],
+        "scale" => &["resize", "size"],
+        "mirror" => &["flip", "reflect", "symmetry"],
+        "stretch" => &["extend", "resize", "deform"],
+        "align" => &["arrange", "line up"],
+        "trim" => &["cut", "clip", "shorten"],
+        "extend" => &["lengthen", "grow", "reach"],
+        "fillet" => &["round", "corner", "radius"],
+        "chamfer" => &["bevel", "corner", "angle"],
+        "offset" => &["parallel", "duplicate", "spacing"],
+        "join" => &["merge", "connect", "weld"],
+        "break" => &["split", "cut", "divide"],
         "lengthen 1" => &["lengthen", "extend", "shorten", "resize"],
-        "reverse"    => &["flip", "invert", "direction"],
-        "array"      => &["grid", "pattern", "repeat", "duplicate"],
-        "matchprop"  => &["match", "properties", "copy format", "paint"],
-        "chlayer"    => &["change layer", "move layer"],
-        "erase"      => &["delete", "remove", "del"],
-        "block"      => &["group", "symbol", "make block"],
-        "insert"     => &["place", "block", "symbol"],
-        "explode"    => &["ungroup", "break apart", "separate"],
-        _            => &[],
+        "reverse" => &["flip", "invert", "direction"],
+        "array" => &["grid", "pattern", "repeat", "duplicate"],
+        "matchprop" => &["match", "properties", "copy format", "paint"],
+        "layer" => &[
+            "layers",
+            "layer manager",
+            "layer properties",
+            "change layer",
+        ],
+        "erase" => &["delete", "remove", "del"],
+        "block" => &["group", "symbol", "make block"],
+        "insert" => &["place", "block", "symbol"],
+        "explode" => &["ungroup", "break apart", "separate"],
+        _ => &[],
     }
 }
 
@@ -229,11 +261,11 @@ pub fn build(
             category: CommandCategory::Draw,
             icon: IconId::DrawGlyph(icon_id),
             keywords: keywords_for(dispatch),
-            section: None,   // Phase 6 assigns sub-groups; none yet
-            visible: always_visible,   // Phase 6b: all default (app unchanged)
+            section: None,           // Phase 6 assigns sub-groups; none yet
+            visible: always_visible, // Phase 6b: all default (app unchanged)
             enabled: always_enabled,
         };
-        reg.order.push(info.id.clone());          // canonical (array) order
+        reg.order.push(info.id.clone()); // canonical (array) order
         reg.commands.insert(info.id.clone(), info);
     }
     for &(kind, dispatch, tooltip) in modify {
@@ -245,8 +277,8 @@ pub fn build(
             category: CommandCategory::Modify,
             icon: IconId::ModifyGlyph(kind),
             keywords: keywords_for(dispatch),
-            section: None,   // Phase 6 assigns sub-groups; none yet
-            visible: always_visible,   // Phase 6b: all default (app unchanged)
+            section: None,           // Phase 6 assigns sub-groups; none yet
+            visible: always_visible, // Phase 6b: all default (app unchanged)
             enabled: always_enabled,
         };
         reg.order.push(info.id.clone());

@@ -21,9 +21,9 @@ fn main() {
     };
     let out_path = args.get(2).cloned().unwrap_or_else(|| "trace.dxf".into());
     let fit = match args.get(3).map(|s| s.as_str()) {
-        Some("arcs")  => FitKind::Arcs,
+        Some("arcs") => FitKind::Arcs,
         Some("nurbs") => FitKind::Nurbs,
-        _             => FitKind::Lines,
+        _ => FitKind::Lines,
     };
     let max_dim: Option<u32> = args.get(4).and_then(|s| s.parse().ok());
 
@@ -33,7 +33,7 @@ fn main() {
     });
     if let Some(m) = max_dim {
         if img.width().max(img.height()) > m {
-            img = img.thumbnail(m, m);   // preserves aspect
+            img = img.thumbnail(m, m); // preserves aspect
         }
     }
     let (w, h) = (img.width(), img.height());
@@ -41,24 +41,43 @@ fn main() {
 
     // Whole-image trace: mask everything in, so the engine keys off ink only.
     let mask = GrayImage::from_pixel(w, h, image::Luma([255]));
-    let params = TraceParams { img_height: h, ..Default::default() };
+    let params = TraceParams {
+        img_height: h,
+        ..Default::default()
+    };
     let t0 = std::time::Instant::now();
     let geoms = trace_layer(&mask, &img, fit, &params);
-    println!("  {} geoms in {:.1}s", geoms.len(), t0.elapsed().as_secs_f32());
+    println!(
+        "  {} geoms in {:.1}s",
+        geoms.len(),
+        t0.elapsed().as_secs_f32()
+    );
 
     let mut doc = Document::default();
-    let lid = doc.layers.add(Layer { name: "TRACE".into(), color: Color::Aci(7),
-                                     ..Layer::layer_zero() });
-    let style = Style { layer: lid, color: Color::ByLayer, ..Style::default() };
-    for g in geoms { doc.push(DObject::with_style(g, style)); }
+    let lid = doc.layers.add(Layer {
+        name: "TRACE".into(),
+        color: Color::Aci(7),
+        ..Layer::layer_zero()
+    });
+    let style = Style {
+        layer: lid,
+        color: Color::ByLayer,
+        ..Style::default()
+    };
+    for g in geoms {
+        doc.push(DObject::with_style(g, style));
+    }
 
     let dxf = cad_io::dxf::write_dxf(&doc);
     std::fs::write(&out_path, &dxf).unwrap_or_else(|e| {
         eprintln!("cannot write {out_path}: {e}");
         std::process::exit(1);
     });
-    println!("wrote {} DObjects → {out_path}  ({} KB)",
-             doc.dobjects.len(), dxf.len() / 1024);
+    println!(
+        "wrote {} DObjects → {out_path}  ({} KB)",
+        doc.dobjects.len(),
+        dxf.len() / 1024
+    );
 
     // Sibling PNG preview: rasterise the traced geometry (black on white) at the
     // source resolution, so the vector result can be eyeballed against the image.
@@ -88,9 +107,17 @@ fn draw_line(img: &mut image::RgbImage, mut x0: i32, mut y0: i32, x1: i32, y1: i
         if x0 >= 0 && y0 >= 0 && x0 < w && y0 < h {
             img.put_pixel(x0 as u32, y0 as u32, image::Rgb([0, 0, 0]));
         }
-        if x0 == x1 && y0 == y1 { break; }
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
         let e2 = 2 * err;
-        if e2 >= dy { err += dy; x0 += sx; }
-        if e2 <= dx { err += dx; y0 += sy; }
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
     }
 }

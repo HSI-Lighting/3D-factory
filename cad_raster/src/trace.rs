@@ -26,11 +26,11 @@ pub enum AssetKind {
 impl AssetKind {
     pub fn label(self) -> &'static str {
         match self {
-            AssetKind::Text      => "Text",
+            AssetKind::Text => "Text",
             AssetKind::Dimension => "Dimension",
             AssetKind::Furniture => "Furniture",
-            AssetKind::Wall      => "Wall",
-            AssetKind::LineArt   => "Line-art",
+            AssetKind::Wall => "Wall",
+            AssetKind::LineArt => "Line-art",
         }
     }
 }
@@ -58,15 +58,19 @@ pub fn convert(asset: AssetKind, _mask: &GrayImage, _working: &DynamicImage) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{DynamicImage, GrayImage, Luma, RgbaImage, Rgba};
+    use image::{DynamicImage, GrayImage, Luma, Rgba, RgbaImage};
 
     #[test]
     fn dispatch_is_stable_and_empty_for_now() {
         let mask = GrayImage::from_pixel(4, 4, Luma([255]));
-        let working = DynamicImage::ImageRgba8(
-            RgbaImage::from_pixel(4, 4, Rgba([0, 0, 0, 255])));
-        for k in [AssetKind::Text, AssetKind::Dimension, AssetKind::Furniture,
-                  AssetKind::Wall, AssetKind::LineArt] {
+        let working = DynamicImage::ImageRgba8(RgbaImage::from_pixel(4, 4, Rgba([0, 0, 0, 255])));
+        for k in [
+            AssetKind::Text,
+            AssetKind::Dimension,
+            AssetKind::Furniture,
+            AssetKind::Wall,
+            AssetKind::LineArt,
+        ] {
             assert!(convert(k, &mask, &working).is_empty());
         }
     }

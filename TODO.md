@@ -1,0 +1,4 @@
+- [x] add calculation support to command line inputs
+- [ ] add close support to hatch
+- [ ] در نظر بگیرید ۲ تا enter اولین enter یا space مثل کنسل عمل می‌کنه.  دومین میاد دستور ماقبل را پیاده می‌کنه.
+- [ ] 

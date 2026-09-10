@@ -13,8 +13,8 @@
 //! Picks arrive as glam `Vec2` in the sketch frame's `(u,v)`.
 
 use cad_kernel::{
-    arc_center_start_end, arc_three_points, bulge_from_arc, ellipse_center_major_minor, Circle, Geom,
-    Line, Point, PolyVertex, Polyline, Vec2 as KVec2,
+    arc_center_start_end, arc_three_points, bulge_from_arc, ellipse_center_major_minor, Circle,
+    Geom, Line, Point, PolyVertex, Polyline, Vec2 as KVec2,
 };
 use glam::Vec2;
 
@@ -83,8 +83,12 @@ pub enum CircleMethod {
 }
 
 impl CircleMethod {
-    pub const ALL: [CircleMethod; 4] =
-        [CircleMethod::CenterRadius, CircleMethod::Diameter, CircleMethod::TwoPoint, CircleMethod::ThreePoint];
+    pub const ALL: [CircleMethod; 4] = [
+        CircleMethod::CenterRadius,
+        CircleMethod::Diameter,
+        CircleMethod::TwoPoint,
+        CircleMethod::ThreePoint,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             CircleMethod::CenterRadius => "Center, Radius",
@@ -110,8 +114,11 @@ pub enum ArcMethod {
 }
 
 impl ArcMethod {
-    pub const ALL: [ArcMethod; 3] =
-        [ArcMethod::ThreePoint, ArcMethod::StartCenterEnd, ArcMethod::CenterStartEnd];
+    pub const ALL: [ArcMethod; 3] = [
+        ArcMethod::ThreePoint,
+        ArcMethod::StartCenterEnd,
+        ArcMethod::CenterStartEnd,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             ArcMethod::ThreePoint => "3 Point",
@@ -324,14 +331,23 @@ impl Draw {
         if self.tool == DrawTool::Line {
             let a = self.pending[0];
             self.pending = vec![uv];
-            return Some(Geom::Line(Line { a: kv(a), b: kv(uv) }));
+            return Some(Geom::Line(Line {
+                a: kv(a),
+                b: kv(uv),
+            }));
         }
         if self.tool == DrawTool::None {
             return None;
         }
         self.pending.push(uv);
         if self.pending.len() >= self.needed() {
-            let g = build(self.tool, self.circle_method, self.arc_method, self.ellipse_method, &self.pending);
+            let g = build(
+                self.tool,
+                self.circle_method,
+                self.arc_method,
+                self.ellipse_method,
+                &self.pending,
+            );
             self.pending.clear();
             return g;
         }
@@ -365,19 +381,39 @@ impl Draw {
                         bulge: self.pl_bulges.get(i).copied().unwrap_or(cursor_bulge),
                     })
                     .collect();
-                vertices.push(PolyVertex { pos: kv(cursor), bulge: 0.0 });
-                vec![Geom::Polyline(Polyline { vertices, closed: false, widths: Vec::new() })]
+                vertices.push(PolyVertex {
+                    pos: kv(cursor),
+                    bulge: 0.0,
+                });
+                vec![Geom::Polyline(Polyline {
+                    vertices,
+                    closed: false,
+                    widths: Vec::new(),
+                })]
             }
             _ => {
                 let mut p = self.pending.clone();
                 p.push(cursor);
                 if p.len() >= self.needed() {
                     let start = p.len() - self.needed();
-                    build(self.tool, self.circle_method, self.arc_method, self.ellipse_method, &p[start..])
-                        .into_iter()
-                        .collect()
+                    build(
+                        self.tool,
+                        self.circle_method,
+                        self.arc_method,
+                        self.ellipse_method,
+                        &p[start..],
+                    )
+                    .into_iter()
+                    .collect()
                 } else {
-                    p.windows(2).map(|w| Geom::Line(Line { a: kv(w[0]), b: kv(w[1]) })).collect()
+                    p.windows(2)
+                        .map(|w| {
+                            Geom::Line(Line {
+                                a: kv(w[0]),
+                                b: kv(w[1]),
+                            })
+                        })
+                        .collect()
                 }
             }
         }
@@ -410,9 +446,16 @@ impl Draw {
             .pending
             .iter()
             .enumerate()
-            .map(|(i, p)| PolyVertex { pos: kv(*p), bulge: self.pl_bulges.get(i).copied().unwrap_or(0.0) })
+            .map(|(i, p)| PolyVertex {
+                pos: kv(*p),
+                bulge: self.pl_bulges.get(i).copied().unwrap_or(0.0),
+            })
             .collect();
-        Some(Geom::Polyline(Polyline { vertices, closed, widths: Vec::new() }))
+        Some(Geom::Polyline(Polyline {
+            vertices,
+            closed,
+            widths: Vec::new(),
+        }))
     }
 
     fn reset_pending(&mut self) {
@@ -512,7 +555,11 @@ impl Draw {
                     }
                     Some(CmdOutcome::Consumed)
                 }
-                "c" | "close" => Some(self.close().map(CmdOutcome::Committed).unwrap_or(CmdOutcome::Consumed)),
+                "c" | "close" => Some(
+                    self.close()
+                        .map(CmdOutcome::Committed)
+                        .unwrap_or(CmdOutcome::Consumed),
+                ),
                 "u" | "undo" => {
                     // cancel an active arc sub-flow first, else drop the last vertex
                     if self.pl_arc_sub != PlineArcSub::Normal {
@@ -554,7 +601,11 @@ impl Draw {
                 PlineArcSub::AwaitingOnArc => "polyline arc: click POINT ON ARC".into(),
                 PlineArcSub::AwaitingEnd(_) => "polyline arc: click ARC END".into(),
                 PlineArcSub::Normal => {
-                    let mode = if self.pline_mode == PlineMode::Arc { "Arc" } else { "Line" };
+                    let mode = if self.pline_mode == PlineMode::Arc {
+                        "Arc"
+                    } else {
+                        "Line"
+                    };
                     if n == 0 {
                         format!("polyline [{mode}]: pick start")
                     } else {
@@ -582,9 +633,16 @@ fn build(
     p: &[Vec2],
 ) -> Option<Geom> {
     match tool {
-        DrawTool::Line => Some(Geom::Line(Line { a: kv(p[0]), b: kv(p[1]) })),
+        DrawTool::Line => Some(Geom::Line(Line {
+            a: kv(p[0]),
+            b: kv(p[1]),
+        })),
         DrawTool::Rectangle => Some(rect(p[0], p[1])),
-        DrawTool::Point => Some(Geom::Point(Point { location: kv(p[0]), style: 0, size: 0.0 })),
+        DrawTool::Point => Some(Geom::Point(Point {
+            location: kv(p[0]),
+            style: 0,
+            size: 0.0,
+        })),
         DrawTool::Circle => build_circle(cm, p),
         DrawTool::Arc => build_arc(am, p),
         DrawTool::Ellipse => build_ellipse(em, p),
@@ -594,15 +652,27 @@ fn build(
 
 fn build_circle(cm: CircleMethod, p: &[Vec2]) -> Option<Geom> {
     let c = match cm {
-        CircleMethod::CenterRadius => Circle { center: kv(p[0]), radius: (p[1] - p[0]).length() as f64 },
-        CircleMethod::Diameter => Circle { center: kv(p[0]), radius: ((p[1] - p[0]).length() * 0.5) as f64 },
+        CircleMethod::CenterRadius => Circle {
+            center: kv(p[0]),
+            radius: (p[1] - p[0]).length() as f64,
+        },
+        CircleMethod::Diameter => Circle {
+            center: kv(p[0]),
+            radius: ((p[1] - p[0]).length() * 0.5) as f64,
+        },
         CircleMethod::TwoPoint => {
             let center = (p[0] + p[1]) * 0.5;
-            Circle { center: kv(center), radius: ((p[1] - p[0]).length() * 0.5) as f64 }
+            Circle {
+                center: kv(center),
+                radius: ((p[1] - p[0]).length() * 0.5) as f64,
+            }
         }
         CircleMethod::ThreePoint => {
             let a = arc_three_points(kv(p[0]), kv(p[1]), kv(p[2]))?;
-            Circle { center: a.center, radius: a.radius }
+            Circle {
+                center: a.center,
+                radius: a.radius,
+            }
         }
     };
     if c.radius < 1e-6 {
@@ -637,7 +707,10 @@ fn build_ellipse(em: EllipseMethod, p: &[Vec2]) -> Option<Geom> {
 
 /// Rectangle → a CLOSED 4-vertex polyline (the app's `rect_polyline`).
 fn rect(a: Vec2, b: Vec2) -> Geom {
-    let v = |x: f32, y: f32| PolyVertex { pos: KVec2::new(x as f64, y as f64), bulge: 0.0 };
+    let v = |x: f32, y: f32| PolyVertex {
+        pos: KVec2::new(x as f64, y as f64),
+        bulge: 0.0,
+    };
     Geom::Polyline(Polyline {
         vertices: vec![v(a.x, a.y), v(b.x, a.y), v(b.x, b.y), v(a.x, b.y)],
         closed: true,
@@ -789,7 +862,7 @@ mod tests {
         d.set_tool(DrawTool::Polyline);
         d.feed(Vec2::ZERO);
         d.feed(Vec2::new(2.0, 0.0)); // first straight segment (bulge 0)
-        // switch to arc mode; the NEXT segment should bulge (tangent-continuous)
+                                     // switch to arc mode; the NEXT segment should bulge (tangent-continuous)
         assert!(matches!(d.option("a"), Some(CmdOutcome::Consumed)));
         assert_eq!(d.pline_mode, PlineMode::Arc);
         d.feed(Vec2::new(4.0, 2.0));
@@ -797,8 +870,15 @@ mod tests {
             Geom::Polyline(p) => {
                 assert_eq!(p.vertices.len(), 3);
                 // segment[1] (index 1) leaves vertex 1 as an arc → non-zero bulge
-                assert!(p.vertices[1].bulge.abs() > 1e-6, "arc segment should bulge, got {}", p.vertices[1].bulge);
-                assert!(p.vertices[0].bulge.abs() < 1e-9, "first segment stays straight");
+                assert!(
+                    p.vertices[1].bulge.abs() > 1e-6,
+                    "arc segment should bulge, got {}",
+                    p.vertices[1].bulge
+                );
+                assert!(
+                    p.vertices[0].bulge.abs() < 1e-9,
+                    "first segment stays straight"
+                );
             }
             _ => panic!("expected polyline"),
         }
@@ -857,7 +937,11 @@ mod tests {
         assert_eq!(d.pl_arc_sub, PlineArcSub::Normal);
         assert_eq!(d.pending.len(), 2);
         match d.finish().unwrap() {
-            Geom::Polyline(p) => assert!(p.vertices[0].bulge.abs() > 1e-6, "3pt arc bulge, got {}", p.vertices[0].bulge),
+            Geom::Polyline(p) => assert!(
+                p.vertices[0].bulge.abs() > 1e-6,
+                "3pt arc bulge, got {}",
+                p.vertices[0].bulge
+            ),
             _ => panic!("expected polyline"),
         }
     }

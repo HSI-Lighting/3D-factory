@@ -43,36 +43,49 @@ use std::time::Instant;
 #[derive(Clone, Debug)]
 pub enum DbgEvent {
     /// Recorder armed / disarmed (matches Start/Stop button presses).
-    SessionStart { reason: String },
-    SessionStop  { reason: String, event_count: usize },
+    SessionStart {
+        reason: String,
+    },
+    SessionStop {
+        reason: String,
+        event_count: usize,
+    },
 
     /// Manual annotation — note dropped via the "📝 Note" button so the
     /// reader can mark "this is where the bug fired".
-    Note { message: String },
+    Note {
+        message: String,
+    },
+
+    /// The command-line prompt text changed (cleared → idle, or a new
+    /// prompt). Lets a dump show what the user was being asked at each step.
+    PromptChange {
+        text: String,
+    },
 
     /// One full `Document` snapshot. Heavy. Tagged with the reason
     /// (auto-cadence / manual / pre-undo / post-snapshot_doc).
     DocSnapshot {
-        reason:         String,
-        dobject_count:  usize,
-        undo_depth:     usize,
-        redo_depth:     usize,
-        layer_count:    usize,
-        index_in_dump:  usize,  // index into DbgRecorder::snapshots
+        reason: String,
+        dobject_count: usize,
+        undo_depth: usize,
+        redo_depth: usize,
+        layer_count: usize,
+        index_in_dump: usize, // index into DbgRecorder::snapshots
     },
 
     /// `run_command(raw)` fired. Records the RAW input + the parsed
     /// `Command` debug-print + where the call came from (typed in cmd
     /// line, menu button, replay).
     CmdRun {
-        raw:           String,
-        parsed_debug:  String,
-        source:        CmdSource,
+        raw: String,
+        parsed_debug: String,
+        source: CmdSource,
         /// Wall-clock the command took to EXECUTE, in µs. The event timestamp says
         /// WHEN it ran; this says HOW LONG it took — so when the app stalls, the dump
         /// names the command responsible instead of leaving you to guess.
         /// `None` = not measured (the value came from an older capture).
-        elapsed_us:    Option<u64>,
+        elapsed_us: Option<u64>,
     },
 
     /// A ZOOM operation (2D or 3D-Factory) — everything needed to judge "is zoom
@@ -80,25 +93,45 @@ pub enum DbgEvent {
     /// resolved sub-command, and the screen zoom status BEFORE vs AFTER. Without this,
     /// a zoom bug is invisible — the dump only showed a bare CMD line and a note.
     ZoomOp {
-        cmd:      String, // raw: "zoom", "z", "zoom w", "zoom 2"
-        choices:  String, // what the command line offers as zoom sub-commands
-        action:   String, // resolved sub-command: "window armed", "extents", "in", …
-        before:   String, // screen zoom status before
-        after:    String, // screen zoom status after
+        cmd: String,     // raw: "zoom", "z", "zoom w", "zoom 2"
+        choices: String, // what the command line offers as zoom sub-commands
+        action: String,  // resolved sub-command: "window armed", "extents", "in", …
+        before: String,  // screen zoom status before
+        after: String,   // screen zoom status after
+    },
+
+    /// A ZOOM step with numeric scales — the 2D-canvas zoom events that
+    /// compare before/after scale factors directly (the legacy RUST-CAD
+    /// form; the SIMLUX line favours [`Self::ZoomOp`]).
+    ZoomChange {
+        source: String,
+        scale_before: f64,
+        scale_after: f64,
+        viewport_dobjects: usize,
+        total_dobjects: usize,
     },
 
     /// Canvas mouse click — fully decoded.
     CanvasClick {
-        screen:        (f32, f32),
-        world:         Vec2,
-        modifiers:     KeyModifiers,
-        hit_dobject:   Option<usize>,
-        active_tool:   String,
-        active_state:  String,    // one-line summary of every state machine
+        screen: (f32, f32),
+        world: Vec2,
+        modifiers: KeyModifiers,
+        hit_dobject: Option<usize>,
+        active_tool: String,
+        active_state: String, // one-line summary of every state machine
     },
     /// Mouse press / release / drag (less decoded — just positions).
-    CanvasPress   { screen: (f32, f32), world: Vec2, button: String },
-    CanvasRelease { screen: (f32, f32), world: Vec2, button: String, drag_px: f32 },
+    CanvasPress {
+        screen: (f32, f32),
+        world: Vec2,
+        button: String,
+    },
+    CanvasRelease {
+        screen: (f32, f32),
+        world: Vec2,
+        button: String,
+        drag_px: f32,
+    },
 
     /// FULL gesture decoder — fires AFTER every press-release pair on
     /// the canvas, regardless of whether it was classified as click or
@@ -106,33 +139,33 @@ pub enum DbgEvent {
     /// so a glance at this event tells you "the user dragged 263 px
     /// R→L but it was demoted to a click and nothing was selected".
     GestureClassification {
-        press_screen:        (f32, f32),
-        release_screen:      (f32, f32),
-        press_world:         Vec2,
-        release_world:       Vec2,
-        motion_px:           f32,
-        motion_dir:          String,    // "L→R ↓ 263 px", "stationary", "vertical ↑"
-        egui_clicked:        bool,
-        egui_drag_stopped:   bool,
-        hit_at_press:        Option<usize>,
-        hit_at_release:      Option<usize>,
-        in_select_mode:      bool,
-        active_tool:         String,
+        press_screen: (f32, f32),
+        release_screen: (f32, f32),
+        press_world: Vec2,
+        release_world: Vec2,
+        motion_px: f32,
+        motion_dir: String, // "L→R ↓ 263 px", "stationary", "vertical ↑"
+        egui_clicked: bool,
+        egui_drag_stopped: bool,
+        hit_at_press: Option<usize>,
+        hit_at_release: Option<usize>,
+        in_select_mode: bool,
+        active_tool: String,
         /// EMPTIED at capture when `counts_only` is on — see `n_before`/`n_after`.
-        selection_before:    Vec<usize>,
-        selection_after:     Vec<usize>,
+        selection_before: Vec<usize>,
+        selection_after: Vec<usize>,
         /// True sizes, stamped by `push()` before any stripping. Always valid.
-        n_before:            usize,
-        n_after:             usize,
-        app_action_taken:    String,    // "click_select(i=2)", "window_first=Some(...)", "add_window_selection", "NOOP — gesture had no effect"
-        outcome_summary:     String,    // human-readable verdict
+        n_before: usize,
+        n_after: usize,
+        app_action_taken: String, // "click_select(i=2)", "window_first=Some(...)", "add_window_selection", "NOOP — gesture had no effect"
+        outcome_summary: String,  // human-readable verdict
     },
     CanvasDrag {
         from_screen: (f32, f32),
-        to_screen:   (f32, f32),
-        from_world:  Vec2,
-        to_world:    Vec2,
-        button:      String,
+        to_screen: (f32, f32),
+        from_world: Vec2,
+        to_world: Vec2,
+        button: String,
     },
 
     /// Selection mutated — what was the basket BEFORE vs AFTER.
@@ -140,53 +173,68 @@ pub enum DbgEvent {
         /// The baskets. EMPTIED at capture when `counts_only` is on — read
         /// `n_before`/`n_after` for the size, which is always populated.
         basket_before: Vec<usize>,
-        basket_after:  Vec<usize>,
+        basket_after: Vec<usize>,
         /// True basket sizes, stamped by `push()` before any stripping. Always valid.
-        n_before:      usize,
-        n_after:       usize,
-        cause:         String,    // "click_select(i=5, shift=false)" etc.
+        n_before: usize,
+        n_after: usize,
+        cause: String, // "click_select(i=5, shift=false)" etc.
     },
 
     /// Tool changed. Tools mean "what's the user drafting / picking".
-    ToolChange { from: String, to: String, cause: String },
+    ToolChange {
+        from: String,
+        to: String,
+        cause: String,
+    },
 
     /// Generic state machine transition. `state_name` is the field name
     /// (`"trim_state"`, `"fillet_state"`, etc.). `before`/`after` are
     /// Debug-printed.
-    StateChange { state_name: String, before: String, after: String, cause: String },
+    StateChange {
+        state_name: String,
+        before: String,
+        after: String,
+        cause: String,
+    },
 
     /// `Document::push` — new dobject added. Records its index, the
     /// Geom variant name, the handle, the kind-summary.
     DocPush {
-        index:         usize,
-        geom_kind:     String,
-        handle:        u64,
-        summary:       String,
+        index: usize,
+        geom_kind: String,
+        handle: u64,
+        summary: String,
     },
     /// `Vec::remove(i)` on doc.dobjects — index + Geom kind + summary.
     DocRemove {
-        index:         usize,
-        geom_kind:     String,
-        summary:       String,
+        index: usize,
+        geom_kind: String,
+        summary: String,
     },
 
     /// `snapshot_doc()` called — the moment that pushes onto undo_stack.
     UndoSnapshotTaken {
         undo_depth_after: usize,
-        bytes_estimate:   usize,
+        bytes_estimate: usize,
     },
     /// `do_undo()` fired — what fell off / what came back.
-    UndoFired { from_depth: usize, to_depth: usize },
+    UndoFired {
+        from_depth: usize,
+        to_depth: usize,
+    },
     /// `do_redo()` fired.
-    RedoFired { from_depth: usize, to_depth: usize },
+    RedoFired {
+        from_depth: usize,
+        to_depth: usize,
+    },
 
     /// One of the `apply_*` methods ran. Generic envelope.
     ApplyOp {
-        name:               String,    // "apply_trim_pick", "apply_chprop", "apply_hatch"
-        before_dobj_count:  usize,
-        after_dobj_count:   usize,
-        success:            bool,
-        detail:             String,    // free-form per-op summary
+        name: String, // "apply_trim_pick", "apply_chprop", "apply_hatch"
+        before_dobj_count: usize,
+        after_dobj_count: usize,
+        success: bool,
+        detail: String, // free-form per-op summary
     },
 
     /// A frame that BLEW THE BUDGET, with a breakdown of where it went.
@@ -200,12 +248,12 @@ pub enum DbgEvent {
     /// time. `candidates` is the key column — at 1.5M dobjects a zoomed-out query
     /// returns EVERY dobject, and the render loop then walks all of them.
     SlowFrame {
-        total_us:   u64,
-        query_us:   u64,
-        draw_us:    u64,
+        total_us: u64,
+        query_us: u64,
+        draw_us: u64,
         candidates: usize,
-        drawn:      usize,
-        capped:     bool,
+        drawn: usize,
+        capped: bool,
     },
 
     /// Spatial-index rebuild — O(n) over the WHOLE drawing, triggered by ~58 places
@@ -215,16 +263,16 @@ pub enum DbgEvent {
     /// dobjects it is ~119 ms PER EDIT — bigger than the 98 ms undo clone that IS
     /// logged. Half the per-edit cost was invisible in the dump.
     IndexRebuild {
-        dobjects:   usize,
+        dobjects: usize,
         elapsed_us: u64,
     },
 
     /// Memory incident — Doc clone, grid rebuild, ACI table grow, etc.
     /// `bytes` is the BEST-EFFORT size estimate; `name` describes WHAT.
     MemoryEvent {
-        name:        String,
-        bytes:       usize,
-        elapsed_us:  u64,
+        name: String,
+        bytes: usize,
+        elapsed_us: u64,
     },
 
     /// One STAGE of opening a drawing (`.dxf`/`.dwg`/`.rsm`) — read-from-disk, parse,
@@ -236,10 +284,10 @@ pub enum DbgEvent {
     /// nothing in normal use. The event timeline's `elapsed_ms` also captures the gaps
     /// between `do_open` returning and the first index rebuild / render.
     ImportStage {
-        stage:       String,
-        dobjects:    usize,
-        elapsed_us:  u64,
-        detail:      String,
+        stage: String,
+        dobjects: usize,
+        elapsed_us: u64,
+        detail: String,
     },
 
     /// One 3D-Factory operation — extrude / cut-through / recess / furniture-extrude /
@@ -251,13 +299,98 @@ pub enum DbgEvent {
     /// cut that hit the wrong body is visible without guessing. `bodies`/`tris` are the
     /// resulting CSG body and triangle counts. Emitted only while recording.
     FactoryOp {
-        op:              String,
-        source:          String,
-        detail:          String,
+        op: String,
+        source: String,
+        detail: String,
         features_before: usize,
-        features_after:  usize,
-        bodies:          usize,
-        tris:            usize,
+        features_after: usize,
+        bodies: usize,
+        tris: usize,
+    },
+
+    /// ONE LIGHTING OPERATION — placing and deleting fittings, and the whole life of a
+    /// calculation. The recorder's last blind spot, and it was a total one: there was no lighting
+    /// event of any kind. `FactoryOp` records what happens to the model, `FactoryPerf` what a frame
+    /// costs, `FactoryScene` what the scene IS — and between them nothing said a fitting had been
+    /// placed or a calculation asked for.
+    ///
+    /// It was reported as "why is the calculations not being made. i noticed the lights were also
+    /// not being placed", and a full session recording of it could not show either half. What it
+    /// showed was one click on empty space.
+    ///
+    /// WHAT THIS IS REALLY FOR IS THE REFUSALS. Both operations decline in several places, and most
+    /// of those declines are silent — `place_illuminaire_at` returns `false` with no message at all
+    /// when no fitting is armed and again when the armed fitting is not in the library, and from
+    /// outside the app that is indistinguishable from a click that missed. `message` carries the
+    /// status line the op left behind, so an EMPTY message on a refusal is itself the finding.
+    LightOp {
+        /// Short verb: "place", "place refused", "delete", "calculate", "calculate refused",
+        /// "calculated", "calculation failed".
+        op: String,
+        /// The specifics — the point, the fitting, the room count, or the reason for a refusal.
+        detail: String,
+        fittings_before: usize,
+        fittings_after: usize,
+        /// The status line AFTER the op — the app's own account of what it just did. Empty when the
+        /// op set no message, which for a refusal is the whole point.
+        message: String,
+        /// Wall-clock for the ops that take time (a calculation); 0 for the rest.
+        elapsed_us: u64,
+    },
+
+    /// 3D-Factory RENDER LOAD & FRAME COST — the "why did the app get slow after I imported
+    /// furniture" tap. Furniture is a triangle-soup mesh INSTANCE (not a CSG feature), so it
+    /// never appears in `FactoryOp`'s body/feature counts; a 90k-triangle couch can tank the
+    /// framerate while every other event looks normal. This makes that load VISIBLE.
+    ///
+    /// Two phases:
+    ///   * `buffer-rebuilt` — the opaque render buffer (solids + posed furniture) was rebuilt
+    ///     this frame (a furniture import / placement / pose / colour / geometry edit). Carries
+    ///     `build_us` (the CPU cost to transform + shade the whole buffer) and the resulting
+    ///     load. This is where the import's weight shows up: right after the import, one line
+    ///     says "94 247 tris, 6.7 MB, rebuilt in 12 ms".
+    ///   * `slow-frame` — a continuously-repainting frame (orbit / drag) that blew the refresh
+    ///     budget while the 3D view is open. Throttled so it can't flood the dump.
+    ///
+    /// Emitted only while recording. On a healthy, unchanging scene NEITHER phase fires (the
+    /// buffer is cached and served from an `Arc` with no rebuild), so it costs nothing.
+    FactoryPerf {
+        phase: String,
+        /// Whole-frame wall time in µs (`slow-frame`); 0 when not measured.
+        frame_us: u64,
+        /// CPU µs spent building the opaque vertex buffer this frame (0 on a cache hit).
+        build_us: u64,
+        scene_tris: usize,
+        furniture_insts: usize,
+        /// Triangle count of the single heaviest placed furniture mesh — the usual culprit.
+        heaviest_tris: usize,
+        /// Bytes re-uploaded to the GPU for the opaque buffer this frame.
+        upload_bytes: usize,
+        cache_rebuilt: bool,
+    },
+
+    /// THE 3D SCENE ITSELF — every input the renderer is handed, in one event.
+    ///
+    /// This is the recorder's biggest blind spot, closed. `FactoryOp` records 3D operations as
+    /// they happen and `FactoryPerf` records what a frame COST, but between them nothing
+    /// described what the scene actually IS. So a dump of a rendering bug showed forty
+    /// frame-time lines and no materials, no cut depths, no camera and no coordinates — enough
+    /// to prove the app was running and nothing else. Diagnosis fell back to reading
+    /// screenshots, which is guessing.
+    ///
+    /// Emitted at session START and STOP (so every dump brackets the 3D state), on demand via
+    /// the `scene` command, and after any op that rebuilds the model.
+    ///
+    /// `sections` are pre-formatted by the app — the recorder stays free of `cad_solid` and
+    /// `factory` types, exactly as `GeometryCapture` and `StretchRecord` do. Every list is
+    /// capped and reports its own omissions, so a truncated capture can never be misread as a
+    /// complete one.
+    FactoryScene {
+        reason: String,
+        /// Headline: counts, world extent, and the f32 resolution that extent implies.
+        summary: String,
+        /// `(section title, lines)`, in reading order.
+        sections: Vec<(String, Vec<String>)>,
     },
 
     /// On-demand snapshot of the user-selected smart-dobject CANDIDATE —
@@ -267,8 +400,8 @@ pub enum DbgEvent {
     /// (from `StretchRecord` steps) transforms; together they're enough to
     /// convert the selection into a parametric smart block.
     GeometryCapture {
-        label:   String,
-        entries: Vec<String>,   // one multi-line block per captured dobject
+        label: String,
+        entries: Vec<String>, // one multi-line block per captured dobject
     },
 
     /// A STRETCH captured for smart-block authoring. The box, the vector,
@@ -277,28 +410,39 @@ pub enum DbgEvent {
     /// which dobjects move, by what vector, inside which box. Recorded for
     /// every `stretch`/DDE-stretch while the recorder is running.
     StretchRecord {
-        box_min:        (f64, f64),
-        box_max:        (f64, f64),
-        base:           (f64, f64),
-        dest:           (f64, f64),
-        vector:         (f64, f64),
+        box_min: (f64, f64),
+        box_max: (f64, f64),
+        base: (f64, f64),
+        dest: (f64, f64),
+        vector: (f64, f64),
         total_selected: usize,
         /// One pre-formatted multi-line block per CHANGED dobject
         /// (idx + handle + kind + verbose before/after coordinates).
-        affected:       Vec<String>,
+        affected: Vec<String>,
     },
 
     /// Dialog or palette state changed.
-    WindowToggle { name: String, opened: bool },
+    WindowToggle {
+        name: String,
+        opened: bool,
+    },
     /// Captured pixel geometry of a UI menu — the whole frame plus every
     /// element (label, value box, swatch, button…) as `name: x y w h` in
     /// screen points. Lets the reader compare the RENDERED layout against
     /// the intended design.
-    MenuLayout   { label: String, elements: Vec<String> },
+    MenuLayout {
+        label: String,
+        elements: Vec<String>,
+    },
     /// Menu button clicked from the menu bar.
-    MenuClick    { path: String },
+    MenuClick {
+        path: String,
+    },
     /// Keyboard event handled outside the cmd-line text edit (Esc, F-keys).
-    KeyEvent     { key: String, modifiers: KeyModifiers },
+    KeyEvent {
+        key: String,
+        modifiers: KeyModifiers,
+    },
 }
 
 /// Where a `run_command` invocation came from. Lets the inspector
@@ -314,8 +458,8 @@ pub enum CmdSource {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KeyModifiers {
     pub shift: bool,
-    pub ctrl:  bool,
-    pub alt:   bool,
+    pub ctrl: bool,
+    pub alt: bool,
 }
 
 // ===========================================================================
@@ -326,8 +470,8 @@ pub struct KeyModifiers {
 #[derive(Clone, Debug)]
 pub struct DbgRecord {
     pub elapsed_ms: f64,
-    pub event:      DbgEvent,
-    pub location:   &'static Location<'static>,
+    pub event: DbgEvent,
+    pub location: &'static Location<'static>,
 }
 
 /// How many dobjects' geometry a snapshot keeps. Enough to verify the draw
@@ -343,19 +487,19 @@ pub const SNAP_GEOM_MAX: usize = 20;
 #[derive(Clone)]
 pub struct DbgSnapshot {
     pub event_index: usize,
-    pub tag:         String,
+    pub tag: String,
     /// Geometry (full coordinates) of the first [`SNAP_GEOM_MAX`] dobjects.
-    pub geom:        Vec<String>,
+    pub geom: Vec<String>,
     /// How many dobjects were NOT captured. Reported in the dump so a capped
     /// snapshot can never be mistaken for a complete one.
-    pub omitted:     usize,
+    pub omitted: usize,
 }
 
 /// The recorder. One per `CadApp`. When `recording == false` every
 /// `record(...)` is a tiny no-op so we can leave the calls in for
 /// production builds.
 pub struct DbgRecorder {
-    pub recording:        bool,
+    pub recording: bool,
     /// **Count dobjects ONLY.** Keep the NUMBER of selected/affected dobjects and
     /// nothing else — never the index lists themselves.
     ///
@@ -365,44 +509,44 @@ pub struct DbgRecorder {
     /// dump stops being pasteable at all. With this on, the lists are dropped AT
     /// CAPTURE — not merely hidden at render — so the recorder's own memory stays O(1)
     /// in the selection size.
-    pub counts_only:      bool,
-    pub session_started:  Option<Instant>,
-    pub events:           Vec<DbgRecord>,
-    pub snapshots:        Vec<DbgSnapshot>,
+    pub counts_only: bool,
+    pub session_started: Option<Instant>,
+    pub events: Vec<DbgRecord>,
+    pub snapshots: Vec<DbgSnapshot>,
     /// Auto-snapshot cadence — every N events. 0 disables.
-    pub auto_snap_every:  usize,
+    pub auto_snap_every: usize,
     /// Ring-buffer cap. Once exceeded, oldest events drop. 0 = no cap.
-    pub max_events:       usize,
+    pub max_events: usize,
     /// `true` → capture full Backtrace per event (very slow). Off by default.
     pub capture_backtrace: bool,
     /// Path of the durable on-disk mirror for the CURRENT session (set on
     /// `start`). The UI shows this so the user knows where to find the
     /// dump after a crash / force-close.
-    pub log_path:         Option<PathBuf>,
+    pub log_path: Option<PathBuf>,
     /// Open handle to the on-disk mirror. Every event is written to it
     /// immediately (unbuffered `File` → bytes reach the kernel), so the
     /// timeline survives a panic, a hang the user force-closes, or an OOM
     /// kill. `None` when not recording or if the file couldn't be opened.
-    file:                 Option<File>,
+    file: Option<File>,
     /// Monotonic sequence number for on-disk line labels (unaffected by
     /// in-memory ring eviction, so file `#NNNNN` are always increasing).
-    written:              usize,
+    written: usize,
 }
 
 impl Default for DbgRecorder {
     fn default() -> Self {
         Self {
-            recording:        false,
-            counts_only:      false,
-            session_started:  None,
-            events:           Vec::new(),
-            snapshots:        Vec::new(),
-            auto_snap_every:  50,
-            max_events:       100_000,
+            recording: false,
+            counts_only: false,
+            session_started: None,
+            events: Vec::new(),
+            snapshots: Vec::new(),
+            auto_snap_every: 50,
+            max_events: 100_000,
             capture_backtrace: false,
-            log_path:         None,
-            file:             None,
-            written:          0,
+            log_path: None,
+            file: None,
+            written: 0,
         }
     }
 }
@@ -433,7 +577,9 @@ impl DbgRecorder {
         // recorder doesn't own the Document.
         self.events.push(DbgRecord {
             elapsed_ms: 0.0,
-            event: DbgEvent::SessionStart { reason: reason.to_string() },
+            event: DbgEvent::SessionStart {
+                reason: reason.to_string(),
+            },
             location: Location::caller(),
         });
         self.mirror_last_to_file();
@@ -452,12 +598,16 @@ impl DbgRecorder {
             });
             self.mirror_last_to_file();
             if let Some(f) = self.file.as_mut() {
-                let _ = writeln!(f, "=== END SESSION ({} events, {} snapshots) ===",
-                    self.events.len(), self.snapshots.len());
+                let _ = writeln!(
+                    f,
+                    "=== END SESSION ({} events, {} snapshots) ===",
+                    self.events.len(),
+                    self.snapshots.len()
+                );
                 let _ = f.flush();
             }
         }
-        self.file = None;   // close the handle — the OS flushes to disk
+        self.file = None; // close the handle — the OS flushes to disk
         self.recording = false;
     }
 
@@ -476,7 +626,9 @@ impl DbgRecorder {
     /// remembers the event count from before its own push and patches from there, so
     /// an outer command's time correctly INCLUDES the inner one it spawned.
     pub fn patch_cmd_elapsed_at(&mut self, from_idx: usize, us: u64) {
-        if !self.recording { return; }
+        if !self.recording {
+            return;
+        }
         for r in self.events.iter_mut().skip(from_idx) {
             if let DbgEvent::CmdRun { elapsed_us, .. } = &mut r.event {
                 if elapsed_us.is_none() {
@@ -488,7 +640,9 @@ impl DbgRecorder {
     }
 
     pub fn push(&mut self, mut event: DbgEvent, loc: &'static Location<'static>) {
-        if !self.recording { return; }
+        if !self.recording {
+            return;
+        }
         // COUNT-ONLY — strip dobject index lists at CAPTURE. Done here, in the single
         // choke point every event passes through, so no emission site can forget it
         // and no future one can bypass it. The counts survive (see `n_before/n_after`).
@@ -496,7 +650,13 @@ impl DbgRecorder {
         // the lists are dropped only in counts-only mode.
         let strip = self.counts_only;
         match &mut event {
-            DbgEvent::SelectChange { basket_before, basket_after, n_before, n_after, .. } => {
+            DbgEvent::SelectChange {
+                basket_before,
+                basket_after,
+                n_before,
+                n_after,
+                ..
+            } => {
                 *n_before = basket_before.len();
                 *n_after = basket_after.len();
                 if strip {
@@ -504,7 +664,13 @@ impl DbgRecorder {
                     *basket_after = Vec::new();
                 }
             }
-            DbgEvent::GestureClassification { selection_before, selection_after, n_before, n_after, .. } => {
+            DbgEvent::GestureClassification {
+                selection_before,
+                selection_after,
+                n_before,
+                n_after,
+                ..
+            } => {
                 *n_before = selection_before.len();
                 *n_after = selection_after.len();
                 if strip {
@@ -533,15 +699,23 @@ impl DbgRecorder {
     /// in-memory ring eviction. Best-effort — write errors are ignored so
     /// logging can never break the app.
     fn mirror_last_to_file(&mut self) {
-        if self.file.is_none() { return; }
+        if self.file.is_none() {
+            return;
+        }
         let seq = self.written;
         let line = match self.events.last() {
             Some(r) => format!(
                 "[{:6.1} ms] #{:05} @ {}:{} — {}",
-                r.elapsed_ms, seq,
-                r.location.file().rsplit('/').next().unwrap_or(r.location.file()),
+                r.elapsed_ms,
+                seq,
+                r.location
+                    .file()
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(r.location.file()),
                 r.location.line(),
-                format_event_oneline(&r.event)),
+                format_event_oneline(&r.event)
+            ),
             None => return,
         };
         if let Some(f) = self.file.as_mut() {
@@ -569,7 +743,9 @@ impl DbgRecorder {
         describe: impl Fn(&cad_kernel::Geom) -> String,
         loc: &'static Location<'static>,
     ) {
-        if !self.recording { return; }
+        if !self.recording {
+            return;
+        }
         let idx = self.snapshots.len();
         let n = doc.dobjects.len();
         let geom: Vec<String> = doc
@@ -581,20 +757,20 @@ impl DbgRecorder {
             .collect();
         self.snapshots.push(DbgSnapshot {
             event_index: self.events.len(),
-            tag:         reason.to_string(),
+            tag: reason.to_string(),
             geom,
-            omitted:     n.saturating_sub(SNAP_GEOM_MAX),
+            omitted: n.saturating_sub(SNAP_GEOM_MAX),
         });
         let dobject_count = doc.dobjects.len();
-        let layer_count   = doc.layers.len();
+        let layer_count = doc.layers.len();
         self.push(
             DbgEvent::DocSnapshot {
-                reason:         reason.to_string(),
+                reason: reason.to_string(),
                 dobject_count,
                 undo_depth,
                 redo_depth,
                 layer_count,
-                index_in_dump:  idx,
+                index_in_dump: idx,
             },
             loc,
         );
@@ -603,7 +779,9 @@ impl DbgRecorder {
     /// Should auto-cadence fire a snapshot AT THIS POINT? Counts events
     /// since the last snapshot.
     pub fn want_auto_snap(&self) -> bool {
-        if !self.recording || self.auto_snap_every == 0 { return false; }
+        if !self.recording || self.auto_snap_every == 0 {
+            return false;
+        }
         let last_snap_at = self.snapshots.last().map(|s| s.event_index).unwrap_or(0);
         let since = self.events.len().saturating_sub(last_snap_at);
         since >= self.auto_snap_every
@@ -622,13 +800,19 @@ impl DbgRecorder {
         let mut out = String::new();
         out.push_str(&format!(
             "=== SESSION DUMP ({} events, {} snapshots) ===\n",
-            self.events.len(), self.snapshots.len()));
+            self.events.len(),
+            self.snapshots.len()
+        ));
         for (i, r) in self.events.iter().enumerate() {
             out.push_str(&format!(
                 "[{:6.1} ms] #{:05} @ {}:{} — {}\n",
                 r.elapsed_ms,
                 i,
-                r.location.file().rsplit('/').next().unwrap_or(r.location.file()),
+                r.location
+                    .file()
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(r.location.file()),
                 r.location.line(),
                 format_event_oneline(&r.event),
             ));
@@ -661,7 +845,8 @@ impl DbgRecorder {
         }
         out.push_str(&format!(
             "=== END SESSION ({} snapshots in side-buffer) ===\n",
-            self.snapshots.len()));
+            self.snapshots.len()
+        ));
         out
     }
 }
@@ -670,13 +855,27 @@ impl DbgRecorder {
 /// read at a glance, terse enough that 1000 events fit on screen.
 pub fn format_event_oneline(e: &DbgEvent) -> String {
     match e {
-        DbgEvent::SessionStart { reason } =>
-            format!("◆ SESSION START — {}", reason),
-        DbgEvent::SessionStop { reason, event_count } =>
-            format!("◆ SESSION STOP — {} ({} events)", reason, event_count),
-        DbgEvent::Note { message } =>
-            format!("📝 NOTE: {}", message),
-        DbgEvent::SlowFrame { total_us, query_us, draw_us, candidates, drawn, capped } => {
+        DbgEvent::SessionStart { reason } => format!("◆ SESSION START — {}", reason),
+        DbgEvent::SessionStop {
+            reason,
+            event_count,
+        } => format!("◆ SESSION STOP — {} ({} events)", reason, event_count),
+        DbgEvent::Note { message } => format!("📝 NOTE: {}", message),
+        DbgEvent::PromptChange { text } => {
+            if text.is_empty() {
+                "⌨ PROMPT ▸ (cleared → idle)".to_string()
+            } else {
+                format!("⌨ PROMPT ▸ {}", text)
+            }
+        }
+        DbgEvent::SlowFrame {
+            total_us,
+            query_us,
+            draw_us,
+            candidates,
+            drawn,
+            capped,
+        } => {
             format!(
                 "🐢 SLOW FRAME {:.1} ms  (query {:.1} · draw {:.1})  candidates={} drawn={}{}",
                 *total_us as f64 / 1000.0,
@@ -684,19 +883,43 @@ pub fn format_event_oneline(e: &DbgEvent) -> String {
                 *draw_us as f64 / 1000.0,
                 candidates,
                 drawn,
-                if *capped { "  ⚠ DRAW CAPPED (frame truncated)" } else { "" },
+                if *capped {
+                    "  ⚠ DRAW CAPPED (frame truncated)"
+                } else {
+                    ""
+                },
             )
         }
-        DbgEvent::IndexRebuild { dobjects, elapsed_us } => {
+        DbgEvent::IndexRebuild {
+            dobjects,
+            elapsed_us,
+        } => {
             let ms = *elapsed_us as f64 / 1000.0;
             // 16 ms = one frame @ 60 Hz — past that the stall is VISIBLE
-            let flag = if *elapsed_us >= 16_000 { "  ⚠ SLOW" } else { "" };
+            let flag = if *elapsed_us >= 16_000 {
+                "  ⚠ SLOW"
+            } else {
+                ""
+            };
             format!("🗂 INDEX REBUILD {dobjects} dobj  ⏱ {ms:.1} ms{flag}")
         }
-        DbgEvent::DocSnapshot { reason, dobject_count, undo_depth, redo_depth, index_in_dump, .. } =>
-            format!("📷 SNAP[{}] {} dobj, undo={}, redo={}  ({})",
-                index_in_dump, dobject_count, undo_depth, redo_depth, reason),
-        DbgEvent::CmdRun { raw, parsed_debug, source, elapsed_us } => {
+        DbgEvent::DocSnapshot {
+            reason,
+            dobject_count,
+            undo_depth,
+            redo_depth,
+            index_in_dump,
+            ..
+        } => format!(
+            "📷 SNAP[{}] {} dobj, undo={}, redo={}  ({})",
+            index_in_dump, dobject_count, undo_depth, redo_depth, reason
+        ),
+        DbgEvent::CmdRun {
+            raw,
+            parsed_debug,
+            source,
+            elapsed_us,
+        } => {
             // Flag the slow ones so they stand out while skimming: 16 ms is one frame
             // at 60 Hz — past that the user SEES the stall.
             let t = match elapsed_us {
@@ -707,29 +930,92 @@ pub fn format_event_oneline(e: &DbgEvent) -> String {
             };
             format!("⌨ CMD \"{}\" → {}  [{:?}]{}", raw, parsed_debug, source, t)
         }
-        DbgEvent::ZoomOp { cmd, choices, action, before, after } => {
-            let delta = if before == after { "  (view UNCHANGED)" } else { "" };
+        DbgEvent::ZoomOp {
+            cmd,
+            choices,
+            action,
+            before,
+            after,
+        } => {
+            let delta = if before == after {
+                "  (view UNCHANGED)"
+            } else {
+                ""
+            };
             format!(
                 "🔍 ZOOM \"{cmd}\" → {action}{delta}\n        choices: [{choices}]\n        before: {before}\n        after : {after}"
             )
         }
-        DbgEvent::CanvasClick { world, hit_dobject, active_tool, active_state, .. } =>
-            format!("🖱 CLICK world=({:.3},{:.3})  hit={:?}  tool={}  state={}",
-                world.x, world.y, hit_dobject, active_tool, active_state),
-        DbgEvent::CanvasPress { world, button, .. } =>
-            format!("🖱 PRESS {} @ ({:.3},{:.3})", button, world.x, world.y),
-        DbgEvent::CanvasRelease { world, button, drag_px, .. } =>
-            format!("🖱 RELEASE {} @ ({:.3},{:.3})  drag={:.1}px", button, world.x, world.y, drag_px),
+        DbgEvent::ZoomChange {
+            source,
+            scale_before,
+            scale_after,
+            viewport_dobjects,
+            total_dobjects,
+        } => {
+            let pct = if *scale_before != 0.0 {
+                (scale_after / scale_before - 1.0) * 100.0
+            } else {
+                0.0
+            };
+            let dir = if scale_after > scale_before {
+                "IN"
+            } else if scale_after < scale_before {
+                "OUT"
+            } else {
+                "—"
+            };
+            format!(
+                "🔎 ZOOM {source} {dir} {scale_before:.4}→{scale_after:.4} ({pct:+.1}%)  \
+                     viewport={viewport_dobjects}/{total_dobjects} dobj"
+            )
+        }
+        DbgEvent::CanvasClick {
+            world,
+            hit_dobject,
+            active_tool,
+            active_state,
+            ..
+        } => format!(
+            "🖱 CLICK world=({:.3},{:.3})  hit={:?}  tool={}  state={}",
+            world.x, world.y, hit_dobject, active_tool, active_state
+        ),
+        DbgEvent::CanvasPress { world, button, .. } => {
+            format!("🖱 PRESS {} @ ({:.3},{:.3})", button, world.x, world.y)
+        }
+        DbgEvent::CanvasRelease {
+            world,
+            button,
+            drag_px,
+            ..
+        } => format!(
+            "🖱 RELEASE {} @ ({:.3},{:.3})  drag={:.1}px",
+            button, world.x, world.y, drag_px
+        ),
         DbgEvent::GestureClassification {
-            motion_px, motion_dir, egui_clicked, egui_drag_stopped,
-            press_world, release_world, hit_at_press, hit_at_release,
-            in_select_mode, active_tool, selection_before, selection_after,
-            n_before, n_after, app_action_taken, outcome_summary, ..
+            motion_px,
+            motion_dir,
+            egui_clicked,
+            egui_drag_stopped,
+            press_world,
+            release_world,
+            hit_at_press,
+            hit_at_release,
+            in_select_mode,
+            active_tool,
+            selection_before,
+            selection_after,
+            n_before,
+            n_after,
+            app_action_taken,
+            outcome_summary,
+            ..
         } => {
             // The selection is printed TWICE here (before → after), so this line is
             // the single biggest dump amplifier: ~11 KB at 916 selected. In
             // counts-only mode print the SIZES instead.
-            let sel = if selection_before.is_empty() && selection_after.is_empty()
+            let sel = if selection_before.is_empty()
+                && selection_after.is_empty()
                 && (*n_before > 0 || *n_after > 0)
             {
                 format!("{n_before} → {n_after} dobject(s)")
@@ -749,60 +1035,215 @@ pub fn format_event_oneline(e: &DbgEvent) -> String {
                 sel,
                 app_action_taken, outcome_summary)
         }
-        DbgEvent::CanvasDrag { from_world, to_world, button, .. } =>
-            format!("🖱 DRAG {} ({:.3},{:.3})→({:.3},{:.3})",
-                button, from_world.x, from_world.y, to_world.x, to_world.y),
-        DbgEvent::SelectChange { basket_before, basket_after, n_before, n_after, cause } => {
-            if basket_before.is_empty() && basket_after.is_empty() && (*n_before > 0 || *n_after > 0) {
+        DbgEvent::CanvasDrag {
+            from_world,
+            to_world,
+            button,
+            ..
+        } => format!(
+            "🖱 DRAG {} ({:.3},{:.3})→({:.3},{:.3})",
+            button, from_world.x, from_world.y, to_world.x, to_world.y
+        ),
+        DbgEvent::SelectChange {
+            basket_before,
+            basket_after,
+            n_before,
+            n_after,
+            cause,
+        } => {
+            if basket_before.is_empty()
+                && basket_after.is_empty()
+                && (*n_before > 0 || *n_after > 0)
+            {
                 // counts-only: the lists were dropped at capture
                 format!("✓ SEL {} → {} dobject(s)  ({})", n_before, n_after, cause)
             } else {
-                format!("✓ SEL {:?} → {:?}  ({})", basket_before, basket_after, cause)
+                format!(
+                    "✓ SEL {:?} → {:?}  ({})",
+                    basket_before, basket_after, cause
+                )
             }
         }
-        DbgEvent::ToolChange { from, to, cause } =>
-            format!("🔧 TOOL {} → {}  ({})", from, to, cause),
-        DbgEvent::StateChange { state_name, before, after, cause } =>
-            format!("🔁 {} {} → {}  ({})", state_name, before, after, cause),
-        DbgEvent::DocPush { index, geom_kind, handle, summary } =>
-            format!("➕ PUSH #{} ({}) handle={:#x} — {}", index, geom_kind, handle, summary),
-        DbgEvent::DocRemove { index, geom_kind, summary } =>
-            format!("➖ REMOVE #{} ({}) — {}", index, geom_kind, summary),
-        DbgEvent::UndoSnapshotTaken { undo_depth_after, bytes_estimate } =>
-            format!("💾 UNDO-SNAP depth={} (~{} bytes)", undo_depth_after, bytes_estimate),
-        DbgEvent::UndoFired { from_depth, to_depth } =>
-            format!("↶ UNDO {} → {}", from_depth, to_depth),
-        DbgEvent::RedoFired { from_depth, to_depth } =>
-            format!("↷ REDO {} → {}", from_depth, to_depth),
-        DbgEvent::ApplyOp { name, before_dobj_count, after_dobj_count, success, detail } =>
-            format!("⚙ {} ok={} dobj {}→{} — {}",
-                name, success, before_dobj_count, after_dobj_count, detail),
-        DbgEvent::MemoryEvent { name, bytes, elapsed_us } =>
-            format!("🧠 {} ~{} bytes in {} µs", name, bytes, elapsed_us),
-        DbgEvent::ImportStage { stage, dobjects, elapsed_us, detail } => {
+        DbgEvent::ToolChange { from, to, cause } => {
+            format!("🔧 TOOL {} → {}  ({})", from, to, cause)
+        }
+        DbgEvent::StateChange {
+            state_name,
+            before,
+            after,
+            cause,
+        } => format!("🔁 {} {} → {}  ({})", state_name, before, after, cause),
+        DbgEvent::DocPush {
+            index,
+            geom_kind,
+            handle,
+            summary,
+        } => format!(
+            "➕ PUSH #{} ({}) handle={:#x} — {}",
+            index, geom_kind, handle, summary
+        ),
+        DbgEvent::DocRemove {
+            index,
+            geom_kind,
+            summary,
+        } => format!("➖ REMOVE #{} ({}) — {}", index, geom_kind, summary),
+        DbgEvent::UndoSnapshotTaken {
+            undo_depth_after,
+            bytes_estimate,
+        } => format!(
+            "💾 UNDO-SNAP depth={} (~{} bytes)",
+            undo_depth_after, bytes_estimate
+        ),
+        DbgEvent::UndoFired {
+            from_depth,
+            to_depth,
+        } => format!("↶ UNDO {} → {}", from_depth, to_depth),
+        DbgEvent::RedoFired {
+            from_depth,
+            to_depth,
+        } => format!("↷ REDO {} → {}", from_depth, to_depth),
+        DbgEvent::ApplyOp {
+            name,
+            before_dobj_count,
+            after_dobj_count,
+            success,
+            detail,
+        } => format!(
+            "⚙ {} ok={} dobj {}→{} — {}",
+            name, success, before_dobj_count, after_dobj_count, detail
+        ),
+        DbgEvent::MemoryEvent {
+            name,
+            bytes,
+            elapsed_us,
+        } => format!("🧠 {} ~{} bytes in {} µs", name, bytes, elapsed_us),
+        DbgEvent::ImportStage {
+            stage,
+            dobjects,
+            elapsed_us,
+            detail,
+        } => {
             let ms = *elapsed_us as f64 / 1000.0;
             // 16 ms = one frame @ 60 Hz — anything past that the user SEES as a stall.
-            let flag = if *elapsed_us >= 16_000 { "  ⚠ SLOW" } else { "" };
-            let det = if detail.is_empty() { String::new() } else { format!("  — {detail}") };
+            let flag = if *elapsed_us >= 16_000 {
+                "  ⚠ SLOW"
+            } else {
+                ""
+            };
+            let det = if detail.is_empty() {
+                String::new()
+            } else {
+                format!("  — {detail}")
+            };
             format!("📂 IMPORT [{stage}] ⏱ {ms:.1} ms  ({dobjects} dobj){flag}{det}")
         }
-        DbgEvent::FactoryOp { op, source, detail, features_before, features_after, bodies, tris } => {
+        DbgEvent::FactoryOp {
+            op,
+            source,
+            detail,
+            features_before,
+            features_after,
+            bodies,
+            tris,
+        } => {
             // Flag a no-op (feature count unchanged) — the usual shape of "nothing showed
             // up". Ops that legitimately add no CSG feature (recompute, delete, mesh
             // import — furniture is a separate mesh instance) are exempt.
             let exempt = matches!(op.as_str(), "recompute" | "delete-selected" | "import-mesh");
             let flag = if features_after == features_before && !exempt {
                 "  ⚠ NO FEATURE ADDED"
-            } else { "" };
+            } else {
+                ""
+            };
             format!(
                 "🧱 FACTORY [{op}] src={source}  feat {features_before}→{features_after}  bodies={bodies} tris={tris}{flag}\n         {detail}"
             )
         }
+        DbgEvent::LightOp {
+            op,
+            detail,
+            fittings_before,
+            fittings_after,
+            message,
+            elapsed_us,
+        } => {
+            // A REFUSAL THAT SAID NOTHING is the finding, not a missing field. Both placement and
+            // calculation decline in places that set no status line, and from outside the app that
+            // is a button doing nothing. Call it out here so nobody has to notice the absence.
+            let refused = op.contains("refused") || op.contains("failed");
+            let msg = if message.is_empty() {
+                if refused {
+                    "  ⚠ NO MESSAGE — the app told the user nothing".to_string()
+                } else {
+                    String::new()
+                }
+            } else {
+                format!("\n         says: {message:?}")
+            };
+            // A placement that changed no count is the shape of "I clicked and nothing happened".
+            let flag = if op == "place" && fittings_after == fittings_before {
+                "  ⚠ FITTING COUNT UNCHANGED"
+            } else {
+                ""
+            };
+            let took = if *elapsed_us > 0 {
+                format!("  ⏱ {:.1} s", *elapsed_us as f64 / 1_000_000.0)
+            } else {
+                String::new()
+            };
+            format!(
+                "💡 LIGHT [{op}] fittings {fittings_before}→{fittings_after}{took}{flag}\n         {detail}{msg}"
+            )
+        }
+        DbgEvent::FactoryPerf {
+            phase,
+            frame_us,
+            build_us,
+            scene_tris,
+            furniture_insts,
+            heaviest_tris,
+            upload_bytes,
+            cache_rebuilt,
+        } => {
+            let mb = *upload_bytes as f64 / (1024.0 * 1024.0);
+            let build_ms = *build_us as f64 / 1000.0;
+            // A frame @ 60 Hz is 16.7 ms — past that the user SEES the stall. Flag whichever
+            // cost blew the budget so a slow line stands out while skimming.
+            let slow = *frame_us >= 16_700 || *build_us >= 16_700;
+            let frame = if *frame_us > 0 {
+                format!("frame {:.1} ms  ", *frame_us as f64 / 1000.0)
+            } else {
+                String::new()
+            };
+            format!(
+                "📊 FACTORY PERF [{phase}]  {frame}build {build_ms:.1} ms  \
+                 tris={scene_tris} furn={furniture_insts} heaviest={heaviest_tris}  \
+                 upload={mb:.1} MB  rebuilt={cache_rebuilt}{}",
+                if slow { "  ⚠ SLOW" } else { "" },
+            )
+        }
+        DbgEvent::FactoryScene {
+            reason,
+            summary,
+            sections,
+        } => {
+            let mut s = format!("🎬 3D SCENE ({reason})\n         {summary}");
+            for (title, lines) in sections {
+                s.push_str(&format!("\n         ── {title} ──"));
+                for l in lines {
+                    s.push_str("\n           ");
+                    s.push_str(l);
+                }
+            }
+            s
+        }
         DbgEvent::GeometryCapture { label, entries } => {
             let mut s = format!(
                 "📐 GEOMETRY CAPTURE — {} ({} entr{})",
-                label, entries.len(),
-                if entries.len() == 1 { "y" } else { "ies" });
+                label,
+                entries.len(),
+                if entries.len() == 1 { "y" } else { "ies" }
+            );
             for e in entries {
                 s.push_str("\n         ");
                 s.push_str(e);
@@ -810,40 +1251,58 @@ pub fn format_event_oneline(e: &DbgEvent) -> String {
             s
         }
         DbgEvent::StretchRecord {
-            box_min, box_max, base, dest, vector, total_selected, affected,
+            box_min,
+            box_max,
+            base,
+            dest,
+            vector,
+            total_selected,
+            affected,
         } => {
             let mag = (vector.0 * vector.0 + vector.1 * vector.1).sqrt();
             let mut s = format!(
                 "✂REC STRETCH  box=({:.3},{:.3})→({:.3},{:.3})  \
                  vec=({:.3},{:.3}) |v|={:.3}  dir=({:.4},{:.4})  \
                  base=({:.3},{:.3})→dest=({:.3},{:.3})  {}/{} changed",
-                box_min.0, box_min.1, box_max.0, box_max.1,
-                vector.0, vector.1, mag,
+                box_min.0,
+                box_min.1,
+                box_max.0,
+                box_max.1,
+                vector.0,
+                vector.1,
+                mag,
                 if mag > 1e-9 { vector.0 / mag } else { 0.0 },
                 if mag > 1e-9 { vector.1 / mag } else { 0.0 },
-                base.0, base.1, dest.0, dest.1,
-                affected.len(), total_selected);
+                base.0,
+                base.1,
+                dest.0,
+                dest.1,
+                affected.len(),
+                total_selected
+            );
             for a in affected {
                 s.push_str("\n         ");
                 s.push_str(a);
             }
             s
         }
-        DbgEvent::WindowToggle { name, opened } =>
-            format!("🪟 {} {}", name, if *opened {"OPENED"} else {"CLOSED"}),
+        DbgEvent::WindowToggle { name, opened } => {
+            format!("🪟 {} {}", name, if *opened { "OPENED" } else { "CLOSED" })
+        }
         DbgEvent::MenuLayout { label, elements } => {
-            let mut s = format!("📐 MENU LAYOUT — {} ({} elements)  [x y w h, screen pts]",
-                label, elements.len());
+            let mut s = format!(
+                "📐 MENU LAYOUT — {} ({} elements)  [x y w h, screen pts]",
+                label,
+                elements.len()
+            );
             for e in elements {
                 s.push_str("\n         ");
                 s.push_str(e);
             }
             s
         }
-        DbgEvent::MenuClick { path } =>
-            format!("☰ MENU {}", path),
-        DbgEvent::KeyEvent { key, modifiers } =>
-            format!("⌨ KEY {} {:?}", key, modifiers),
+        DbgEvent::MenuClick { path } => format!("☰ MENU {}", path),
+        DbgEvent::KeyEvent { key, modifiers } => format!("⌨ KEY {} {:?}", key, modifiers),
     }
 }
 
@@ -860,37 +1319,40 @@ pub fn format_event_oneline(e: &DbgEvent) -> String {
 pub struct WatchedState {
     /// Which viewport the user is working in (2D plan / 3D Factory). This is the
     /// signal the modifiers dispatch on, so a dump must show it.
-    pub active_view:         String,
-    pub tool:                String,
-    pub select_mode:         String,
+    pub active_view: String,
+    pub tool: String,
+    pub select_mode: String,
     // The five core modifiers. They were MISSING from the watched set, which is why a
     // dump of a MOVE showed the command being typed and then nothing — the one state
     // that was live was the one state never printed.
-    pub move_state:          String,
-    pub copy_state:          String,
-    pub rotate_state:        String,
-    pub scale_state:         String,
-    pub mirror_state:        String,
-    pub trim_state:          String,
-    pub extend_state:        String,
-    pub fillet_state:        String,
-    pub chamfer_state:       String,
-    pub offset_state:        String,
-    pub dist_state:          String,
-    pub text_draft:          String,
-    pub matchprops_state:    String,
-    pub align_state:         String,
-    pub stretch_state:       String,
-    pub break_state:         String,
-    pub lengthen_state:      String,
+    pub move_state: String,
+    pub copy_state: String,
+    pub rotate_state: String,
+    pub scale_state: String,
+    pub mirror_state: String,
+    pub trim_state: String,
+    pub extend_state: String,
+    pub fillet_state: String,
+    pub chamfer_state: String,
+    pub offset_state: String,
+    pub dist_state: String,
+    pub area_state: bool,
+    pub layer_pick: String,
+    pub ptdist_state: String,
+    pub text_draft: String,
+    pub matchprops_state: String,
+    pub align_state: String,
+    pub stretch_state: String,
+    pub break_state: String,
+    pub lengthen_state: String,
     /// Block / insert POINT-PICK phases. These capture a coordinate on a
     /// single click; if a pick "catches grips" or selects instead, the
     /// transition here vs. the click that fired is the smoking gun.
-    pub block_def_state:     String,
-    pub insert_state:        String,
+    pub block_def_state: String,
+    pub insert_state: String,
     /// Block dialog "Pick ⊕" base-point capture in progress.
-    pub block_pick_base:     bool,
-    pub grip_drag:           bool,
+    pub block_pick_base: bool,
+    pub grip_drag: bool,
     // NOTE: there is deliberately NO `selection` field here.
     //
     // It used to hold a `Vec<usize>` CLONE of the selection, rebuilt EVERY FRAME while
@@ -906,7 +1368,7 @@ pub struct WatchedState {
     /// puts itself here and waits for the user to pick. If you see
     /// `queued_op != None` linger past Enter, the queued op never
     /// fired — almost always the bug shape.
-    pub queued_op:           String,
+    pub queued_op: String,
     /// Override for the next window — `Some(true)` = force inside
     /// (user typed `w`), `Some(false)` = force crossing (`c`), `None`
     /// = use direction default. Consumed by the FIRST completing
@@ -916,33 +1378,33 @@ pub struct WatchedState {
     /// Captured first corner of a two-click window gesture. While
     /// `Some`, the next click commits the window. `None` after a
     /// successful or aborted gesture.
-    pub window_first:        String,
-    pub doc_dobjects_len:    usize,
-    pub undo_depth:          usize,
-    pub redo_depth:          usize,
+    pub window_first: String,
+    pub doc_dobjects_len: usize,
+    pub undo_depth: usize,
+    pub redo_depth: usize,
     /// All Window-state flags concatenated as bits → "open/closed"
     /// map of every palette. One field per Window.
-    pub window_flags:        WindowFlags,
+    pub window_flags: WindowFlags,
     /// Persisted SYSVARs we want to see flip live. Cherry-picked —
     /// not every byte of `env` (would flood the timeline).
-    pub sysvar_summary:      String,
+    pub sysvar_summary: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct WindowFlags {
-    pub cmd_window:        bool,
-    pub layers_window:     bool,
-    pub pens_window:       bool,
-    pub info_window:       bool,
-    pub dobjects_window:   bool,
-    pub snap_window:       bool,
-    pub trim_debug:        bool,
-    pub hatch_debug:       bool,
-    pub hatch_dialog:      bool,
-    pub hatch_confirm:     bool,
+    pub cmd_window: bool,
+    pub layers_window: bool,
+    pub pens_window: bool,
+    pub info_window: bool,
+    pub dobjects_window: bool,
+    pub snap_window: bool,
+    pub trim_debug: bool,
+    pub hatch_debug: bool,
+    pub hatch_dialog: bool,
+    pub hatch_confirm: bool,
     pub text_style_dialog: bool,
-    pub dim_style_dialog:  bool,
-    pub dbg_window:        bool,
+    pub dim_style_dialog: bool,
+    pub dbg_window: bool,
 }
 
 impl WindowFlags {
@@ -952,21 +1414,25 @@ impl WindowFlags {
         let mut closed = Vec::new();
         macro_rules! flag {
             ($name:literal, $field:ident) => {
-                if self.$field { open.push($name); } else { closed.push($name); }
+                if self.$field {
+                    open.push($name);
+                } else {
+                    closed.push($name);
+                }
             };
         }
-        flag!("cmd",          cmd_window);
-        flag!("layers",       layers_window);
-        flag!("pens",         pens_window);
-        flag!("info",         info_window);
-        flag!("dobjects",     dobjects_window);
-        flag!("snap",         snap_window);
-        flag!("trim_debug",   trim_debug);
-        flag!("hatch_debug",  hatch_debug);
+        flag!("cmd", cmd_window);
+        flag!("layers", layers_window);
+        flag!("pens", pens_window);
+        flag!("info", info_window);
+        flag!("dobjects", dobjects_window);
+        flag!("snap", snap_window);
+        flag!("trim_debug", trim_debug);
+        flag!("hatch_debug", hatch_debug);
         flag!("hatch_dialog", hatch_dialog);
-        flag!("hatch_confirm",hatch_confirm);
-        flag!("text_style",   text_style_dialog);
-        flag!("dim_style",    dim_style_dialog);
+        flag!("hatch_confirm", hatch_confirm);
+        flag!("text_style", text_style_dialog);
+        flag!("dim_style", dim_style_dialog);
         flag!("dbg_recorder", dbg_window);
         format!("open=[{}] closed=[{}]", open.join(","), closed.join(","))
     }
@@ -981,96 +1447,116 @@ pub fn diff_watched(
     curr: &WatchedState,
     loc: &'static Location<'static>,
 ) -> usize {
-    if !rec.recording { return 0; }
+    if !rec.recording {
+        return 0;
+    }
     let mut n = 0;
     macro_rules! diff_field {
         ($name:expr, $field:ident) => {
             if prev.$field != curr.$field {
-                rec.push(DbgEvent::StateChange {
-                    state_name: $name.to_string(),
-                    before:     format!("{:?}", prev.$field),
-                    after:      format!("{:?}", curr.$field),
-                    cause:      "state poll (frame end)".to_string(),
-                }, loc);
+                rec.push(
+                    DbgEvent::StateChange {
+                        state_name: $name.to_string(),
+                        before: format!("{:?}", prev.$field),
+                        after: format!("{:?}", curr.$field),
+                        cause: "state poll (frame end)".to_string(),
+                    },
+                    loc,
+                );
                 n += 1;
             }
         };
     }
     // Tool gets its own dedicated event variant for easier filtering.
     if prev.tool != curr.tool {
-        rec.push(DbgEvent::ToolChange {
-            from:  prev.tool.clone(),
-            to:    curr.tool.clone(),
-            cause: "state poll (frame end)".to_string(),
-        }, loc);
+        rec.push(
+            DbgEvent::ToolChange {
+                from: prev.tool.clone(),
+                to: curr.tool.clone(),
+                cause: "state poll (frame end)".to_string(),
+            },
+            loc,
+        );
         n += 1;
     }
-    diff_field!("active_view",       active_view);
-    diff_field!("select_mode",       select_mode);
-    diff_field!("move_state",        move_state);
-    diff_field!("copy_state",        copy_state);
-    diff_field!("rotate_state",      rotate_state);
-    diff_field!("scale_state",       scale_state);
-    diff_field!("mirror_state",      mirror_state);
-    diff_field!("trim_state",        trim_state);
-    diff_field!("extend_state",      extend_state);
-    diff_field!("fillet_state",      fillet_state);
-    diff_field!("chamfer_state",     chamfer_state);
-    diff_field!("offset_state",      offset_state);
-    diff_field!("dist_state",        dist_state);
-    diff_field!("text_draft",        text_draft);
-    diff_field!("matchprops_state",  matchprops_state);
-    diff_field!("align_state",       align_state);
-    diff_field!("stretch_state",     stretch_state);
-    diff_field!("break_state",       break_state);
-    diff_field!("lengthen_state",    lengthen_state);
-    diff_field!("block_def_state",   block_def_state);
-    diff_field!("insert_state",      insert_state);
+    diff_field!("active_view", active_view);
+    diff_field!("select_mode", select_mode);
+    diff_field!("move_state", move_state);
+    diff_field!("copy_state", copy_state);
+    diff_field!("rotate_state", rotate_state);
+    diff_field!("scale_state", scale_state);
+    diff_field!("mirror_state", mirror_state);
+    diff_field!("trim_state", trim_state);
+    diff_field!("extend_state", extend_state);
+    diff_field!("fillet_state", fillet_state);
+    diff_field!("chamfer_state", chamfer_state);
+    diff_field!("offset_state", offset_state);
+    diff_field!("dist_state", dist_state);
+    diff_field!("area_state", area_state);
+    diff_field!("layer_pick", layer_pick);
+    diff_field!("ptdist_state", ptdist_state);
+    diff_field!("text_draft", text_draft);
+    diff_field!("matchprops_state", matchprops_state);
+    diff_field!("align_state", align_state);
+    diff_field!("stretch_state", stretch_state);
+    diff_field!("break_state", break_state);
+    diff_field!("lengthen_state", lengthen_state);
+    diff_field!("block_def_state", block_def_state);
+    diff_field!("insert_state", insert_state);
     if prev.block_pick_base != curr.block_pick_base {
-        rec.push(DbgEvent::StateChange {
-            state_name: "block_pick_base".into(),
-            before:     prev.block_pick_base.to_string(),
-            after:      curr.block_pick_base.to_string(),
-            cause:      "state poll (frame end)".into(),
-        }, loc);
+        rec.push(
+            DbgEvent::StateChange {
+                state_name: "block_pick_base".into(),
+                before: prev.block_pick_base.to_string(),
+                after: curr.block_pick_base.to_string(),
+                cause: "state poll (frame end)".into(),
+            },
+            loc,
+        );
         n += 1;
     }
-    diff_field!("queued_op",           queued_op);
+    diff_field!("queued_op", queued_op);
     diff_field!("armed_window_inside", armed_window_inside);
-    diff_field!("window_first",        window_first);
+    diff_field!("window_first", window_first);
     if prev.grip_drag != curr.grip_drag {
-        rec.push(DbgEvent::StateChange {
-            state_name: "grip_drag".into(),
-            before:     prev.grip_drag.to_string(),
-            after:      curr.grip_drag.to_string(),
-            cause:      "state poll (frame end)".into(),
-        }, loc);
+        rec.push(
+            DbgEvent::StateChange {
+                state_name: "grip_drag".into(),
+                before: prev.grip_drag.to_string(),
+                after: curr.grip_drag.to_string(),
+                cause: "state poll (frame end)".into(),
+            },
+            loc,
+        );
         n += 1;
     }
     // Per-window toggle event for any flag flipped.
     macro_rules! window_diff {
         ($name:literal, $field:ident) => {
             if prev.window_flags.$field != curr.window_flags.$field {
-                rec.push(DbgEvent::WindowToggle {
-                    name:   $name.to_string(),
-                    opened: curr.window_flags.$field,
-                }, loc);
+                rec.push(
+                    DbgEvent::WindowToggle {
+                        name: $name.to_string(),
+                        opened: curr.window_flags.$field,
+                    },
+                    loc,
+                );
                 n += 1;
             }
         };
     }
-    window_diff!("cmd",           cmd_window);
-    window_diff!("layers",        layers_window);
-    window_diff!("pens",          pens_window);
-    window_diff!("info",          info_window);
-    window_diff!("dobjects",      dobjects_window);
-    window_diff!("snap",          snap_window);
-    window_diff!("trim_debug",    trim_debug);
-    window_diff!("hatch_debug",   hatch_debug);
-    window_diff!("hatch_dialog",  hatch_dialog);
+    window_diff!("cmd", cmd_window);
+    window_diff!("layers", layers_window);
+    window_diff!("pens", pens_window);
+    window_diff!("info", info_window);
+    window_diff!("dobjects", dobjects_window);
+    window_diff!("snap", snap_window);
+    window_diff!("trim_debug", trim_debug);
+    window_diff!("hatch_debug", hatch_debug);
+    window_diff!("hatch_dialog", hatch_dialog);
     window_diff!("hatch_confirm", hatch_confirm);
-    window_diff!("text_style",    text_style_dialog);
-    window_diff!("dbg_recorder",  dbg_window);
+    window_diff!("text_style", text_style_dialog);
+    window_diff!("dbg_recorder", dbg_window);
     diff_field!("sysvar_summary", sysvar_summary);
     n
 }
@@ -1090,19 +1576,12 @@ macro_rules! dbg_event {
     }};
 }
 
-/// Take a Document snapshot tagged with `reason`. Forwards undo/redo
-/// depths and the call site.
-#[macro_export]
-macro_rules! dbg_snapshot {
-    ($app:expr, $reason:expr) => {{
-        if $app.dbg.recording {
-            $app.dbg.take_snapshot(
-                &$app.doc,
-                $reason,
-                $app.undo_stack.len(),
-                $app.redo_stack.len(),
-                std::panic::Location::caller(),
-            );
-        }
-    }};
-}
+// There was a `dbg_snapshot!` macro here. It was DEAD and it could not compile: it called
+// `take_snapshot` without the `describe` argument, so any use of it was a type error. Nothing
+// used it, which is the only reason that went unnoticed.
+//
+// It is deleted rather than repaired because it was actively misleading — it read as the
+// sanctioned way to take a snapshot while the three real call sites (session start, auto cadence,
+// the 📷 button) all call `take_snapshot` directly. A macro that cannot compile is worse than no
+// macro: it invites a fix in the wrong place. Snapshots must pass `plan_doc()`, never `doc`,
+// which while a face-sketch session is live IS the sketch.

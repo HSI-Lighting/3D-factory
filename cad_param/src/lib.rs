@@ -24,4 +24,6 @@ pub mod solve;
 pub use expr::{eval, Var, VarTable};
 pub use io::{read_rsmp, write_rsmp};
 pub use model::{Circle, CircleId, Constraint, Line, LineId, PointId, ScalarId, Sketch};
-pub use solve::{current_rms, dof_analysis, residual_breakdown, residuals, solve, DofReport, SolveReport};
+pub use solve::{
+    current_rms, dof_analysis, residual_breakdown, residuals, solve, DofReport, SolveReport,
+};

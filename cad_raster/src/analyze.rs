@@ -21,17 +21,17 @@ pub struct Report {
     /// Distinct colours after a coarse quantise (line art = few).
     pub approx_colors: usize,
     /// Fraction of pixels that sit on a strong intensity edge (0..1).
-    pub edge_density:  f32,
-    pub class:         RasterClass,
+    pub edge_density: f32,
+    pub class: RasterClass,
     /// 0..1 confidence in the class.
-    pub confidence:    f32,
+    pub confidence: f32,
 }
 
 /// Analyze a working raster. Samples on a stride for speed on big scans.
 pub fn analyze(img: &DynamicImage) -> Report {
     let (w, h) = img.dimensions();
     let rgba = img.to_rgba8();
-    let stride = ((w.max(h) / 512).max(1)) as u32;   // cap work on huge images
+    let stride = ((w.max(h) / 512).max(1)) as u32; // cap work on huge images
 
     // Coarse colour count (quantise to 4 bits/channel).
     let mut colors: HashSet<u16> = HashSet::new();
@@ -40,9 +40,7 @@ pub fn analyze(img: &DynamicImage) -> Report {
         let mut x = 0;
         while x < w {
             let p = rgba.get_pixel(x, y).0;
-            let key = ((p[0] as u16 >> 4) << 8)
-                    | ((p[1] as u16 >> 4) << 4)
-                    |  (p[2] as u16 >> 4);
+            let key = ((p[0] as u16 >> 4) << 8) | ((p[1] as u16 >> 4) << 4) | (p[2] as u16 >> 4);
             colors.insert(key);
             x += stride;
         }
@@ -57,16 +55,22 @@ pub fn analyze(img: &DynamicImage) -> Report {
     while y + 1 < h {
         let mut x = 1;
         while x + 1 < w {
-            let c  = g.get_pixel(x, y).0[0] as i32;
+            let c = g.get_pixel(x, y).0[0] as i32;
             let gx = (g.get_pixel(x + 1, y).0[0] as i32 - c).abs();
             let gy = (g.get_pixel(x, y + 1).0[0] as i32 - c).abs();
-            if gx.max(gy) > 40 { edge += 1; }
+            if gx.max(gy) > 40 {
+                edge += 1;
+            }
             total += 1;
             x += stride;
         }
         y += stride;
     }
-    let edge_density = if total > 0 { edge as f32 / total as f32 } else { 0.0 };
+    let edge_density = if total > 0 {
+        edge as f32 / total as f32
+    } else {
+        0.0
+    };
 
     // Classify.
     let approx_colors = colors.len();
@@ -78,19 +82,23 @@ pub fn analyze(img: &DynamicImage) -> Report {
         (RasterClass::PhotoNotSuitable, 0.7)
     };
 
-    Report { approx_colors, edge_density, class, confidence }
+    Report {
+        approx_colors,
+        edge_density,
+        class,
+        confidence,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{DynamicImage, Luma, GrayImage};
+    use image::{DynamicImage, GrayImage, Luma};
 
     #[test]
     fn line_art_image_classifies_as_line_art() {
         // Black vertical lines on white → few colours, clear edges.
-        let g = GrayImage::from_fn(64, 64, |x, _|
-            Luma([if x % 8 == 0 { 0 } else { 255 }]));
+        let g = GrayImage::from_fn(64, 64, |x, _| Luma([if x % 8 == 0 { 0 } else { 255 }]));
         let r = analyze(&DynamicImage::ImageLuma8(g));
         assert_eq!(r.class, RasterClass::LineArt);
         assert!(r.approx_colors <= 24);

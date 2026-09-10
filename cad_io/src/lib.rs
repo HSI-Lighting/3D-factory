@@ -14,8 +14,11 @@
 //! filesystem, threading, or UI — pass in / receive a `&[u8]` (RSM) or a
 //! `&str` (DXF) and let the caller handle I/O.
 
+pub mod dwg;
 pub mod dxf;
 pub mod pat;
+pub mod plot_table;
 pub mod rsm;
 
 pub use pat::{parse_pat, PatLine, PatParse, PatPattern};
+pub use plot_table::{load_plot_table, plot_table_from_json, plot_table_to_json, save_plot_table};

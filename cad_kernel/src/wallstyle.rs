@@ -8,18 +8,18 @@
 /// A named wall type.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WallStyle {
-    pub name:        String,
+    pub name: String,
     /// Default centerline-to-face thickness (full width).
-    pub thickness:   f64,
+    pub thickness: f64,
     /// Poché fill color (AutoCAD Color Index). 0 = no fill (hollow wall).
     /// A solid tint for now; true hatch patterns are a follow-up.
-    pub fill_color:  u32,
+    pub fill_color: u32,
     /// Face-line color (ACI). 0 = ByLayer/ByBlock (use the dobject color).
-    pub face_color:  u32,
+    pub face_color: u32,
     /// Draw a batt-INSULATION symbol (sine wave) in the cavity — the
     /// architectural insulation-layer wall. Amplitude auto-fits the thickness.
     /// NOT persisted to RSM yet (reader defaults it false, like the table).
-    pub insulation:  bool,
+    pub insulation: bool,
     /// Free-text note shown in the Wall Style Manager.
     pub description: String,
 }
@@ -28,11 +28,11 @@ impl WallStyle {
     /// The built-in STANDARD style (always id 0).
     pub fn standard() -> Self {
         Self {
-            name:        "STANDARD".into(),
-            thickness:   0.2,
-            fill_color:  0,
-            face_color:  0,
-            insulation:  false,
+            name: "STANDARD".into(),
+            thickness: 0.2,
+            fill_color: 0,
+            face_color: 0,
+            insulation: false,
             description: String::new(),
         }
     }
@@ -48,7 +48,9 @@ impl WallStyleTable {
     pub const STANDARD: u32 = 0;
 
     pub fn with_defaults() -> Self {
-        Self { styles: vec![WallStyle::standard()] }
+        Self {
+            styles: vec![WallStyle::standard()],
+        }
     }
     pub fn get(&self, id: u32) -> Option<&WallStyle> {
         self.styles.get(id as usize)
@@ -59,13 +61,21 @@ impl WallStyleTable {
         id
     }
     pub fn find(&self, name: &str) -> Option<u32> {
-        self.styles.iter().position(|s| s.name.eq_ignore_ascii_case(name))
+        self.styles
+            .iter()
+            .position(|s| s.name.eq_ignore_ascii_case(name))
             .map(|i| i as u32)
     }
-    pub fn len(&self) -> usize { self.styles.len() }
-    pub fn is_empty(&self) -> bool { self.styles.is_empty() }
+    pub fn len(&self) -> usize {
+        self.styles.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.styles.is_empty()
+    }
 }
 
 impl Default for WallStyleTable {
-    fn default() -> Self { Self::with_defaults() }
+    fn default() -> Self {
+        Self::with_defaults()
+    }
 }

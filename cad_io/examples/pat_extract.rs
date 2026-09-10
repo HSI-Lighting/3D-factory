@@ -20,12 +20,21 @@ fn main() {
     let r = cad_io::parse_pat(&text);
     println!("== .pat extract: {path} ==");
     for p in &r.patterns {
-        let kind = if !p.is_usable() { "EMPTY (no families)" }
-                   else if p.is_solid_lines() { "solid lines" }
-                   else { "dashed lines" };
+        let kind = if !p.is_usable() {
+            "EMPTY (no families)"
+        } else if p.is_solid_lines() {
+            "solid lines"
+        } else {
+            "dashed lines"
+        };
         let mark = if p.is_usable() { "✓" } else { "✗" };
-        println!("  {mark} {:<14} {} family(ies) · {:<18} {}",
-                 p.name, p.lines.len(), kind, p.description);
+        println!(
+            "  {mark} {:<14} {} family(ies) · {:<18} {}",
+            p.name,
+            p.lines.len(),
+            kind,
+            p.description
+        );
     }
     println!("\n-- summary --");
     println!("  patterns:        {}", r.patterns.len());
@@ -33,7 +42,11 @@ fn main() {
     println!("  empty/headers:   {}", r.patterns.len() - r.usable_count());
     if !r.warnings.is_empty() {
         println!("  warnings:        {}", r.warnings.len());
-        for w in r.warnings.iter().take(10) { println!("    ! {w}"); }
-        if r.warnings.len() > 10 { println!("    … {} more", r.warnings.len() - 10); }
+        for w in r.warnings.iter().take(10) {
+            println!("    ! {w}");
+        }
+        if r.warnings.len() > 10 {
+            println!("    … {} more", r.warnings.len() - 10);
+        }
     }
 }

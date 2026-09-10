@@ -9,12 +9,26 @@ path = "src/main.rs"
 
 [dependencies]
 cad_kernel = { path = "../cad_kernel" }
+cad_text   = { path = "../cad_text" }
 cad_io     = { path = "../cad_io" }
+cad_plot   = { path = "../cad_plot" }
 cad_wall   = { path = "../cad_wall" }
 cad_raster = { path = "../cad_raster" }
 cad_param  = { path = "../cad_param" }
+# WP-SCRIPT: the plain-Rust scripting facade. This is the ONLY pyo3 path into
+# the app (Rule 1 — no `pyo3::` is ever compiled inside cad_app). NOTE: linking
+# cad_script embeds CPython, so cad_app.exe requires a CPython 3.11+ runtime
+# (python3.dll) present at LOAD — see PYTHON_SCRIPTING.md "Deployment".
+cad_script = { path = "../cad_script" }
 serde      = { version = "1", features = ["derive"] }   # SIMLUX sidecar (drawing.simlux.json)
-serde_json = "1"
+# `float_roundtrip` IS NOT DECORATION HERE. serde_json's default float parser is fast and is NOT
+# always correctly rounded — it can hand back a value one ULP from the one that was written.
+# Writing is exact, so a number survives being saved and comes back very slightly different, which
+# is the kind of drift nobody notices and nobody can explain: a stored calculation reloaded with a
+# minimum of 11.000000000000002 lx instead of 11, a sidecar dimension that moves in its last digit
+# each time a project is opened and closed. Caught by the stored-result round trip, which compares
+# the restored figures BIT FOR BIT against the ones the calculation produced.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 cad_light  = { path = "../cad_light" }   # SIMLUX lighting engine (IES + lux + Document extrude)
 # 3D_FACTORY: the 3D solid layer (Model/Feature/Plane/Frame + parametric CSG via csgrs) and
 # the 3D modifiers. UI-agnostic, so the app drives it the same way it drives cad_light.
@@ -24,7 +38,17 @@ cad_light  = { path = "../cad_light" }   # SIMLUX lighting engine (IES + lux + D
 cad_solid  = { path = "../cad_solid" }
 glam       = "0.29"                       # SIMLUX 3D camera math (same version cad_light uses)
 miniz_oxide = "0.8"                       # zlib inflate for FBX binary arrays (furniture import); already in tree via image/png
-image      = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }
+# ~2x faster raw-deflate DECOMPRESSION than miniz for the furniture geometry
+# blobs (RSM native + sidecar/DXF base64). Pure Rust; the writer still
+# compresses with miniz, so the on-disk formats do not change and every older
+# build reads what we write.
+zune-inflate = "0.2"
+# `hdr` + `exr` are what make IMAGE-BASED LIGHTING possible at all: an 8-bit PNG cannot carry a sun
+# ten thousand times brighter than the sky beside it, and that ratio IS the lighting. They are also
+# the two formats HDRI libraries actually ship (Poly Haven gives you both).
+image      = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff", "hdr", "exr"] }
+arboard    = "3"                          # read images from the OS clipboard (paste-as-texture); already in tree via egui-winit
+base64     = "0.22"                        # compact texture blobs in the sidecar (PNG bytes → base64)
 # Base eframe features shared across platforms. The Linux windowing backends
 # (wayland/x11) are added only on Linux below — on Windows eframe uses the
 # native Win32 backend automatically and those crates don't compile.

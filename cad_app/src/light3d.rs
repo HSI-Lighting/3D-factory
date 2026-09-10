@@ -16,20 +16,181 @@ use glam::{Mat4, Vec3};
 
 use cad_light::{LuxGrid, Material, Mesh};
 
-/// One 3D vertex: position (metres, Z-up) + baked RGB colour.
+/// One 3D vertex: position (metres, Z-up) + baked RGB colour + the AMBIENT share of that colour.
+///
+/// The colour is **scene-referred linear light** — the CPU shader in `factory.rs` decodes the
+/// material's authored sRGB and multiplies it by linear irradiance, so nothing is re-encoded on the
+/// way to the framebuffer. `amb` is what fraction of that light arrived as ambient (sky or fill)
+/// rather than as the key/sun, which is the only part screen-space occlusion may darken; without it
+/// AO would grey out a crease standing in full sunlight.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct V3 {
     pub x: f32,
     pub y: f32,
     pub z: f32,
+    /// The surface's OWN colour, in authored sRGB — not a lit one. The fragment shader lights it,
+    /// which is what lets the sun move without rebuilding this buffer.
     pub r: f32,
     pub g: f32,
     pub b: f32,
+    /// World normal. Zero marks a UI swatch, which is passed through unlit.
+    pub nx: f32,
+    pub ny: f32,
+    pub nz: f32,
+    /// Which lighting response to apply — `SHADE_UI` / `SHADE_SCENE` / `SHADE_FURNITURE` from
+    /// `factory.rs`. Per vertex, because one buffer mixes walls, furniture and overlays.
+    pub mode: f32,
 }
 
-const CEILING: u32 = 2; // material id skipped in the viewer so we can look in
+/// One TRANSLUCENT vertex: position + baked RGB + per-vertex OPACITY. Used only by the blended
+/// transparent pass (glass panes and other see-through furniture faces), so the opaque `V3`
+/// fast path keeps its 24-byte, alpha-free layout.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct V3A {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+/// One TEXTURED vertex: position (metres, Z-up) + UV + a baked scalar shade (0..1) + opacity.
+/// The textured pass samples the bound image at `u,v` and multiplies by `s`, so a surface keeps
+/// its flat-shaded lighting while showing the pasted picture. `a` is the vertex opacity — 1.0 for
+/// every opaque surface (feature walls/floors, ordinary furniture); below 1.0 only for textured
+/// glass, which is drawn in the blended textured pass.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TexVtx {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub u: f32,
+    pub v: f32,
+    pub s: f32,
+    pub a: f32,
+}
+
+/// A PROCEDURAL material evaluated in the fragment shader from world position — the engine's
+/// answer to Blender's noise→ColorRamp materials (wood grain, marble, …). `mode` 0 = "not
+/// procedural, sample the bound image" (the default); 1 = wood, 2 = marble, 3 = noise, 4 = checker.
+/// `scale` is ANISOTROPIC (squash across the grain, stretch along it) and read against WORLD
+/// position, so the pattern runs continuously across every piece — the grain-match Blender gets for
+/// free from object coordinates.
+#[derive(Clone, Copy, Debug)]
+pub struct ProcParams {
+    pub mode: i32,
+    pub col_a: [f32; 3],
+    pub col_b: [f32; 3],
+    pub scale: [f32; 3],
+    pub detail: f32,
+    pub rough: f32,
+    pub contrast: f32,
+    pub ramp: [f32; 2],
+    /// Surface roughness at the two ends of the SAME pattern field that drives the colour — dark
+    /// grain rougher than light, mortar rougher than tile. Equal values mean a uniform finish.
+    /// This is most of what separates a procedural that reads as a material from one that reads as
+    /// a picture painted on plastic: a real surface varies in gloss wherever it varies in colour.
+    pub rough_lo: f32,
+    pub rough_hi: f32,
+    /// Bump strength. The pattern field is treated as a height field and its gradient perturbs the
+    /// shading normal, so the grain catches light instead of just tinting it. 0 = flat.
+    pub bump: f32,
+}
+
+impl Default for ProcParams {
+    fn default() -> Self {
+        Self {
+            mode: 0,
+            col_a: [0.5, 0.5, 0.5],
+            col_b: [0.5, 0.5, 0.5],
+            scale: [1.0, 1.0, 1.0],
+            detail: 6.0,
+            rough: 0.6,
+            contrast: 1.0,
+            ramp: [0.35, 0.65],
+            rough_lo: 0.5,
+            rough_hi: 0.5,
+            bump: 0.0,
+        }
+    }
+}
+
+// (There was a `const CEILING: u32 = 2` here, "material id skipped in the viewer so we can
+// look in". It was the whole of the SIMLUX hide-ceilings bug: the viewer skipped it whatever the
+// toggle said. Hiding the ceiling is the caller's decision now, so nothing here needs the id.)
 const FLOOR: u32 = 0;
+
+const IDENTITY16: [f32; 16] = [
+    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+];
+
+/// Per-texture PBR maps (Texture Phase 2): tangent-space **normal** + **roughness** map indices (into
+/// the app's texture list, so they upload through the normal texture cache), plus the scalar
+/// Principled parameters used when there's no map. `metallic`/`ior` reach the raster shader from
+/// here — before Phase 1 they existed only in the path tracer, so a "metal" in the Materials Factory
+/// rendered as grey plastic in the viewport.
+#[derive(Clone, Copy, Debug)]
+pub struct PbrParams {
+    pub normal_idx: Option<usize>,
+    pub rough_idx: Option<usize>,
+    /// Metallic and ambient-occlusion maps — the other two members of a downloaded PBR texture set.
+    pub metal_idx: Option<usize>,
+    pub ao_idx: Option<usize>,
+    /// Map this material in WORLD space (triplanar) at `tiles_per_m` rather than through the mesh's
+    /// own UVs. The default for architecture, which is extruded from a plan and has none.
+    pub triplanar: bool,
+    pub tiles_per_m: f32,
+    pub roughness: f32,
+    /// This material is a MEDIUM light travels through, not a surface with holes in it — see
+    /// `TextureAsset::transmission`. Only a medium is a volume, and only a volume's back faces may
+    /// be dropped.
+    pub transmission: f32,
+    pub metallic: f32,
+    /// Dielectric index of refraction — sets the specular F0 (1.5 ⇒ the usual 0.04).
+    pub ior: f32,
+    /// Emitted radiance, already multiplied by its strength and already linear. An emissive
+    /// material used to glow only in the path tracer; it now lights up the viewport as well.
+    pub emission: [f32; 3],
+    /// CLEARCOAT: a thin varnish over the material, with its own smooth specular lobe. 0 = bare.
+    /// Reflects about the GEOMETRIC normal — lacquer fills the grain, so a polished tabletop shows
+    /// the timber but mirrors the window as one clean shape.
+    pub clearcoat: f32,
+    pub clearcoat_rough: f32,
+    /// SHEEN: the pale rim fabric gets at grazing angles from light scattering through the fuzz
+    /// standing off its surface. 0 = none. Without it velvet, felt and heavy curtains all render
+    /// as matte plastic, because a diffuse lobe has nothing that brightens along the surface.
+    pub sheen: f32,
+    /// The colour of that fuzz — usually near-white even on a dark fabric, which is most of why
+    /// black velvet reads as velvet.
+    pub sheen_tint: [f32; 3],
+}
+
+impl Default for PbrParams {
+    fn default() -> Self {
+        Self {
+            normal_idx: None,
+            rough_idx: None,
+            metal_idx: None,
+            ao_idx: None,
+            triplanar: false,
+            tiles_per_m: 1.0,
+            roughness: 0.5,
+            transmission: 0.0,
+            metallic: 0.0,
+            ior: 1.5,
+            emission: [0.0; 3],
+            clearcoat: 0.0,
+            clearcoat_rough: 0.1,
+            sheen: 0.0,
+            sheen_tint: [1.0; 3],
+        }
+    }
+}
 
 /// Fixed key light for flat shading (points down-ish onto the scene).
 fn light_dir() -> Vec3 {
@@ -42,27 +203,45 @@ fn shade(base: [f32; 3], n: Vec3) -> [f32; 3] {
 }
 
 fn material_color(materials: &[Material], id: u32) -> [f32; 3] {
-    materials.iter().find(|m| m.id == id).map(|m| m.color).unwrap_or([0.7, 0.7, 0.7])
+    materials
+        .iter()
+        .find(|m| m.id == id)
+        .map(|m| m.color)
+        .unwrap_or([0.7, 0.7, 0.7])
 }
 
-/// Build the flat-shaded triangle soup for the room. The ceiling is skipped so
-/// the camera can look down into the room. If `floor_grid` is given, floor
-/// vertices are coloured by sampled lux (P3) instead of the floor material.
+/// Build the flat-shaded triangle soup for the room. If `floor_grid` is given, floor vertices are
+/// coloured by sampled lux (P3) instead of the floor material.
+///
+/// IT DRAWS WHAT IT IS GIVEN. This used to skip `material == CEILING` unconditionally — "the ceiling
+/// is skipped so the camera can look down into the room" — which made the SIMLUX hide-ceilings
+/// toggle DEAD CODE for the whole life of the toggle: ticked or unticked, the ceiling was never
+/// drawn. That is the reported "hide ceiling in simlux doesnt work", and it went unnoticed because
+/// the SIMLUX default is `hide_ceilings: true`, so the broken state and the intended state looked
+/// identical out of the box.
+///
+/// Whether to hide the ceiling is the CALLER's decision. There is exactly one caller and it makes
+/// that decision explicitly; a filter here could only ever remove meshes this function was about to
+/// drop anyway, while silently overriding the one that mattered.
 pub fn build_scene_verts(
     meshes: &[Mesh],
     materials: &[Material],
-    floor_grid: Option<(&LuxGrid, &cad_light::CalcPlane, f64, fn(f32) -> (f32, f32, f32))>,
+    floor_grid: Option<(
+        &LuxGrid,
+        &cad_light::CalcPlane,
+        f64,
+        fn(f32) -> (f32, f32, f32),
+    )>,
 ) -> Vec<V3> {
     let mut out = Vec::new();
     for m in meshes {
-        if m.material == CEILING {
-            continue;
-        }
         let base = material_color(materials, m.material);
         for t in &m.triangles {
-            let (Some(a), Some(b), Some(c)) =
-                (m.vertices.get(t.a as usize), m.vertices.get(t.b as usize), m.vertices.get(t.c as usize))
-            else {
+            let (Some(a), Some(b), Some(c)) = (
+                m.vertices.get(t.a as usize),
+                m.vertices.get(t.b as usize),
+                m.vertices.get(t.c as usize),
+            ) else {
                 continue;
             };
             let (pa, pb, pc) = (a.to_vec3(), b.to_vec3(), c.to_vec3());
@@ -78,17 +257,239 @@ pub fn build_scene_verts(
                     }
                     _ => flat,
                 };
-                out.push(V3 { x: p.x, y: p.y, z: p.z, r: col[0], g: col[1], b: col[2] });
+                // amb = 0: this is the SIMLUX lighting view, whose colours are a false-colour lux
+                // scale or a fixed studio shade — neither is something occlusion may re-grade.
+                out.push(V3 {
+                    x: p.x,
+                    y: p.y,
+                    z: p.z,
+                    r: col[0],
+                    g: col[1],
+                    b: col[2],
+                    nx: 0.0,
+                    ny: 0.0,
+                    nz: 0.0,
+                    mode: 0.0,
+                });
             }
         }
     }
     out
 }
 
+/// THE RESULT AS ITS OWN SHEET, laid flat over the floor — not as a tint on the floor's vertices.
+///
+/// Reported as: *"in the simlux window the false colors are not appearing how it appears in the
+/// report. it should be exactly as in the report."*
+///
+/// The old heatmap coloured the FLOOR MESH'S VERTICES and let the rasteriser interpolate between
+/// them. Measured on the project this came from — a 9.58 × 7.58 m room — that floor is **14
+/// triangles**, so the "false colour" was a Gouraud wash across fourteen facets standing in for a
+/// 1,140-cell field. It could not show a band edge, because it had nowhere to put one: no vertex
+/// falls on the boundary, and every colour between two vertices is a blend of their two. No choice
+/// of palette or scale would have fixed it — the resolution was never there.
+///
+/// So the field gets its own geometry at the resolution of the field, and the floor goes back to
+/// being a floor.
+pub fn push_lux_sheet(
+    out: &mut Vec<V3>,
+    f: &crate::isolux::Field,
+    plane: &cad_light::CalcPlane,
+    z: f32,
+    paint: &dyn Fn(f64) -> [f32; 3],
+) {
+    if f.nx == 0 || f.ny == 0 {
+        return;
+    }
+    let (ox, oy) = (plane.origin.x, plane.origin.y);
+    let (sx, sy) = (plane.width / f.nx as f32, plane.depth / f.ny as f32);
+    for j in 0..f.ny {
+        for i in 0..f.nx {
+            if !f.inside.get(j * f.nx + i).copied().unwrap_or(true) {
+                continue;
+            }
+            let c = paint(crate::isolux::cell_value(f, i, j));
+            let (x0, y0) = (ox + i as f32 * sx, oy + j as f32 * sy);
+            let (x1, y1) = (x0 + sx, y0 + sy);
+            let v = |x: f32, y: f32| V3 {
+                x,
+                y,
+                z,
+                r: c[0],
+                g: c[1],
+                b: c[2],
+                nx: 0.0,
+                ny: 0.0,
+                nz: 0.0,
+                mode: 0.0,
+            };
+            // Two triangles, wound counter-clockwise seen from above so the sheet faces the way
+            // anybody looking at a plan is looking.
+            out.extend([v(x0, y0), v(x1, y0), v(x1, y1)]);
+            out.extend([v(x0, y0), v(x1, y1), v(x0, y1)]);
+        }
+    }
+}
+
+/// Isolux lines as flat ribbons, `width` metres wide, at height `z`.
+///
+/// Ribbons rather than GL lines: this renderer draws triangles and nothing else, and a line width
+/// set through the driver is capped at 1 px on most of them anyway — which reads as a hairline that
+/// disappears when the view is zoomed out, exactly when the lines are most wanted.
+pub fn push_isolux_lines(
+    out: &mut Vec<V3>,
+    segs: &[crate::isolux::Seg],
+    nx: usize,
+    ny: usize,
+    plane: &cad_light::CalcPlane,
+    z: f32,
+    width: f32,
+    rgb: [f32; 3],
+) {
+    if nx == 0 || ny == 0 {
+        return;
+    }
+    let (ox, oy) = (plane.origin.x, plane.origin.y);
+    let (sx, sy) = (plane.width / nx as f32, plane.depth / ny as f32);
+    let half = width.max(1e-4) * 0.5;
+    for s in segs {
+        let (ax, ay) = (ox + s[0].0 as f32 * sx, oy + s[0].1 as f32 * sy);
+        let (bx, by) = (ox + s[1].0 as f32 * sx, oy + s[1].1 as f32 * sy);
+        let (dx, dy) = (bx - ax, by - ay);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1e-6 {
+            continue;
+        }
+        // The perpendicular, scaled to half the ribbon's width.
+        let (px, py) = (-dy / len * half, dx / len * half);
+        let v = |x: f32, y: f32| V3 {
+            x,
+            y,
+            z,
+            r: rgb[0],
+            g: rgb[1],
+            b: rgb[2],
+            nx: 0.0,
+            ny: 0.0,
+            nz: 0.0,
+            mode: 0.0,
+        };
+        let (p0, p1) = ((ax + px, ay + py), (ax - px, ay - py));
+        let (p2, p3) = ((bx - px, by - py), (bx + px, by + py));
+        out.extend([v(p0.0, p0.1), v(p1.0, p1.1), v(p2.0, p2.1)]);
+        out.extend([v(p0.0, p0.1), v(p2.0, p2.1), v(p3.0, p3.1)]);
+        // A ROUND JOIN, as a square cap at each end. Segments meet at any angle and butt ends
+        // leave a visible notch on a curve; a cap the width of the ribbon fills it. Cheap enough
+        // that it is not worth deciding whether a given joint needs one.
+        for (cx, cy) in [(ax, ay), (bx, by)] {
+            let q = |ddx: f32, ddy: f32| v(cx + ddx, cy + ddy);
+            out.extend([q(-half, -half), q(half, -half), q(half, half)]);
+            out.extend([q(-half, -half), q(half, half), q(-half, half)]);
+        }
+    }
+}
+
+/// WHERE A FITTING IS POINTING — a shaft from the luminaire to `hit`, with a head on the end.
+///
+/// Asked for as: *"add aiming arrows … that shows where the light is aimed at."*
+///
+/// The shaft is TWO CROSSED QUADS rather than a tube. A tube of any useful thickness is a dozen
+/// triangles per fitting and looks like a pipe; a single flat ribbon vanishes edge-on, which on an
+/// orbiting camera means the arrow disappears exactly when it is turned to look at. Two quads at
+/// right angles are four triangles, always present something to the eye, and read as a line rather
+/// than as an object.
+pub fn push_aim_arrow(out: &mut Vec<V3>, from: Vec3, hit: Vec3, rgb: [f32; 3]) {
+    let along = hit - from;
+    let len = along.length();
+    if len < 1e-4 {
+        return;
+    }
+    let dir = along / len;
+    // Two perpendiculars to the shaft. `Z` unless the shaft is itself vertical, which every
+    // un-aimed downlight is — so the degenerate case here is the COMMON one, not an edge case.
+    let up = if dir.z.abs() < 0.99 { Vec3::Z } else { Vec3::X };
+    let u = up.cross(dir).normalize_or_zero();
+    if u.length_squared() < 0.5 {
+        return;
+    }
+    let w = dir.cross(u);
+    // Scaled to the run, so a 6 m throw is not drawn with the same hairline as a 0.5 m one.
+    let half = (len * 0.006).clamp(0.008, 0.03);
+    let head = (len * 0.10).clamp(0.06, 0.30);
+    let neck = hit - dir * head;
+
+    let v = |p: Vec3| V3 {
+        x: p.x,
+        y: p.y,
+        z: p.z,
+        r: rgb[0],
+        g: rgb[1],
+        b: rgb[2],
+        nx: 0.0,
+        ny: 0.0,
+        nz: 0.0,
+        mode: 0.0,
+    };
+    // The shaft, stopping at the neck so the head is not drawn over its own stem.
+    for perp in [u, w] {
+        let (a, b) = (from + perp * half, from - perp * half);
+        let (c, d) = (neck - perp * half, neck + perp * half);
+        out.extend([v(a), v(b), v(c)]);
+        out.extend([v(a), v(c), v(d)]);
+    }
+    // A four-sided pyramid for the head, apex ON the target — the point of the whole thing is
+    // where it lands, so that is the vertex that has to be exact.
+    let r = head * 0.34;
+    let ring = [neck + u * r, neck + w * r, neck - u * r, neck - w * r];
+    for k in 0..4 {
+        out.extend([v(hit), v(ring[k]), v(ring[(k + 1) % 4])]);
+    }
+}
+
+/// A small cross lying flat at the point a fitting is aimed at.
+///
+/// The arrow says which way; this says exactly where, and stays readable looking straight down —
+/// the view a lighting plan is actually checked in, and the one in which an arrow pointing at the
+/// camera is a dot.
+pub fn push_aim_target(out: &mut Vec<V3>, at: Vec3, size: f32, rgb: [f32; 3]) {
+    let v = |p: Vec3| V3 {
+        x: p.x,
+        y: p.y,
+        z: p.z,
+        r: rgb[0],
+        g: rgb[1],
+        b: rgb[2],
+        nx: 0.0,
+        ny: 0.0,
+        nz: 0.0,
+        mode: 0.0,
+    };
+    let t = (size * 0.14).max(0.004);
+    for (ax, ay) in [(1.0_f32, 0.0_f32), (0.0, 1.0)] {
+        let d = Vec3::new(ax, ay, 0.0) * size;
+        let p = Vec3::new(-ay, ax, 0.0) * t;
+        let (a, b) = (at - d + p, at - d - p);
+        let (c, e) = (at + d - p, at + d + p);
+        out.extend([v(a), v(b), v(c)]);
+        out.extend([v(a), v(c), v(e)]);
+    }
+}
+
 /// Append a small bright octahedron marking a luminaire at (x, y, z).
 pub fn push_luminaire_marker(out: &mut Vec<V3>, x: f32, y: f32, z: f32, s: f32) {
     let c = [1.0, 0.86, 0.38];
-    let v = |dx: f32, dy: f32, dz: f32| V3 { x: x + dx, y: y + dy, z: z + dz, r: c[0], g: c[1], b: c[2] };
+    let v = |dx: f32, dy: f32, dz: f32| V3 {
+        x: x + dx,
+        y: y + dy,
+        z: z + dz,
+        r: c[0],
+        g: c[1],
+        b: c[2],
+        nx: 0.0,
+        ny: 0.0,
+        nz: 0.0,
+        mode: 0.0,
+    };
     let top = v(0.0, 0.0, s);
     let bot = v(0.0, 0.0, -s);
     let pn = v(s, 0.0, 0.0);
@@ -122,8 +523,24 @@ fn sample_lux(grid: &LuxGrid, plane: &cad_light::CalcPlane, p: Vec3) -> f64 {
     grid.values[(row * plane.cols + col) as usize]
 }
 
+/// The orbit camera's world EYE position for `(yaw, pitch, dist, target)` — same formula [`mvp`]
+/// uses, exposed so the caller can pass it to `render` for the reflection sheen.
+pub fn cam_eye(yaw: f32, pitch: f32, dist: f32, target: [f32; 3]) -> [f32; 3] {
+    let t = Vec3::from(target);
+    let (cp, sp) = (pitch.cos(), pitch.sin());
+    let (cy, sy) = (yaw.cos(), yaw.sin());
+    (t + Vec3::new(cp * cy, cp * sy, sp) * dist.max(0.1)).to_array()
+}
+
 /// Orbit-camera MVP: yaw/pitch around `target`, `dist` away, GL depth convention.
-pub fn mvp(yaw: f32, pitch: f32, dist: f32, target: [f32; 3], aspect: f32, ortho: bool) -> [f32; 16] {
+pub fn mvp(
+    yaw: f32,
+    pitch: f32,
+    dist: f32,
+    target: [f32; 3],
+    aspect: f32,
+    ortho: bool,
+) -> [f32; 16] {
     let t = Vec3::from(target);
     let (cp, sp) = (pitch.cos(), pitch.sin());
     let (cy, sy) = (yaw.cos(), yaw.sin());
@@ -141,33 +558,883 @@ pub fn mvp(yaw: f32, pitch: f32, dist: f32, target: [f32; 3], aspect: f32, ortho
         let z = (dist * 20.0).max(200.0);
         Mat4::orthographic_rh_gl(-hw, hw, -hh, hh, -z, z)
     } else {
-        // Near scales with distance so the depth buffer keeps precision when dollied far
-        // back over a large plan (fixed 0.05 vs a 600k far plane = severe z-fighting). The
-        // 0.05 floor preserves close-up behaviour exactly for normal-sized models.
-        let near = (dist * 0.001).max(0.05);
-        Mat4::perspective_rh_gl(45f32.to_radians(), aspect.max(0.01), near, (dist * 6.0).max(80.0))
+        // NEAR is what decides depth precision, and it decides it brutally: resolution at
+        // distance z is roughly z² / (near · 2²⁴), so it is LINEAR in near and quadratic in
+        // how far away you are looking. At the old dist·0.001 a 50 m view got near = 0.05 and
+        // ~3 mm of depth resolution — coarser than the gap between a floor slab and the solid
+        // sitting on it, which is why coplanar surfaces flickered across whole rooms.
+        //
+        // dist·0.01 gives 0.5 m at that range and ~0.3 mm of resolution: a tenfold gain for
+        // nothing, because when the camera is 50 m from what it is looking at there is
+        // nothing to see 5 cm in front of the lens. The 0.05 floor still governs close work,
+        // where near never binds and behaviour is unchanged.
+        let near = (dist * 0.01).max(0.05);
+        Mat4::perspective_rh_gl(
+            45f32.to_radians(),
+            aspect.max(0.01),
+            near,
+            (dist * 6.0).max(80.0),
+        )
     };
     (proj * view).to_cols_array()
 }
+
+/// IS THIS BOX POSSIBLY IN SHOT? — the conservative frustum test, in clip space.
+///
+/// Every furniture instance was submitted every frame whether or not any of it was on screen. On
+/// the reference gym plan that is 26 instances and 7,036,129 triangles handed to the GPU in order
+/// to look at the inside of one machine.
+///
+/// `clip` is projection·view·model, so an asset's own cached LOCAL bounds go in untransformed and
+/// this does the transform — no per-instance world AABB to build or keep in step.
+///
+/// The eight corners are tested against the six planes as `-w ≤ x,y,z ≤ w`, the convention both
+/// `perspective_rh_gl` and `orthographic_rh_gl` produce. A box is rejected only when ALL EIGHT
+/// corners fall outside THE SAME plane, which is the standard conservative form and is the right
+/// way round: it will occasionally keep a box that is not really visible — a large one straddling
+/// two planes with no corner inside, which is exactly the room you are standing in — and it can
+/// never drop one that is.
+pub fn aabb_in_frustum(clip: &[f32; 16], mn: [f32; 3], mx: [f32; 3]) -> bool {
+    let m = Mat4::from_cols_array(clip);
+    // One counter per plane. Rejecting on "outside ANY plane" instead — the tempting simpler
+    // form — culls a box that spans the whole view, because no single corner need be inside it.
+    let mut out = [0u8; 6];
+    for i in 0..8 {
+        let p = glam::Vec4::new(
+            if i & 1 == 0 { mn[0] } else { mx[0] },
+            if i & 2 == 0 { mn[1] } else { mx[1] },
+            if i & 4 == 0 { mn[2] } else { mx[2] },
+            1.0,
+        );
+        let c = m * p;
+        // `w` is negative behind the eye, which makes these comparisons flip — and that is the
+        // behaviour wanted, not a bug to guard: a point behind the camera then fails both the
+        // near test and one of each opposing pair, so a box entirely behind is culled by `z < -w`.
+        if c.x < -c.w {
+            out[0] += 1;
+        }
+        if c.x > c.w {
+            out[1] += 1;
+        }
+        if c.y < -c.w {
+            out[2] += 1;
+        }
+        if c.y > c.w {
+            out[3] += 1;
+        }
+        if c.z < -c.w {
+            out[4] += 1;
+        }
+        if c.z > c.w {
+            out[5] += 1;
+        }
+    }
+    !out.iter().any(|&n| n == 8)
+}
+
+// Depth-only pass from the sun's point of view — the shadow map. Positions only; the fragment
+// stage writes nothing but depth.
+const DEPTH_VS: &str = r#"
+    #version 330 core
+    layout(location=0) in vec3 a_pos;
+    uniform mat4 u_depth_mvp;
+    void main() { gl_Position = u_depth_mvp * vec4(a_pos, 1.0); }
+"#;
+const DEPTH_FS: &str = r#"
+    #version 330 core
+    void main() {}
+"#;
+
+// A 3×3 PCF shadow lookup shared by the scene + textured fragment shaders. Returns 1 = fully lit,
+// 0 = fully shadowed. Off-map or beyond the far plane counts as lit.
+// CASCADED SHADOW MAPS.
+//
+// One shadow map stretched over a whole site spends nearly all of its resolution on ground nobody
+// is looking at. Fitted to a 100 m villa plot, a 2048² map is 7 cm per texel — a window mullion's
+// shadow is two texels wide and comes out as mush, while the same map wastes half its area on the
+// far end of the garden. Cascades give the near ground its own tight map and let the distant
+// ground have the coarse one, which is where the resolution actually belongs.
+//
+// Selection is by CONTAINMENT, not by a split distance: walk the cascades tightest-first and use
+// the first one the fragment actually falls inside. That needs no split-plane uniforms, and — more
+// to the point — it cannot select a cascade that does not cover the fragment, which is the classic
+// way a distance-based selector puts a hard black line across the floor at a cascade boundary.
+const CASCADE_MAX: usize = 3;
+const SHADOW_GLSL: &str = r#"
+    uniform int u_shadow_on;
+    uniform int u_csm_n;                  // cascades actually in use, 1..CASCADE_MAX
+    uniform mat4 u_light_mvp[CASCADE_MAX_GLSL];
+    uniform sampler2DArray u_shadow;
+    float shadow_lit(vec3 wpos) {
+        for (int c = 0; c < CASCADE_MAX_GLSL; c++) {
+            if (c >= u_csm_n) break;
+            vec4 lc = u_light_mvp[c] * vec4(wpos, 1.0);
+            vec3 p = lc.xyz / lc.w * 0.5 + 0.5;
+            // Not inside this cascade — try the next, coarser one.
+            if (p.z > 1.0 || p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) continue;
+            // One constant bias serves every cascade: the ortho depth range and the texel's world
+            // size both scale with the cascade radius, so the NDC error a slope produces across one
+            // texel is the same in all of them.
+            float bias = 0.0022;
+            vec2 tx = 1.0 / vec2(textureSize(u_shadow, 0).xy);
+            float lit = 0.0;
+            for (int y = -1; y <= 1; y++)
+                for (int x = -1; x <= 1; x++) {
+                    float d = texture(u_shadow, vec3(p.xy + vec2(x, y) * tx, float(c))).r;
+                    lit += (p.z - bias > d) ? 0.0 : 1.0;
+                }
+            return lit / 9.0;
+        }
+        return 1.0;   // beyond every cascade — unshadowed rather than wrongly dark
+    }
+"#;
+
+/// [`SHADOW_GLSL`] with the cascade count substituted in — GLSL needs a compile-time array size,
+/// and Rust owns the number.
+fn shadow_glsl() -> String {
+    SHADOW_GLSL.replace("CASCADE_MAX_GLSL", &CASCADE_MAX.to_string())
+}
+
+/// Side of one cascade's shadow map, in texels. Public so the app can snap its cascade boxes to
+/// this grid — snapping to the wrong size is the same as not snapping at all.
+pub const SHADOW_MAP_SIZE: i32 = 2048;
+
+/// The most cascades the shader can sample. Public so the UI can bound its own control.
+pub const MAX_CASCADES: usize = CASCADE_MAX;
 
 const SCENE_VS: &str = r#"
     #version 330 core
     layout(location=0) in vec3 a_pos;
     layout(location=1) in vec3 a_col;
+    layout(location=2) in vec3 a_nrm;
+    layout(location=3) in float a_mode;
     uniform mat4 u_mvp;
+    uniform mat4 u_model;   // world = u_model * a_pos (identity for the world-space scene batch)
     out vec3 v_col;
-    void main() { gl_Position = u_mvp * vec4(a_pos, 1.0); v_col = a_col; }
+    out vec3 v_wpos;
+    out vec3 v_nrm;
+    flat out float v_mode;
+    void main() {
+        gl_Position = u_mvp * vec4(a_pos, 1.0);
+        v_col = a_col;
+        // The normal rides the model matrix like the position. A drag uses a rigid model matrix
+        // (rotation + uniform scale), so the inverse-transpose is not needed here.
+        v_nrm = mat3(u_model) * a_nrm;
+        v_mode = a_mode;
+        v_wpos = (u_model * vec4(a_pos, 1.0)).xyz;
+    }
 "#;
 
 const SCENE_FS: &str = r#"
     #version 330 core
     in vec3 v_col;
-    out vec4 frag;
+    in vec3 v_wpos;
+    in vec3 v_nrm;
+    flat in float v_mode;
+    // TWO targets. 0 = light that is already accounted for (direct sun, specular, emission);
+    // 1 = the AMBIENT share, which is the only part screen-space occlusion is entitled to darken.
+    // Splitting here rather than multiplying AO into the final image is what stops a crease in
+    // full sunlight from going grey.
+    layout(location=0) out vec4 frag;
+    layout(location=1) out vec4 amb_out;
+    ALBEDO_OUT_GLSL
     // Per-PASS alpha: V3 carries no alpha channel, so translucency for the overlay
     // pass (selection shade / modifier ghosts) rides on this uniform. 1.0 for the
     // opaque solid + line passes.
     uniform float u_alpha;
-    void main() { frag = vec4(v_col, u_alpha); }
+    // 1 = the vertex colours are authored sRGB and must be decoded before they mix with light —
+    // the overlay/line passes, whose colours are UI swatches. 0 = they already carry scene-referred
+    // linear light (the CPU-shaded solids) or display values (the SIMLUX lux heatmap).
+    uniform int u_linearize;
+    SHADOW_GLSL
+    SRGB_GLSL
+    SKY_GLSL
+    const vec3 STUDIO_DIR = vec3(0.35, 0.25, 0.9);
+    void main() {
+        // A UI swatch — a grid line, a selection tint, a lux heatmap value. Not a surface, so it
+        // is not lit, and ambient occlusion has no business dimming it either.
+        if (v_mode < 0.5) {
+            vec3 col = u_linearize == 1 ? srgb_to_lin(v_col) : v_col;
+            frag = vec4(col, u_alpha);
+            amb_out = vec4(0.0, 0.0, 0.0, u_alpha);
+            // A UI swatch is not a surface, so it has no albedo to bounce with. Zero, so screen
+            // -space GI treats a grid line as what it is rather than as a glowing white wire.
+            alb_out = vec4(0.0);
+            return;
+        }
+        // A LIT SURFACE. The albedo and the normal arrive per vertex and the light is applied
+        // here, per fragment — the twin of `shade` / `shade_furniture` in factory.rs, which the
+        // tests compare against. Doing it here is what lets the sun move, a shadow soften or a
+        // sample jitter without rebuilding a single vertex.
+        vec3 albedo = srgb_to_lin(v_col);
+        // TWO-SIDED. Foliage, fabric and any imported thin card is one sheet of triangles whose
+        // authored normal points one way; seen from behind it takes zero direct sun and only the
+        // dim downward ambient, and renders BLACK — which is exactly how the villa's trees came
+        // out. The textured path already faces its normal to the viewer; this is the flat path
+        // catching up. The path tracer flips the same way (`if tri.n.dot(rd) > 0 { -tri.n }`), so
+        // this also stops the viewport and an offline render disagreeing about a leaf.
+        vec3 N = normalize(v_nrm);
+        if (!gl_FrontFacing) N = -N;
+        bool furniture = v_mode > 1.5;
+        vec3 ambient, direct;
+        // An HDRI lights the scene whether or not the analytic SUN is on — the same decision as in
+        // the textured shader. Gating this on the sun meant a loaded environment lit nothing.
+        bool ibl = (u_sky_on == 1 || u_env_on == 1);
+        if (ibl) {
+            // Furniture keeps a slightly higher ambient floor so an imported mesh never reads
+            // murky — the 0.05 in `shade_furniture`.
+            float extra = furniture ? 0.05 : 0.0;
+            ambient = albedo * (sh_ambient(N) + vec3(extra));
+            direct = vec3(0.0);
+            if (u_sky_on == 1) {
+                float lit = max(dot(N, u_sky_sun), 0.0);
+                float sh = (u_shadow_on == 1) ? shadow_lit(v_wpos) : 1.0;
+                direct = albedo * u_sky_sun_col * (lit * sh);
+            }
+        } else {
+            // Studio: a constant fill plus a two-sided directional term, exactly as the CPU built
+            // it. Furniture uses 0.6 / 0.4 where the scene uses 0.35 / 0.65.
+            float fill = furniture ? 0.6 : 0.35;
+            float k = (furniture ? 0.4 : 0.65) * abs(dot(N, normalize(STUDIO_DIR)));
+            ambient = albedo * fill;
+            direct = albedo * k;
+        }
+        frag = vec4(direct, u_alpha);
+        amb_out = vec4(ambient, u_alpha);
+        alb_out = vec4(albedo, u_alpha);
+    }
+"#;
+
+// Transparent furniture pass: pos + colour + per-vertex opacity. Same flat colour as the solid
+// pass, but alpha rides on the vertex so glass panes blend. Drawn AFTER all opaque geometry,
+// depth-tested but with depth writes OFF, back-to-front (sorted CPU-side).
+const TRANSP_VS: &str = r#"
+    #version 330 core
+    layout(location=0) in vec3 a_pos;
+    layout(location=1) in vec3 a_col;
+    layout(location=2) in float a_a;
+    uniform mat4 u_mvp;
+    // World placement + the rebase origin, so the fragment shader can build the pane's normal
+    // from an INTERPOLATED position near zero. It used to reconstruct that position from the
+    // depth buffer and differentiate it, which cannot work on a plan sited at survey
+    // coordinates: the reconstruction lands at ~6852 m where an f32 ULP is 0.8 mm — the size of
+    // a close-up pixel footprint — and it carries the depth buffer's own nonlinearity on top.
+    // dFdx of that is noise, and the normal built from it feeds a FIFTH-POWER Fresnel term and
+    // the refraction offset, so every pane speckled and smeared, and reshuffled as the camera
+    // moved. Interpolating a small value instead carries ~1e-6 m.
+    uniform mat4 u_model;   // local → world
+    uniform vec3 u_uv_org;  // whole-unit origin the rebase is measured from
+    out vec3 v_col;
+    out float v_a;
+    out vec3 v_qpos;        // world position, rebased — see above
+    void main() {
+        gl_Position = u_mvp * vec4(a_pos, 1.0);
+        v_col = a_col; v_a = a_a;
+        v_qpos = (u_model * vec4(a_pos, 1.0)).xyz - u_uv_org;
+    }
+"#;
+
+// A copy of the OPAQUE scene, composed the way the composite composes it, taken just before the
+// transparent pass so glass has something to refract. A shader cannot read the buffer it is
+// writing to, so this is the only way a pane can bend what is behind it.
+const SCENE_COPY_FS: &str = r#"
+    #version 330 core
+    in vec2 v_uv;
+    out vec4 frag;
+    uniform sampler2D u_lit;
+    uniform sampler2D u_amb;
+    void main() {
+        // No ambient occlusion here: the AO pass runs after ALL geometry, so it does not exist
+        // yet. What is lost is a slight over-brightening of creases seen THROUGH glass, which is
+        // not worth reordering the frame for.
+        frag = vec4(texture(u_lit, v_uv).rgb + texture(u_amb, v_uv).rgb, 1.0);
+    }
+"#;
+
+const TRANSP_FS: &str = r#"
+    #version 330 core
+    in vec3 v_col;
+    in float v_a;
+    in vec3 v_qpos;     // world position rebased to u_uv_org — see TRANSP_VS
+    layout(location=0) out vec4 frag;
+    layout(location=1) out vec4 amb_out;
+    ALBEDO_OUT_GLSL
+    uniform int u_linearize;
+    uniform vec3 u_uv_org;
+    // REFRACTION. `u_scene` is the opaque scene as it stood before this pass began.
+    uniform sampler2D u_scene;
+    uniform mat4  u_scene_vp;      // the WORLD→clip matrix, not this draw's camera·model
+    uniform vec3  u_refr_cam;
+    uniform vec2  u_refr_vp;       // viewport size in pixels
+    uniform float u_refr_ior;
+    uniform float u_refr_thick;    // how much glass the ray crosses, metres
+    uniform int   u_refr_on;
+    SRGB_GLSL
+    void main() {
+        vec3 tint = u_linearize == 1 ? srgb_to_lin(v_col) : v_col;
+        if (u_refr_on == 1) {
+            // The pane's own position, REBASED — interpolated from the vertices rather than
+            // reconstructed from the depth buffer. The reconstruction was the bug: on a plan at
+            // survey coordinates it lands near 6852 m, where an f32 ULP is 0.8 mm, and it adds
+            // the depth buffer's nonlinearity on top. Differentiating that gives a normal made
+            // mostly of noise, which then drives a fifth-power Fresnel and the refraction offset
+            // — so a pane speckled and smeared, and reshuffled whenever the camera moved.
+            vec2 uv = gl_FragCoord.xy / u_refr_vp;
+            vec3 Q = v_qpos;
+            // Glass is flat, so screen-space derivatives of a small, linearly interpolated
+            // position give the normal exactly — and no per-vertex normal has to be threaded
+            // through a vertex format that never carried one.
+            vec3 N = normalize(cross(dFdx(Q), dFdy(Q)));
+            // Back to world for the ray maths. Kept at metre scale, where f32 is ample.
+            vec3 P = Q + u_uv_org;
+            vec3 V = normalize(P - u_refr_cam);
+            if (dot(N, V) > 0.0) N = -N;
+            // Where the ray comes out after crossing `u_refr_thick` of glass, projected back to
+            // the screen. Sampling THERE is what bends the view.
+            vec3 Rf = refract(V, N, 1.0 / max(u_refr_ior, 1.0));
+            vec4 c1 = u_scene_vp * vec4(P + Rf * u_refr_thick, 1.0);
+            vec2 uv1 = (c1.w > 0.0) ? (c1.xy / c1.w * 0.5 + 0.5) : uv;
+            // Total internal reflection returns a zero vector; fall back to the straight view so
+            // the pane goes clear rather than black.
+            if (dot(Rf, Rf) < 1e-6) uv1 = uv;
+            vec3 behind = texture(u_scene, clamp(uv1, vec2(0.001), vec2(0.999))).rgb;
+            // Fresnel: glass seen edge-on reflects rather than transmits, which is most of what
+            // makes a window read as glass at all.
+            float f = 0.04 + 0.96 * pow(1.0 - max(dot(N, -V), 0.0), 5.0);
+            // Written OPAQUE. The refracted background has already been fetched and composed here,
+            // so blending it again would mix in the UNBENT pixel underneath and halve the effect.
+            frag = vec4(mix(behind * tint, tint, max(v_a, f)), 1.0);
+            amb_out = vec4(0.0, 0.0, 0.0, 1.0);
+            alb_out = vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+        }
+        frag = vec4(tint, v_a);
+        // Glass contributes no occludable ambient of its own, but it must still blend against the
+        // ambient buffer — writing (0,0,0,alpha) attenuates what is behind it by the same factor
+        // the colour buffer uses, so a pane does not leave an un-dimmed ghost in the AO term.
+        amb_out = vec4(0.0, 0.0, 0.0, v_a);
+        // Glass does not bounce diffuse light — it transmits. Leaving the albedo buffer at what
+        // is BEHIND the pane is also what we want for screen-space GI: the bounce should come from
+        // the wall you can see through the window, not from the window.
+        alb_out = vec4(0.0, 0.0, 0.0, v_a);
+    }
+"#;
+
+// Textured surface pass: pos + uv + baked shade. Samples the bound image and keeps the
+// flat-shaded lighting via the scalar `a_shade`. Used for objects with a pasted texture.
+const TEX_VS: &str = r#"
+    #version 330 core
+    layout(location=0) in vec3 a_pos;
+    layout(location=1) in vec2 a_uv;
+    layout(location=2) in float a_shade;
+    layout(location=3) in float a_a;
+    uniform mat4 u_mvp;
+    uniform mat4 u_model;   // world = u_model * a_pos (identity for world-space feature surfaces)
+    out vec2 v_uv;
+    out float v_shade;
+    out float v_a;
+    out vec3 v_wpos;   // WORLD position — reflection sheen, sun lighting, shadow lookup, normal maps
+    // The SAME position measured from `u_uv_org`, and the one every texture lookup, procedural
+    // field and screen-space DERIVATIVE must use. Subtracting the origin in the FRAGMENT shader
+    // — which is what this code used to do — cannot work: `v_wpos` arrives there already
+    // interpolated at survey coordinates in the thousands, where an f32 ULP is ~0.8 mm, so the
+    // value is quantised to 0.8 mm steps BEFORE the subtraction and those bits are simply gone.
+    // Rebasing here interpolates a number near zero instead, which carries ~1e-6 m. The
+    // subtraction itself is exact — the operands are within a factor of two of each other, so
+    // Sterbenz applies and no rounding occurs.
+    //
+    // It matters twice over. The texture coordinate quantises into visible bands, and — worse —
+    // dFdx/dFdy of a value whose steps are the size of a close-up pixel footprint is
+    // catastrophic cancellation, so the reconstructed normal jitters between neighbouring pixels
+    // and lights as black speckle that reshuffles whenever the camera moves.
+    uniform vec3 u_uv_org;
+    out vec3 v_qpos;
+    void main() {
+        gl_Position = u_mvp * vec4(a_pos, 1.0);
+        v_uv = a_uv; v_shade = a_shade; v_a = a_a;
+        v_wpos = (u_model * vec4(a_pos, 1.0)).xyz;
+        v_qpos = v_wpos - u_uv_org;
+    }
+"#;
+
+const TEX_FS: &str = r#"
+    #version 330 core
+    in vec2 v_uv;
+    in float v_shade;
+    in float v_a;
+    in vec3 v_wpos;
+    // World position REBASED to `u_uv_org` in the vertex shader — see TEX_VS. Everything that
+    // reads position at a fine scale (texture lookup, procedural field, and every dFdx/dFdy)
+    // must use this one; `v_wpos` is for lighting, which only needs metres.
+    in vec3 v_qpos;
+    // 0 = direct + specular + emission · 1 = the diffuse AMBIENT term, the only thing AO darkens.
+    layout(location=0) out vec4 frag;
+    layout(location=1) out vec4 amb_out;
+    ALBEDO_OUT_GLSL
+    uniform sampler2D u_img;
+    uniform vec3 u_cam;       // camera world position
+    uniform float u_reflect;  // 0 = matte, 1 = full environment reflection
+    // PROCEDURAL material (evaluated from world position when u_proc > 0).
+    uniform int   u_proc;       // 0=image, 1=wood, 2=marble, 3=noise, 4=checker
+    uniform vec3  u_col_a;      // ramp low / colour A
+    uniform vec3  u_col_b;      // ramp high / colour B
+    uniform vec3  u_pscale;    // anisotropic world scale (across, along, through the grain)
+    uniform float u_detail;    // fbm octaves
+    uniform float u_prough;    // fbm amplitude falloff
+    uniform float u_pcontrast; // ramp hardness about the midpoint
+    uniform vec2  u_ramp;      // ramp low/high positions
+    uniform float u_rough_lo;  // surface roughness at the ramp's low end …
+    uniform float u_rough_hi;  // … and at its high end (equal = uniform finish)
+    uniform float u_bump;      // relief from the same field, 0 = flat
+    // WORLD-SPACE (triplanar) mapping and its texel density, for geometry with no useful UVs.
+    uniform int   u_triplanar;
+    uniform float u_tpm;       // tiles per metre
+    // Origin the triplanar lookup is measured FROM. A plan imported from a survey sits at
+    // world coordinates in the thousands, and a texture coordinate that large is a precision
+    // disaster: the texel is picked by the FRACTIONAL part, so computing it from a huge number
+    // interpolated in f32 across a triangle throws away most of the bits that choose the
+    // texel. That shows as moiré banding which crawls with the camera, worst at grazing
+    // angles. Subtracting a whole-unit origin keeps the lookup near zero and the phase intact.
+    uniform vec3  u_uv_org;
+    // TRANSMISSION — light that travels THROUGH the material (glTF's KHR_materials_transmission),
+    // which is a different thing from alpha coverage and cannot be expressed by the blender. Needs
+    // a copy of the opaque scene taken before any glass was drawn.
+    uniform int       u_tr_on;
+    uniform sampler2D u_tr_scene;     // unit 6 — 5 is the AO map
+    uniform mat4      u_tr_scene_vp;  // world → clip for the SCENE, to re-project the bent ray
+    uniform vec2      u_tr_vp;        // viewport pixels, for gl_FragCoord → uv
+    uniform float     u_tr_ior;
+    uniform float     u_tr_thick;     // apparent thickness the ray is displaced through
+    // Is this material a MEDIUM (water, solid glass) rather than a surface with holes? Only a
+    // medium is a VOLUME, and only a volume's back faces may be dropped.
+    uniform float     u_transmission;
+    // …and the SCENE reflected in this surface, marched through the same copy. Declared after the
+    // two uniforms above because it reads both.
+    SSR_GLSL
+    // Daylight (sun) — when u_sun_on, light this surface by the real sun instead of the baked shade.
+    uniform int   u_sun_on;
+    uniform vec3  u_sun_dir;   // TO the sun
+    uniform vec3  u_sun_col;   // direct term, calibrated as irradiance/PI
+    // EMISSION — an emissive material now actually glows in the viewport. Already multiplied by its
+    // strength on the CPU, and already linear.
+    uniform vec3  u_emission;
+    // PBR maps (Texture Phase 2). Tangent-space normal + roughness, sampled per fragment; the TBN is
+    // reconstructed from screen-space derivatives so NO per-vertex tangents are needed.
+    uniform sampler2D u_nrm;
+    uniform sampler2D u_rough;
+    uniform sampler2D u_metal;
+    uniform sampler2D u_aomap;
+    uniform int   u_has_nrm;
+    uniform int   u_has_rough;
+    uniform int   u_has_metal;
+    uniform int   u_has_ao;
+    uniform float u_rough_base; // scalar roughness when there's no map
+    uniform float u_metallic;   // 0 = dielectric, 1 = conductor (F0 becomes the albedo)
+    uniform float u_ior;        // dielectric index of refraction → specular F0
+    // CLEARCOAT — a thin varnish over the material. Its own smooth specular lobe on top of
+    // whatever the base is doing, and it does NOT follow the base's bump: lacquer fills the grain,
+    // which is precisely why a polished tabletop shows the timber underneath but reflects the
+    // window as one clean shape rather than as a rippled one.
+    uniform float u_coat;       // 0 = bare
+    uniform float u_coat_rough;
+    // SHEEN — the pale rim fabric gets at grazing angles, from light scattering through the fuzz
+    // standing off its surface. Without it velvet, felt and heavy curtains all render as matte
+    // plastic, because a diffuse lobe has nothing that brightens as you look along the surface.
+    uniform float u_sheen;
+    uniform vec3  u_sheen_tint;
+    uniform int   u_clay;       // 1 = override albedo to flat clay grey (glass keeps its alpha)
+    uniform int   u_hl;         // 1 = this draw's material is selected in the Materials Factory
+    uniform float u_hl_k;       // highlight pulse strength 0..1 (app-driven)
+    SHADOW_GLSL
+    SRGB_GLSL
+    SKY_GLSL
+    ENV_BRDF_GLSL
+
+    // Sample a map either with the mesh's UVs, or — in triplanar mode — as three world-axis
+    // projections blended by the surface normal, which is what removes the stretching a single
+    // planar projection leaves on every face that is not square to it.
+    vec4 tri_or_uv(sampler2D s, vec2 uv, vec3 w) {
+        if (u_triplanar == 0) return texture(s, uv);
+        vec3 q = v_qpos;              // already near the origin — see u_uv_org / TEX_VS
+        return texture(s, q.yz * u_tpm) * w.x
+             + texture(s, q.xz * u_tpm) * w.y
+             + texture(s, q.xy * u_tpm) * w.z;
+    }
+
+    // Cheap hash-based value noise + fBm in 3D — enough for grain/marble at this range.
+    float vhash(vec3 p){ p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+    float vnoise(vec3 x){
+        vec3 i = floor(x); vec3 f = fract(x); f = f * f * (3.0 - 2.0 * f);
+        return mix(mix(mix(vhash(i+vec3(0,0,0)), vhash(i+vec3(1,0,0)), f.x),
+                       mix(vhash(i+vec3(0,1,0)), vhash(i+vec3(1,1,0)), f.x), f.y),
+                   mix(mix(vhash(i+vec3(0,0,1)), vhash(i+vec3(1,0,1)), f.x),
+                       mix(vhash(i+vec3(0,1,1)), vhash(i+vec3(1,1,1)), f.x), f.y), f.z);
+    }
+    float fbm(vec3 p){
+        float a = 0.5, s = 0.0, norm = 0.0;
+        for (int i = 0; i < 8; i++) {
+            if (float(i) >= u_detail) break;
+            s += a * vnoise(p); norm += a; p *= 2.0; a *= u_prough;
+        }
+        return norm > 0.0 ? s / norm : s;
+    }
+    // The raw pattern FIELD at a world point, 0..1. Colour, roughness and the bump all read this
+    // one function — which is the whole point. A material whose gloss and relief vary with its own
+    // grain reads as a material; three unrelated maps read as a picture printed on plastic.
+    float proc_field(vec3 wp){
+        vec3 p = wp * u_pscale;
+        if (u_proc == 2) {          // marble — fbm turbulence folded through a sine band
+            return 0.5 + 0.5 * sin((p.x + p.y) * 0.6 + fbm(p) * 6.2831);
+        } else if (u_proc == 4) {   // checker — hard cells in world space
+            vec3 c = floor(p);
+            return mod(c.x + c.y + c.z, 2.0);
+        }
+        return fbm(p);              // 1 = wood (anisotropic scale does the work), 3 = plain noise
+    }
+
+    // Map the field through the two-stop ramp + contrast. The ramp colours are AUTHORED sRGB (that
+    // is what the colour pickers show), so they decode to linear here — image textures get the same
+    // treatment for free from their SRGB8_ALPHA8 upload.
+    float proc_ramp_t(float val){
+        float t = smoothstep(u_ramp.x, u_ramp.y, val);
+        return clamp((t - 0.5) * u_pcontrast + 0.5, 0.0, 1.0);
+    }
+    vec3 proc_color(float f){ return srgb_to_lin(mix(u_col_a, u_col_b, proc_ramp_t(f))); }
+
+    // Treat the field as a height map and tilt the normal by its gradient, projected into the
+    // surface plane. Central differences at a step tied to the PATTERN's own period, not to the
+    // model, so the relief looks the same on a door and on a wall.
+    vec3 proc_bump(vec3 N, vec3 wp, float f0){
+        if (u_bump <= 0.0 || u_proc == 0) return N;
+        float e = 0.35 / max(max(u_pscale.x, u_pscale.y), max(u_pscale.z, 1e-3));
+        vec3 g = vec3(proc_field(wp + vec3(e, 0.0, 0.0)) - f0,
+                      proc_field(wp + vec3(0.0, e, 0.0)) - f0,
+                      proc_field(wp + vec3(0.0, 0.0, e)) - f0);
+        g -= N * dot(N, g);          // only the in-plane part tilts a surface
+        return normalize(N - g * (u_bump * 4.0));
+    }
+
+    // ── Cook-Torrance GGX ────────────────────────────────────────────────────────────────────
+    // Replaces the Blinn-Phong `pow(dot(N,H), shininess)` this shader used to run, which had no
+    // Fresnel, no energy conservation, and no way for `metallic` to mean anything.
+    const float PI = 3.14159265359;
+    float d_ggx(float NoH, float a) {
+        float a2 = a * a;
+        float d = NoH * NoH * (a2 - 1.0) + 1.0;
+        return a2 / max(PI * d * d, 1e-7);
+    }
+    // Height-correlated Smith visibility (the G term already divided by 4·NoV·NoL).
+    float v_smith(float NoV, float NoL, float a) {
+        float a2 = a * a;
+        float sv = NoL * sqrt(NoV * NoV * (1.0 - a2) + a2);
+        float sl = NoV * sqrt(NoL * NoL * (1.0 - a2) + a2);
+        return 0.5 / max(sv + sl, 1e-5);
+    }
+    vec3 f_schlick(vec3 f0, float u) { return f0 + (vec3(1.0) - f0) * pow(clamp(1.0 - u, 0.0, 1.0), 5.0); }
+
+    // The environment seen along a reflection ray, blurred by roughness. A prefiltered cubemap mip
+    // chain is the textbook answer; this interpolates between the two limits it would produce —
+    // the mirror direction (rough 0, sun disc and all) and the cosine-lobe average about that
+    // direction (rough 1, which is exactly what the SH ambient already stores). It costs no
+    // render target and no upload, and the middle of the range is the part nobody can pick out.
+    vec3 env_sample(vec3 R, float rough) {
+        // With an HDR environment loaded nothing has to be approximated: the prefiltered chain
+        // already holds the real GGX convolution at every roughness, so this is one fetch.
+        if (u_env_on == 1) return env_glossy(R, rough);
+        return mix(sky_with_sun(R), sh_ambient(R), clamp(rough * 1.4, 0.0, 1.0));
+    }
+
+    // The environment reflection for this surface, with the SCENE substituted wherever the trace
+    // can see it.
+    //
+    // ONE place, because the studio branch needs exactly the same substitution as the daylight one
+    // and a second copy would drift from this the first time either was touched — which is how SSR
+    // shipped working only under a sky and doing nothing at all in studio mode, the very case with
+    // no environment to reflect and therefore the most to gain.
+    vec3 with_ssr(vec3 sky_spec, vec3 Rd, float rgh, vec3 w) {
+        // A single mirror ray is only the right answer for a smooth surface. On a rough one the
+        // reflection is a wide lobe that one ray cannot stand in for, and forcing it paints a
+        // sharp, noisy picture of the room onto a matte wall.
+        if (u_ssr_on != 1 || rgh >= 0.35) return sky_spec;
+        vec4 hit = ssr_trace(v_wpos, Rd, u_cam);
+        // A `mix`, never an add: what the trace found REPLACES the sky it would otherwise have
+        // shown along that same ray. Adding would double-count and make the effect pop in and out
+        // wherever the trace lost confidence.
+        return mix(sky_spec, hit.rgb * w, hit.a * (1.0 - smoothstep(0.15, 0.35, rgh)));
+    }
+
+    // The fixed studio key light, when there is no daylight. Kept in one place because the shader
+    // has to reproduce the CPU's `0.35 + 0.65·|n·d|` split to know which part of the baked shade is
+    // ambient — that share, and only that share, is what ambient occlusion may darken.
+    const vec3 STUDIO_DIR = vec3(0.35, 0.25, 0.9);
+
+    // Output alpha = the vertex opacity × the image's own alpha channel. Opaque draws run with
+    // blending OFF, so this alpha is simply ignored there; only the blended textured pass uses it.
+    void main() {
+        // A MEDIUM's surface that lies ON an opaque one is the container, not a thing to look
+        // through.
+        //
+        // Modelled water is a closed box sitting inside a pool liner, so five of its six faces are
+        // exactly coplanar with the tiles. Drawing them put two coincident surfaces into a
+        // per-pixel z-fight — and because the transmission branch below composes an OPAQUE result,
+        // whichever won overwrote the other, so the fight read as triangular wedges crawling over
+        // the water as the camera moved.
+        //
+        // The test is DISTANCE IN FRONT of whatever is already there, deliberately not
+        // `gl_FrontFacing`: facing depends on winding surviving an exporter, an axis conversion and
+        // an instance matrix, and if any of those flips it this discards the surface you can see
+        // instead of the one you cannot. "Is there opaque geometry within 2 cm of this fragment"
+        // depends on nothing but the depth buffer.
+        //
+        // Gated on TRANSMISSION, never on alpha: an alpha-cutout leaf card is see-through too, and
+        // it is a single sheet lying flat on nothing.
+        if (u_transmission > 0.0 && u_tr_on == 1) {
+            vec2 suv = gl_FragCoord.xy / u_tr_vp;
+            float sd = texture(u_ssr_depth, suv).r;
+            // Compared in METRES. The depth buffer is nonlinear, so a fixed epsilon in its own
+            // units is millimetres up close and metres out at the far plane.
+            if (sd < 0.99999 &&
+                distance(ssr_world(suv, sd), u_cam) - distance(v_wpos, u_cam) < 0.02) discard;
+        }
+
+        // Geometric normal from screen-space derivatives (no per-vertex normal needed), faced to
+        // the viewer so two-sided surfaces light correctly. Differentiate the REBASED position:
+        // `v_wpos` at survey coordinates is quantised to ~0.8 mm, which is the size of a close-up
+        // pixel footprint, so its derivative is mostly cancellation noise and the normal — hence
+        // the shading — flickers pixel to pixel.
+        vec3 Ng = normalize(cross(dFdx(v_qpos), dFdy(v_qpos)));
+        vec3 V = normalize(u_cam - v_wpos);
+        if (dot(Ng, V) < 0.0) Ng = -Ng;
+        vec3 N = Ng;
+
+        // TEXTURE COORDINATES. Either the mesh's own, or a world-space TRIPLANAR projection at a
+        // real tiles-per-metre. Architecture here is mostly CSG extruded from a plan and carries no
+        // meaningful UVs at all, so world-space mapping is the only way a brick or a floor tile can
+        // be given a believable physical SIZE rather than "one image per face".
+        vec2 uv = v_uv;
+        vec3 twt = vec3(0.0);
+        if (u_triplanar == 1) {
+            twt = pow(abs(Ng), vec3(4.0));      // sharp blend: seams only in a narrow band
+            twt /= max(twt.x + twt.y + twt.z, 1e-4);
+            // One dominant-axis frame for anything needing a single consistent tangent basis.
+            vec3 q = v_qpos;              // already near the origin — see u_uv_org / TEX_VS
+            uv = (twt.x >= twt.y && twt.x >= twt.z) ? q.yz * u_tpm
+               : (twt.y >= twt.z)                   ? q.xz * u_tpm
+                                                    : q.xy * u_tpm;
+        }
+
+        // REBASED, like every other fine-scale read of position. A procedural field sampled at
+        // survey coordinates is evaluated on a ~0.8 mm lattice, and `proc_bump`'s central
+        // difference then steps by an epsilon of the same order — so the relief it returns is
+        // quantisation, not the pattern.
+        float field = (u_proc > 0) ? proc_field(v_qpos) : 0.0;
+        vec4 t = (u_proc > 0) ? vec4(proc_color(field), 1.0) : tri_or_uv(u_img, uv, twt);
+        // Clay: flat grey, keep t.a for glass. Image albedo arrives already linear — the sampler
+        // decodes it, because albedo textures upload as SRGB8_ALPHA8 (data maps do not).
+        vec3 albedo = u_clay == 1 ? srgb_to_lin(vec3(0.62)) : t.rgb;
+
+        // Tangent-space normal map via a derivative cotangent frame (Schüler) — no stored tangents.
+        if (u_has_nrm == 1) {
+            vec3 dp1 = dFdx(v_qpos), dp2 = dFdy(v_qpos);
+            vec2 duv1 = dFdx(uv), duv2 = dFdy(uv);
+            vec3 dp2perp = cross(dp2, Ng), dp1perp = cross(Ng, dp1);
+            vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+            vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+            float invmax = inversesqrt(max(dot(T, T), dot(B, B)));
+            mat3 TBN = mat3(T * invmax, B * invmax, Ng);
+            vec3 nm = texture(u_nrm, uv).xyz * 2.0 - 1.0;
+            N = normalize(TBN * nm);
+        }
+        // …and the procedural's own relief, from the field that already coloured it.
+        N = proc_bump(N, v_qpos, field);
+
+        // ROUGHNESS, in priority order: a map, then the procedural's own lo→hi range, then the
+        // material's scalar. The middle one is what makes a procedural stop looking like a picture:
+        // dark grain is rougher than light, so the highlight breaks up along the timber.
+        // A pattern whose two ends are EQUAL does not vary its finish, and then the material's own
+        // roughness slider is the one that means something — which is also how every pre-Phase-3
+        // material loads, so nothing already authored changes.
+        float rough = u_rough_base;
+        if (u_has_rough == 1)                                        rough = tri_or_uv(u_rough, uv, twt).r;
+        else if (u_proc > 0 && abs(u_rough_hi - u_rough_lo) > 0.001) rough = mix(u_rough_lo, u_rough_hi, proc_ramp_t(field));
+        rough = clamp(rough, 0.03, 1.0);
+        float metallic = (u_has_metal == 1) ? tri_or_uv(u_metal, uv, twt).r * u_metallic : u_metallic;
+        // A baked AO map darkens the ambient only — same rule the screen-space pass follows.
+        float ao_map = (u_has_ao == 1) ? tri_or_uv(u_aomap, uv, twt).r : 1.0;
+
+        // Specular F0: conductors reflect their own colour, dielectrics a few percent set by IOR.
+        float f0d = (u_ior - 1.0) / (u_ior + 1.0);
+        f0d = clamp(f0d * f0d, 0.0, 0.25);
+        vec3 f0 = mix(vec3(f0d), albedo, metallic);
+        vec3 diff = albedo * (1.0 - metallic);
+        float a = max(rough * rough, 1e-3);   // Disney-style perceptual → GGX alpha
+        float NoV = max(dot(N, V), 1e-4);
+
+        // The reflection ray, and the split-sum weights that say how much of F0 survives at this
+        // roughness and viewing angle (Karis's fit — see env.rs).
+        vec3 R = reflect(-V, N);
+        vec2 ab = env_brdf(rough, NoV);
+        vec3 env_w = (f0 * ab.x + ab.y) * clamp(u_reflect, 0.0, 1.0);
+
+        vec3 direct;    // sun + specular + emission — AO must NOT touch this
+        vec3 ambient;   // the sky's diffuse contribution — AO's whole remit
+        // The key light, resolved the same way by both branches so the clearcoat and sheen lobes
+        // below can be written ONCE. Without this they would have to be duplicated, and the studio
+        // copy would drift from the daylight copy the first time either was touched.
+        vec3  Ldir;     // direction TO the light
+        vec3  Lrad;     // its radiance
+        float shf;      // shadow factor
+        vec3  amb_irr;  // irradiance the ambient term is built from (already occluded by any AO map)
+        // The SPECULAR share of `direct`, accumulated alongside it. Transmission needs the two
+        // apart: light that passed through the material never scattered off it, so the diffuse
+        // must fall away as transmission rises — but a reflection of the sky is still a reflection
+        // of the sky, and dimming it in step with transmission is what makes rendered glass look
+        // like tinted plastic.
+        vec3  spec = vec3(0.0);
+        // Is there an ENVIRONMENT to be lit by — an analytic sky, a loaded HDRI, or both?
+        //
+        // Deliberately NOT the same question as "is the sun switched on". An HDR environment is a
+        // light source in its own right, and gating its irradiance on the analytic sun meant that
+        // loading a sky lit nothing: the backdrop showed a real place while every surface kept the
+        // fixed studio lamp. The two are independent, and the shader has to treat them so.
+        bool ibl = (u_sky_on == 1 || u_env_on == 1);
+        if (ibl) {
+            // `u_sun_col` is calibrated as irradiance/π (which is why the specular carries the π
+            // back), and the ambient is the environment's own irradiance projected onto spherical
+            // harmonics — a north wall and a south wall genuinely differ, which the old two-colour
+            // `mix(ground, sky, n.z)` fill could not express.
+            float sh = (u_shadow_on == 1) ? shadow_lit(v_wpos) : 1.0;
+            ambient = diff * sh_ambient(N) * ao_map;
+            direct = vec3(0.0);
+            Ldir = normalize(STUDIO_DIR); Lrad = vec3(0.0); shf = sh;
+            // The DIRECT sun is a separate question from where the ambient came from. With an
+            // HDRI and no analytic sun there is simply no directional term — the environment lights
+            // the scene on its own, which is what image-based lighting is for.
+            if (u_sun_on == 1) {
+                float NoL = max(dot(N, u_sun_dir), 0.0);
+                direct = diff * (u_sun_col * NoL * sh);
+                vec3 H = normalize(u_sun_dir + V);
+                vec3 F = f_schlick(f0, max(dot(V, H), 0.0));
+                vec3 sun_spec = F * (d_ggx(max(dot(N, H), 0.0), a) * v_smith(NoV, NoL, a) * NoL * sh * PI) * u_sun_col;
+                direct += sun_spec; spec += sun_spec;
+                Ldir = u_sun_dir; Lrad = u_sun_col;
+            }
+            // Environment specular — the sky itself, reflected. This is what gives a metal
+            // something to be a metal ABOUT; before it there was nothing to mirror and a chrome
+            // surface rendered as grey plastic no matter what the material said.
+            // …and where the SCENE is in the way of that sky, reflect the scene instead.
+            vec3 env_spec = with_ssr(env_sample(R, rough) * env_w, R, rough, env_w);
+            direct += env_spec; spec += env_spec;
+            amb_irr = sh_ambient(N) * ao_map;
+        } else {
+            // Studio mode (no daylight): the baked scalar stands in for irradiance. Split it the
+            // same way the CPU built it, `0.35 + 0.65·|n·d|`, so the constant fill is separated
+            // from the key light and only the fill is occludable.
+            float k = abs(dot(N, normalize(STUDIO_DIR)));
+            float ambf = 0.35 / (0.35 + 0.65 * k);
+            ambient = diff * v_shade * ambf * ao_map;
+            direct = diff * v_shade * (1.0 - ambf);
+            // Studio mode has no environment at all, so the SCENE is the only thing there is to
+            // reflect — the case with the most to gain, and the one SSR was silently skipping.
+            vec3 env_spec = with_ssr(vec3(v_shade) * env_w, R, rough, env_w);
+            direct += env_spec; spec += env_spec;
+            Ldir = normalize(STUDIO_DIR); Lrad = vec3(v_shade * (1.0 - ambf)); shf = 1.0;
+            amb_irr = vec3(v_shade * ambf * ao_map);
+        }
+
+        // ---- CLEARCOAT + SHEEN ------------------------------------------
+        // Both are SPECULAR, so both ride on `direct`: ambient occlusion has no business dimming
+        // a reflection of the window in a lacquered tabletop.
+        if (u_coat > 0.0) {
+            // The coat took some light before the material underneath ever saw it. Applied HERE,
+            // between the base and the coat's own lobes, so it dims the base and not itself —
+            // otherwise a strong clearcoat would darken the very reflection it is adding.
+            float loss = u_coat * (0.04 + 0.96 * pow(1.0 - NoV, 5.0));
+            direct *= (1.0 - loss);
+            ambient *= (1.0 - loss);
+
+            // Reflected about the GEOMETRIC normal, not the bumped one. Varnish fills the grain,
+            // which is exactly what separates a polished tabletop — timber visible underneath, the
+            // window reflected as one clean shape — from timber with a shiny bump map.
+            float ca = max(u_coat_rough * u_coat_rough, 1e-3);
+            float NcV = max(dot(Ng, V), 1e-4);
+            float NcL = max(dot(Ng, Ldir), 0.0);
+            vec3  Hc  = normalize(Ldir + V);
+            float Fc  = (0.04 + 0.96 * pow(1.0 - max(dot(V, Hc), 0.0), 5.0)) * u_coat;
+            vec3 coat_key = vec3(d_ggx(max(dot(Ng, Hc), 0.0), ca) * v_smith(NcV, NcL, ca) * NcL * shf * PI * Fc) * Lrad;
+            direct += coat_key; spec += coat_key;
+            vec2 cab = env_brdf(u_coat_rough, NcV);
+            vec3 coat_env = env_sample(reflect(-V, Ng), u_coat_rough)
+                          * ((0.04 * cab.x + cab.y) * u_coat * clamp(u_reflect, 0.0, 1.0));
+            direct += coat_env; spec += coat_env;
+        }
+        if (u_sheen > 0.0) {
+            // Disney's retroreflective term — a Fresnel-shaped rim peaking where the half vector
+            // grazes the view, which is where a nap of fibres actually catches the light.
+            vec3  Hs   = normalize(Ldir + V);
+            float FH   = pow(clamp(1.0 - max(dot(V, Hs), 0.0), 0.0, 1.0), 5.0);
+            float NoLs = max(dot(N, Ldir), 0.0);
+            vec3 sheen_key = u_sheen_tint * (u_sheen * FH * NoLs * shf) * Lrad;
+            direct += sheen_key; spec += sheen_key;
+            // …and the same rim under sky light alone. Without this a velvet curtain in a
+            // north-facing room — the one place anybody would put one — would be the single
+            // situation where the effect disappeared.
+            ambient += u_sheen_tint * (u_sheen * pow(1.0 - NoV, 5.0) * 0.5) * amb_irr;
+        }
+        direct += u_emission;
+
+        // MATERIAL HIGHLIGHT — the material selected in the Materials Factory pulses cyan so the
+        // user sees exactly WHERE it is while tuning it. u_hl flags this draw's texture; u_hl_k is
+        // the app-driven pulse (0..1). Mixed in LINEAR (the cyan is decoded) so it lands where it
+        // used to once the view transform has run. It rides on the direct term so AO cannot eat it.
+        if (u_hl == 1) {
+            direct = mix(direct + ambient, srgb_to_lin(vec3(0.25, 0.85, 1.0)), u_hl_k * 0.45);
+            ambient = vec3(0.0);
+        }
+        // NOTE: no tone-map here. Every pass writes scene-referred LINEAR light into an RGBA16F
+        // target; exposure and the view transform happen once, at the composite (see color.rs).
+        float alpha = t.a * v_a;
+
+        // ---- TRANSMISSION ------------------------------------------------
+        // Alpha blending composes `src·α + dst·(1−α)`, which says the surface COVERS part of the
+        // pixel and leaves the rest a hole. That is right for a wire mesh and wrong for water:
+        // the background arrives at full strength and undyed, so 45%-transmissive water over pale
+        // pool tiles came out pale, with its own teal diluted to nothing rather than tinting what
+        // was beneath it. Light going THROUGH a medium is FILTERED by it — `behind × albedo` —
+        // and that is the whole difference between water and a hole in the ground.
+        //
+        // Composed here, so the draw writes alpha 1 and the blender leaves the result alone.
+        if (u_tr_on == 1 && alpha < 0.999) {
+            float transmit = 1.0 - alpha;
+            vec2 suv = gl_FragCoord.xy / u_tr_vp;
+            // Bend the view ray at the surface and re-project it — the textured path knows its own
+            // world position and shaded normal, so unlike the flat glass pass nothing has to be
+            // reconstructed from the depth buffer.
+            vec2 uv1 = suv;
+            vec3 Rf = refract(-V, N, 1.0 / max(u_tr_ior, 1.0));
+            if (dot(Rf, Rf) > 1e-6 && u_tr_thick > 0.0) {
+                vec4 c1 = u_tr_scene_vp * vec4(v_wpos + Rf * u_tr_thick, 1.0);
+                if (c1.w > 0.0) uv1 = c1.xy / c1.w * 0.5 + 0.5;
+            }
+            vec3 behind = texture(u_tr_scene, clamp(uv1, vec2(0.001), vec2(0.999))).rgb;
+            // Everything that is NOT a mirror reflection scatters off the surface, so it fades as
+            // transmission rises; the reflection itself does not.
+            vec3 body = max(direct - spec, vec3(0.0)) + ambient;
+            frag = vec4(spec + body * alpha + behind * albedo * transmit, 1.0);
+            // The scene copy already carries the ambient behind this surface, so contributing it
+            // again here would double-count it; and glass is a poor GI bouncer.
+            amb_out = vec4(0.0, 0.0, 0.0, 1.0);
+            alb_out = vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+        }
+
+        frag = vec4(direct, alpha);
+        amb_out = vec4(ambient, alpha);
+        // The DIFFUSE albedo — what this surface would bounce. `diff` already has the metallic
+        // share removed, which is right: a mirror reflects, it does not scatter, and letting a
+        // chrome tap bleed its colour onto the wall behind it is a classic screen-space GI tell.
+        alb_out = vec4(diff, alpha);
+    }
 "#;
 
 // Composite: draw the FBO colour texture over an NDC rect (the panel viewport).
@@ -179,13 +1446,984 @@ const BLIT_VS: &str = r#"
     void main() { v_uv = a_uv; gl_Position = vec4(a_pos, 0.0, 1.0); }
 "#;
 
+// The composite is also the DISPLAY TRANSFORM: the FBO holds scene-referred linear light, and this
+// is the single point where exposure, the view transform and the sRGB encode are applied — the same
+// place Blender puts them, and the reason a bright surface now rolls off instead of clipping.
+//
+// It is also where the two light buffers are recombined. `u_tex` holds everything that is already
+// accounted for (direct sun, specular, emission) and `u_amb` the diffuse ambient; occlusion scales
+// only the second. Multiplying AO into the finished image instead — which is what "SSAO" usually
+// means in a hurry — would grey out a crease standing in full sunlight.
 const BLIT_FS: &str = r#"
     #version 330 core
     in vec2 v_uv;
     out vec4 frag;
     uniform sampler2D u_tex;
-    void main() { frag = texture(u_tex, v_uv); }
+    uniform sampler2D u_amb;
+    uniform sampler2D u_ao;
+    uniform sampler2D u_bloom;
+    uniform sampler2D u_ssgi;
+    uniform int u_ao_on;
+    uniform float u_ssgi_k;
+    uniform float u_bloom_k;
+    // 1 = `u_tex` is the ACCUMULATION buffer, which already holds composed light (ambient, occlusion
+    // and bloom folded in by the TAA resolve). Adding them again here would double them.
+    uniform int u_composed;
+    FOG_GLSL
+    VIEW_GLSL
+    void main() {
+        vec4 c = texture(u_tex, v_uv);
+        vec3 a = texture(u_amb, v_uv).rgb;
+        float ao = (u_ao_on == 1) ? texture(u_ao, v_uv).r : 1.0;
+        vec3 lit = (u_composed == 1) ? c.rgb : c.rgb + a * ao;
+        // Bounced light, before bloom — a bright wall lit by a bounce should be able to bloom, the
+        // same as one lit by the sun. `u_ssgi_k` is zeroed when the input is already composed, so
+        // the accumulator's bounce is never counted twice.
+        if (u_ssgi_k > 0.0) lit += texture(u_ssgi, v_uv).rgb * u_ssgi_k;
+        // Bloom is added to SCENE-REFERRED light, before the view transform — a real lens scatters
+        // light, it does not brighten pixels. Added after the tone map it would wash out instead of
+        // glowing, which is the difference between a luminaire and a smear.
+        if (u_bloom_k > 0.0) lit += texture(u_bloom, v_uv).rgb * u_bloom_k;
+        // …and so is fog, for the same reason: it is light scattered INTO the ray by the air, and
+        // a tone map applied to the sum is not the sum of two tone maps. `u_fog_on` is zeroed when
+        // the input is already composed, so the accumulator's fog is never applied twice.
+        lit = apply_fog(lit, v_uv);
+        frag = vec4(apply_view(lit), c.a);
+    }
 "#;
+
+// ── BLOOM ────────────────────────────────────────────────────────────────────────────────────
+// Light spilling around anything bright enough to overwhelm a lens. For a LIGHTING application
+// this is not decoration: without it a luminaire is just a pale rectangle, and the one thing the
+// user is designing never reads as a source of light.
+//
+// Three shaders and an FBO ping-pong — no compute needed. Bright-pass into a half-resolution
+// target, downsample five times, then upsample back up ADDING as it goes (the "dual filter" every
+// modern engine uses). Successive small blurs compose into a wide one for a fraction of the taps a
+// single wide Gaussian would need.
+
+// Bright-pass. The knee matters: a hard cutoff makes a visible contour crawl across a surface as
+// the exposure changes, because pixels cross the threshold one at a time.
+const BLOOM_PRE_FS: &str = r#"
+    #version 330 core
+    in vec2 v_uv;
+    out vec4 frag;
+    uniform sampler2D u_tex;
+    uniform sampler2D u_amb;
+    uniform sampler2D u_ao;
+    uniform int u_ao_on;
+    uniform float u_threshold;
+    uniform float u_knee;
+    void main() {
+        vec3 c = texture(u_tex, v_uv).rgb;
+        vec3 a = texture(u_amb, v_uv).rgb;
+        float ao = (u_ao_on == 1) ? texture(u_ao, v_uv).r : 1.0;
+        c += a * ao;
+        // NOTHING past this line may be infinite or NaN.
+        //
+        // The weight below divides by the pixel's own brightness, so an INFINITE pixel gives
+        // Inf/Inf = NaN — and NaN does not stay where it started. The downsample averages it into
+        // its neighbours and the upsample tent smears it back out, so one blown texel becomes a
+        // black block the size of a mip level, with the power-of-two edges to prove it. An HDRI sun
+        // reaches this easily: a stock Poly Haven sky peaks at 75360 against half-float's 65504
+        // ceiling, so it arrives from the texture already infinite. A strong emissive material can
+        // do it too.
+        c = min(max(c, vec3(0.0)), vec3(BLOOM_CEILING));
+        if (any(isnan(c))) c = vec3(0.0);
+        float br = max(c.r, max(c.g, c.b));
+        float soft = clamp(br - u_threshold + u_knee, 0.0, 2.0 * u_knee);
+        soft = soft * soft / (4.0 * u_knee + 1e-5);
+        float w = max(soft, br - u_threshold) / max(br, 1e-5);
+        frag = vec4(c * w, 1.0);
+    }
+"#;
+
+// Downsample: four bilinear taps at the source's texel corners, i.e. a 4×4 box for four fetches.
+const BLOOM_DOWN_FS: &str = r#"
+    #version 330 core
+    in vec2 v_uv;
+    out vec4 frag;
+    uniform sampler2D u_tex;
+    uniform vec2 u_texel;
+    void main() {
+        vec3 s = texture(u_tex, v_uv + u_texel * vec2(-1.0, -1.0)).rgb
+               + texture(u_tex, v_uv + u_texel * vec2( 1.0, -1.0)).rgb
+               + texture(u_tex, v_uv + u_texel * vec2(-1.0,  1.0)).rgb
+               + texture(u_tex, v_uv + u_texel * vec2( 1.0,  1.0)).rgb;
+        frag = vec4(s * 0.25, 1.0);
+    }
+"#;
+
+// Upsample: a 3×3 tent, blended additively onto the level above.
+const BLOOM_UP_FS: &str = r#"
+    #version 330 core
+    in vec2 v_uv;
+    out vec4 frag;
+    uniform sampler2D u_tex;
+    uniform vec2 u_texel;
+    void main() {
+        vec3 s = texture(u_tex, v_uv + u_texel * vec2(-1.0, -1.0)).rgb * 1.0
+               + texture(u_tex, v_uv + u_texel * vec2( 0.0, -1.0)).rgb * 2.0
+               + texture(u_tex, v_uv + u_texel * vec2( 1.0, -1.0)).rgb * 1.0
+               + texture(u_tex, v_uv + u_texel * vec2(-1.0,  0.0)).rgb * 2.0
+               + texture(u_tex, v_uv).rgb                              * 4.0
+               + texture(u_tex, v_uv + u_texel * vec2( 1.0,  0.0)).rgb * 2.0
+               + texture(u_tex, v_uv + u_texel * vec2(-1.0,  1.0)).rgb * 1.0
+               + texture(u_tex, v_uv + u_texel * vec2( 0.0,  1.0)).rgb * 2.0
+               + texture(u_tex, v_uv + u_texel * vec2( 1.0,  1.0)).rgb * 1.0;
+        frag = vec4(s / 16.0, 1.0);
+    }
+"#;
+
+// ── TEMPORAL ACCUMULATION ────────────────────────────────────────────────────────────────────
+// While nothing in the frame changes, keep re-rendering it with a sub-pixel camera jitter and
+// average the results. Sixteen samples of a still frame cost sixteen ordinary frames — about a
+// quarter of a second — and buy anti-aliasing no single-sample raster can reach, because the
+// samples land at sixteen positions inside every pixel rather than one.
+//
+// This is an ACCUMULATOR, not a reprojecting TAA. There is no motion vector, no neighbourhood
+// clamp and no history rejection heuristic: the moment ANY input to the frame changes, the
+// history is thrown away and the next frame starts again from a single clean sample. That makes
+// it incapable of the ghosting and smearing that game TAA is notorious for — the failure mode is
+// only ever "no accumulation yet", which looks exactly like today's image.
+//
+// The averaging happens in SCENE-REFERRED LINEAR light, before the view transform. Averaging
+// display values would be wrong: AgX is a curve, and the mean of a curve is not the curve of the
+// mean. It matters more later than now — a noisy signal (soft shadows, screen-space GI) averaged
+// after the tone map converges to the wrong answer, not merely a slightly different one.
+const TAA_FS: &str = r#"
+    #version 330 core
+    in vec2 v_uv;
+    out vec4 frag;
+    uniform sampler2D u_tex;
+    uniform sampler2D u_amb;
+    uniform sampler2D u_ao;
+    uniform sampler2D u_bloom;
+    uniform sampler2D u_hist;
+    uniform sampler2D u_ssgi;
+    uniform int u_ao_on;
+    uniform float u_ssgi_k;
+    uniform float u_bloom_k;
+    // Weight of THIS frame: 1.0 on the first sample (history is garbage), 1/(n+1) after, which
+    // makes the running result the exact unweighted mean of every sample so far.
+    uniform float u_blend;
+    FOG_GLSL
+    void main() {
+        vec4 c = texture(u_tex, v_uv);
+        vec3 a = texture(u_amb, v_uv).rgb;
+        float ao = (u_ao_on == 1) ? texture(u_ao, v_uv).r : 1.0;
+        vec3 lit = c.rgb + a * ao;
+        if (u_ssgi_k > 0.0) lit += texture(u_ssgi, v_uv).rgb * u_ssgi_k;
+        if (u_bloom_k > 0.0) lit += texture(u_bloom, v_uv).rgb * u_bloom_k;
+        lit = apply_fog(lit, v_uv);
+        vec4 cur = vec4(lit, c.a);
+        frag = (u_blend >= 1.0) ? cur : mix(texture(u_hist, v_uv), cur, u_blend);
+    }
+"#;
+
+// The fog uniforms + the depth-to-world reconstruction, shared by the composite and the
+// accumulation resolve so the two compose a frame identically. The integral itself lives in
+// `crate::env::FOG_GLSL`, next to the settings that drive it, and is spliced in below.
+const FOG_BLOCK: &str = r#"
+    uniform sampler2D u_fog_depth;
+    uniform mat4 u_fog_inv_vp;
+    uniform vec3 u_fog_cam;
+    uniform vec3 u_fog_col;
+    uniform float u_fog_density;
+    uniform float u_fog_base;
+    uniform float u_fog_falloff;
+    uniform int u_fog_on;
+    FOG_GLSL_BODY
+    vec3 apply_fog(vec3 lit, vec2 uv) {
+        if (u_fog_on != 1) return lit;
+        float d = texture(u_fog_depth, uv).r;
+        // The far plane is SKY, not a surface 10 km away. Fogging it would drag the whole
+        // background towards the fog colour and flatten the very thing distance is measured
+        // against — the sky already IS the haze, drawn properly.
+        if (d >= 0.999999) return lit;
+        vec4 p = u_fog_inv_vp * vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+        vec3 world = p.xyz / p.w;
+        float t = fog_transmittance(u_fog_cam, world);
+        return lit * t + u_fog_col * (1.0 - t);
+    }
+"#;
+
+/// The whole fog block with the integral spliced in — what `FOG_GLSL` expands to in a shader.
+fn fog_glsl() -> String {
+    FOG_BLOCK.replace("FOG_GLSL_BODY", crate::env::FOG_GLSL)
+}
+
+/// Attachment 2 of the G-buffer: the surface's DIFFUSE ALBEDO — what it would bounce.
+///
+/// Screen-space GI cannot work without it. Every other buffer holds light that has already been
+/// multiplied by albedo (`ambient` is albedo × irradiance, inseparably), so a bounce computed from
+/// them alone would land equally on a white floor and a black one. The colour of what light picks
+/// up on its way is the entire effect.
+///
+/// EVERY program that draws into the offscreen FBO must declare and write this. GLSL leaves an
+/// undeclared output's attachment undefined rather than zero, so a shader that forgets it does not
+/// fail to compile — it fills the albedo buffer with whatever the tile memory held, and GI bounces
+/// garbage off it.
+const ALBEDO_OUT_GLSL: &str = "layout(location=2) out vec4 alb_out;";
+
+/// SCREEN-SPACE REFLECTIONS, as a function the textured shader calls in place of its sky lookup.
+///
+/// The environment lobe can only ever return what an environment map holds, and a sky map holds
+/// sky. A pool cannot reflect the trees standing beside it out of one, however good the map — the
+/// trees are simply not in it. This marches the reflected ray through the depth of the scene as it
+/// stood before any glass was drawn, and returns what it actually struck.
+///
+/// The confidence in `.a` is the important part. It is 0 whenever the march cannot answer — the ray
+/// left the frame, ran out of length, or found only sky — and the caller then keeps the environment
+/// reflection it already had. So this only ever REPLACES the sky where real geometry is in the way,
+/// which means there is nothing to double-count and nothing to fade in and out as the camera moves.
+///
+/// Shares `u_tr_scene` / `u_tr_scene_vp` with transmission: the same copy of the same scene, and
+/// two copies of a 134 MB scene's framebuffer is not a saving worth making.
+const SSR_GLSL: &str = r#"
+    uniform int       u_ssr_on;
+    uniform sampler2D u_ssr_depth;   // unit 7 — depth of the opaque scene, copied beside its colour
+    uniform mat4      u_ssr_inv_vp;
+    uniform float     u_ssr_dist;    // how far a ray may travel, metres
+    uniform float     u_ssr_thick;   // how far behind a surface still counts as hitting it
+    uniform int       u_ssr_frame;   // accumulation frame, for the per-frame jitter
+
+    vec3 ssr_world(vec2 uv, float d) {
+        vec4 p = u_ssr_inv_vp * vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+        return p.xyz / p.w;
+    }
+
+    vec4 ssr_trace(vec3 P, vec3 R, vec3 cam) {
+        vec4 c0 = u_tr_scene_vp * vec4(P, 1.0);
+        vec4 c1 = u_tr_scene_vp * vec4(P + R * u_ssr_dist, 1.0);
+        if (c0.w <= 1e-5) return vec4(0.0);
+        // A ray whose far end passes behind the camera still has a useful stretch in front of it,
+        // so clip it to the near plane instead of abandoning the whole trace.
+        if (c1.w <= 1e-5) c1 = mix(c0, c1, (c0.w - 1e-4) / (c0.w - c1.w));
+
+        vec2 uv0 = c0.xy / c0.w * 0.5 + 0.5;
+        vec2 uv1 = c1.xy / c1.w * 0.5 + 0.5;
+
+        // CLIP THE SEGMENT TO THE VIEWPORT before choosing a step count.
+        //
+        // A reflected ray almost always leaves the frame long before it reaches its full length —
+        // off a pool the villa is ten metres away and the ray is forty, so most of it is sky above
+        // the top of the screen. Sizing the march over the WHOLE segment spends nearly every
+        // sample out there where nothing can be found: with the ray covering 5000 px and only the
+        // first 300 on screen, 96 steps put six of them anywhere useful, and the march simply
+        // stepped over the building. Clipping first spends all 96 on the part that exists.
+        vec2 d = uv1 - uv0;
+        float tmax = 1.0;
+        if (abs(d.x) > 1e-6) tmax = min(tmax, max((0.0 - uv0.x) / d.x, (1.0 - uv0.x) / d.x));
+        if (abs(d.y) > 1e-6) tmax = min(tmax, max((0.0 - uv0.y) / d.y, (1.0 - uv0.y) / d.y));
+        tmax = clamp(tmax, 0.0, 1.0);
+        if (tmax <= 1e-4) return vec4(0.0);
+
+        // STEP IN SCREEN SPACE, not along the world ray.
+        //
+        // This is the whole difference between a clean reflection and one crawling with triangular
+        // bands that slide as the camera turns. A step of fixed WORLD length covers a large span of
+        // pixels near the camera and a fraction of one far away, so the depth buffer gets sampled
+        // at a density that changes across the image AND with the view — every gap between samples
+        // is a place the march can step straight over a surface, and the pattern of those gaps
+        // moves whenever anything moves. Marching a fixed number of PIXELS instead samples it
+        // evenly, and what the trace finds stops depending on where you happen to be standing.
+        float px = length(d * tmax * u_tr_vp);
+        if (px < 1.0) return vec4(0.0);
+        int steps = int(clamp(px / 3.0, 12.0, 96.0));
+
+        // NDC z interpolates LINEARLY across the screen, so the ray's depth at each pixel is a
+        // plain mix() of the endpoints — perspective-correct, and it never leaves the depth
+        // buffer's own space.
+        //
+        // Why it is linear, since it looks like it should not be: a perspective projection gives
+        // `z_ndc = -a - b/z_eye` and `1/w = -1/z_eye`, so z_ndc is AFFINE in 1/w; and 1/w is the
+        // textbook screen-linear quantity. Affine-in-linear is linear. (Orthographic is trivially
+        // linear — w is 1 everywhere.)
+        //
+        // This used to divide by an interpolated 1/w as well, on the reflex that screen-space
+        // interpolation always needs that correction. It does when you are recovering a 3D
+        // attribute from `attribute/w`; z_ndc is already the divided quantity, so dividing again
+        // yielded z_CLIP — tens to thousands, not 0..1. Every first step then compared as "behind
+        // the scene" and reported a hit at the fragment itself, whose reconstructed world position
+        // was nonsense, so the thickness test below threw it away. The trace has therefore never
+        // returned a single hit: the reflections that were visible were the sky, and only the sky.
+        float zn0 = c0.z / c0.w, zn1 = c1.z / c1.w;
+
+        // Offset the first sample by a per-pixel, per-frame fraction of a step. Whatever banding
+        // survives then falls somewhere different on every pixel and every frame, so it reads as
+        // faint noise rather than as a moving pattern — and the still-frame accumulation, which
+        // averages over exactly this frame index, resolves it away completely.
+        float jit = fract(sin(dot(gl_FragCoord.xy + vec2(float(u_ssr_frame) * 13.0),
+                                 vec2(12.9898, 78.233))) * 43758.5453);
+
+        float prev = 0.0, hit_s = -1.0;
+        for (int i = 1; i <= 96; i++) {
+            if (i > steps) break;
+            float s = tmax * (float(i) - jit) / float(steps);
+            vec2 uv = mix(uv0, uv1, s);
+            if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;
+            float sd = texture(u_ssr_depth, uv).r;
+            if (sd >= 0.99999) { prev = s; continue; }     // sky here: nothing to hit, keep going
+            float rd = mix(zn0, zn1, s) * 0.5 + 0.5;
+            if (rd > sd) { hit_s = s; break; }             // the ray has passed behind that surface
+            prev = s;
+        }
+        if (hit_s < 0.0) return vec4(0.0);
+
+        // Bisect between the last miss and the hit, in the same screen parameter. Without this the
+        // contact lands wherever the step happened to fall and the reflection detaches from the
+        // object casting it by up to one step.
+        float lo = prev, hi = hit_s;
+        for (int k = 0; k < 6; k++) {
+            float mid = 0.5 * (lo + hi);
+            vec2 uvm = mix(uv0, uv1, mid);
+            float sdm = texture(u_ssr_depth, uvm).r;
+            float rdm = mix(zn0, zn1, mid) * 0.5 + 0.5;
+            if (sdm < 0.99999 && rdm > sdm) hi = mid; else lo = mid;
+        }
+
+        vec2 huv = mix(uv0, uv1, hi);
+        float hsd = texture(u_ssr_depth, huv).r;
+        if (hsd >= 0.99999) return vec4(0.0);
+        // THICKNESS, in metres. The depth buffer holds one surface per pixel and no thickness, so
+        // "the ray went behind it" has to be qualified by how far behind: a ray sliding along under
+        // a distant wall passes behind it for its whole length and would otherwise register a hit
+        // anywhere along that stretch, smearing the wall across the reflection.
+        vec3 S = ssr_world(huv, hsd);
+        vec3 Q = ssr_world(huv, mix(zn0, zn1, hi) * 0.5 + 0.5);
+        if (distance(Q, cam) - distance(S, cam) > u_ssr_thick) return vec4(0.0);
+
+        // Fade at the frame edge and as the ray runs out. What lies off-screen is precisely what
+        // this cannot know, so a reflection must thin out there rather than stop at a hard line —
+        // an abrupt edge is the most recognisable screen-space artefact there is.
+        vec2 e = min(huv, vec2(1.0) - huv);
+        float edge = smoothstep(0.0, 0.12, min(e.x, e.y));
+        float reach = 1.0 - smoothstep(0.75, 1.0, hi);
+        return vec4(texture(u_tr_scene, huv).rgb, edge * reach);
+    }
+"#;
+
+// The SKY as the backdrop. Drawn first, over the whole viewport, with depth testing off — the
+// geometry then paints over it. The ray is reconstructed from the inverse view-projection, so it is
+// the same camera the model is drawn with and the horizon sits where it should.
+const SKY_FS: &str = r#"
+    #version 330 core
+    in vec2 v_uv;
+    layout(location=0) out vec4 frag;
+    layout(location=1) out vec4 amb_out;
+    ALBEDO_OUT_GLSL
+    uniform mat4 u_inv_vp;
+    uniform vec3 u_cam;
+    SKY_GLSL
+    void main() {
+        vec4 p = u_inv_vp * vec4(v_uv * 2.0 - 1.0, 1.0, 1.0);
+        vec3 dir = normalize(p.xyz / p.w - u_cam);
+        frag = vec4(sky_with_sun(dir), 1.0);
+        amb_out = vec4(0.0, 0.0, 0.0, 1.0);
+        // The sky is not a surface and has no albedo. Zero marks it as BACKGROUND, which is what
+        // stops screen-space GI from treating the horizon as an enormous bounce card — the sky
+        // already lights the scene properly through its spherical harmonics.
+        alb_out = vec4(0.0);
+    }
+"#;
+
+// SCREEN-SPACE AMBIENT OCCLUSION. Sky lighting alone makes a render *flatter*, not rounder: every
+// point gets the sky's full irradiance for its normal, whether it sits on an open wall or wedged in
+// the corner behind a sofa. This estimates how much of the hemisphere is actually blocked, from the
+// depth buffer alone — no extra geometry pass, and it covers every draw kind automatically.
+//
+// World space rather than view space on purpose: the radius is then a length in metres that means
+// the same thing at any zoom, which is what lets it be a user setting instead of a magic number.
+/// A view-projection with the camera translation factored OUT, plus its inverse.
+///
+/// Every full-screen pass that recovers a position from the depth buffer gets these instead of
+/// the world matrices. A world reconstruction on a plan sited at survey coordinates lands near
+/// 6852 m, where an f32 ULP is 0.8 mm; a screen-space derivative of that is cancellation noise,
+/// and passes like SSAO build their surface NORMAL from exactly that derivative. Reconstructing
+/// relative to the camera keeps every value at scene scale — metres — where f32 has bits to
+/// spare, and it costs nothing: a screen-space pass never needed absolute coordinates.
+///
+/// `vp · T(cam)` cancels the translation ANALYTICALLY (`vp = P·V` and `V = R·T(−cam)`, so the
+/// product is `P·R`), and both matrices come out translation-free. The multiply and the inverse
+/// run in f64 deliberately: doing that cancellation in f32 would leave a ~0.8 mm residue in the
+/// translation column and hand back the very error this exists to remove.
+fn camera_relative_vp(vp: &[f32; 16], cam: [f32; 3]) -> ([f32; 16], [f32; 16]) {
+    let vp64 = glam::DMat4::from_cols_array(&std::array::from_fn(|i| vp[i] as f64));
+    let rel = vp64
+        * glam::DMat4::from_translation(glam::DVec3::new(
+            cam[0] as f64,
+            cam[1] as f64,
+            cam[2] as f64,
+        ));
+    (
+        rel.as_mat4().to_cols_array(),
+        rel.inverse().as_mat4().to_cols_array(),
+    )
+}
+
+const SSAO_FS: &str = r#"
+    #version 330 core
+    in vec2 v_uv;
+    out vec4 frag;
+    uniform sampler2D u_depth;
+    // CAMERA-RELATIVE view-projection and its inverse — see `camera_relative_vp`. Everything in
+    // this pass is measured from the camera, which is therefore the origin and needs no uniform.
+    // Reconstructing WORLD positions here was a real bug: on a plan at survey coordinates they
+    // land near 6852 m, an f32 ULP is 0.8 mm, and `N` below is a screen-space DERIVATIVE of that
+    // — so the normal was largely cancellation noise, the sample hemisphere pointed anywhere, and
+    // occlusion came out as blotchy speckle that crawled with the camera.
+    uniform mat4 u_vp;
+    uniform mat4 u_inv_vp;
+    uniform float u_radius;
+    uniform float u_strength;
+
+    // Position RELATIVE TO THE CAMERA. Occlusion is a purely local comparison, so absolute
+    // coordinates were never needed — only their difference, which is what this returns directly.
+    vec3 rel_at(vec2 uv) {
+        float d = texture(u_depth, uv).r;
+        vec4 p = u_inv_vp * vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+        return p.xyz / p.w;
+    }
+
+    void main() {
+        float d0 = texture(u_depth, v_uv).r;
+        if (d0 >= 0.99999) { frag = vec4(1.0); return; }   // background — nothing to occlude
+        vec3 P = rel_at(v_uv);
+        // The normal comes from the depth buffer's own screen-space derivatives, so no normal
+        // target is needed. It is faceted at silhouettes; the blur that follows hides that.
+        vec3 N = normalize(cross(dFdx(P), dFdy(P)));
+        if (dot(N, -P) < 0.0) N = -N;   // …towards the camera, which sits at the origin here
+        vec3 up = abs(N.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+        vec3 T = normalize(cross(N, up));
+        vec3 B = cross(N, T);
+        // Per-pixel spin: 16 samples that are differently oriented at every pixel read as far more
+        // than 16 once the blur averages a neighbourhood of them.
+        float rot = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
+
+        float occ = 0.0;
+        for (int i = 0; i < 16; i++) {
+            float a = (float(i) + 0.5) / 16.0;
+            float phi = a * 6.2831853 * 5.0 + rot;
+            float st = sqrt(a), ct = sqrt(1.0 - a);
+            float rr = mix(0.15, 1.0, a * a);   // bunch the samples near the origin: contact first
+            vec3 dir = T * (cos(phi) * st) + B * (sin(phi) * st) + N * ct;
+            vec3 sp = P + dir * (u_radius * rr);
+            vec4 cp = u_vp * vec4(sp, 1.0);
+            if (cp.w <= 0.0) continue;
+            vec2 su = cp.xy / cp.w * 0.5 + 0.5;
+            if (su.x < 0.0 || su.x > 1.0 || su.y < 0.0 || su.y > 1.0) continue;
+            float sample_d = length(sp);           // already measured from the camera
+            float scene_d = length(rel_at(su));
+            float bias = 0.02 + 0.01 * sample_d;   // scales with distance: no acne when dollied out
+            if (scene_d < sample_d - bias) {
+                // Range check — a wall forty metres behind a table must not shadow it.
+                occ += smoothstep(0.0, 1.0, u_radius / max(sample_d - scene_d, 1e-4));
+            }
+        }
+        frag = vec4(clamp(1.0 - u_strength * occ / 16.0, 0.0, 1.0));
+    }
+"#;
+
+// SCREEN-SPACE GLOBAL ILLUMINATION — one bounce of coloured light between surfaces.
+//
+// The renderer's only indirect light is the sky's irradiance, which is the same in every direction
+// a normal can face and knows nothing about the room. So a red rug lights nothing, a white wall
+// beside a window bounces nothing onto the ceiling, and every interior comes out looking like the
+// objects were composited in rather than standing in the space. This gathers the light actually
+// leaving nearby surfaces and lets it land.
+//
+// It is an APPROXIMATION and cannot be otherwise: it can only gather from surfaces the camera can
+// already see, so a bounce off a wall behind you does not exist, and one leaving the frame fades
+// out. Two things keep it from looking broken rather than merely incomplete:
+//
+//   * the EMITTER's normal is reconstructed and must face back at the receiver. Without that,
+//     light pours through walls — the single most recognisable screen-space GI failure.
+//   * the receiver's ALBEDO multiplies the result here, not at the composite. Bounced light is
+//     coloured by what it lands on; a term that ignored albedo would light a black floor and a
+//     white one identically, which reads as fog rather than as bounce.
+const SSGI_FS: &str = r#"
+    #version 330 core
+    in vec2 v_uv;
+    out vec4 frag;
+    uniform sampler2D u_depth;
+    uniform sampler2D u_lit;    // attachment 0 — direct + specular + emission
+    uniform sampler2D u_amb;    // attachment 1 — the diffuse ambient
+    uniform sampler2D u_alb;    // attachment 2 — diffuse albedo
+    uniform sampler2D u_ao;
+    uniform int   u_ao_on;
+    // CAMERA-RELATIVE, like SSAO — see `camera_relative_vp`. Every position here is used only in
+    // differences (`to = Q - P`, distances, normals), so absolute coordinates bought nothing and
+    // cost the precision the normals are built from.
+    uniform mat4  u_vp;
+    uniform mat4  u_inv_vp;
+    uniform float u_radius;
+    uniform float u_strength;
+    uniform vec2  u_texel;
+    uniform int   u_frame;
+
+    vec3 rel_at(vec2 uv) {
+        float d = texture(u_depth, uv).r;
+        vec4 p = u_inv_vp * vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+        return p.xyz / p.w;
+    }
+    // The light LEAVING a pixel, composed exactly as the composite composes it. Anything else and
+    // the bounce would carry a different picture than the one on screen.
+    vec3 radiance_at(vec2 uv) {
+        vec3 c = texture(u_lit, uv).rgb;
+        vec3 a = texture(u_amb, uv).rgb;
+        float ao = (u_ao_on == 1) ? texture(u_ao, uv).r : 1.0;
+        return c + a * ao;
+    }
+    // The emitter's normal, by finite difference on the depth buffer. `dFdx` cannot be used for
+    // this: the point is fetched from a texture, so its derivative across the quad is meaningless.
+    vec3 normal_at(vec2 uv, vec3 c) {
+        vec3 dx = rel_at(uv + vec2(u_texel.x, 0.0)) - c;
+        vec3 dy = rel_at(uv + vec2(0.0, u_texel.y)) - c;
+        return normalize(cross(dx, dy));
+    }
+
+    void main() {
+        float d0 = texture(u_depth, v_uv).r;
+        if (d0 >= 0.99999) { frag = vec4(0.0); return; }   // background
+        vec3 alb = texture(u_alb, v_uv).rgb;
+        // Nothing to bounce with: background, glass, or a UI swatch. All three write zero albedo.
+        if (alb.r + alb.g + alb.b <= 0.0) { frag = vec4(0.0); return; }
+
+        vec3 P = rel_at(v_uv);
+        vec3 N = normalize(cross(dFdx(P), dFdy(P)));
+        if (dot(N, -P) < 0.0) N = -N;   // …towards the camera, at the origin here
+        vec3 up = abs(N.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+        vec3 T = normalize(cross(N, up));
+        vec3 B = cross(N, T);
+        // Spun per PIXEL and per FRAME. Per-pixel alone would make temporal accumulation average
+        // the same eight directions sixteen times over and converge to its own bias; varying with
+        // the frame is what turns the accumulation into a real integral.
+        float rot = fract(sin(dot(gl_FragCoord.xy + vec2(float(u_frame) * 17.0),
+                                 vec2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
+
+        vec3 gi = vec3(0.0);
+        for (int i = 0; i < 8; i++) {
+            float a = (float(i) + 0.5) / 8.0;
+            float phi = a * 6.2831853 * 3.0 + rot;
+            float st = sqrt(a), ct = sqrt(1.0 - a);
+            vec3 dir = T * (cos(phi) * st) + B * (sin(phi) * st) + N * ct;
+            vec4 cp = u_vp * vec4(P + dir * (u_radius * mix(0.25, 1.0, a)), 1.0);
+            if (cp.w <= 0.0) continue;
+            vec2 su = cp.xy / cp.w * 0.5 + 0.5;
+            if (su.x < 0.0 || su.x > 1.0 || su.y < 0.0 || su.y > 1.0) continue;
+            if (texture(u_depth, su).r >= 0.99999) continue;   // sky is not a bounce card
+            vec3 Q = rel_at(su);
+            vec3 to = Q - P;
+            float dist = length(to);
+            if (dist < 1e-3 || dist > u_radius) continue;
+            to /= dist;
+            // Both of these are REJECTIONS, not weights.
+            //
+            // The directions above are drawn cosine-weighted (cos = sqrt(1-a)), so the receiver's
+            // cosine and the 1/pi of the diffuse BRDF are already carried by the sampling: the
+            // estimator of outgoing radiance is simply albedo times the MEAN of what those
+            // directions saw. Multiplying by the cosine again applies it twice, which is what made
+            // the whole effect four-odd times too dark to see.
+            if (dot(N, to) <= 0.0) continue;                    // behind the receiver
+            if (-dot(normal_at(su, Q), to) <= 0.0) continue;    // the far side of a wall
+            // A window, not an attenuation: full strength out to most of the radius, then a fade
+            // so a surface does not pop as it crosses the boundary.
+            gi += radiance_at(su) * smoothstep(1.0, 0.65, dist / u_radius);
+        }
+        // The mean over ALL directions, including the ones that found nothing — a direction that
+        // escaped saw the sky, and the sky is already lighting this surface through its spherical
+        // harmonics. Counting it here as well would be double-counting.
+        frag = vec4(alb * gi * (u_strength / 8.0), 1.0);
+    }
+"#;
+
+// A 4×4 box blur over an RGB target — the twin of `BLUR_FS`, which is single-channel. The GI
+// gather is deliberately noisy (eight jittered directions), and this is what turns that noise back
+// into the broad, soft term bounced light actually is.
+const BLUR_RGB_FS: &str = r#"
+    #version 330 core
+    in vec2 v_uv;
+    out vec4 frag;
+    uniform sampler2D u_src;
+    void main() {
+        vec2 tx = 1.0 / vec2(textureSize(u_src, 0));
+        vec3 s = vec3(0.0);
+        for (int y = -2; y <= 1; y++)
+            for (int x = -2; x <= 1; x++)
+                s += texture(u_src, v_uv + vec2(x, y) * tx).rgb;
+        frag = vec4(s / 16.0, 1.0);
+    }
+"#;
+
+// A plain 4×4 box blur over the AO buffer — the per-pixel rotation above trades banding for noise,
+// and this is what turns that noise back into a smooth term.
+const BLUR_FS: &str = r#"
+    #version 330 core
+    in vec2 v_uv;
+    out vec4 frag;
+    uniform sampler2D u_ao;
+    void main() {
+        vec2 tx = 1.0 / vec2(textureSize(u_ao, 0));
+        float s = 0.0;
+        for (int y = -2; y <= 1; y++)
+            for (int x = -2; x <= 1; x++)
+                s += texture(u_ao, v_uv + vec2(x, y) * tx).r;
+        frag = vec4(s / 16.0);
+    }
+"#;
+
+/// `&[f32]` as raw bytes for a GL upload. Same lifetime, same alignment (4 ≥ 1), no copy.
+fn bytemuck_cast(v: &[f32]) -> &[u8] {
+    // SAFETY: f32 has no padding and no invalid bit patterns, and the result borrows `v`, so the
+    // slice cannot outlive the data or be written through.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+/// One HDR environment ready for upload: the prefiltered chain and a version that changes whenever
+/// the map does, so the renderer can tell "same environment" from "new environment" without
+/// comparing megabytes of pixels.
+pub struct EnvUpload<'a> {
+    pub chain: &'a [crate::env_map::EnvMip],
+    /// The environment at FULL resolution, for the backdrop and near-mirror reflection. The chain's
+    /// own level 0 is capped to keep it a clean mip chain, which is too soft for something looked
+    /// at directly.
+    pub source: &'a crate::env_map::EnvMap,
+    pub version: u64,
+}
+
+/// Texture unit the HDR environment lives on, in every program that includes
+/// [`crate::env::SKY_GLSL`]. Units 0–5 are already spoken for (albedo, shadow, and the four PBR
+/// maps), and one number shared by all three programs is one fewer thing to get out of step.
+const ENV_UNIT: i32 = 6;
+
+/// The uniform locations [`crate::env::SKY_GLSL`] declares. Two programs include that source — the
+/// backdrop and the surface shader — and a uniform belongs to a *program*, not to the text, so the
+/// locations have to be resolved and set once per program. Bundling them keeps the two in step.
+#[derive(Default)]
+struct SkyUniforms {
+    perez: Option<glow::UniformLocation>,
+    perez_norm: Option<glow::UniformLocation>,
+    zenith_xy: Option<glow::UniformLocation>,
+    scale: Option<glow::UniformLocation>,
+    sun: Option<glow::UniformLocation>,
+    ground: Option<glow::UniformLocation>,
+    sun_col: Option<glow::UniformLocation>,
+    on: Option<glow::UniformLocation>,
+    sh: Option<glow::UniformLocation>,
+    env: Option<glow::UniformLocation>,
+    env_bg: Option<glow::UniformLocation>,
+    env_on: Option<glow::UniformLocation>,
+    env_rot: Option<glow::UniformLocation>,
+    env_strength: Option<glow::UniformLocation>,
+}
+
+impl SkyUniforms {
+    unsafe fn locate(gl: &glow::Context, prog: glow::Program) -> Self {
+        Self {
+            perez: gl.get_uniform_location(prog, "u_perez"),
+            perez_norm: gl.get_uniform_location(prog, "u_perez_norm"),
+            zenith_xy: gl.get_uniform_location(prog, "u_zenith_xy"),
+            scale: gl.get_uniform_location(prog, "u_sky_scale"),
+            sun: gl.get_uniform_location(prog, "u_sky_sun"),
+            ground: gl.get_uniform_location(prog, "u_sky_ground"),
+            sun_col: gl.get_uniform_location(prog, "u_sky_sun_col"),
+            on: gl.get_uniform_location(prog, "u_sky_on"),
+            sh: gl.get_uniform_location(prog, "u_sh"),
+            env: gl.get_uniform_location(prog, "u_env"),
+            env_bg: gl.get_uniform_location(prog, "u_env_bg"),
+            env_on: gl.get_uniform_location(prog, "u_env_on"),
+            env_rot: gl.get_uniform_location(prog, "u_env_rot"),
+            env_strength: gl.get_uniform_location(prog, "u_env_strength"),
+        }
+    }
+
+    /// Push one frame's environment. The program must already be bound.
+    ///
+    /// `env_unit` is the texture unit the HDR environment is bound to — passed in rather than
+    /// fixed, because the textured program has albedo/normal/roughness/AO ahead of it and the
+    /// scene program does not, so "the next free unit" is a different number in each.
+    unsafe fn set(&self, gl: &glow::Context, env: &crate::env::EnvRender, env_unit: i32) {
+        let on = env.sky.map(|s| s.valid).unwrap_or(false);
+        if let Some(loc) = &self.on {
+            gl.uniform_1_i32(Some(loc), on as i32);
+        }
+        // The HDR environment, when one is loaded. Set on EVERY program that includes SKY_GLSL,
+        // including when it is off — a stale `u_env_on` left at 1 on a program that has since lost
+        // its texture samples whatever happens to be bound to that unit.
+        if let Some(loc) = &self.env {
+            gl.uniform_1_i32(Some(loc), env_unit);
+        }
+        if let Some(loc) = &self.env_bg {
+            gl.uniform_1_i32(Some(loc), env_unit + 1);
+        }
+        if let Some(loc) = &self.env_on {
+            gl.uniform_1_i32(Some(loc), env.hdri.is_some() as i32);
+        }
+        if let Some(loc) = &self.env_rot {
+            gl.uniform_1_f32(Some(loc), env.hdri.map(|h| h.rot).unwrap_or(0.0));
+        }
+        if let Some(loc) = &self.env_strength {
+            gl.uniform_1_f32(Some(loc), env.hdri.map(|h| h.strength).unwrap_or(1.0));
+        }
+        // The SH ambient is uploaded regardless: the studio path leaves it at zero, and a stale
+        // set of coefficients on a program that has stopped using them is a real class of bug.
+        if let Some(loc) = &self.sh {
+            let mut flat = [0.0f32; 27];
+            for (i, c) in env.sh.iter().enumerate() {
+                flat[i * 3..i * 3 + 3].copy_from_slice(c);
+            }
+            gl.uniform_3_f32_slice(Some(loc), &flat);
+        }
+        let Some(sky) = env.sky else { return };
+        if let Some(loc) = &self.perez {
+            gl.uniform_3_f32_slice(Some(loc), &sky.perez_uniform());
+        }
+        if let Some(loc) = &self.perez_norm {
+            let n = sky.norm_uniform();
+            gl.uniform_3_f32(Some(loc), n[0], n[1], n[2]);
+        }
+        if let Some(loc) = &self.zenith_xy {
+            gl.uniform_2_f32(Some(loc), sky.zenith_xy[0], sky.zenith_xy[1]);
+        }
+        if let Some(loc) = &self.scale {
+            gl.uniform_1_f32(Some(loc), sky.scale);
+        }
+        if let Some(loc) = &self.sun {
+            gl.uniform_3_f32(Some(loc), sky.sun_dir.x, sky.sun_dir.y, sky.sun_dir.z);
+        }
+        if let Some(loc) = &self.ground {
+            gl.uniform_3_f32(Some(loc), sky.ground[0], sky.ground[1], sky.ground[2]);
+        }
+        if let Some(loc) = &self.sun_col {
+            gl.uniform_3_f32(Some(loc), sky.sun_col[0], sky.sun_col[1], sky.sun_col[2]);
+        }
+    }
+}
+
+/// Paste the shared GLSL chunks into the textured fragment shader. One function so `ensure_init`
+/// and the shader-assembly tests compile the identical text — a test that assembled it slightly
+/// differently would be testing nothing.
+fn assemble_tex_fs() -> String {
+    TEX_FS
+        .replace("SSR_GLSL", SSR_GLSL)
+        .replace("ALBEDO_OUT_GLSL", ALBEDO_OUT_GLSL)
+        .replace("SHADOW_GLSL", &shadow_glsl())
+        .replace("SRGB_GLSL", crate::color::SRGB_GLSL)
+        .replace("SKY_GLSL", crate::env::SKY_GLSL)
+        .replace("ENV_BRDF_GLSL", crate::env::ENV_BRDF_GLSL)
+}
+
+/// The other three programs that draw into the offscreen FBO, assembled the same way and in ONE
+/// place each — so `ensure_init` and every test compile identical text. A test that assembled the
+/// shader slightly differently from the renderer would be testing nothing.
+fn assemble_scene_fs() -> String {
+    SCENE_FS
+        .replace("ALBEDO_OUT_GLSL", ALBEDO_OUT_GLSL)
+        .replace("SHADOW_GLSL", &shadow_glsl())
+        .replace("SRGB_GLSL", crate::color::SRGB_GLSL)
+        .replace("SKY_GLSL", crate::env::SKY_GLSL)
+}
+
+fn assemble_transp_fs() -> String {
+    TRANSP_FS
+        .replace("ALBEDO_OUT_GLSL", ALBEDO_OUT_GLSL)
+        .replace("SRGB_GLSL", crate::color::SRGB_GLSL)
+}
+
+fn assemble_sky_fs() -> String {
+    SKY_FS
+        .replace("ALBEDO_OUT_GLSL", ALBEDO_OUT_GLSL)
+        .replace("SKY_GLSL", crate::env::SKY_GLSL)
+}
+
+/// The assembled textured fragment shader, for cross-module tests that need to check the GLSL
+/// against a Rust twin of it (see [`crate::proc_tex`]).
+#[cfg(test)]
+pub fn tex_fs_for_test() -> String {
+    assemble_tex_fs()
+}
+
+/// The assembled SCENE fragment shader, so a test can read the lighting constants back out of the
+/// source rather than trust that the Rust twin and the GLSL were typed the same.
+#[cfg(test)]
+pub fn scene_fs_for_test() -> String {
+    SCENE_FS
+        .replace("SHADOW_GLSL", &shadow_glsl())
+        .replace("SRGB_GLSL", crate::color::SRGB_GLSL)
+        .replace("SKY_GLSL", crate::env::SKY_GLSL)
+}
+
+/// Everything about one [`Scene3dRenderer::render`] call that could change the resulting image,
+/// reduced to something comparable with the previous frame's.
+///
+/// Temporal accumulation is only honest while the image is genuinely unchanged, so "did anything
+/// change?" has to be answered from ALL the inputs. Miss one and the viewport silently keeps
+/// showing a stale picture — the worst kind of rendering bug, because nothing looks broken.
+///
+/// That is why this is built INSIDE `render`, out of `render`'s own parameters, rather than by the
+/// caller: the renderer cannot forget an argument it was handed. Bulk data (vertices, matrices,
+/// ids) is folded into a hash; the small settings structs go in through their `Debug` output,
+/// because `Debug` prints every field — so a field added to `ProcParams` or `ColorPipeline` later
+/// joins the key automatically instead of quietly falling out of it.
+#[derive(Default, PartialEq, Clone, Copy, Debug)]
+struct FrameKey {
+    hash: u64,
+    /// The accumulation buffers are viewport-sized, so a resize invalidates the history outright.
+    size: (i32, i32),
+}
+
+/// FNV-1a over 64-bit words. Not cryptographic and not trying to be — it only has to notice
+/// change, and it runs over every dynamic vertex the frame uploads, so it has to be cheap.
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+    fn u64(&mut self, v: u64) {
+        self.0 = (self.0 ^ v).wrapping_mul(0x100_0000_01b3);
+    }
+    fn f32(&mut self, v: f32) {
+        self.u64(v.to_bits() as u64);
+    }
+    fn f32s(&mut self, v: &[f32]) {
+        for &x in v {
+            self.f32(x);
+        }
+    }
+    fn bytes(&mut self, b: &[u8]) {
+        let mut it = b.chunks_exact(8);
+        for c in &mut it {
+            self.u64(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let mut tail = [0u8; 8];
+        let r = it.remainder();
+        tail[..r.len()].copy_from_slice(r);
+        self.u64(u64::from_le_bytes(tail));
+        self.u64(b.len() as u64);
+    }
+    /// Fold a value in through its `Debug` output, reusing `buf` so this never allocates.
+    fn dbg(&mut self, buf: &mut String, v: &dyn std::fmt::Debug) {
+        use std::fmt::Write;
+        buf.clear();
+        let _ = write!(buf, "{v:?}");
+        self.bytes(buf.as_bytes());
+    }
+}
+
+/// The sub-pixel offset of accumulation sample `i`, in pixels, from a Halton (2, 3) sequence.
+///
+/// Halton rather than random: it fills the pixel evenly at EVERY prefix length, so the image is
+/// already well anti-aliased after four samples instead of only after all sixteen.
+fn halton_jitter(i: u32) -> (f32, f32) {
+    (halton_base(i, 2) - 0.5, halton_base(i, 3) - 0.5)
+}
+
+/// Nudge a view-projection matrix by `(jx, jy)` PIXELS on a `w`×`h` viewport.
+///
+/// The shift has to be proportional to `w` (clip space), not applied after the divide, or objects
+/// at different depths would jitter by different amounts and the accumulation would blur the scene
+/// instead of anti-aliasing it. In a column-major `[f32; 16]`, row 0 is elements 0, 4, 8, 12 and
+/// row 3 (the `w` row) is 3, 7, 11, 15.
+fn jitter_mvp(mvp: &[f32; 16], jx: f32, jy: f32, w: i32, h: i32) -> [f32; 16] {
+    let (sx, sy) = (2.0 * jx / w.max(1) as f32, 2.0 * jy / h.max(1) as f32);
+    let mut m = *mvp;
+    for c in 0..4 {
+        m[c * 4] += sx * m[c * 4 + 3];
+        m[c * 4 + 1] += sy * m[c * 4 + 3];
+    }
+    m
+}
+
+/// Move the sun to a different point on its own disc for accumulation sample `i`, and carry the
+/// shadow matrix with it.
+///
+/// The sun is not a point — it is half a degree wide. That is the whole reason a real shadow edge
+/// is crisp under a table leg and soft under a roof eave: the penumbra is the sun's disc projected
+/// past the occluder, so it widens with the distance the shadow has to travel. Rendering each
+/// accumulation sample from a different point on the disc and averaging reproduces exactly that.
+///
+/// It gets the WIDENING right, which is what no amount of blurring a shadow map can do — a blur
+/// has one width everywhere, so it either smears the contact shadow under a chair leg or leaves
+/// the eaves razor-sharp, and usually both at once. And it costs nothing beyond the accumulation
+/// that is running anyway: the same sixteen frames that anti-alias the image also integrate the
+/// sun's disc.
+///
+/// The shadow matrix is rotated rather than rebuilt, because the app owns how it was fitted to the
+/// scene and this code has no business duplicating that. Rotating the world by `R⁻¹` about the
+/// point the light frustum is centred on is exactly equivalent to rotating the light by `R`, and
+/// leaves the fit intact — at half a degree the frustum still covers what it covered.
+fn jitter_sun(
+    dir: [f32; 3],
+    shadow: Option<[f32; 16]>,
+    half_angle: f32,
+    i: u32,
+) -> ([f32; 3], Option<[f32; 16]>) {
+    let (d2, spin) = sun_disc_sample(dir, half_angle, i);
+    let Some(spin) = spin else {
+        return (dir, shadow);
+    };
+    (d2, shadow.map(|m| rotate_light(m, spin)))
+}
+
+/// The sun's direction for accumulation sample `i`, and the world rotation that takes the light
+/// there — split out so a whole set of cascades can be turned by the SAME rotation. Turning each
+/// cascade by an independently drawn sample would light each slice of the view from a slightly
+/// different sun, and the seam between two cascades would flicker.
+///
+/// `None` for the rotation means "nothing to do" — a zero-width disc, or a degenerate direction.
+fn sun_disc_sample(dir: [f32; 3], half_angle: f32, i: u32) -> ([f32; 3], Option<glam::Quat>) {
+    let d = Vec3::from(dir).normalize_or_zero();
+    if d == Vec3::ZERO || half_angle <= 0.0 {
+        return (dir, None);
+    }
+    // A point on the disc, area-uniform (the sqrt) so the middle is not over-weighted. Halton
+    // again, for the same reason as the pixel jitter: every prefix is already well spread, so the
+    // penumbra looks right after four samples rather than only after all sixteen.
+    let (h2, h3) = (halton_base(i, 2), halton_base(i, 3));
+    let (r, phi) = (h2.sqrt() * half_angle, h3 * std::f32::consts::TAU);
+    // Any two vectors perpendicular to the sun. Which two does not matter — the disc is round.
+    let seed = if d.z.abs() < 0.9 { Vec3::Z } else { Vec3::X };
+    let u = d.cross(seed).normalize_or_zero();
+    let v = d.cross(u);
+    let d2 = (d + u * (r * phi.cos()) + v * (r * phi.sin())).normalize_or_zero();
+    if d2 == Vec3::ZERO {
+        return (dir, None);
+    }
+    (
+        [d2.x, d2.y, d2.z],
+        Some(glam::Quat::from_rotation_arc(d, d2)),
+    )
+}
+
+/// Turn a light matrix by `spin`, as if the light itself had moved.
+///
+/// Rotating the WORLD by `spin⁻¹` about the point the light frustum is centred on is exactly
+/// equivalent to rotating the light by `spin`, and it leaves the app's fit intact — which matters,
+/// because the app owns how the cascade was framed and this code has no business duplicating that.
+/// About the frustum's own centre, not the origin: a scene 200 m from the world origin would
+/// otherwise swing bodily out of its own shadow map.
+fn rotate_light(m: [f32; 16], spin: glam::Quat) -> [f32; 16] {
+    let lm = Mat4::from_cols_array(&m);
+    if lm.determinant().abs() < 1e-20 {
+        return m; // not invertible — leave it alone rather than corrupt it
+    }
+    let c = lm.inverse().project_point3(Vec3::ZERO);
+    let rot = Mat4::from_quat(spin.inverse());
+    (lm * (Mat4::from_translation(c) * rot * Mat4::from_translation(-c))).to_cols_array()
+}
+
+/// The `i`-th value of the Halton sequence in `base` — the building block of both jitters.
+fn halton_base(mut i: u32, base: u32) -> f32 {
+    let (mut f, mut r) = (1.0f32, 0.0f32);
+    while i > 0 {
+        f /= base as f32;
+        r += f * (i % base) as f32;
+        i /= base;
+    }
+    r
+}
 
 pub struct Scene3dRenderer {
     inited: bool,
@@ -194,15 +2432,264 @@ pub struct Scene3dRenderer {
     u_alpha: Option<glow::UniformLocation>,
     scene_vao: Option<glow::VertexArray>,
     scene_vbo: Option<glow::Buffer>,
+    // STATIC opaque batches with their own VBO/VAO, re-uploaded ONLY when their version
+    // changes — so a heavy scene (or a dragged mesh) isn't re-sent to the GPU every frame
+    // (that 28 MB/frame upload was the idle lag with a 400k-tri import). Slot 0 = the opaque
+    // scene, slot 1 = the dragged furniture.
+    static_vao: [Option<glow::VertexArray>; 2],
+    static_vbo: [Option<glow::Buffer>; 2],
+    static_ver: [u64; 2],
+    static_len: [i32; 2],
+    /// Per-furniture GPU buffers, keyed by (asset,colour). Each furniture mesh is uploaded
+    /// ONCE and drawn every frame with just a model matrix — so importing/moving/rotating a
+    /// multi-million-triangle piece never CPU-transforms or re-uploads it. Shared by all
+    /// instances of the same asset+colour.
+    furn_bufs: std::collections::HashMap<u64, (glow::VertexArray, glow::Buffer, i32)>,
+    // TRANSPARENT furniture pass: its own program (pos+colour+opacity) and per-mesh GPU buffers,
+    // keyed like `furn_bufs` but holding only the translucent triangles of an asset.
+    transp_prog: Option<glow::Program>,
+    u_transp_mvp: Option<glow::UniformLocation>,
+    /// Local→world for the glass pass, and the rebase origin. The pane's normal is built from an
+    /// interpolated rebased position; see TRANSP_VS for why reconstructing it from depth cannot
+    /// work on a model sited at survey coordinates.
+    u_transp_model: Option<glow::UniformLocation>,
+    u_transp_uv_org: Option<glow::UniformLocation>,
+    // Refraction uniforms on the transparent program — see [`RefractSettings`].
+    u_transp_scene: Option<glow::UniformLocation>,
+    u_transp_scene_vp: Option<glow::UniformLocation>,
+    /// TRANSMISSION in the TEXTURED program — the same scene copy the flat glass pass refracts,
+    /// but composed as a filter rather than as coverage (see the shader).
+    u_tex_tr_on: Option<glow::UniformLocation>,
+    u_tex_tr_scene: Option<glow::UniformLocation>,
+    u_tex_tr_scene_vp: Option<glow::UniformLocation>,
+    u_tex_tr_vp: Option<glow::UniformLocation>,
+    u_tex_tr_ior: Option<glow::UniformLocation>,
+    u_tex_tr_thick: Option<glow::UniformLocation>,
+    /// SCREEN-SPACE REFLECTIONS in the textured program (shares the scene copy above).
+    u_tex_ssr_on: Option<glow::UniformLocation>,
+    u_tex_ssr_depth: Option<glow::UniformLocation>,
+    u_tex_ssr_inv_vp: Option<glow::UniformLocation>,
+    u_tex_ssr_dist: Option<glow::UniformLocation>,
+    u_tex_ssr_thick: Option<glow::UniformLocation>,
+    u_tex_ssr_frame: Option<glow::UniformLocation>,
+
+    u_transp_cam: Option<glow::UniformLocation>,
+    u_transp_refr_vp: Option<glow::UniformLocation>,
+    u_transp_ior: Option<glow::UniformLocation>,
+    u_transp_thick: Option<glow::UniformLocation>,
+    u_transp_refr_on: Option<glow::UniformLocation>,
+    transp_bufs: std::collections::HashMap<u64, (glow::VertexArray, glow::Buffer, i32)>,
+    // TEXTURED pass: its own program (pos+uv+shade), per-mesh GPU buffers keyed like
+    // `furn_bufs`, and a cache of uploaded GL images keyed by the app-side texture index.
+    tex_prog: Option<glow::Program>,
+    u_tex_mvp: Option<glow::UniformLocation>,
+    u_tex_img: Option<glow::UniformLocation>,
+    u_tex_cam: Option<glow::UniformLocation>,
+    u_tex_reflect: Option<glow::UniformLocation>,
+    // PROCEDURAL material uniforms — when `u_proc` > 0 the textured shader ignores the bound image
+    // and evaluates a world-space noise→ramp pattern (wood grain, marble, …) instead.
+    u_tex_proc: Option<glow::UniformLocation>,
+    u_tex_col_a: Option<glow::UniformLocation>,
+    u_tex_col_b: Option<glow::UniformLocation>,
+    u_tex_pscale: Option<glow::UniformLocation>,
+    u_tex_detail: Option<glow::UniformLocation>,
+    u_tex_prough: Option<glow::UniformLocation>,
+    u_tex_pcontrast: Option<glow::UniformLocation>,
+    u_tex_ramp: Option<glow::UniformLocation>,
+    // Sun/shadow/PBR-map uniforms for the textured program (Texture Phase 2 + daylight).
+    u_tex_model: Option<glow::UniformLocation>,
+    u_tex_sun_on: Option<glow::UniformLocation>,
+    u_tex_sun_dir: Option<glow::UniformLocation>,
+    u_tex_sun_col: Option<glow::UniformLocation>,
+    u_tex_emission: Option<glow::UniformLocation>,
+    /// The HDR environment as ONE 2D texture whose mip levels ARE the roughness chain, plus the
+    /// version of the map it was built from so it re-uploads only when the environment changes.
+    env_tex: Option<glow::Texture>,
+    /// The same environment at FULL resolution — the backdrop and near-mirror reflections.
+    env_bg_tex: Option<glow::Texture>,
+    env_version: u64,
+    /// BLOOM: the bright-pass/downsample/upsample programs, and the pyramid they ping-pong through.
+    /// `bloom_tex[0]` is half the viewport, each level half the one above.
+    bloom_pre_prog: Option<glow::Program>,
+    bloom_down_prog: Option<glow::Program>,
+    bloom_up_prog: Option<glow::Program>,
+    bloom_tex: Vec<glow::Texture>,
+    bloom_size: Vec<(i32, i32)>,
+    bloom_fbo: Option<glow::Framebuffer>,
+    /// TEMPORAL ACCUMULATION (see [`TAA_FS`]). Two viewport-sized RGBA16F buffers ping-ponged by
+    /// the resolve pass, plus the bookkeeping that decides when to start over.
+    taa_prog: Option<glow::Program>,
+    taa_fbo: Option<glow::Framebuffer>,
+    taa_tex: [Option<glow::Texture>; 2],
+    /// The size `taa_tex` was allocated at — its own, because `fbo_w`/`fbo_h` have already been
+    /// updated to the NEW size by the time the accumulator gets to notice a resize.
+    taa_size: (i32, i32),
+    /// Which of `taa_tex` holds the CURRENT accumulation (the other is last frame's history).
+    taa_cur: usize,
+    /// Requested by the caller through [`Scene3dRenderer::set_taa`]; 0 samples = off.
+    taa_max: u32,
+    /// How many samples the history already holds. 0 = nothing accumulated yet.
+    taa_n: u32,
+    /// Whether `taa_tex[taa_cur]` actually HOLDS a finished image.
+    ///
+    /// Separate from `taa_n` because the two can disagree, and the disagreement is catastrophic:
+    /// the converged path re-presents the accumulation buffer INSTEAD of drawing the scene, so if
+    /// it ever presents a buffer nothing wrote, the viewport goes black and stays black — there is
+    /// no next frame that would fix it, because the whole point of that path is not to render one.
+    taa_valid: bool,
+    /// Everything about the last frame that could change the image — see [`FrameKey`].
+    taa_key: FrameKey,
+    /// LAST FRAME'S KEY, BROKEN DOWN BY SECTION — the same inputs as `taa_key`, hashed in groups
+    /// so a restart can name WHICH group moved.
+    ///
+    /// A single whole-frame hash answers "did anything change" and nothing else, which is the one
+    /// question that is never in doubt when a viewport is grinding: of course something changed —
+    /// the point is what. On the reported project every frame was sample 1 of 16 at ~300 ms, and
+    /// telling a legitimate orbit from an input that will never settle needed exactly this.
+    taa_sections: [u64; Self::TAA_SECTIONS],
+    /// The section that last restarted the refinement — see [`Self::taa_reason`].
+    taa_why: &'static str,
+    /// Whether the last frame's key MATCHED the one before it.
+    ///
+    /// The renderer only asks the caller to keep repainting once it has seen the frame hold still
+    /// at least once. Without that condition, a scene whose draw list is rebuilt slightly
+    /// differently every frame would repaint → change → repaint forever, spinning the GPU at full
+    /// speed on a viewport nobody is touching, and the loop would be driven by the very requests
+    /// meant to end it. Costing one frame of latency to rule that out is a good trade.
+    taa_stable: bool,
+    /// Scratch string the key formats into, reused so a per-frame comparison never allocates.
+    taa_dbg: String,
+    /// The sky/IBL uniforms of the TEXTURED program (see [`SkyUniforms`]).
+    sky_u_tex: SkyUniforms,
+    sky_u_scene: SkyUniforms,
+    u_tex_hl: Option<glow::UniformLocation>,
+    u_tex_hl_k: Option<glow::UniformLocation>,
+    u_tex_nrm: Option<glow::UniformLocation>,
+    u_tex_rough: Option<glow::UniformLocation>,
+    u_tex_metal_map: Option<glow::UniformLocation>,
+    u_tex_ao_map: Option<glow::UniformLocation>,
+    u_tex_has_nrm: Option<glow::UniformLocation>,
+    u_tex_has_rough: Option<glow::UniformLocation>,
+    u_tex_has_metal: Option<glow::UniformLocation>,
+    u_tex_has_ao: Option<glow::UniformLocation>,
+    u_tex_triplanar: Option<glow::UniformLocation>,
+    u_tex_tpm: Option<glow::UniformLocation>,
+    /// Origin the triplanar lookup is measured from — keeps UVs near zero for a model at
+    /// survey coordinates, where large texture coordinates alias badly. See the shader.
+    u_tex_uv_org: Option<glow::UniformLocation>,
+    /// Set by the app to match the CPU-side UV rebase (see `FactoryState::feature_textured_meshes`).
+    pub uv_origin: [f32; 3],
+    u_tex_rough_lo: Option<glow::UniformLocation>,
+    u_tex_rough_hi: Option<glow::UniformLocation>,
+    u_tex_bump: Option<glow::UniformLocation>,
+    u_tex_rough_base: Option<glow::UniformLocation>,
+    u_tex_transmission: Option<glow::UniformLocation>,
+    u_tex_coat: Option<glow::UniformLocation>,
+    u_tex_coat_rough: Option<glow::UniformLocation>,
+    u_tex_sheen: Option<glow::UniformLocation>,
+    u_tex_sheen_tint: Option<glow::UniformLocation>,
+    u_tex_shadow_on: Option<glow::UniformLocation>,
+    u_tex_light_mvp: Option<glow::UniformLocation>,
+    u_tex_csm_n: Option<glow::UniformLocation>,
+    u_tex_shadow: Option<glow::UniformLocation>,
+    u_tex_clay: Option<glow::UniformLocation>,
+    u_tex_metallic: Option<glow::UniformLocation>,
+    u_tex_ior: Option<glow::UniformLocation>,
+    // Scene program: world-model + shadow uniforms.
+    u_scene_model: Option<glow::UniformLocation>,
+    u_scene_linearize: Option<glow::UniformLocation>,
+    u_transp_linearize: Option<glow::UniformLocation>,
+    u_scene_shadow_on: Option<glow::UniformLocation>,
+    u_scene_light_mvp: Option<glow::UniformLocation>,
+    u_scene_csm_n: Option<glow::UniformLocation>,
+    u_scene_shadow: Option<glow::UniformLocation>,
+    // Depth (shadow-map) program + its FBO/texture.
+    depth_prog: Option<glow::Program>,
+    u_depth_mvp: Option<glow::UniformLocation>,
+    shadow_fbo: Option<glow::Framebuffer>,
+    shadow_tex: Option<glow::Texture>,
+    shadow_size: i32,
+    tex_bufs: std::collections::HashMap<u64, (glow::VertexArray, glow::Buffer, i32)>,
+    /// Uploaded GL images, keyed by `(app texture index, is-sRGB)` — see [`Self::ensure_texture`].
+    tex_images: std::collections::HashMap<(usize, bool), glow::Texture>,
+    // Shared DYNAMIC buffer for textured FEATURES (walls/floors), whose world-space geometry
+    // changes on every recompute — re-uploaded each frame instead of cached per key.
+    tex_dyn_vao: Option<glow::VertexArray>,
+    tex_dyn_vbo: Option<glow::Buffer>,
     blit_prog: Option<glow::Program>,
     u_tex: Option<glow::UniformLocation>,
+    // The composite is where colour management happens (see `crate::color`) and where the direct
+    // and ambient buffers are recombined with occlusion.
+    u_blit_view: Option<glow::UniformLocation>,
+    u_blit_exposure: Option<glow::UniformLocation>,
+    u_blit_look: Option<glow::UniformLocation>,
+    u_blit_punchy: Option<glow::UniformLocation>,
+    u_blit_amb: Option<glow::UniformLocation>,
+    u_blit_ao: Option<glow::UniformLocation>,
+    u_blit_ao_on: Option<glow::UniformLocation>,
+    u_blit_bloom: Option<glow::UniformLocation>,
+    u_blit_bloom_k: Option<glow::UniformLocation>,
+    u_blit_ssgi: Option<glow::UniformLocation>,
+    u_blit_ssgi_k: Option<glow::UniformLocation>,
+    u_blit_composed: Option<glow::UniformLocation>,
     blit_vao: Option<glow::VertexArray>,
     blit_vbo: Option<glow::Buffer>,
+    // SKY BACKDROP: a full-viewport pass that draws the physical sky behind the model.
+    sky_prog: Option<glow::Program>,
+    u_sky_inv_vp: Option<glow::UniformLocation>,
+    u_sky_cam: Option<glow::UniformLocation>,
+    sky_u_bg: SkyUniforms,
+    // SSAO: an occlusion pass over the depth texture, then a box blur.
+    ssao_prog: Option<glow::Program>,
+    u_ssao_depth: Option<glow::UniformLocation>,
+    u_ssao_vp: Option<glow::UniformLocation>,
+    u_ssao_inv_vp: Option<glow::UniformLocation>,
+
+    u_ssao_radius: Option<glow::UniformLocation>,
+    u_ssao_strength: Option<glow::UniformLocation>,
+    blur_prog: Option<glow::Program>,
+    u_blur_ao: Option<glow::UniformLocation>,
+    /// SSGI: the gather and its RGB blur, plus two HALF-resolution targets they ping-pong through.
+    /// Half res because a bounce is a broad, soft term — the detail it would gain at full
+    /// resolution is detail the blur exists to remove, so it would be paid for twice.
+    ssgi_prog: Option<glow::Program>,
+    blur_rgb_prog: Option<glow::Program>,
+    ssgi_fbo: [Option<glow::Framebuffer>; 2],
+    ssgi_tex: [Option<glow::Texture>; 2],
+    ssgi_size: (i32, i32),
+    /// REFRACTION: the opaque scene as it stood before the transparent pass, so glass has
+    /// something to bend. A shader cannot read the buffer it is writing to.
+    scene_copy_prog: Option<glow::Program>,
+    refr_fbo: Option<glow::Framebuffer>,
+    refr_tex: Option<glow::Texture>,
+    /// The opaque scene's DEPTH, blitted beside its colour so screen-space reflections can march
+    /// it without sampling the buffer the transparent pass is drawing into.
+    refr_depth: Option<glow::Texture>,
+    refr_size: (i32, i32),
+    ao_fbo: [Option<glow::Framebuffer>; 2],
+    ao_tex: [Option<glow::Texture>; 2],
     fbo: Option<glow::Framebuffer>,
     color: Option<glow::Texture>,
-    depth: Option<glow::Renderbuffer>,
+    /// Colour attachment 1 — the diffuse AMBIENT term, kept apart so occlusion can scale it alone.
+    ambient: Option<glow::Texture>,
+    /// Colour attachment 2 — the surface's DIFFUSE ALBEDO, the one thing no other buffer holds.
+    /// Every other target carries light already multiplied by it, inseparably; see
+    /// [`ALBEDO_OUT_GLSL`] for why screen-space GI cannot be written without this.
+    albedo: Option<glow::Texture>,
+    /// Depth is a TEXTURE, not a renderbuffer: SSAO reconstructs world positions by sampling it,
+    /// which a renderbuffer cannot do.
+    depth: Option<glow::Texture>,
     fbo_w: i32,
     fbo_h: i32,
+    /// Anisotropy to request on albedo textures — resolved once from the extension list at init.
+    /// 0 means the driver has no anisotropic filtering and we stay on plain trilinear.
+    aniso_max: f32,
+    /// What the driver actually offers (see [`GlCaps`]) — read once at init.
+    pub caps: GlCaps,
+    /// Programs the driver rejected at init — see [`Scene3dRenderer::shader_failures`].
+    shader_fail: Vec<&'static str>,
+    /// What the last frame drew with — see [`FrameGeom`].
+    geom: FrameGeom,
 }
 
 // Safety: glow handles are integer ids; they're only *used* on the GL thread.
@@ -218,42 +2705,1245 @@ impl Default for Scene3dRenderer {
             u_alpha: None,
             scene_vao: None,
             scene_vbo: None,
+            static_vao: [None, None],
+            static_vbo: [None, None],
+            static_ver: [u64::MAX, u64::MAX],
+            static_len: [0, 0],
+            furn_bufs: std::collections::HashMap::new(),
+            transp_prog: None,
+            u_transp_mvp: None,
+            u_transp_model: None,
+            u_transp_uv_org: None,
+            u_transp_scene: None,
+            u_transp_scene_vp: None,
+            u_tex_tr_on: None,
+            u_tex_tr_scene: None,
+            u_tex_tr_scene_vp: None,
+            u_tex_tr_vp: None,
+            u_tex_tr_ior: None,
+            u_tex_tr_thick: None,
+            u_tex_ssr_on: None,
+            u_tex_ssr_depth: None,
+            u_tex_ssr_inv_vp: None,
+            u_tex_ssr_dist: None,
+            u_tex_ssr_thick: None,
+            u_tex_ssr_frame: None,
+
+            u_transp_cam: None,
+            u_transp_refr_vp: None,
+            u_transp_ior: None,
+            u_transp_thick: None,
+            u_transp_refr_on: None,
+            transp_bufs: std::collections::HashMap::new(),
+            tex_prog: None,
+            u_tex_mvp: None,
+            u_tex_img: None,
+            u_tex_cam: None,
+            u_tex_reflect: None,
+            u_tex_proc: None,
+            u_tex_col_a: None,
+            u_tex_col_b: None,
+            u_tex_pscale: None,
+            u_tex_detail: None,
+            u_tex_prough: None,
+            u_tex_pcontrast: None,
+            u_tex_ramp: None,
+            u_tex_model: None,
+            u_tex_sun_on: None,
+            u_tex_sun_dir: None,
+            u_tex_sun_col: None,
+            u_tex_emission: None,
+            env_tex: None,
+            env_bg_tex: None,
+            env_version: 0,
+            bloom_pre_prog: None,
+            bloom_down_prog: None,
+            bloom_up_prog: None,
+            bloom_tex: Vec::new(),
+            bloom_size: Vec::new(),
+            bloom_fbo: None,
+            taa_prog: None,
+            taa_fbo: None,
+            taa_tex: [None, None],
+            taa_size: (0, 0),
+            taa_cur: 0,
+            taa_max: 0,
+            taa_n: 0,
+            taa_valid: false,
+            taa_key: FrameKey::default(),
+            taa_sections: [0; Self::TAA_SECTIONS],
+            taa_why: "",
+            taa_stable: false,
+            taa_dbg: String::new(),
+            sky_u_tex: SkyUniforms::default(),
+            sky_u_scene: SkyUniforms::default(),
+            u_tex_hl: None,
+            u_tex_hl_k: None,
+            u_tex_nrm: None,
+            u_tex_rough: None,
+            u_tex_metal_map: None,
+            u_tex_ao_map: None,
+            u_tex_has_nrm: None,
+            u_tex_has_rough: None,
+            u_tex_has_metal: None,
+            u_tex_has_ao: None,
+            u_tex_triplanar: None,
+            u_tex_tpm: None,
+            u_tex_uv_org: None,
+            uv_origin: [0.0; 3],
+            u_tex_rough_lo: None,
+            u_tex_rough_hi: None,
+            u_tex_bump: None,
+            u_tex_rough_base: None,
+            u_tex_transmission: None,
+            u_tex_coat: None,
+            u_tex_coat_rough: None,
+            u_tex_sheen: None,
+            u_tex_sheen_tint: None,
+            u_tex_shadow_on: None,
+            u_tex_light_mvp: None,
+            u_tex_csm_n: None,
+            u_tex_shadow: None,
+            u_tex_clay: None,
+            u_tex_metallic: None,
+            u_tex_ior: None,
+            u_scene_linearize: None,
+            u_transp_linearize: None,
+            u_scene_model: None,
+            u_scene_shadow_on: None,
+            u_scene_light_mvp: None,
+            u_scene_csm_n: None,
+            u_scene_shadow: None,
+            depth_prog: None,
+            u_depth_mvp: None,
+            shadow_fbo: None,
+            shadow_tex: None,
+            shadow_size: SHADOW_MAP_SIZE,
+            tex_bufs: std::collections::HashMap::new(),
+            tex_images: std::collections::HashMap::new(),
+            tex_dyn_vao: None,
+            tex_dyn_vbo: None,
             blit_prog: None,
             u_tex: None,
+            u_blit_view: None,
+            u_blit_exposure: None,
+            u_blit_look: None,
+            u_blit_punchy: None,
+            u_blit_composed: None,
+            u_blit_amb: None,
+            u_blit_ao: None,
+            u_blit_ao_on: None,
+            u_blit_bloom: None,
+            u_blit_bloom_k: None,
+            u_blit_ssgi: None,
+            u_blit_ssgi_k: None,
             blit_vao: None,
             blit_vbo: None,
+            sky_prog: None,
+            u_sky_inv_vp: None,
+            u_sky_cam: None,
+            sky_u_bg: SkyUniforms::default(),
+            ssao_prog: None,
+            u_ssao_depth: None,
+            u_ssao_vp: None,
+            u_ssao_inv_vp: None,
+
+            u_ssao_radius: None,
+            u_ssao_strength: None,
+            blur_prog: None,
+            u_blur_ao: None,
+            ssgi_prog: None,
+            blur_rgb_prog: None,
+            ssgi_fbo: [None, None],
+            ssgi_tex: [None, None],
+            ssgi_size: (0, 0),
+            scene_copy_prog: None,
+            refr_fbo: None,
+            refr_tex: None,
+            refr_depth: None,
+            refr_size: (0, 0),
+            ao_fbo: [None, None],
+            ao_tex: [None, None],
             fbo: None,
             color: None,
+            ambient: None,
+            albedo: None,
             depth: None,
             fbo_w: 0,
             fbo_h: 0,
+            aniso_max: 0.0,
+            caps: GlCaps::default(),
+            shader_fail: Vec::new(),
+            geom: FrameGeom::default(),
+        }
+    }
+}
+
+/// What the GL context can actually do, read once at init.
+///
+/// This exists to keep a specific mistake from being made twice: treating `#version 330` — a floor
+/// this code chose — as the hardware's ceiling. Techniques ruled out for needing compute shaders or
+/// SSBOs (screen-space occlusion by horizon scan, GPU-side shadow paging, tracing against a hi-Z
+/// pyramid) are only ruled out if `compute`/`ssbo` come back false here.
+#[derive(Clone, Debug, Default)]
+pub struct GlCaps {
+    pub version: String,
+    pub renderer: String,
+    pub glsl: String,
+    /// GL 4.3 — compute shaders.
+    pub compute: bool,
+    /// GL 4.3 — shader storage buffer objects.
+    pub ssbo: bool,
+    /// GL 4.2 — image load/store (read-write textures from a shader).
+    pub image_load_store: bool,
+    /// The driver LISTS `GL_ARB_compute_shader`, which on a 3.3 core context it will not honour.
+    /// Kept only so the gap between "advertised" and "usable" is visible rather than surprising.
+    pub advertised_compute: bool,
+}
+
+impl GlCaps {
+    fn query(gl: &glow::Context) -> Self {
+        use glow::HasContext as _;
+        let (version, renderer, glsl) = unsafe {
+            (
+                gl.get_parameter_string(glow::VERSION),
+                gl.get_parameter_string(glow::RENDERER),
+                gl.get_parameter_string(glow::SHADING_LANGUAGE_VERSION),
+            )
+        };
+        // The version string starts "<major>.<minor>" for desktop GL; anything unparseable is
+        // treated as the 3.3 floor, which is the safe answer.
+        let (mj, mn) = {
+            let head: String = version
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            let mut it = head.split('.');
+            (
+                it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(3),
+                it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(3),
+            )
+        };
+        let at_least = |a: u32, b: u32| mj > a || (mj == a && mn >= b);
+        let ext = gl.supported_extensions();
+        // The CONTEXT version is what binds, not the extension string. NVIDIA advertises
+        // `GL_ARB_compute_shader` on this machine even though the context is 3.3 core, and
+        // ARB_compute_shader's own spec requires a 4.2 baseline — so believing the extension would
+        // mean writing a compute path that cannot be created. Report both, and only claim a
+        // feature is USABLE when the version grants it.
+        Self {
+            compute: at_least(4, 3),
+            ssbo: at_least(4, 3),
+            image_load_store: at_least(4, 2),
+            advertised_compute: ext.contains("GL_ARB_compute_shader"),
+            version,
+            renderer,
+            glsl,
         }
     }
 }
 
 impl Scene3dRenderer {
+    /// Build the bloom pyramid for a `w × h` viewport, reusing it while the size is unchanged.
+    ///
+    /// Half resolution at the top and halving down: bloom is a wide, low-frequency spill, so
+    /// resolving it at full resolution would cost four times the fill rate for the same blur.
+    unsafe fn bloom_targets(&mut self, gl: &glow::Context, w: i32, h: i32) -> bool {
+        const LEVELS: usize = 6;
+        let want: Vec<(i32, i32)> = (0..LEVELS)
+            .map(|i| ((w >> (i + 1)).max(1), (h >> (i + 1)).max(1)))
+            .take_while(|(lw, lh)| *lw >= 2 && *lh >= 2)
+            .collect();
+        if want.is_empty() {
+            return false;
+        }
+        if self.bloom_size == want && self.bloom_tex.len() == want.len() {
+            return true;
+        }
+        for t in self.bloom_tex.drain(..) {
+            gl.delete_texture(t);
+        }
+        for &(lw, lh) in &want {
+            let Ok(t) = gl.create_texture() else {
+                return false;
+            };
+            gl.bind_texture(glow::TEXTURE_2D, Some(t));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA16F as i32,
+                lw,
+                lh,
+                0,
+                glow::RGBA,
+                glow::FLOAT,
+                glow::PixelUnpackData::Slice(None),
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::LINEAR as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::LINEAR as i32,
+            );
+            // CLAMP, never repeat: a bright window at the left edge must not bleed in from the right.
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_S,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_T,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            self.bloom_tex.push(t);
+        }
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        self.bloom_size = want;
+        true
+    }
+
+    /// Run the bloom chain over the finished scene buffer, leaving the result in `bloom_tex[0]`.
+    ///
+    /// Returns false when it could not run, so the composite skips it rather than sampling a
+    /// texture nothing ever wrote.
+    unsafe fn bloom_pass(
+        &mut self,
+        gl: &glow::Context,
+        w: i32,
+        h: i32,
+        ao_ready: bool,
+        color: crate::color::ColorPipeline,
+    ) -> bool {
+        if color.bloom <= 0.0 || !self.bloom_targets(gl, w, h) {
+            return false;
+        }
+        let (Some(fbo), Some(vao), Some(vbo), Some(pre), Some(down), Some(up), Some(src)) = (
+            self.bloom_fbo,
+            self.blit_vao,
+            self.blit_vbo,
+            self.bloom_pre_prog,
+            self.bloom_down_prog,
+            self.bloom_up_prog,
+            self.color,
+        ) else {
+            return false;
+        };
+        // A fullscreen pair of triangles in NDC; every bloom pass draws exactly this.
+        const FULL: [f32; 24] = [
+            -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 0.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0,
+        ];
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&FULL), glow::DYNAMIC_DRAW);
+        gl.bind_vertex_array(Some(vao));
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+        gl.disable(glow::DEPTH_TEST);
+        gl.disable(glow::BLEND);
+
+        // 1 — bright pass, straight into the top of the pyramid.
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(self.bloom_tex[0]),
+            0,
+        );
+        gl.viewport(0, 0, self.bloom_size[0].0, self.bloom_size[0].1);
+        gl.use_program(Some(pre));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(src));
+        gl.active_texture(glow::TEXTURE1);
+        gl.bind_texture(glow::TEXTURE_2D, self.ambient);
+        gl.active_texture(glow::TEXTURE2);
+        gl.bind_texture(
+            glow::TEXTURE_2D,
+            if ao_ready { self.ao_tex[1] } else { None },
+        );
+        for (n, v) in [
+            ("u_tex", 0),
+            ("u_amb", 1),
+            ("u_ao", 2),
+            ("u_ao_on", ao_ready as i32),
+        ] {
+            if let Some(l) = gl.get_uniform_location(pre, n) {
+                gl.uniform_1_i32(Some(&l), v);
+            }
+        }
+        let thr = color.bloom_threshold.max(0.0);
+        if let Some(l) = gl.get_uniform_location(pre, "u_threshold") {
+            gl.uniform_1_f32(Some(&l), thr);
+        }
+        if let Some(l) = gl.get_uniform_location(pre, "u_knee") {
+            // A quarter of the threshold: wide enough to hide the contour, narrow enough that
+            // ordinary lit surfaces still do not bloom.
+            gl.uniform_1_f32(Some(&l), (thr * 0.25).max(0.02));
+        }
+        gl.active_texture(glow::TEXTURE0);
+        gl.draw_arrays(glow::TRIANGLES, 0, 6);
+
+        // 2 — downsample to the bottom of the pyramid.
+        gl.use_program(Some(down));
+        if let Some(l) = gl.get_uniform_location(down, "u_tex") {
+            gl.uniform_1_i32(Some(&l), 0);
+        }
+        for lv in 1..self.bloom_tex.len() {
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(self.bloom_tex[lv]),
+                0,
+            );
+            gl.viewport(0, 0, self.bloom_size[lv].0, self.bloom_size[lv].1);
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.bloom_tex[lv - 1]));
+            let (sw, sh) = self.bloom_size[lv - 1];
+            if let Some(l) = gl.get_uniform_location(down, "u_texel") {
+                gl.uniform_2_f32(Some(&l), 1.0 / sw as f32, 1.0 / sh as f32);
+            }
+            gl.draw_arrays(glow::TRIANGLES, 0, 6);
+        }
+
+        // 3 — upsample back up, ADDING at each step. Successive small blurs compose into one wide
+        // blur, which is the whole trick: a single Gaussian this wide would need hundreds of taps.
+        gl.use_program(Some(up));
+        if let Some(l) = gl.get_uniform_location(up, "u_tex") {
+            gl.uniform_1_i32(Some(&l), 0);
+        }
+        gl.enable(glow::BLEND);
+        gl.blend_func(glow::ONE, glow::ONE);
+        for lv in (0..self.bloom_tex.len() - 1).rev() {
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(self.bloom_tex[lv]),
+                0,
+            );
+            gl.viewport(0, 0, self.bloom_size[lv].0, self.bloom_size[lv].1);
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.bloom_tex[lv + 1]));
+            let (sw, sh) = self.bloom_size[lv + 1];
+            if let Some(l) = gl.get_uniform_location(up, "u_texel") {
+                gl.uniform_2_f32(Some(&l), 1.0 / sw as f32, 1.0 / sh as f32);
+            }
+            gl.draw_arrays(glow::TRIANGLES, 0, 6);
+        }
+
+        gl.disable(glow::BLEND);
+        gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+        gl.bind_vertex_array(None);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        for u in [1u32, 2] {
+            gl.active_texture(glow::TEXTURE0 + u);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        true
+    }
+
+    /// Set the fog uniforms on `prog` and bind the depth buffer it reads.
+    ///
+    /// The DEPTH unit is 5 — 0–4 are the colour attachment, the ambient, occlusion, bloom and the
+    /// accumulation history. Passing `on: false` is how the composite is told the fog is already in
+    /// its input: the uniforms still go up, so the shader stays valid, but the branch is skipped.
+    unsafe fn set_fog(
+        &self,
+        gl: &glow::Context,
+        prog: glow::Program,
+        fog: &crate::env::FogSettings,
+        cam: [f32; 3],
+        inv_vp: &[f32; 16],
+        on: bool,
+    ) {
+        const UNIT: i32 = 5;
+        gl.active_texture(glow::TEXTURE0 + UNIT as u32);
+        gl.bind_texture(glow::TEXTURE_2D, self.depth);
+        gl.active_texture(glow::TEXTURE0);
+        let on = on && fog.enabled && fog.density > 0.0 && self.depth.is_some();
+        for (n, v) in [("u_fog_depth", UNIT), ("u_fog_on", on as i32)] {
+            if let Some(l) = gl.get_uniform_location(prog, n) {
+                gl.uniform_1_i32(Some(&l), v);
+            }
+        }
+        if !on {
+            return; // nothing else is read; skip the uploads
+        }
+        if let Some(l) = gl.get_uniform_location(prog, "u_fog_inv_vp") {
+            gl.uniform_matrix_4_f32_slice(Some(&l), false, inv_vp);
+        }
+        for (n, v) in [("u_fog_cam", cam), ("u_fog_col", fog.color)] {
+            if let Some(l) = gl.get_uniform_location(prog, n) {
+                gl.uniform_3_f32(Some(&l), v[0], v[1], v[2]);
+            }
+        }
+        for (n, v) in [
+            ("u_fog_density", fog.density.max(0.0)),
+            ("u_fog_base", fog.base_z),
+            ("u_fog_falloff", fog.falloff.max(0.0)),
+        ] {
+            if let Some(l) = gl.get_uniform_location(prog, n) {
+                gl.uniform_1_f32(Some(&l), v);
+            }
+        }
+    }
+
+    /// Ask for temporal accumulation: refine a STILL frame over up to `samples` sub-pixel jitters.
+    ///
+    /// `samples <= 1` turns it off and frees the buffers. Call this every frame — the renderer is
+    /// shared with the SIMLUX lighting view, which must never accumulate (its vertex colours are a
+    /// false-colour measurement, and averaging jittered samples of a scale would blur the reading).
+    /// The buffers are deliberately NOT freed here, only on a viewport resize (as bloom's pyramid
+    /// is). The lighting view calls this with 0 every frame it paints; freeing on the way down
+    /// would mean allocating two full-screen RGBA16F targets per frame whenever both views are
+    /// on screen at once — a stutter, to reclaim memory that is about to be needed again.
+    pub fn set_taa(&mut self, _gl: &glow::Context, samples: u32) {
+        let want = if samples <= 1 { 0 } else { samples.min(64) };
+        if want != self.taa_max {
+            self.taa_max = want;
+            self.taa_n = 0;
+            self.taa_valid = false;
+        }
+    }
+
+    /// Shaders the driver refused, by name. Empty is the healthy case.
+    ///
+    /// A failed program is not a crash — the feature it drove stops drawing and everything else
+    /// carries on, which is right, but it also means the symptom reaches the user as "part of the
+    /// picture is wrong" with nothing to point at. This puts the names somewhere a session dump
+    /// can report them.
+    pub fn shader_failures(&self) -> &[&'static str] {
+        &self.shader_fail
+    }
+
+    /// What the last frame drew with — see [`FrameGeom`].
+    pub fn last_geom(&self) -> FrameGeom {
+        self.geom
+    }
+
+    /// How many groups the frame key is hashed in — see [`Self::taa_sections`].
+    const TAA_SECTIONS: usize = 7;
+
+    /// What each group is called, in the order they are folded in.
+    const TAA_SECTION_NAMES: [&'static str; Self::TAA_SECTIONS] = [
+        "camera",
+        "scene",
+        "overlay/lines",
+        "furniture",
+        "textures",
+        "sun/shadow/env",
+        "materials",
+    ];
+
+    /// The FIRST section whose hash moved — the culprit.
+    ///
+    /// Each section hash folds in every earlier one, so once the camera moves every LATER section
+    /// differs too. Naming all of them would point at everything on every restart, which is the
+    /// same as pointing at nothing.
+    ///
+    /// A free function rather than an inline `find`, because the first version of its test
+    /// re-implemented the search instead of calling it — and then passed happily against a
+    /// renderer changed to report the LAST section that moved.
+    fn taa_first_changed(
+        now: &[u64; Self::TAA_SECTIONS],
+        was: &[u64; Self::TAA_SECTIONS],
+    ) -> &'static str {
+        Self::TAA_SECTION_NAMES
+            .iter()
+            .zip(now.iter().zip(was.iter()))
+            .find(|(_, (a, b))| a != b)
+            .map(|(name, _)| *name)
+            .unwrap_or("")
+    }
+
+    /// WHICH INPUT RESTARTED THE REFINEMENT, or empty when nothing did.
+    ///
+    /// Temporal accumulation only pays for itself if a still frame CONVERGES: sample 1 costs a
+    /// full render and sample 16 costs nothing, because the finished buffer is re-presented. A
+    /// frame key that never settles inverts that — every frame is sample 1, for ever — and a
+    /// scene heavy enough to want TAA is exactly the scene that then grinds.
+    ///
+    /// From outside, an orbit in progress and a key that will never settle are the same line in a
+    /// report: `n=1/16`, every frame, at 300 ms each. This names the group that moved, which is
+    /// the difference between "you were dragging the camera" and a real defect.
+    pub fn taa_reason(&self) -> &str {
+        if self.taa_stable {
+            ""
+        } else {
+            self.taa_why
+        }
+    }
+
+    /// Record the frame's geometry for the session dump. Cheap: one `check_framebuffer_status`.
+    unsafe fn note_geom(
+        &mut self,
+        gl: &glow::Context,
+        vp: (i32, i32, i32, i32),
+        screen: (i32, i32),
+        env: &crate::env::EnvRender,
+        cascades: usize,
+    ) {
+        let complete = self.fbo.is_some_and(|f| {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f));
+            let ok = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            ok
+        });
+        self.geom = FrameGeom {
+            vp,
+            screen,
+            fbo: (self.fbo_w, self.fbo_h),
+            taa: self.taa_size,
+            taa_valid: self.taa_valid,
+            taa_n: self.taa_n,
+            taa_max: self.taa_max,
+            bloom0: self.bloom_size.first().copied().unwrap_or((0, 0)),
+            fbo_complete: complete,
+            env: env.hdri.is_some(),
+            cascades: cascades as u32,
+        };
+    }
+
+    /// True while the picture is still being refined — the caller should keep asking for repaints.
+    ///
+    /// Requires the frame to have HELD STILL for at least one repaint (`taa_stable`); see that
+    /// field for why. Read one frame late (the paint callback runs after the UI code that checks
+    /// it), which is harmless: at worst it costs one extra repaint at the end of a convergence.
+    pub fn taa_converging(&self) -> bool {
+        self.taa_max > 0 && self.taa_stable && self.taa_n < self.taa_max
+    }
+
+    /// How far the refinement has got, as `(samples so far, target)` — for a progress hint.
+    pub fn taa_progress(&self) -> (u32, u32) {
+        (self.taa_n, self.taa_max)
+    }
+
+    /// Allocate (or resize) the two accumulation buffers. Returns false if the driver refuses.
+    unsafe fn taa_targets(&mut self, gl: &glow::Context, w: i32, h: i32) -> bool {
+        if self.taa_tex[0].is_some() && self.taa_size == (w, h) {
+            return self.taa_fbo.is_some();
+        }
+        for t in self.taa_tex.iter_mut().filter_map(Option::take) {
+            gl.delete_texture(t);
+        }
+        self.taa_valid = false; // the fresh buffers hold nothing until a resolve writes one
+        for i in 0..2 {
+            let Ok(t) = gl.create_texture() else {
+                return false;
+            };
+            gl.bind_texture(glow::TEXTURE_2D, Some(t));
+            // RGBA16F for the same reason every other buffer here is: this holds scene-referred
+            // light, which routinely exceeds 1.0. Accumulating in 8 bits would clip the highlights
+            // the view transform exists to roll off, and quantise the average into banding.
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA16F as i32,
+                w,
+                h,
+                0,
+                glow::RGBA,
+                glow::FLOAT,
+                glow::PixelUnpackData::Slice(None),
+            );
+            for (p, v) in [
+                (glow::TEXTURE_MIN_FILTER, glow::NEAREST),
+                (glow::TEXTURE_MAG_FILTER, glow::NEAREST),
+                (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+                (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+            ] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, p, v as i32);
+            }
+            self.taa_tex[i] = Some(t);
+        }
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        self.taa_size = (w, h);
+        if self.taa_fbo.is_none() {
+            self.taa_fbo = gl.create_framebuffer().ok();
+        }
+        self.taa_fbo.is_some()
+    }
+
+    /// Compose this frame's light and average it into the history, leaving the running mean in
+    /// `taa_tex[taa_cur]`. Returns the texture the composite should read, or `None` on failure —
+    /// in which case the caller falls back to the ordinary single-sample path.
+    unsafe fn taa_resolve(
+        &mut self,
+        gl: &glow::Context,
+        w: i32,
+        h: i32,
+        ao_ready: bool,
+        bloom_ready: bool,
+        ssgi_ready: bool,
+        color: crate::color::ColorPipeline,
+        fog: &crate::env::FogSettings,
+        cam: [f32; 3],
+        inv_vp: &[f32; 16],
+        gi: &crate::env::GiSettings,
+    ) -> Option<glow::Texture> {
+        if !self.taa_targets(gl, w, h) {
+            return None;
+        }
+        let (Some(prog), Some(fbo), Some(vao), Some(vbo), Some(src)) = (
+            self.taa_prog,
+            self.taa_fbo,
+            self.blit_vao,
+            self.blit_vbo,
+            self.color,
+        ) else {
+            return None;
+        };
+        let prev = self.taa_cur;
+        let next = 1 - prev;
+        let (Some(hist), Some(dst)) = (self.taa_tex[prev], self.taa_tex[next]) else {
+            return None;
+        };
+        const FULL: [f32; 24] = [
+            -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 0.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0,
+        ];
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&FULL), glow::DYNAMIC_DRAW);
+        gl.bind_vertex_array(Some(vao));
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(dst),
+            0,
+        );
+        gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
+        gl.viewport(0, 0, w, h);
+        gl.disable(glow::DEPTH_TEST);
+        gl.disable(glow::BLEND);
+        gl.use_program(Some(prog));
+        for (unit, tex) in [
+            (0, Some(src)),
+            (1, self.ambient),
+            (2, if ao_ready { self.ao_tex[1] } else { None }),
+            (3, bloom_ready.then(|| self.bloom_tex[0])),
+            (4, Some(hist)),
+            (6, ssgi_ready.then_some(self.ssgi_tex[1]).flatten()),
+        ] {
+            gl.active_texture(glow::TEXTURE0 + unit as u32);
+            gl.bind_texture(glow::TEXTURE_2D, tex);
+        }
+        for (n, v) in [
+            ("u_tex", 0),
+            ("u_amb", 1),
+            ("u_ao", 2),
+            ("u_bloom", 3),
+            ("u_hist", 4),
+            ("u_ssgi", 6),
+            ("u_ao_on", ao_ready as i32),
+        ] {
+            if let Some(l) = gl.get_uniform_location(prog, n) {
+                gl.uniform_1_i32(Some(&l), v);
+            }
+        }
+        if let Some(l) = gl.get_uniform_location(prog, "u_bloom_k") {
+            gl.uniform_1_f32(Some(&l), if bloom_ready { color.bloom } else { 0.0 });
+        }
+        // 1, not the strength: the gather has already applied it. Multiplying here as well would
+        // square it, so the slider would behave like a curve and "2" would mean four times.
+        if let Some(l) = gl.get_uniform_location(prog, "u_ssgi_k") {
+            gl.uniform_1_f32(Some(&l), if ssgi_ready { 1.0 } else { 0.0 });
+        }
+        // 1/(n+1): the running result stays the exact unweighted mean of every sample so far,
+        // rather than the exponential fade a fixed blend factor would give (which never quite
+        // converges and keeps a trace of the first frame forever).
+        if let Some(l) = gl.get_uniform_location(prog, "u_blend") {
+            gl.uniform_1_f32(Some(&l), 1.0 / (self.taa_n + 1) as f32);
+        }
+        self.set_fog(gl, prog, fog, cam, inv_vp, true);
+        gl.draw_arrays(glow::TRIANGLES, 0, 6);
+        for unit in 0..6u32 {
+            gl.active_texture(glow::TEXTURE0 + unit);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_vertex_array(None);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        self.taa_cur = next;
+        self.taa_n += 1;
+        self.taa_valid = true; // `dst` now holds a real image — the re-present path may use it
+        Some(dst)
+    }
+
+    /// The one place scene-referred light becomes display pixels: draw `src` into the panel rect
+    /// through the view transform. `composed` says `src` already has ambient/occlusion/bloom in it.
+    unsafe fn composite(
+        &mut self,
+        gl: &glow::Context,
+        quad: &[f32; 24],
+        src: glow::Texture,
+        composed: bool,
+        ao_ready: bool,
+        bloom_ready: bool,
+        ssgi_ready: bool,
+        color: crate::color::ColorPipeline,
+        fog: &crate::env::FogSettings,
+        cam: [f32; 3],
+        inv_vp: &[f32; 16],
+        rect: (i32, i32, i32, i32),
+    ) {
+        let (Some(prog), Some(vao), Some(vbo)) = (self.blit_prog, self.blit_vao, self.blit_vbo)
+        else {
+            return;
+        };
+        // Scissor to OUR OWN viewport rect rather than trusting whatever egui left set.
+        //
+        // egui scissors a callback to its CLIP rect, which is the enclosing panel — not the
+        // smaller rect the 3D view was allocated inside it. So a quad that is even slightly wrong,
+        // or a panel with anything else in it, paints the scene over its neighbours. The rect is
+        // right here in the arguments; there is no reason to infer it from GL state.
+        gl.enable(glow::SCISSOR_TEST);
+        gl.scissor(rect.0, rect.1, rect.2.max(0), rect.3.max(0));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(quad), glow::DYNAMIC_DRAW);
+        gl.use_program(Some(prog));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(src));
+        if let Some(loc) = &self.u_tex {
+            gl.uniform_1_i32(Some(loc), 0);
+        }
+        // Attachment 1 (the ambient) and the blurred occlusion, on their own units.
+        gl.active_texture(glow::TEXTURE1);
+        gl.bind_texture(glow::TEXTURE_2D, self.ambient);
+        if let Some(loc) = &self.u_blit_amb {
+            gl.uniform_1_i32(Some(loc), 1);
+        }
+        gl.active_texture(glow::TEXTURE2);
+        gl.bind_texture(
+            glow::TEXTURE_2D,
+            if ao_ready { self.ao_tex[1] } else { None },
+        );
+        if let Some(loc) = &self.u_blit_ao {
+            gl.uniform_1_i32(Some(loc), 2);
+        }
+        if let Some(loc) = &self.u_blit_ao_on {
+            gl.uniform_1_i32(Some(loc), (ao_ready && !composed) as i32);
+        }
+        gl.active_texture(glow::TEXTURE3);
+        gl.bind_texture(glow::TEXTURE_2D, bloom_ready.then(|| self.bloom_tex[0]));
+        if let Some(loc) = &self.u_blit_bloom {
+            gl.uniform_1_i32(Some(loc), 3);
+        }
+        if let Some(loc) = &self.u_blit_bloom_k {
+            gl.uniform_1_f32(
+                Some(loc),
+                if bloom_ready && !composed {
+                    color.bloom
+                } else {
+                    0.0
+                },
+            );
+        }
+        gl.active_texture(glow::TEXTURE0 + 6);
+        gl.bind_texture(
+            glow::TEXTURE_2D,
+            ssgi_ready.then_some(self.ssgi_tex[1]).flatten(),
+        );
+        if let Some(loc) = &self.u_blit_ssgi {
+            gl.uniform_1_i32(Some(loc), 6);
+        }
+        // 1, not the strength — the gather already applied it. And zero when the input is already
+        // composed, so an accumulated buffer's bounce is never counted a second time.
+        if let Some(loc) = &self.u_blit_ssgi_k {
+            gl.uniform_1_f32(Some(loc), (ssgi_ready && !composed) as i32 as f32);
+        }
+        if let Some(loc) = &self.u_blit_composed {
+            gl.uniform_1_i32(Some(loc), composed as i32);
+        }
+        // `!composed`: an accumulated buffer already has the fog folded in.
+        self.set_fog(gl, prog, fog, cam, inv_vp, !composed);
+        gl.active_texture(glow::TEXTURE0);
+        if let Some(loc) = &self.u_blit_view {
+            gl.uniform_1_i32(Some(loc), color.view.id());
+        }
+        if let Some(loc) = &self.u_blit_exposure {
+            gl.uniform_1_f32(Some(loc), color.exposure);
+        }
+        if let Some(loc) = &self.u_blit_look {
+            gl.uniform_1_f32(Some(loc), color.look);
+        }
+        if let Some(loc) = &self.u_blit_punchy {
+            gl.uniform_1_f32(Some(loc), color.punchy);
+        }
+        gl.bind_vertex_array(Some(vao));
+        gl.draw_arrays(glow::TRIANGLES, 0, 6);
+        gl.bind_vertex_array(None);
+        for unit in 0..7u32 {
+            gl.active_texture(glow::TEXTURE0 + unit);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+        gl.active_texture(glow::TEXTURE0);
+    }
+
+    /// Upload an HDR environment, or drop the one that is loaded.
+    ///
+    /// The chain arrives as a real mip chain (each level exactly half the one above), so it goes up
+    /// as ONE `GL_TEXTURE_2D` with explicit levels and `LINEAR_MIPMAP_LINEAR` filtering. That is
+    /// what makes the shader side a single `textureLod(u_env, uv, roughness * 5)` — the hardware
+    /// interpolates between two roughnesses for nothing, and there is no second sampler to bind.
+    ///
+    /// Wrapping is REPEAT across longitude and CLAMP down latitude: an equirect map is continuous
+    /// where its left edge meets its right, and is not continuous over the poles.
+    pub fn set_environment(&mut self, gl: &glow::Context, up: Option<EnvUpload<'_>>) {
+        unsafe {
+            match up {
+                None => {
+                    for t in [self.env_tex.take(), self.env_bg_tex.take()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        gl.delete_texture(t);
+                    }
+                    self.env_version = 0;
+                }
+                Some(up) => {
+                    if self.env_version == up.version && self.env_tex.is_some() {
+                        return; // same environment; the pixels are already on the GPU
+                    }
+                    for t in [self.env_tex.take(), self.env_bg_tex.take()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        gl.delete_texture(t);
+                    }
+                    // The BACKDROP copy: full resolution, its own ordinary mip chain (so a distant
+                    // grazing view still filters properly rather than shimmering).
+                    if let Ok(bg) = gl.create_texture() {
+                        let flat: Vec<f32> = up.source.px.iter().flatten().map(half_safe).collect();
+                        gl.bind_texture(glow::TEXTURE_2D, Some(bg));
+                        gl.tex_image_2d(
+                            glow::TEXTURE_2D,
+                            0,
+                            glow::RGB16F as i32,
+                            up.source.w as i32,
+                            up.source.h as i32,
+                            0,
+                            glow::RGB,
+                            glow::FLOAT,
+                            glow::PixelUnpackData::Slice(Some(bytemuck_cast(&flat))),
+                        );
+                        gl.generate_mipmap(glow::TEXTURE_2D);
+                        gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_MIN_FILTER,
+                            glow::LINEAR_MIPMAP_LINEAR as i32,
+                        );
+                        gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_MAG_FILTER,
+                            glow::LINEAR as i32,
+                        );
+                        gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_WRAP_S,
+                            glow::REPEAT as i32,
+                        );
+                        gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_WRAP_T,
+                            glow::CLAMP_TO_EDGE as i32,
+                        );
+                        self.env_bg_tex = Some(bg);
+                    }
+                    let Ok(tex) = gl.create_texture() else { return };
+                    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                    for (level, mip) in up.chain.iter().enumerate() {
+                        let flat: Vec<f32> = mip.px.iter().flatten().map(half_safe).collect();
+                        gl.tex_image_2d(
+                            glow::TEXTURE_2D,
+                            level as i32,
+                            glow::RGB16F as i32,
+                            mip.w as i32,
+                            mip.h as i32,
+                            0,
+                            glow::RGB,
+                            glow::FLOAT,
+                            glow::PixelUnpackData::Slice(Some(bytemuck_cast(&flat))),
+                        );
+                    }
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_BASE_LEVEL, 0);
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_MAX_LEVEL,
+                        up.chain.len() as i32 - 1,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_MIN_FILTER,
+                        glow::LINEAR_MIPMAP_LINEAR as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_MAG_FILTER,
+                        glow::LINEAR as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_WRAP_S,
+                        glow::REPEAT as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_WRAP_T,
+                        glow::CLAMP_TO_EDGE as i32,
+                    );
+                    gl.bind_texture(glow::TEXTURE_2D, None);
+                    self.env_tex = Some(tex);
+                    self.env_version = up.version;
+                }
+            }
+        }
+    }
+
     fn ensure_init(&mut self, gl: &glow::Context) {
         if self.inited {
             return;
         }
         unsafe {
-            // --- scene program + VAO (position + colour, interleaved) ---
-            let scene_prog = compile(gl, SCENE_VS, SCENE_FS);
-            self.u_mvp = gl.get_uniform_location(scene_prog, "u_mvp");
-            self.u_alpha = gl.get_uniform_location(scene_prog, "u_alpha");
+            // What the DRIVER actually gave us. Every shader here is `#version 330`, but that is
+            // our choice, not the context's: eframe builds the context with
+            // `ContextAttributesBuilder::new()` and no version, and glutin's default asks for the
+            // highest CORE version the driver supports — 4.6 on any current desktop GPU. Compute
+            // shaders (4.3), SSBOs (4.3) and image load/store (4.2) are therefore probably already
+            // available, and several rendering techniques we have written off as out of reach are
+            // only out of reach of the floor we picked. Record it so that is a fact rather than an
+            // assumption; `caps` is what a higher-tier path would branch on.
+            self.caps = GlCaps::query(gl);
+            let line = format!(
+                "[gl] {} | {} | GLSL {} | usable: compute={} ssbo={} image_ls={} (advertised compute={})",
+                self.caps.version, self.caps.renderer, self.caps.glsl,
+                self.caps.compute, self.caps.ssbo, self.caps.image_load_store,
+                self.caps.advertised_compute,
+            );
+            eprintln!("{line}");
+            // Also to a FILE beside the executable. A console line is easy to miss, scroll away or
+            // never see at all depending on how the app was launched, and this answer decides how
+            // several rendering features get built — it should not depend on catching it live.
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    let _ = std::fs::write(dir.join("gl_caps.txt"), format!("{line}\n"));
+                }
+            }
+            // Anisotropic filtering is an extension on GL 3.3 — resolve it once, by name.
+            if gl
+                .supported_extensions()
+                .contains("GL_EXT_texture_filter_anisotropic")
+                || gl
+                    .supported_extensions()
+                    .contains("GL_ARB_texture_filter_anisotropic")
+            {
+                self.aniso_max = gl.get_parameter_f32(0x84FF).clamp(1.0, 8.0); // MAX_TEXTURE_MAX_ANISOTROPY
+            }
+            // --- scene program + VAO (position + colour + ambient share, interleaved) ---
+            let scene_fs = assemble_scene_fs();
+            if let Some(scene_prog) = compile(gl, "scene", SCENE_VS, &scene_fs) {
+                self.u_mvp = gl.get_uniform_location(scene_prog, "u_mvp");
+                self.u_alpha = gl.get_uniform_location(scene_prog, "u_alpha");
+                self.u_scene_linearize = gl.get_uniform_location(scene_prog, "u_linearize");
+                self.u_scene_model = gl.get_uniform_location(scene_prog, "u_model");
+                self.u_scene_shadow_on = gl.get_uniform_location(scene_prog, "u_shadow_on");
+                self.u_scene_light_mvp = gl.get_uniform_location(scene_prog, "u_light_mvp");
+                self.u_scene_csm_n = gl.get_uniform_location(scene_prog, "u_csm_n");
+                self.u_scene_shadow = gl.get_uniform_location(scene_prog, "u_shadow");
+                self.sky_u_scene = SkyUniforms::locate(gl, scene_prog);
+                self.scene_prog = Some(scene_prog);
+            }
+            // --- depth (shadow map) program ---
+            if let Some(depth_prog) = compile(gl, "depth", DEPTH_VS, DEPTH_FS) {
+                self.u_depth_mvp = gl.get_uniform_location(depth_prog, "u_depth_mvp");
+                self.depth_prog = Some(depth_prog);
+            }
             let svbo = gl.create_buffer().unwrap();
             let svao = gl.create_vertex_array().unwrap();
             gl.bind_vertex_array(Some(svao));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(svbo));
-            let stride = size_of::<V3>() as i32; // 24
-            gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
-            gl.enable_vertex_attrib_array(1);
-            gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, stride, 12);
+            v3_attribs(gl);
+
+            // --- two STATIC scene VAOs/VBOs (same pos+colour+ambient layout) ---
+            for i in 0..2 {
+                let vbo = gl.create_buffer().unwrap();
+                let vao = gl.create_vertex_array().unwrap();
+                gl.bind_vertex_array(Some(vao));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                v3_attribs(gl);
+                self.static_vao[i] = Some(vao);
+                self.static_vbo[i] = Some(vbo);
+            }
+
+            // --- transparent furniture program (pos+colour+opacity); VAOs built lazily ---
+            let transp_fs = assemble_transp_fs();
+            if let Some(transp_prog) = compile(gl, "transparent", TRANSP_VS, &transp_fs) {
+                self.u_transp_mvp = gl.get_uniform_location(transp_prog, "u_mvp");
+                self.u_transp_linearize = gl.get_uniform_location(transp_prog, "u_linearize");
+                self.u_transp_scene = gl.get_uniform_location(transp_prog, "u_scene");
+                self.u_transp_scene_vp = gl.get_uniform_location(transp_prog, "u_scene_vp");
+
+                self.u_transp_cam = gl.get_uniform_location(transp_prog, "u_refr_cam");
+                self.u_transp_refr_vp = gl.get_uniform_location(transp_prog, "u_refr_vp");
+                self.u_transp_ior = gl.get_uniform_location(transp_prog, "u_refr_ior");
+                self.u_transp_thick = gl.get_uniform_location(transp_prog, "u_refr_thick");
+                self.u_transp_refr_on = gl.get_uniform_location(transp_prog, "u_refr_on");
+                self.u_transp_model = gl.get_uniform_location(transp_prog, "u_model");
+                self.u_transp_uv_org = gl.get_uniform_location(transp_prog, "u_uv_org");
+                self.transp_prog = Some(transp_prog);
+            }
+
+            // --- textured program (pos+uv+shade); per-mesh VAOs are built lazily ---
+            let tex_fs = assemble_tex_fs();
+            if let Some(tex_prog) = compile(gl, "textured", TEX_VS, &tex_fs) {
+                self.u_tex_mvp = gl.get_uniform_location(tex_prog, "u_mvp");
+                self.u_tex_img = gl.get_uniform_location(tex_prog, "u_img");
+                self.u_tex_cam = gl.get_uniform_location(tex_prog, "u_cam");
+                self.u_tex_tr_on = gl.get_uniform_location(tex_prog, "u_tr_on");
+                self.u_tex_tr_scene = gl.get_uniform_location(tex_prog, "u_tr_scene");
+                self.u_tex_tr_scene_vp = gl.get_uniform_location(tex_prog, "u_tr_scene_vp");
+                self.u_tex_tr_vp = gl.get_uniform_location(tex_prog, "u_tr_vp");
+                self.u_tex_tr_ior = gl.get_uniform_location(tex_prog, "u_tr_ior");
+                self.u_tex_tr_thick = gl.get_uniform_location(tex_prog, "u_tr_thick");
+                self.u_tex_ssr_on = gl.get_uniform_location(tex_prog, "u_ssr_on");
+                self.u_tex_ssr_depth = gl.get_uniform_location(tex_prog, "u_ssr_depth");
+                self.u_tex_ssr_inv_vp = gl.get_uniform_location(tex_prog, "u_ssr_inv_vp");
+                self.u_tex_ssr_dist = gl.get_uniform_location(tex_prog, "u_ssr_dist");
+                self.u_tex_ssr_thick = gl.get_uniform_location(tex_prog, "u_ssr_thick");
+                self.u_tex_ssr_frame = gl.get_uniform_location(tex_prog, "u_ssr_frame");
+                self.u_tex_reflect = gl.get_uniform_location(tex_prog, "u_reflect");
+                self.u_tex_proc = gl.get_uniform_location(tex_prog, "u_proc");
+                self.u_tex_col_a = gl.get_uniform_location(tex_prog, "u_col_a");
+                self.u_tex_col_b = gl.get_uniform_location(tex_prog, "u_col_b");
+                self.u_tex_pscale = gl.get_uniform_location(tex_prog, "u_pscale");
+                self.u_tex_detail = gl.get_uniform_location(tex_prog, "u_detail");
+                self.u_tex_prough = gl.get_uniform_location(tex_prog, "u_prough");
+                self.u_tex_pcontrast = gl.get_uniform_location(tex_prog, "u_pcontrast");
+                self.u_tex_ramp = gl.get_uniform_location(tex_prog, "u_ramp");
+                self.u_tex_model = gl.get_uniform_location(tex_prog, "u_model");
+                self.u_tex_sun_on = gl.get_uniform_location(tex_prog, "u_sun_on");
+                self.u_tex_sun_dir = gl.get_uniform_location(tex_prog, "u_sun_dir");
+                self.u_tex_sun_col = gl.get_uniform_location(tex_prog, "u_sun_col");
+                self.u_tex_emission = gl.get_uniform_location(tex_prog, "u_emission");
+                self.sky_u_tex = SkyUniforms::locate(gl, tex_prog);
+                self.u_tex_hl = gl.get_uniform_location(tex_prog, "u_hl");
+                self.u_tex_hl_k = gl.get_uniform_location(tex_prog, "u_hl_k");
+                self.u_tex_nrm = gl.get_uniform_location(tex_prog, "u_nrm");
+                self.u_tex_rough = gl.get_uniform_location(tex_prog, "u_rough");
+                self.u_tex_metal_map = gl.get_uniform_location(tex_prog, "u_metal");
+                self.u_tex_ao_map = gl.get_uniform_location(tex_prog, "u_aomap");
+                self.u_tex_has_nrm = gl.get_uniform_location(tex_prog, "u_has_nrm");
+                self.u_tex_has_rough = gl.get_uniform_location(tex_prog, "u_has_rough");
+                self.u_tex_has_metal = gl.get_uniform_location(tex_prog, "u_has_metal");
+                self.u_tex_has_ao = gl.get_uniform_location(tex_prog, "u_has_ao");
+                self.u_tex_triplanar = gl.get_uniform_location(tex_prog, "u_triplanar");
+                self.u_tex_tpm = gl.get_uniform_location(tex_prog, "u_tpm");
+                self.u_tex_uv_org = gl.get_uniform_location(tex_prog, "u_uv_org");
+                self.u_tex_rough_lo = gl.get_uniform_location(tex_prog, "u_rough_lo");
+                self.u_tex_rough_hi = gl.get_uniform_location(tex_prog, "u_rough_hi");
+                self.u_tex_bump = gl.get_uniform_location(tex_prog, "u_bump");
+                self.u_tex_rough_base = gl.get_uniform_location(tex_prog, "u_rough_base");
+                self.u_tex_transmission = gl.get_uniform_location(tex_prog, "u_transmission");
+                self.u_tex_coat = gl.get_uniform_location(tex_prog, "u_coat");
+                self.u_tex_coat_rough = gl.get_uniform_location(tex_prog, "u_coat_rough");
+                self.u_tex_sheen = gl.get_uniform_location(tex_prog, "u_sheen");
+                self.u_tex_sheen_tint = gl.get_uniform_location(tex_prog, "u_sheen_tint");
+                self.u_tex_shadow_on = gl.get_uniform_location(tex_prog, "u_shadow_on");
+                self.u_tex_light_mvp = gl.get_uniform_location(tex_prog, "u_light_mvp");
+                self.u_tex_csm_n = gl.get_uniform_location(tex_prog, "u_csm_n");
+                self.u_tex_shadow = gl.get_uniform_location(tex_prog, "u_shadow");
+                self.u_tex_clay = gl.get_uniform_location(tex_prog, "u_clay");
+                self.u_tex_metallic = gl.get_uniform_location(tex_prog, "u_metallic");
+                self.u_tex_ior = gl.get_uniform_location(tex_prog, "u_ior");
+                self.tex_prog = Some(tex_prog);
+            }
+            // Shared DYNAMIC textured buffer (feature surfaces re-uploaded each frame).
+            {
+                let vbo = gl.create_buffer().unwrap();
+                let vao = gl.create_vertex_array().unwrap();
+                gl.bind_vertex_array(Some(vao));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                let stride = size_of::<TexVtx>() as i32;
+                gl.enable_vertex_attrib_array(0);
+                gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
+                gl.enable_vertex_attrib_array(1);
+                gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 12);
+                gl.enable_vertex_attrib_array(2);
+                gl.vertex_attrib_pointer_f32(2, 1, glow::FLOAT, false, stride, 20);
+                gl.enable_vertex_attrib_array(3);
+                gl.vertex_attrib_pointer_f32(3, 1, glow::FLOAT, false, stride, 24);
+                self.tex_dyn_vao = Some(vao);
+                self.tex_dyn_vbo = Some(vbo);
+            }
 
             // --- blit program + a dynamic 6-vertex quad (pos.xy, uv) ---
-            let blit_prog = compile(gl, BLIT_VS, BLIT_FS);
-            self.u_tex = gl.get_uniform_location(blit_prog, "u_tex");
+            // Bloom's three passes. They share the blit's fullscreen vertex shader.
+            // A ceiling far inside half-float range, so the pyramid's own sums cannot reach it
+            // either: even four taps of the maximum leave headroom before 65504.
+            let bloom_pre = BLOOM_PRE_FS.replace("BLOOM_CEILING", "4000.0");
+            self.bloom_pre_prog = compile(gl, "bloom-prefilter", BLIT_VS, &bloom_pre);
+            self.bloom_down_prog = compile(gl, "bloom-down", BLIT_VS, BLOOM_DOWN_FS);
+            self.bloom_up_prog = compile(gl, "bloom-up", BLIT_VS, BLOOM_UP_FS);
+            self.bloom_fbo = gl.create_framebuffer().ok();
+
+            let blit_fs = BLIT_FS
+                .replace("FOG_GLSL", &fog_glsl())
+                .replace("VIEW_GLSL", crate::color::VIEW_GLSL);
+            if let Some(blit_prog) = compile(gl, "composite", BLIT_VS, &blit_fs) {
+                self.u_tex = gl.get_uniform_location(blit_prog, "u_tex");
+                self.u_blit_view = gl.get_uniform_location(blit_prog, "u_view");
+                self.u_blit_exposure = gl.get_uniform_location(blit_prog, "u_exposure");
+                self.u_blit_look = gl.get_uniform_location(blit_prog, "u_look");
+                self.u_blit_punchy = gl.get_uniform_location(blit_prog, "u_punchy");
+                self.u_blit_amb = gl.get_uniform_location(blit_prog, "u_amb");
+                self.u_blit_ao = gl.get_uniform_location(blit_prog, "u_ao");
+                self.u_blit_ao_on = gl.get_uniform_location(blit_prog, "u_ao_on");
+                self.u_blit_bloom = gl.get_uniform_location(blit_prog, "u_bloom");
+                self.u_blit_bloom_k = gl.get_uniform_location(blit_prog, "u_bloom_k");
+                self.u_blit_ssgi = gl.get_uniform_location(blit_prog, "u_ssgi");
+                self.u_blit_ssgi_k = gl.get_uniform_location(blit_prog, "u_ssgi_k");
+                self.u_blit_composed = gl.get_uniform_location(blit_prog, "u_composed");
+                self.blit_prog = Some(blit_prog);
+            }
+            // Temporal accumulation shares the blit's fullscreen vertex shader too.
+            self.taa_prog = compile(
+                gl,
+                "taa-resolve",
+                BLIT_VS,
+                &TAA_FS.replace("FOG_GLSL", &fog_glsl()),
+            );
+            self.taa_fbo = gl.create_framebuffer().ok();
+
+            // --- sky backdrop, SSAO and its blur: all full-viewport passes sharing BLIT_VS ---
+            let sky_fs = assemble_sky_fs();
+            if let Some(p) = compile(gl, "sky", BLIT_VS, &sky_fs) {
+                self.u_sky_inv_vp = gl.get_uniform_location(p, "u_inv_vp");
+                self.u_sky_cam = gl.get_uniform_location(p, "u_cam");
+                self.sky_u_bg = SkyUniforms::locate(gl, p);
+                self.sky_prog = Some(p);
+            }
+            if let Some(p) = compile(gl, "ssao", BLIT_VS, SSAO_FS) {
+                self.u_ssao_depth = gl.get_uniform_location(p, "u_depth");
+                self.u_ssao_vp = gl.get_uniform_location(p, "u_vp");
+                self.u_ssao_inv_vp = gl.get_uniform_location(p, "u_inv_vp");
+
+                self.u_ssao_radius = gl.get_uniform_location(p, "u_radius");
+                self.u_ssao_strength = gl.get_uniform_location(p, "u_strength");
+                self.ssao_prog = Some(p);
+            }
+            if let Some(p) = compile(gl, "ao blur", BLIT_VS, BLUR_FS) {
+                self.u_blur_ao = gl.get_uniform_location(p, "u_ao");
+                self.blur_prog = Some(p);
+            }
+            self.ssgi_prog = compile(gl, "ssgi", BLIT_VS, SSGI_FS);
+            self.blur_rgb_prog = compile(gl, "rgb blur", BLIT_VS, BLUR_RGB_FS);
+            self.scene_copy_prog = compile(gl, "scene copy", BLIT_VS, SCENE_COPY_FS);
+
             let bvbo = gl.create_buffer().unwrap();
             let bvao = gl.create_vertex_array().unwrap();
             gl.bind_vertex_array(Some(bvao));
@@ -267,12 +3957,33 @@ impl Scene3dRenderer {
             gl.bind_vertex_array(None);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
 
-            self.scene_prog = Some(scene_prog);
             self.scene_vao = Some(svao);
             self.scene_vbo = Some(svbo);
-            self.blit_prog = Some(blit_prog);
             self.blit_vao = Some(bvao);
             self.blit_vbo = Some(bvbo);
+            // Which programs the driver refused. `compile` already logs the GLSL error to stderr,
+            // but a user reporting "part of the picture is wrong" has no stderr — this puts the
+            // names where a session dump can carry them back.
+            self.shader_fail = [
+                ("scene", self.scene_prog.is_none()),
+                ("textured", self.tex_prog.is_none()),
+                ("transparent", self.transp_prog.is_none()),
+                ("composite", self.blit_prog.is_none()),
+                ("depth", self.depth_prog.is_none()),
+                ("sky", self.sky_prog.is_none()),
+                ("ssao", self.ssao_prog.is_none()),
+                ("ao-blur", self.blur_prog.is_none()),
+                ("bloom-prefilter", self.bloom_pre_prog.is_none()),
+                ("bloom-down", self.bloom_down_prog.is_none()),
+                ("bloom-up", self.bloom_up_prog.is_none()),
+                ("taa-resolve", self.taa_prog.is_none()),
+                ("ssgi", self.ssgi_prog.is_none()),
+                ("rgb-blur", self.blur_rgb_prog.is_none()),
+                ("scene-copy", self.scene_copy_prog.is_none()),
+            ]
+            .into_iter()
+            .filter_map(|(n, failed)| failed.then_some(n))
+            .collect();
             self.inited = true;
         }
     }
@@ -285,42 +3996,624 @@ impl Scene3dRenderer {
         if let Some(f) = self.fbo.take() {
             gl.delete_framebuffer(f);
         }
-        if let Some(t) = self.color.take() {
+        for t in [
+            self.color.take(),
+            self.ambient.take(),
+            self.albedo.take(),
+            self.depth.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             gl.delete_texture(t);
         }
-        if let Some(d) = self.depth.take() {
-            gl.delete_renderbuffer(d);
+        // The accumulation buffers are viewport-sized too, and their content is meaningless at a
+        // new size. `taa_targets` re-creates them on demand.
+        for t in self.taa_tex.iter_mut().filter_map(Option::take) {
+            gl.delete_texture(t);
+        }
+        self.taa_n = 0;
+        self.taa_valid = false;
+        for i in 0..2 {
+            if let Some(f) = self.ao_fbo[i].take() {
+                gl.delete_framebuffer(f);
+            }
+            if let Some(t) = self.ao_tex[i].take() {
+                gl.delete_texture(t);
+            }
         }
 
-        let color = gl.create_texture().unwrap();
-        gl.bind_texture(glow::TEXTURE_2D, Some(color));
-        gl.tex_image_2d(
-            glow::TEXTURE_2D, 0, glow::RGBA8 as i32, w, h, 0,
-            glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None),
-        );
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        // A small helper: every target here wants the same clamped, unfiltered-neighbourhood setup.
+        let make_tex =
+            |internal: u32, format: u32, ty: u32, filter: u32| -> Option<glow::Texture> {
+                let t = gl.create_texture().ok()?;
+                gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    internal as i32,
+                    w,
+                    h,
+                    0,
+                    format,
+                    ty,
+                    glow::PixelUnpackData::Slice(None),
+                );
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter as i32);
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_WRAP_S,
+                    glow::CLAMP_TO_EDGE as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_WRAP_T,
+                    glow::CLAMP_TO_EDGE as i32,
+                );
+                Some(t)
+            };
 
-        let depth = gl.create_renderbuffer().unwrap();
-        gl.bind_renderbuffer(glow::RENDERBUFFER, Some(depth));
-        gl.renderbuffer_storage(glow::RENDERBUFFER, glow::DEPTH_COMPONENT24, w, h);
+        // RGBA16F, not RGBA8: every pass writes SCENE-REFERRED linear light, which routinely
+        // exceeds 1.0 (a sunlit wall, a lamp lens). In 8 bits those values were clipped before the
+        // view transform ever saw them, so highlights had nothing left to roll off.
+        //
+        // TWO of them. Attachment 0 carries light that is already placed — direct sun, specular,
+        // emission — and attachment 1 the diffuse ambient. They are recombined at the composite
+        // with occlusion applied to the second only.
+        let color = make_tex(glow::RGBA16F, glow::RGBA, glow::FLOAT, glow::LINEAR);
+        let ambient = make_tex(glow::RGBA16F, glow::RGBA, glow::FLOAT, glow::LINEAR);
+        // Attachment 2, the ALBEDO: what each surface would BOUNCE. RGBA8 rather than RGBA16F
+        // because an albedo is a reflectance — it lives in 0..1 by definition and cannot blow past
+        // the range the way radiance does, so the extra eight bits per channel would buy nothing
+        // but bandwidth on a full-screen target written by every draw.
+        let albedo = make_tex(glow::RGBA8, glow::RGBA, glow::UNSIGNED_BYTE, glow::LINEAR);
+        // Depth as a TEXTURE: SSAO reconstructs world position by sampling it, which is impossible
+        // with the renderbuffer this used to be. NEAREST — interpolating depth across a silhouette
+        // would invent surfaces that are not there.
+        let depth = make_tex(
+            glow::DEPTH_COMPONENT24,
+            glow::DEPTH_COMPONENT,
+            glow::FLOAT,
+            glow::NEAREST,
+        );
 
         let fbo = gl.create_framebuffer().unwrap();
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-        gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(color), 0);
-        gl.framebuffer_renderbuffer(glow::FRAMEBUFFER, glow::DEPTH_ATTACHMENT, glow::RENDERBUFFER, Some(depth));
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            color,
+            0,
+        );
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT1,
+            glow::TEXTURE_2D,
+            ambient,
+            0,
+        );
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT2,
+            glow::TEXTURE_2D,
+            albedo,
+            0,
+        );
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::DEPTH_ATTACHMENT,
+            glow::TEXTURE_2D,
+            depth,
+            0,
+        );
+        gl.draw_buffers(&[
+            glow::COLOR_ATTACHMENT0,
+            glow::COLOR_ATTACHMENT1,
+            glow::COLOR_ATTACHMENT2,
+        ]);
+
+        // Two single-channel AO targets: one for the raw occlusion, one for its blur. LINEAR so the
+        // composite can sample them at whatever resolution they end up.
+        for i in 0..2 {
+            let t = make_tex(glow::R8, glow::RED, glow::UNSIGNED_BYTE, glow::LINEAR);
+            let f = gl.create_framebuffer().ok();
+            if let (Some(t), Some(f)) = (t, f) {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f));
+                gl.framebuffer_texture_2d(
+                    glow::FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(t),
+                    0,
+                );
+                gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
+                self.ao_fbo[i] = Some(f);
+                self.ao_tex[i] = Some(t);
+            }
+        }
 
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         gl.bind_texture(glow::TEXTURE_2D, None);
-        gl.bind_renderbuffer(glow::RENDERBUFFER, None);
 
         self.fbo = Some(fbo);
-        self.color = Some(color);
-        self.depth = Some(depth);
+        self.color = color;
+        self.ambient = ambient;
+        self.albedo = albedo;
+        self.depth = depth;
         self.fbo_w = w;
         self.fbo_h = h;
+    }
+
+    /// Run the occlusion pass over the depth texture and blur it, leaving the result in
+    /// `ao_tex[1]`. Returns `false` if anything it needs is missing, in which case the composite
+    /// falls back to no occlusion rather than sampling a stale or absent buffer.
+    unsafe fn run_ssao(
+        &mut self,
+        gl: &glow::Context,
+        ao: &crate::env::AoSettings,
+        mvp: &[f32; 16],
+        cam: [f32; 3],
+        w: i32,
+        h: i32,
+    ) -> bool {
+        let (Some(prog), Some(blur), Some(depth)) = (self.ssao_prog, self.blur_prog, self.depth)
+        else {
+            return false;
+        };
+        let (Some(f0), Some(f1), Some(t0)) = (self.ao_fbo[0], self.ao_fbo[1], self.ao_tex[0])
+        else {
+            return false;
+        };
+        let (Some(vao), Some(vbo)) = (self.blit_vao, self.blit_vbo) else {
+            return false;
+        };
+        let (rel_vp, rel_inv) = camera_relative_vp(mvp, cam);
+
+        // A full-NDC quad; the same buffer the composite uses, re-uploaded.
+        const FULL: [f32; 24] = [
+            -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 0.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0,
+        ];
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&FULL), glow::DYNAMIC_DRAW);
+        gl.disable(glow::DEPTH_TEST);
+        gl.disable(glow::BLEND);
+        gl.viewport(0, 0, w, h);
+
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f0));
+        gl.use_program(Some(prog));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(depth));
+        if let Some(l) = &self.u_ssao_depth {
+            gl.uniform_1_i32(Some(l), 0);
+        }
+        // CAMERA-RELATIVE, not world — see `camera_relative_vp`. The camera is the origin in this
+        // pass, so there is no `u_cam` to send.
+        if let Some(l) = &self.u_ssao_vp {
+            gl.uniform_matrix_4_f32_slice(Some(l), false, &rel_vp);
+        }
+        if let Some(l) = &self.u_ssao_inv_vp {
+            gl.uniform_matrix_4_f32_slice(Some(l), false, &rel_inv);
+        }
+        if let Some(l) = &self.u_ssao_radius {
+            gl.uniform_1_f32(Some(l), ao.radius.max(0.01));
+        }
+        if let Some(l) = &self.u_ssao_strength {
+            gl.uniform_1_f32(Some(l), ao.strength.clamp(0.0, 2.0));
+        }
+        gl.bind_vertex_array(Some(vao));
+        gl.draw_arrays(glow::TRIANGLES, 0, 6);
+
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f1));
+        gl.use_program(Some(blur));
+        gl.bind_texture(glow::TEXTURE_2D, Some(t0));
+        if let Some(l) = &self.u_blur_ao {
+            gl.uniform_1_i32(Some(l), 0);
+        }
+        gl.draw_arrays(glow::TRIANGLES, 0, 6);
+        gl.bind_vertex_array(None);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        true
+    }
+
+    /// Snapshot the opaque scene into `refr_tex` so the transparent pass has something to refract.
+    ///
+    /// Returns false when it could not run, in which case glass falls back to plain blending —
+    /// which is what it did before refraction existed, so nothing looks broken.
+    unsafe fn scene_copy(&mut self, gl: &glow::Context, w: i32, h: i32) -> bool {
+        if self.refr_tex.is_none() || self.refr_size != (w, h) {
+            if let Some(t) = self.refr_tex.take() {
+                gl.delete_texture(t);
+            }
+            let Ok(t) = gl.create_texture() else {
+                return false;
+            };
+            gl.bind_texture(glow::TEXTURE_2D, Some(t));
+            // RGBA16F, like everything else here: this is scene-referred light, and what shows
+            // through a window is routinely the brightest thing in the frame.
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA16F as i32,
+                w,
+                h,
+                0,
+                glow::RGBA,
+                glow::FLOAT,
+                glow::PixelUnpackData::Slice(None),
+            );
+            for (p, v) in [
+                (glow::TEXTURE_MIN_FILTER, glow::LINEAR),
+                (glow::TEXTURE_MAG_FILTER, glow::LINEAR),
+                // CLAMP: a ray refracted past the edge of the frame reads the border pixel rather
+                // than wrapping round to the opposite side of the room.
+                (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+                (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+            ] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, p, v as i32);
+            }
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            if self.refr_fbo.is_none() {
+                self.refr_fbo = gl.create_framebuffer().ok();
+            }
+            self.refr_tex = Some(t);
+            self.refr_size = (w, h);
+            // A copy of the DEPTH beside the colour, for screen-space reflections to march.
+            //
+            // Not the scene's own depth texture: that one is still attached to the framebuffer the
+            // transparent pass is drawing into, and sampling a texture you are simultaneously
+            // rendering with is undefined even when the writes are masked off. A blit costs one
+            // pass and removes the question.
+            if let Some(d) = self.refr_depth.take() {
+                gl.delete_texture(d);
+            }
+            if let Ok(d) = gl.create_texture() {
+                gl.bind_texture(glow::TEXTURE_2D, Some(d));
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::DEPTH_COMPONENT24 as i32,
+                    w,
+                    h,
+                    0,
+                    glow::DEPTH_COMPONENT,
+                    glow::FLOAT,
+                    glow::PixelUnpackData::Slice(None),
+                );
+                for (p, v) in [
+                    // NEAREST: interpolating depth across a silhouette invents surfaces that are
+                    // not there, and a ray would hit one of them.
+                    (glow::TEXTURE_MIN_FILTER, glow::NEAREST),
+                    (glow::TEXTURE_MAG_FILTER, glow::NEAREST),
+                    (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+                    (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+                ] {
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, p, v as i32);
+                }
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                self.refr_depth = Some(d);
+            }
+        }
+        let (Some(prog), Some(fbo), Some(tex), Some(vao), Some(vbo), Some(lit), Some(amb)) = (
+            self.scene_copy_prog,
+            self.refr_fbo,
+            self.refr_tex,
+            self.blit_vao,
+            self.blit_vbo,
+            self.color,
+            self.ambient,
+        ) else {
+            return false;
+        };
+        const FULL: [f32; 24] = [
+            -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 0.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0,
+        ];
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(tex),
+            0,
+        );
+        gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
+        gl.viewport(0, 0, w, h);
+        gl.disable(glow::DEPTH_TEST);
+        gl.disable(glow::BLEND);
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&FULL), glow::DYNAMIC_DRAW);
+        gl.bind_vertex_array(Some(vao));
+        gl.use_program(Some(prog));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(lit));
+        gl.active_texture(glow::TEXTURE1);
+        gl.bind_texture(glow::TEXTURE_2D, Some(amb));
+        for (n, v) in [("u_lit", 0), ("u_amb", 1)] {
+            if let Some(l) = gl.get_uniform_location(prog, n) {
+                gl.uniform_1_i32(Some(&l), v);
+            }
+        }
+        gl.active_texture(glow::TEXTURE1);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        gl.active_texture(glow::TEXTURE0);
+        gl.draw_arrays(glow::TRIANGLES, 0, 6);
+        gl.bind_vertex_array(None);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        // …and the depth alongside it, so reflected rays have a scene to march through.
+        if let Some(d) = self.refr_depth {
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::DEPTH_ATTACHMENT,
+                glow::TEXTURE_2D,
+                Some(d),
+                0,
+            );
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, self.fbo);
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(fbo));
+            gl.blit_framebuffer(
+                0,
+                0,
+                w,
+                h,
+                0,
+                0,
+                w,
+                h,
+                glow::DEPTH_BUFFER_BIT,
+                glow::NEAREST,
+            );
+        }
+        // Back to the scene, with depth on — the transparent pass draws next.
+        gl.bind_framebuffer(glow::FRAMEBUFFER, self.fbo);
+        gl.viewport(0, 0, w, h);
+        gl.enable(glow::DEPTH_TEST);
+        true
+    }
+
+    /// Gather one bounce of light between visible surfaces, leaving the result in `ssgi_tex[1]`.
+    ///
+    /// Returns false when it could not run, so the composite skips it rather than sampling a
+    /// texture nothing ever wrote.
+    unsafe fn run_ssgi(
+        &mut self,
+        gl: &glow::Context,
+        gi: &crate::env::GiSettings,
+        ao_ready: bool,
+        // No `inv_vp`: this pass derives its own CAMERA-RELATIVE pair from `mvp` + `cam`, because
+        // the world one the caller holds is exactly what made the gather's normals noise.
+        mvp: &[f32; 16],
+        cam: [f32; 3],
+        w: i32,
+        h: i32,
+    ) -> bool {
+        if !gi.enabled || gi.strength <= 0.0 {
+            return false;
+        }
+        // Half resolution. A bounce is broad and soft, and the blur below removes exactly the
+        // detail full resolution would buy — so it would be paid for twice.
+        let (gw, gh) = ((w / 2).max(1), (h / 2).max(1));
+        if self.ssgi_tex[0].is_none() || self.ssgi_size != (gw, gh) {
+            for f in self.ssgi_fbo.iter_mut().filter_map(Option::take) {
+                gl.delete_framebuffer(f);
+            }
+            for t in self.ssgi_tex.iter_mut().filter_map(Option::take) {
+                gl.delete_texture(t);
+            }
+            for i in 0..2 {
+                let (Ok(t), Ok(f)) = (gl.create_texture(), gl.create_framebuffer()) else {
+                    return false;
+                };
+                gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA16F as i32,
+                    gw,
+                    gh,
+                    0,
+                    glow::RGBA,
+                    glow::FLOAT,
+                    glow::PixelUnpackData::Slice(None),
+                );
+                for (p, v) in [
+                    (glow::TEXTURE_MIN_FILTER, glow::LINEAR),
+                    (glow::TEXTURE_MAG_FILTER, glow::LINEAR),
+                    (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+                    (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+                ] {
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, p, v as i32);
+                }
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f));
+                gl.framebuffer_texture_2d(
+                    glow::FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(t),
+                    0,
+                );
+                gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
+                self.ssgi_tex[i] = Some(t);
+                self.ssgi_fbo[i] = Some(f);
+            }
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            self.ssgi_size = (gw, gh);
+        }
+        let (Some(prog), Some(blur), Some(vao), Some(vbo)) = (
+            self.ssgi_prog,
+            self.blur_rgb_prog,
+            self.blit_vao,
+            self.blit_vbo,
+        ) else {
+            return false;
+        };
+        let (Some(f0), Some(f1), Some(t0), Some(depth), Some(lit), Some(amb), Some(alb)) = (
+            self.ssgi_fbo[0],
+            self.ssgi_fbo[1],
+            self.ssgi_tex[0],
+            self.depth,
+            self.color,
+            self.ambient,
+            self.albedo,
+        ) else {
+            return false;
+        };
+        const FULL: [f32; 24] = [
+            -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 0.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0,
+        ];
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&FULL), glow::DYNAMIC_DRAW);
+        gl.bind_vertex_array(Some(vao));
+        gl.disable(glow::DEPTH_TEST);
+        gl.disable(glow::BLEND);
+
+        // 1 — the gather.
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f0));
+        gl.viewport(0, 0, gw, gh);
+        gl.use_program(Some(prog));
+        for (unit, tex) in [
+            (0, Some(depth)),
+            (1, Some(lit)),
+            (2, Some(amb)),
+            (3, Some(alb)),
+            (4, if ao_ready { self.ao_tex[1] } else { None }),
+        ] {
+            gl.active_texture(glow::TEXTURE0 + unit as u32);
+            gl.bind_texture(glow::TEXTURE_2D, tex);
+        }
+        for (n, v) in [
+            ("u_depth", 0),
+            ("u_lit", 1),
+            ("u_amb", 2),
+            ("u_alb", 3),
+            ("u_ao", 4),
+            ("u_ao_on", ao_ready as i32),
+            // The accumulation sample index, so the gather's jitter varies frame to frame and the
+            // refinement converges to the integral instead of re-averaging one fixed set of rays.
+            ("u_frame", self.taa_n as i32),
+        ] {
+            if let Some(l) = gl.get_uniform_location(prog, n) {
+                gl.uniform_1_i32(Some(&l), v);
+            }
+        }
+        // CAMERA-RELATIVE — see `camera_relative_vp`. Computed here rather than taking the
+        // caller's `inv_vp`, which is the WORLD one and is still what the fog wants (fog needs a
+        // distance from the camera, not a normal, and is unaffected by the precision this fixes).
+        let (rel_vp, rel_inv) = camera_relative_vp(mvp, cam);
+        if let Some(l) = gl.get_uniform_location(prog, "u_vp") {
+            gl.uniform_matrix_4_f32_slice(Some(&l), false, &rel_vp);
+        }
+        if let Some(l) = gl.get_uniform_location(prog, "u_inv_vp") {
+            gl.uniform_matrix_4_f32_slice(Some(&l), false, &rel_inv);
+        }
+        if let Some(l) = gl.get_uniform_location(prog, "u_radius") {
+            gl.uniform_1_f32(Some(&l), gi.radius.max(0.05));
+        }
+        if let Some(l) = gl.get_uniform_location(prog, "u_strength") {
+            gl.uniform_1_f32(Some(&l), gi.strength.clamp(0.0, 4.0));
+        }
+        // The FULL-resolution texel, because every fetch this shader makes is against the
+        // full-resolution G-buffer even though it is drawing at half.
+        if let Some(l) = gl.get_uniform_location(prog, "u_texel") {
+            gl.uniform_2_f32(Some(&l), 1.0 / w as f32, 1.0 / h as f32);
+        }
+        gl.active_texture(glow::TEXTURE0);
+        gl.draw_arrays(glow::TRIANGLES, 0, 6);
+
+        // 2 — blur the noise back into the broad term bounced light actually is.
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f1));
+        gl.use_program(Some(blur));
+        gl.bind_texture(glow::TEXTURE_2D, Some(t0));
+        if let Some(l) = gl.get_uniform_location(blur, "u_src") {
+            gl.uniform_1_i32(Some(&l), 0);
+        }
+        gl.draw_arrays(glow::TRIANGLES, 0, 6);
+
+        for unit in 0..5u32 {
+            gl.active_texture(glow::TEXTURE0 + unit);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_vertex_array(None);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        true
+    }
+
+    /// The cascade shadow maps: ONE `GL_TEXTURE_2D_ARRAY` with a layer per cascade.
+    ///
+    /// An array rather than N separate textures because the fragment shader has to be able to pick
+    /// a cascade at runtime, and GL 3.3 cannot index an array of samplers by a non-constant — a
+    /// texture array is the only way to say "sample cascade `c`" in one lookup.
+    unsafe fn ensure_shadow_fbo(&mut self, gl: &glow::Context) {
+        if self.shadow_fbo.is_some() {
+            return;
+        }
+        let s = self.shadow_size;
+        let tex = gl.create_texture().unwrap();
+        gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(tex));
+        gl.tex_image_3d(
+            glow::TEXTURE_2D_ARRAY,
+            0,
+            glow::DEPTH_COMPONENT24 as i32,
+            s,
+            s,
+            CASCADE_MAX as i32,
+            0,
+            glow::DEPTH_COMPONENT,
+            glow::FLOAT,
+            glow::PixelUnpackData::Slice(None),
+        );
+        for (p, v) in [
+            (glow::TEXTURE_MIN_FILTER, glow::NEAREST),
+            (glow::TEXTURE_MAG_FILTER, glow::NEAREST),
+            (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_BORDER),
+            (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_BORDER),
+        ] {
+            gl.tex_parameter_i32(glow::TEXTURE_2D_ARRAY, p, v as i32);
+        }
+        // A white border means "nothing in front of this" — a fragment that lands just off the
+        // edge of a cascade reads as lit rather than as shadowed by a texel that was never drawn.
+        gl.tex_parameter_f32_slice(
+            glow::TEXTURE_2D_ARRAY,
+            glow::TEXTURE_BORDER_COLOR,
+            &[1.0, 1.0, 1.0, 1.0],
+        );
+
+        let fbo = gl.create_framebuffer().unwrap();
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+        gl.framebuffer_texture_layer(glow::FRAMEBUFFER, glow::DEPTH_ATTACHMENT, Some(tex), 0, 0);
+        gl.draw_buffer(glow::NONE);
+        gl.read_buffer(glow::NONE);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.bind_texture(glow::TEXTURE_2D_ARRAY, None);
+        self.shadow_fbo = Some(fbo);
+        self.shadow_tex = Some(tex);
+    }
+
+    /// Ensure a furniture instance's GPU buffer exists (shared by the main + shadow passes) and
+    /// return its VAO + vertex count.
+    unsafe fn furn_buf(
+        &mut self,
+        gl: &glow::Context,
+        key: u64,
+        verts: &[V3],
+    ) -> Option<(glow::VertexArray, i32)> {
+        if let Some((vao, _vbo, len)) = self.furn_bufs.get(&key).copied() {
+            return Some((vao, len));
+        }
+        let vbo = gl.create_buffer().ok()?;
+        let vao = gl.create_vertex_array().ok()?;
+        gl.bind_vertex_array(Some(vao));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(verts), glow::STATIC_DRAW);
+        v3_attribs(gl);
+        gl.bind_vertex_array(None);
+        let len = verts.len() as i32;
+        self.furn_bufs.insert(key, (vao, vbo, len));
+        Some((vao, len))
     }
 
     /// Render `verts` with `mvp` into the FBO, then composite into the panel rect.
@@ -340,6 +4633,479 @@ impl Scene3dRenderer {
     ///
     /// All three passes share one program/VAO/VBO — `V3` (pos+colour) is the same
     /// vertex format throughout, so each pass just re-uploads and switches mode.
+    /// Draw one opaque triangle batch. `ver = Some(v)` uses the persistent static VBO for
+    /// `slot` and re-uploads only when `v` differs from the last upload; `None` re-uploads into
+    /// the shared dynamic VBO every call. Caller has already set the opaque GL state.
+    unsafe fn draw_opaque_batch(
+        &mut self,
+        gl: &glow::Context,
+        verts: &[V3],
+        mvp: &[f32; 16],
+        ver: Option<u64>,
+        slot: usize,
+    ) {
+        let Some(prog) = self.scene_prog else { return };
+        let (vao, vbo, count) = match ver {
+            Some(v) => {
+                let (vao, vbo) = (self.static_vao[slot], self.static_vbo[slot]);
+                let (Some(vao), Some(vbo)) = (vao, vbo) else {
+                    return;
+                };
+                if self.static_ver[slot] != v {
+                    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                    gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(verts), glow::STATIC_DRAW);
+                    self.static_ver[slot] = v;
+                    self.static_len[slot] = verts.len() as i32;
+                }
+                (vao, vbo, self.static_len[slot])
+            }
+            None => {
+                let (Some(vao), Some(vbo)) = (self.scene_vao, self.scene_vbo) else {
+                    return;
+                };
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(verts), glow::DYNAMIC_DRAW);
+                (vao, vbo, verts.len() as i32)
+            }
+        };
+        let _ = vbo;
+        gl.use_program(Some(prog));
+        if let Some(loc) = &self.u_mvp {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
+        }
+        if let Some(loc) = &self.u_alpha {
+            gl.uniform_1_f32(Some(loc), 1.0);
+        }
+        // The opaque scene batch is already in WORLD space → identity model for the shadow lookup.
+        if let Some(loc) = &self.u_scene_model {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, &IDENTITY16);
+        }
+        gl.bind_vertex_array(Some(vao));
+        gl.draw_arrays(glow::TRIANGLES, 0, count);
+        gl.bind_vertex_array(None);
+    }
+
+    /// Draw one furniture instance from its own persistent GPU buffer (keyed by `key` =
+    /// asset+colour). The buffer is created + uploaded the FIRST time a key is seen and reused
+    /// forever after; `mvp` = camera·model, so moving/rotating is just a matrix — no CPU
+    /// transform, no re-upload, regardless of triangle count. Opaque GL state already set.
+    unsafe fn draw_furn(
+        &mut self,
+        gl: &glow::Context,
+        key: u64,
+        verts: &[V3],
+        mvp: &[f32; 16],
+        model: &[f32; 16],
+    ) {
+        let Some(prog) = self.scene_prog else { return };
+        let Some((vao, count)) = self.furn_buf(gl, key, verts) else {
+            return;
+        };
+        gl.use_program(Some(prog));
+        if let Some(loc) = &self.u_mvp {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
+        }
+        if let Some(loc) = &self.u_alpha {
+            gl.uniform_1_f32(Some(loc), 1.0);
+        }
+        // Furniture verts are LOCAL → give the shadow lookup the instance model matrix.
+        if let Some(loc) = &self.u_scene_model {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, model);
+        }
+        gl.bind_vertex_array(Some(vao));
+        gl.draw_arrays(glow::TRIANGLES, 0, count);
+        gl.bind_vertex_array(None);
+    }
+
+    /// Draw one furniture instance's TRANSLUCENT triangles (glass panes etc.) from a persistent
+    /// per-key buffer of [`V3A`]. Blend state (SRC_ALPHA / ONE_MINUS_SRC_ALPHA, depth-write off)
+    /// is set once by the caller around the whole transparent pass; ordering is handled CPU-side.
+    unsafe fn draw_transp(
+        &mut self,
+        gl: &glow::Context,
+        key: u64,
+        verts: &[V3A],
+        mvp: &[f32; 16],
+        model: &[f32; 16],
+    ) {
+        let Some(prog) = self.transp_prog else { return };
+        let entry = self.transp_bufs.get(&key).copied();
+        let (vao, count) = match entry {
+            Some((vao, _vbo, len)) => (vao, len),
+            None => {
+                let vbo = match gl.create_buffer() {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                let vao = match gl.create_vertex_array() {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                gl.bind_vertex_array(Some(vao));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(verts), glow::STATIC_DRAW);
+                let stride = size_of::<V3A>() as i32; // 28
+                gl.enable_vertex_attrib_array(0);
+                gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
+                gl.enable_vertex_attrib_array(1);
+                gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, stride, 12);
+                gl.enable_vertex_attrib_array(2);
+                gl.vertex_attrib_pointer_f32(2, 1, glow::FLOAT, false, stride, 24);
+                gl.bind_vertex_array(None);
+                let len = verts.len() as i32;
+                self.transp_bufs.insert(key, (vao, vbo, len));
+                (vao, len)
+            }
+        };
+        gl.use_program(Some(prog));
+        if let Some(loc) = &self.u_transp_mvp {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
+        }
+        // Verts are LOCAL, so the world placement has to come in separately — the pane's normal
+        // is built from it. See TRANSP_VS.
+        if let Some(loc) = &self.u_transp_model {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, model);
+        }
+        if let Some(loc) = &self.u_transp_uv_org {
+            let o = self.uv_origin;
+            gl.uniform_3_f32(Some(loc), o[0], o[1], o[2]);
+        }
+        gl.bind_vertex_array(Some(vao));
+        gl.draw_arrays(glow::TRIANGLES, 0, count);
+        gl.bind_vertex_array(None);
+    }
+
+    /// Ensure the app-side texture `idx` (RGBA8 bytes, `w`×`h`, top row first) is uploaded to a GL
+    /// texture, uploading it once and caching. Returns the GL handle.
+    ///
+    /// `srgb` decides the internal format, and it is not cosmetic. An **albedo** image is authored
+    /// in sRGB, so it uploads as `SRGB8_ALPHA8` and the sampler decodes it to linear for free —
+    /// without that, every texture in the app was being multiplied by light in the wrong space. A
+    /// **data map** (tangent-space normals, roughness) carries numbers rather than colour and must
+    /// stay `RGBA8`; decoding one of those would bend every normal toward the surface. The cache is
+    /// keyed on the flag too, so the same image can serve as both without fighting over one upload.
+    unsafe fn ensure_texture(
+        &mut self,
+        gl: &glow::Context,
+        idx: usize,
+        w: i32,
+        h: i32,
+        rgba: &[u8],
+        srgb: bool,
+    ) -> Option<glow::Texture> {
+        if let Some(t) = self.tex_images.get(&(idx, srgb)) {
+            return Some(*t);
+        }
+        if w <= 0 || h <= 0 || rgba.len() < (w as usize * h as usize * 4) {
+            return None;
+        }
+        let tex = gl.create_texture().ok()?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            if srgb {
+                glow::SRGB8_ALPHA8
+            } else {
+                glow::RGBA8
+            } as i32,
+            w,
+            h,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(Some(&rgba[..(w as usize * h as usize * 4)])),
+        );
+        gl.generate_mipmap(glow::TEXTURE_2D);
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::LINEAR_MIPMAP_LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::REPEAT as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::REPEAT as i32);
+        // Anisotropic filtering where the driver has it: a tiled floor seen at a grazing angle is
+        // the worst case for trilinear alone, and it is exactly the shot people judge a render by.
+        // GL 3.3 has no core anisotropy, so the extension is checked by NAME — querying the enum
+        // blind would raise GL_INVALID_ENUM on drivers without it and poison later error checks.
+        if self.aniso_max > 1.0 {
+            gl.tex_parameter_f32(glow::TEXTURE_2D, 0x84FE, self.aniso_max); // TEXTURE_MAX_ANISOTROPY_EXT
+        }
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        self.tex_images.insert((idx, srgb), tex);
+        Some(tex)
+    }
+
+    /// Set the procedural-material uniforms for the textured program (already bound). `mode 0`
+    /// leaves the shader sampling the bound image.
+    unsafe fn set_proc(&self, gl: &glow::Context, proc: &ProcParams) {
+        if let Some(loc) = &self.u_tex_proc {
+            gl.uniform_1_i32(Some(loc), proc.mode);
+        }
+        if let Some(loc) = &self.u_tex_col_a {
+            gl.uniform_3_f32(Some(loc), proc.col_a[0], proc.col_a[1], proc.col_a[2]);
+        }
+        if let Some(loc) = &self.u_tex_col_b {
+            gl.uniform_3_f32(Some(loc), proc.col_b[0], proc.col_b[1], proc.col_b[2]);
+        }
+        if let Some(loc) = &self.u_tex_pscale {
+            gl.uniform_3_f32(Some(loc), proc.scale[0], proc.scale[1], proc.scale[2]);
+        }
+        if let Some(loc) = &self.u_tex_detail {
+            gl.uniform_1_f32(Some(loc), proc.detail);
+        }
+        if let Some(loc) = &self.u_tex_prough {
+            gl.uniform_1_f32(Some(loc), proc.rough);
+        }
+        if let Some(loc) = &self.u_tex_pcontrast {
+            gl.uniform_1_f32(Some(loc), proc.contrast);
+        }
+        if let Some(loc) = &self.u_tex_ramp {
+            gl.uniform_2_f32(Some(loc), proc.ramp[0], proc.ramp[1]);
+        }
+        if let Some(loc) = &self.u_tex_rough_lo {
+            gl.uniform_1_f32(Some(loc), proc.rough_lo);
+        }
+        if let Some(loc) = &self.u_tex_rough_hi {
+            gl.uniform_1_f32(Some(loc), proc.rough_hi);
+        }
+        if let Some(loc) = &self.u_tex_bump {
+            gl.uniform_1_f32(Some(loc), proc.bump);
+        }
+    }
+
+    /// Bind the PBR normal/roughness maps (units 2/3) for the textured program and set their
+    /// presence flags + scalar roughness. Maps come from the app's texture cache (`tex_images`).
+    unsafe fn set_pbr(&self, gl: &glow::Context, pbr: &PbrParams) {
+        // Data maps, so the LINEAR upload of each (see `ensure_texture`) — never the sRGB one.
+        let nrm = pbr
+            .normal_idx
+            .and_then(|i| self.tex_images.get(&(i, false)).copied());
+        let rgh = pbr
+            .rough_idx
+            .and_then(|i| self.tex_images.get(&(i, false)).copied());
+        let met = pbr
+            .metal_idx
+            .and_then(|i| self.tex_images.get(&(i, false)).copied());
+        let aom = pbr
+            .ao_idx
+            .and_then(|i| self.tex_images.get(&(i, false)).copied());
+        if let Some(loc) = &self.u_tex_has_nrm {
+            gl.uniform_1_i32(Some(loc), nrm.is_some() as i32);
+        }
+        if let Some(loc) = &self.u_tex_has_rough {
+            gl.uniform_1_i32(Some(loc), rgh.is_some() as i32);
+        }
+        if let Some(loc) = &self.u_tex_has_metal {
+            gl.uniform_1_i32(Some(loc), met.is_some() as i32);
+        }
+        if let Some(loc) = &self.u_tex_has_ao {
+            gl.uniform_1_i32(Some(loc), aom.is_some() as i32);
+        }
+        if let Some(loc) = &self.u_tex_triplanar {
+            gl.uniform_1_i32(Some(loc), pbr.triplanar as i32);
+        }
+        if let Some(loc) = &self.u_tex_tpm {
+            gl.uniform_1_f32(Some(loc), pbr.tiles_per_m.max(1e-3));
+        }
+        if let Some(loc) = &self.u_tex_uv_org {
+            let o = self.uv_origin;
+            gl.uniform_3_f32(Some(loc), o[0], o[1], o[2]);
+        }
+        if let Some(loc) = &self.u_tex_rough_base {
+            gl.uniform_1_f32(Some(loc), pbr.roughness);
+        }
+        if let Some(loc) = &self.u_tex_transmission {
+            gl.uniform_1_f32(Some(loc), pbr.transmission.clamp(0.0, 1.0));
+        }
+        if let Some(loc) = &self.u_tex_metallic {
+            gl.uniform_1_f32(Some(loc), pbr.metallic.clamp(0.0, 1.0));
+        }
+        if let Some(loc) = &self.u_tex_ior {
+            gl.uniform_1_f32(Some(loc), pbr.ior.clamp(1.0, 3.0));
+        }
+        if let Some(loc) = &self.u_tex_coat {
+            gl.uniform_1_f32(Some(loc), pbr.clearcoat.clamp(0.0, 1.0));
+        }
+        if let Some(loc) = &self.u_tex_coat_rough {
+            gl.uniform_1_f32(Some(loc), pbr.clearcoat_rough.clamp(0.01, 1.0));
+        }
+        if let Some(loc) = &self.u_tex_sheen {
+            gl.uniform_1_f32(Some(loc), pbr.sheen.clamp(0.0, 1.0));
+        }
+        if let Some(loc) = &self.u_tex_sheen_tint {
+            let t = pbr.sheen_tint;
+            gl.uniform_3_f32(Some(loc), t[0], t[1], t[2]);
+        }
+        if let Some(loc) = &self.u_tex_emission {
+            gl.uniform_3_f32(Some(loc), pbr.emission[0], pbr.emission[1], pbr.emission[2]);
+        }
+        if let Some(tex) = nrm {
+            gl.active_texture(glow::TEXTURE2);
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            if let Some(loc) = &self.u_tex_nrm {
+                gl.uniform_1_i32(Some(loc), 2);
+            }
+        }
+        if let Some(tex) = rgh {
+            gl.active_texture(glow::TEXTURE3);
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            if let Some(loc) = &self.u_tex_rough {
+                gl.uniform_1_i32(Some(loc), 3);
+            }
+        }
+        if let Some(tex) = met {
+            gl.active_texture(glow::TEXTURE4);
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            if let Some(loc) = &self.u_tex_metal_map {
+                gl.uniform_1_i32(Some(loc), 4);
+            }
+        }
+        if let Some(tex) = aom {
+            gl.active_texture(glow::TEXTURE5);
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            if let Some(loc) = &self.u_tex_ao_map {
+                gl.uniform_1_i32(Some(loc), 5);
+            }
+        }
+        gl.active_texture(glow::TEXTURE0);
+    }
+
+    /// Draw one textured mesh: `mesh_key` picks (and lazily builds) a persistent GPU buffer of
+    /// `TexVtx`, `img` is the bound GL image, `mvp` = camera·model, `model` the world matrix (for
+    /// shadows/normal maps). Opaque GL state already set.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_textured(
+        &mut self,
+        gl: &glow::Context,
+        mesh_key: u64,
+        verts: &[TexVtx],
+        mvp: &[f32; 16],
+        model: &[f32; 16],
+        img: glow::Texture,
+        cam: [f32; 3],
+        reflect: f32,
+        proc: ProcParams,
+        pbr: PbrParams,
+        hl: bool,
+    ) {
+        let Some(prog) = self.tex_prog else { return };
+        let entry = self.tex_bufs.get(&mesh_key).copied();
+        let (vao, count) = match entry {
+            Some((vao, _vbo, len)) => (vao, len),
+            None => {
+                let vbo = match gl.create_buffer() {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                let vao = match gl.create_vertex_array() {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                gl.bind_vertex_array(Some(vao));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(verts), glow::STATIC_DRAW);
+                let stride = size_of::<TexVtx>() as i32; // 28
+                gl.enable_vertex_attrib_array(0);
+                gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
+                gl.enable_vertex_attrib_array(1);
+                gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 12);
+                gl.enable_vertex_attrib_array(2);
+                gl.vertex_attrib_pointer_f32(2, 1, glow::FLOAT, false, stride, 20);
+                gl.enable_vertex_attrib_array(3);
+                gl.vertex_attrib_pointer_f32(3, 1, glow::FLOAT, false, stride, 24);
+                gl.bind_vertex_array(None);
+                let len = verts.len() as i32;
+                self.tex_bufs.insert(mesh_key, (vao, vbo, len));
+                (vao, len)
+            }
+        };
+        gl.use_program(Some(prog));
+        if let Some(loc) = &self.u_tex_mvp {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
+        }
+        if let Some(loc) = &self.u_tex_model {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, model);
+        }
+        if let Some(loc) = &self.u_tex_cam {
+            gl.uniform_3_f32(Some(loc), cam[0], cam[1], cam[2]);
+        }
+        if let Some(loc) = &self.u_tex_reflect {
+            gl.uniform_1_f32(Some(loc), reflect);
+        }
+        if let Some(loc) = &self.u_tex_hl {
+            gl.uniform_1_i32(Some(loc), hl as i32);
+        }
+        self.set_proc(gl, &proc);
+        self.set_pbr(gl, &pbr);
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(img));
+        if let Some(loc) = &self.u_tex_img {
+            gl.uniform_1_i32(Some(loc), 0);
+        }
+        gl.bind_vertex_array(Some(vao));
+        gl.draw_arrays(glow::TRIANGLES, 0, count);
+        gl.bind_vertex_array(None);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+    }
+
+    /// Draw a textured mesh from the SHARED DYNAMIC buffer (re-uploaded every call) — for
+    /// world-space feature surfaces whose geometry changes on recompute. `mvp` = scene matrix and
+    /// the geometry is already world-space, so the world model is the identity.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_textured_dyn(
+        &mut self,
+        gl: &glow::Context,
+        verts: &[TexVtx],
+        mvp: &[f32; 16],
+        img: glow::Texture,
+        cam: [f32; 3],
+        reflect: f32,
+        proc: ProcParams,
+        pbr: PbrParams,
+        hl: bool,
+    ) {
+        let (Some(prog), Some(vao), Some(vbo)) =
+            (self.tex_prog, self.tex_dyn_vao, self.tex_dyn_vbo)
+        else {
+            return;
+        };
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(verts), glow::DYNAMIC_DRAW);
+        gl.use_program(Some(prog));
+        if let Some(loc) = &self.u_tex_mvp {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
+        }
+        if let Some(loc) = &self.u_tex_model {
+            gl.uniform_matrix_4_f32_slice(Some(loc), false, &IDENTITY16);
+        }
+        if let Some(loc) = &self.u_tex_cam {
+            gl.uniform_3_f32(Some(loc), cam[0], cam[1], cam[2]);
+        }
+        if let Some(loc) = &self.u_tex_reflect {
+            gl.uniform_1_f32(Some(loc), reflect);
+        }
+        if let Some(loc) = &self.u_tex_hl {
+            gl.uniform_1_i32(Some(loc), hl as i32);
+        }
+        self.set_proc(gl, &proc);
+        self.set_pbr(gl, &pbr);
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(img));
+        if let Some(loc) = &self.u_tex_img {
+            gl.uniform_1_i32(Some(loc), 0);
+        }
+        gl.bind_vertex_array(Some(vao));
+        gl.draw_arrays(glow::TRIANGLES, 0, verts.len() as i32);
+        gl.bind_vertex_array(None);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+    }
+
     pub fn render(
         &mut self,
         gl: &glow::Context,
@@ -347,6 +5113,110 @@ impl Scene3dRenderer {
         overlay: &[V3],
         lines: &[V3],
         mvp: &[f32; 16],
+        // `scene_ver`: when `Some(v)`, `verts` is drawn from a persistent buffer that is
+        // re-uploaded ONLY when `v` changes (kills the per-frame upload of a static heavy
+        // scene). `None` = re-upload every frame.
+        scene_ver: Option<u64>,
+        // WHICH PERSISTENT SLOT `verts` LIVES IN — and it must differ per VIEW.
+        //
+        // The 3D Factory and the SIMLUX viewport share one `Scene3dRenderer` and can both be open.
+        // They used to be safe by accident, because SIMLUX passed `scene_ver = None` and drew from
+        // the scratch buffer. Giving SIMLUX a version put both views on slot 0 with different
+        // versions, so each frame evicted the other's upload and BOTH re-uploaded their whole scene
+        // — the exact per-frame cost the versioning was added to remove, doubled.
+        scene_slot: usize,
+        // OPAQUE TRIANGLES THAT CHANGE EVERY FRAME — drawn in the same pass as `verts`, right
+        // after it, from the scratch buffer.
+        //
+        // The SIMLUX view used to pass its whole buffer as `verts` with `scene_ver = None`,
+        // because the comment above once said "the small SIMLUX light view" and it was. It is not
+        // any more: with furniture in the light scene it is millions of triangles, re-uploaded
+        // sixty times a second. Versioning it is only half the fix, because a handful of those
+        // vertices — the fitting markers, sized by camera distance, and the aim arrows — really do
+        // change per frame, and mixing them in would invalidate the version every frame and buy
+        // nothing. They come through here instead, and the heavy half stays parked on the GPU.
+        //
+        // Not the `overlay` pass, which blends at a fixed 0.45 with depth-write off: these are
+        // solid objects and would come out as ghosts. Not in the shadow pass either — nothing here
+        // is big enough to cast a shadow worth the upload.
+        dyn_verts: &[V3],
+        // Furniture instances, each `(key, local_mesh, camera·model)`. Every furniture is drawn
+        // from a persistent per-key GPU buffer with a model matrix — so a heavy mesh is uploaded
+        // once and never CPU-transformed on import/move/rotate. `key` = asset+colour; instances
+        // that share it share the buffer. `local_mesh` is only read the first time a key appears.
+        // `(key, local_mesh, camera·model, world model, in_view)` — the world model for the shadow
+        // lookup + normal maps (identity's fine for already-world geometry).
+        //
+        // `in_view` is [`aabb_in_frustum`] against the CAMERA, and ONLY THE CAMERA PASS MAY HONOUR
+        // IT. The list still has to arrive whole, because two other things read it and both would
+        // be wrong with the off-screen instances missing: the shadow pass, where a machine behind
+        // the camera still casts into shot, and the buffer-eviction set, which would drop the GPU
+        // buffer of anything off screen and re-upload it the moment it came back — turning a pan
+        // into a stutter, which is the opposite of the point.
+        furn: &[(u64, &[V3], [f32; 16], [f32; 16], bool)],
+        // TRANSLUCENT furniture triangles, each `(key, local_mesh, camera·model)` like `furn` but
+        // holding only the see-through faces (glass). Uploaded once per key, drawn in a blended
+        // pass after all opaque geometry; the caller passes them BACK-TO-FRONT for correct order.
+        transp: &[(u64, &[V3A], [f32; 16], [f32; 16])],
+        // Textures referenced by `tex_draws` this frame, as `(index, w, h, rgba)` — uploaded
+        // to GL once and cached by index, so re-pasting the same texture never re-uploads.
+        tex_assets: &[(usize, i32, i32, &[u8])],
+        // Textured draws: `(texture_index, mesh_key, &[TexVtx], camera·model, world model)`.
+        tex_draws: &[(usize, u64, &[TexVtx], [f32; 16], [f32; 16])],
+        // TRANSLUCENT textured draws (textured glass): same tuple as `tex_draws` but drawn in the
+        // blended pass after all opaque geometry, back-to-front, so the image shows through.
+        tex_transp: &[(usize, u64, &[TexVtx], [f32; 16], [f32; 16])],
+        // Textured FEATURE surfaces (world-space, `(texture_index, &[TexVtx])`), re-uploaded
+        // each frame and drawn with the scene `mvp` (they carry no per-object model matrix).
+        tex_feat: &[(usize, &[TexVtx])],
+        // TRANSLUCENT textured feature surfaces (a CSG solid whose texture opacity < 1): same as
+        // `tex_feat` but drawn in the blended pass, back-to-front, so the solid reads see-through.
+        tex_feat_transp: &[(usize, &[TexVtx])],
+        // Camera world position (for the reflection sheen) and per-texture REFLECTION amounts
+        // `(texture_index, reflect 0..1)`. A texture absent here / reflect 0 = matte.
+        cam_pos: [f32; 3],
+        tex_reflect: &[(usize, f32)],
+        // Per-texture PROCEDURAL material params `(texture_index, ProcParams)`. A texture absent
+        // here (or mode 0) samples its bound image as before; mode > 0 evaluates a world-space
+        // noise→ramp pattern in the shader instead (wood grain, marble, …).
+        tex_proc: &[(usize, ProcParams)],
+        // Per-texture PBR maps `(texture_index, PbrParams)` — tangent-space normal + roughness
+        // maps for the textured pass (Texture Phase 2). Absent / all-None renders as before.
+        tex_pbr: &[(usize, PbrParams)],
+        // DAYLIGHT: `Some((dir, sun_rgb))` lights every surface by the sun (dir points TO the sun)
+        // instead of the baked studio scalar. The AMBIENT half no longer travels with it — that is
+        // now the sky in `env`, integrated properly rather than lerped between two colours.
+        // `None` = the fixed studio light (unchanged).
+        sun: Option<([f32; 3], [f32; 3])>,
+        // Sun SHADOWS, as CASCADES: one light matrix per cascade, TIGHTEST FIRST. Empty (or `sun`
+        // None) = no cast shadows. One entry reproduces the single whole-scene map exactly.
+        //
+        // Ordering is load-bearing: the fragment shader walks them in order and uses the first that
+        // contains the fragment, so the tightest map has to come first or every fragment would be
+        // shadowed by the coarsest one available.
+        shadow_mvp: &[[f32; 16]],
+        // CLAY mode: force textured/procedural surfaces to flat grey (glass keeps its alpha). The
+        // flat V3 scene/furniture are greyed CPU-side (see `factory::set_clay`); this covers the
+        // textured pass, which samples its albedo in-shader.
+        clay: bool,
+        // MATERIAL HIGHLIGHT: `Some((texture_index, pulse 0..1))` tints every surface using that
+        // material cyan (pulsing) so the Materials Factory selection is visible in the scene.
+        highlight: Option<(usize, f32)>,
+        // COLOUR MANAGEMENT. Every pass writes scene-referred LINEAR light into an RGBA16F target;
+        // this decides how that becomes pixels at the composite. Pass
+        // [`crate::color::ColorPipeline::passthrough`] for a view whose vertex colours are already
+        // display values (the SIMLUX lux heatmap) — re-grading a false-colour scale corrupts it.
+        color: crate::color::ColorPipeline,
+        // ENVIRONMENT. The analytic sky that lights the scene (its 9 SH coefficients drive every
+        // diffuse ambient, its radiance every glossy reflection), what to draw behind the model,
+        // and the ambient-occlusion settings. [`crate::env::EnvRender::none`] reproduces the
+        // studio-only behaviour exactly, which is what the SIMLUX lighting view passes.
+        env: crate::env::EnvRender,
+        // When true, delete any furniture/texture GPU buffers + GL images NOT referenced this
+        // frame (recolour/delete/re-texture leave stale ones). The factory passes true; the
+        // SIMLUX light view passes false so its empty lists don't wipe the factory's buffers
+        // (both share one renderer).
+        evict_stale: bool,
         vp_left: i32,
         vp_from_bottom: i32,
         vp_w: i32,
@@ -358,8 +5228,444 @@ impl Scene3dRenderer {
             return;
         }
         self.ensure_init(gl);
+
+        // ---- TEMPORAL ACCUMULATION: has anything changed? ----------------
+        // Built from this function's OWN parameters, so no input can be left out of the question
+        // (see [`FrameKey`]). Anything different from last frame throws the history away and the
+        // refinement starts over from one clean sample.
+        //
+        // Bulk geometry that the renderer CACHES by key or version is keyed the same way here —
+        // hashing content the renderer would not re-upload anyway would only invent differences.
+        // Geometry it re-uploads every frame (overlays, lines, feature surfaces) is hashed whole.
+        let taa_on = self.taa_max > 0;
+        if taa_on {
+            // HASHED IN SECTIONS, so a restart can say WHICH input moved.
+            //
+            // The whole-frame hash below is still the thing that decides — these are the same
+            // bytes, folded in groups on the way past. A single hash answers "did anything
+            // change", which is the one question never in doubt when a viewport is grinding.
+            let mut sec = [0u64; Self::TAA_SECTIONS];
+            let mut dbg = std::mem::take(&mut self.taa_dbg);
+
+            let mut f = Fnv::new();
+            f.f32s(mvp);
+            f.f32s(&cam_pos);
+            sec[0] = f.0; // camera
+
+            f.u64(self.env_version);
+            match scene_ver {
+                Some(v) => f.u64(v),
+                None => f.bytes(bytes(verts)),
+            }
+            sec[1] = f.0; // scene
+
+            f.bytes(bytes(overlay));
+            f.bytes(bytes(lines));
+            // Re-uploaded every frame like the other two, so it is hashed whole like them — a
+            // diagnostic that ignored it would report "nothing changed" while the aim arrows moved.
+            f.bytes(bytes(dyn_verts));
+            sec[2] = f.0; // overlay + lines + per-frame opaque
+
+            for (k, m, mv, md, _) in furn {
+                f.u64(*k);
+                f.u64(m.len() as u64);
+                f.f32s(mv);
+                f.f32s(md);
+            }
+            for (k, m, mv, md) in transp {
+                f.u64(*k);
+                f.u64(m.len() as u64);
+                f.f32s(mv);
+                // The world model is part of what the pass draws now — a pane that moves without
+                // its camera·model changing would otherwise reuse a stale accumulation.
+                f.f32s(md);
+            }
+            sec[3] = f.0; // furniture
+
+            for (i, w, h, px) in tex_assets {
+                f.u64(*i as u64);
+                f.u64(((*w as u64) << 32) | *h as u64);
+                f.u64(px.len() as u64);
+            }
+            for (ti, k, m, mv, md) in tex_draws.iter().chain(tex_transp) {
+                f.u64(*ti as u64);
+                f.u64(*k);
+                f.u64(m.len() as u64);
+                f.f32s(mv);
+                f.f32s(md);
+            }
+            for (ti, m) in tex_feat.iter().chain(tex_feat_transp) {
+                f.u64(*ti as u64);
+                f.bytes(bytes(m));
+            }
+            sec[4] = f.0; // textures
+
+            f.dbg(&mut dbg, &(sun, shadow_mvp, clay, highlight, color, env));
+            sec[5] = f.0; // sun, shadow, colour, environment
+
+            for e in tex_reflect {
+                f.dbg(&mut dbg, e);
+            }
+            for e in tex_proc {
+                f.dbg(&mut dbg, e);
+            }
+            for e in tex_pbr {
+                f.dbg(&mut dbg, e);
+            }
+            sec[6] = f.0; // material passes
+
+            self.taa_dbg = dbg;
+            let key = FrameKey {
+                hash: f.0,
+                size: (vp_w, vp_h),
+            };
+            self.taa_stable = key == self.taa_key;
+            if !self.taa_stable {
+                // NAME THE SECTIONS THAT MOVED, before overwriting them. Each section hash folds
+                // in every earlier one, so the FIRST that differs is the culprit and the rest
+                // differ only because it did — reporting all of them would point at everything
+                // every time, which is the same as pointing at nothing.
+                let why = Self::taa_first_changed(&sec, &self.taa_sections);
+                self.taa_why = if !why.is_empty() {
+                    why
+                } else if (vp_w, vp_h) != self.taa_key.size {
+                    "viewport"
+                } else {
+                    "?"
+                };
+                self.taa_sections = sec;
+                self.taa_key = key;
+                self.taa_n = 0;
+            }
+        } else {
+            self.taa_n = 0;
+            self.taa_stable = false;
+        }
+
+        // Sub-pixel camera jitter, from sample 1 onwards. Sample 0 is deliberately UNJITTERED, so
+        // the first frame after any change is bit-for-bit the image this renderer drew before TAA
+        // existed — a drag or an orbit never sees the picture shift under the cursor.
+        let jittered;
+        let mvp: &[f32; 16] = if taa_on && self.taa_n >= 1 {
+            let (jx, jy) = halton_jitter(self.taa_n);
+            jittered = jitter_mvp(mvp, jx, jy, vp_w, vp_h);
+            &jittered
+        } else {
+            mvp
+        };
+
+        // SOFT SUN SHADOWS. Same idea, one dimension up: each accumulation sample sees the sun
+        // from a different point on its disc, so the average is the disc's own penumbra. Applied
+        // AFTER the frame key, deliberately — the jitter is how the frame is being refined, not a
+        // change to what the frame is, and folding it into the key would restart the refinement
+        // every frame and guarantee it never converged.
+        let spun_cascades;
+        let (sun, shadow_mvp): (_, &[[f32; 16]]) = match sun {
+            Some((d, col)) if taa_on && self.taa_n >= 1 && env.sun_angle_deg > 0.0 => {
+                let half = env.sun_angle_deg.to_radians() * 0.5;
+                match sun_disc_sample(d, half, self.taa_n) {
+                    (d2, Some(spin)) => {
+                        // The SAME rotation for every cascade. Drawing an independent sample per
+                        // cascade would light each slice of the view from a slightly different sun,
+                        // and the seam where two cascades meet would flicker.
+                        spun_cascades = shadow_mvp
+                            .iter()
+                            .map(|m| rotate_light(*m, spin))
+                            .collect::<Vec<_>>();
+                        (Some((d2, col)), &spun_cascades[..])
+                    }
+                    _ => (sun, shadow_mvp),
+                }
+            }
+            _ => (sun, shadow_mvp),
+        };
+
         unsafe {
             self.ensure_fbo(gl, vp_w, vp_h);
+
+            // Converged, and nothing changed: the finished image is already sitting in the
+            // accumulation buffer, so present it and skip the scene entirely. This is what makes
+            // an idle heavy viewport nearly free — the alternative is redrawing a million
+            // triangles to arrive at a pixel-identical result.
+            if taa_on && self.taa_valid && self.taa_n >= self.taa_max {
+                if let Some(src) = self.taa_tex[self.taa_cur] {
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                    gl.viewport(0, 0, screen_w.max(1), screen_h.max(1));
+                    gl.enable(glow::SCISSOR_TEST);
+                    gl.disable(glow::DEPTH_TEST);
+                    gl.disable(glow::BLEND);
+                    let quad = panel_quad(vp_left, vp_from_bottom, vp_w, vp_h, screen_w, screen_h);
+                    // `composed` = true, so the fog arguments are inert here — the accumulated
+                    // buffer already has it.
+                    self.composite(
+                        gl,
+                        &quad,
+                        src,
+                        true,
+                        false,
+                        false,
+                        false,
+                        color,
+                        &env.fog,
+                        cam_pos,
+                        mvp,
+                        (vp_left, vp_from_bottom, vp_w, vp_h),
+                    );
+                    release_scissor(gl, screen_w, screen_h);
+                    gl.enable(glow::BLEND);
+                    gl.use_program(None);
+                    self.note_geom(
+                        gl,
+                        (vp_left, vp_from_bottom, vp_w, vp_h),
+                        (screen_w, screen_h),
+                        &env,
+                        0,
+                    );
+                    return;
+                }
+            }
+
+            // ---- evict GPU resources no longer referenced ----------------
+            // Deleting/recolouring/re-texturing an object orphans its per-key buffer; without
+            // this they accumulate for the whole session. Keyed on what THIS frame draws.
+            if evict_stale {
+                use std::collections::HashSet;
+                let live_furn: HashSet<u64> = furn.iter().map(|&(k, _, _, _, _)| k).collect();
+                self.furn_bufs.retain(|k, &mut (vao, vbo, _)| {
+                    if live_furn.contains(k) {
+                        return true;
+                    }
+                    gl.delete_vertex_array(vao);
+                    gl.delete_buffer(vbo);
+                    false
+                });
+                let live_transp: HashSet<u64> = transp.iter().map(|&(k, _, _, _)| k).collect();
+                self.transp_bufs.retain(|k, &mut (vao, vbo, _)| {
+                    if live_transp.contains(k) {
+                        return true;
+                    }
+                    gl.delete_vertex_array(vao);
+                    gl.delete_buffer(vbo);
+                    false
+                });
+                let live_tex: HashSet<u64> = tex_draws
+                    .iter()
+                    .map(|&(_, k, _, _, _)| k)
+                    .chain(tex_transp.iter().map(|&(_, k, _, _, _)| k))
+                    .collect();
+                self.tex_bufs.retain(|k, &mut (vao, vbo, _)| {
+                    if live_tex.contains(k) {
+                        return true;
+                    }
+                    gl.delete_vertex_array(vao);
+                    gl.delete_buffer(vbo);
+                    false
+                });
+                let live_img: HashSet<usize> = tex_assets.iter().map(|&(i, _, _, _)| i).collect();
+                self.tex_images.retain(|&(k, _srgb), &mut tex| {
+                    if live_img.contains(&k) {
+                        return true;
+                    }
+                    gl.delete_texture(tex);
+                    false
+                });
+            }
+
+            // ---- SUN SHADOW MAP: depth pass from the sun's point of view ----
+            // Only when daylight + shadows are requested. Renders the opaque casters (scene +
+            // furniture) into the depth-only shadow FBO with the light-space matrix; the main
+            // passes below sample it. Front-face culling during the depth pass curbs shadow acne.
+            let cascades = &shadow_mvp[..shadow_mvp.len().min(CASCADE_MAX)];
+            let do_shadow = sun.is_some() && !cascades.is_empty();
+            if do_shadow {
+                self.ensure_shadow_fbo(gl);
+                if let (Some(dprog), Some(sfbo), Some(stex)) =
+                    (self.depth_prog, self.shadow_fbo, self.shadow_tex)
+                {
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(sfbo));
+                    // SCISSOR OFF, and this is the whole ballgame.
+                    //
+                    // egui hands the callback a scissor set to the 3D panel's rect in WINDOW
+                    // coordinates, and it is still set here. The shadow map is a 2048² texture with
+                    // its own coordinate space, so that rectangle lands somewhere arbitrary inside
+                    // it — and `glClear` obeys the scissor just as draws do. The result is a depth
+                    // map that is only cleared and only drawn inside a window-shaped patch; every
+                    // texel outside it keeps whatever was in that memory, which reads as "an
+                    // occluder is standing right here" and comes out as hard black shadow.
+                    //
+                    // Because the patch is fixed in WINDOW space while the map is in LIGHT space,
+                    // moving the camera slides the scene across the boundary — so the black region
+                    // swims about as you orbit and the sun looks welded to the viewpoint. It is not:
+                    // the sun's direction never sees the camera. This is the shadow map being
+                    // partly undrawn.
+                    gl.disable(glow::SCISSOR_TEST);
+                    gl.viewport(0, 0, self.shadow_size, self.shadow_size);
+                    gl.enable(glow::DEPTH_TEST);
+                    gl.depth_func(glow::LESS);
+                    gl.disable(glow::BLEND);
+                    gl.enable(glow::CULL_FACE);
+                    gl.cull_face(glow::FRONT);
+                    gl.use_program(Some(dprog));
+                    // The scene's static buffer is uploaded ONCE, outside the cascade loop — three
+                    // cascades must not mean three re-uploads of a million-triangle villa.
+                    let scene_ready = !verts.is_empty()
+                        && match (
+                            scene_ver,
+                            self.static_vao[scene_slot],
+                            self.static_vbo[scene_slot],
+                        ) {
+                            (Some(v), Some(_), Some(vbo)) => {
+                                if self.static_ver[scene_slot] != v {
+                                    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                                    gl.buffer_data_u8_slice(
+                                        glow::ARRAY_BUFFER,
+                                        bytes(verts),
+                                        glow::STATIC_DRAW,
+                                    );
+                                    self.static_ver[scene_slot] = v;
+                                    self.static_len[scene_slot] = verts.len() as i32;
+                                }
+                                true
+                            }
+                            _ => false,
+                        };
+                    for (ci, lmvp) in cascades.iter().enumerate() {
+                        // Re-point the FBO at this cascade's layer of the array and clear IT — the
+                        // clear has to be inside the loop or every cascade after the first would be
+                        // drawn on top of the one before.
+                        gl.framebuffer_texture_layer(
+                            glow::FRAMEBUFFER,
+                            glow::DEPTH_ATTACHMENT,
+                            Some(stex),
+                            0,
+                            ci as i32,
+                        );
+                        gl.clear(glow::DEPTH_BUFFER_BIT);
+                        // Scene (world-space) → depth_mvp = light_mvp.
+                        if scene_ready {
+                            if let Some(vao) = self.static_vao[scene_slot] {
+                                if let Some(loc) = &self.u_depth_mvp {
+                                    gl.uniform_matrix_4_f32_slice(Some(loc), false, lmvp);
+                                }
+                                gl.bind_vertex_array(Some(vao));
+                                gl.draw_arrays(glow::TRIANGLES, 0, self.static_len[scene_slot]);
+                            }
+                        }
+                        // Furniture (local) → depth_mvp = light_mvp · model.
+                        let lm = Mat4::from_cols_array(lmvp);
+                        for &(key, fverts, _fmvp, ref model, _seen) in furn {
+                            if let Some((vao, count)) = self.furn_buf(gl, key, fverts) {
+                                let dm = (lm * Mat4::from_cols_array(model)).to_cols_array();
+                                if let Some(loc) = &self.u_depth_mvp {
+                                    gl.uniform_matrix_4_f32_slice(Some(loc), false, &dm);
+                                }
+                                gl.bind_vertex_array(Some(vao));
+                                gl.draw_arrays(glow::TRIANGLES, 0, count);
+                            }
+                        }
+                    }
+                    gl.cull_face(glow::BACK);
+                    gl.disable(glow::CULL_FACE);
+                    gl.bind_vertex_array(None);
+                }
+            }
+
+            // ---- per-frame sun + shadow uniforms on the scene & textured programs ----
+            // Bind the shadow map on unit 1 for both programs to sample.
+            if do_shadow {
+                gl.active_texture(glow::TEXTURE1);
+                gl.bind_texture(glow::TEXTURE_2D_ARRAY, self.shadow_tex);
+                gl.active_texture(glow::TEXTURE0);
+            }
+            // The HDR environment stays bound for the whole frame — the backdrop, the solid pass
+            // and the textured pass all read it from the same unit, so binding it once here is
+            // simpler than three binds and cannot get out of step with the uniform.
+            if self.env_tex.is_some() {
+                gl.active_texture(glow::TEXTURE0 + ENV_UNIT as u32);
+                gl.bind_texture(glow::TEXTURE_2D, self.env_tex);
+                gl.active_texture(glow::TEXTURE0 + ENV_UNIT as u32 + 1);
+                // Falls back to the chain if the full-resolution copy could not be created (a 4K
+                // RGB16F is 50 MB). Softer than intended beats an unbound sampler, which reads as
+                // black and looks like the environment failed to load.
+                gl.bind_texture(glow::TEXTURE_2D, self.env_bg_tex.or(self.env_tex));
+                gl.active_texture(glow::TEXTURE0);
+            }
+            // The cascade matrices as ONE flat upload — a `mat4[3]` uniform takes 48 contiguous
+            // floats. Unused cascades are left as identity; `u_csm_n` stops the shader reading them.
+            let mut lmvps = [0.0f32; CASCADE_MAX * 16];
+            for c in 0..CASCADE_MAX {
+                let m = cascades.get(c).copied().unwrap_or(IDENTITY16);
+                lmvps[c * 16..(c + 1) * 16].copy_from_slice(&m);
+            }
+            let csm_n = cascades.len() as i32;
+            // The SOLID passes carry scene-referred linear light already (the CPU shader decodes the
+            // material's sRGB before multiplying it by irradiance), so they must not be decoded
+            // again. Only the overlay and line passes carry authored sRGB — UI swatches — and they
+            // set this back to 1 just before they draw.
+            let lin = color.linearize_vertex as i32;
+            if let Some(prog) = self.scene_prog {
+                gl.use_program(Some(prog));
+                self.sky_u_scene.set(gl, &env, ENV_UNIT);
+                if let Some(loc) = &self.u_scene_shadow_on {
+                    gl.uniform_1_i32(Some(loc), do_shadow as i32);
+                }
+                if let Some(loc) = &self.u_scene_light_mvp {
+                    gl.uniform_matrix_4_f32_slice(Some(loc), false, &lmvps);
+                }
+                if let Some(loc) = &self.u_scene_csm_n {
+                    gl.uniform_1_i32(Some(loc), csm_n);
+                }
+                if let Some(loc) = &self.u_scene_shadow {
+                    gl.uniform_1_i32(Some(loc), 1);
+                }
+                if let Some(loc) = &self.u_scene_linearize {
+                    gl.uniform_1_i32(Some(loc), 0);
+                }
+            }
+            if let Some(prog) = self.transp_prog {
+                gl.use_program(Some(prog));
+                if let Some(loc) = &self.u_transp_linearize {
+                    gl.uniform_1_i32(Some(loc), 0);
+                }
+            }
+            if let Some(prog) = self.tex_prog {
+                gl.use_program(Some(prog));
+                let on = sun.is_some();
+                if let Some(loc) = &self.u_tex_sun_on {
+                    gl.uniform_1_i32(Some(loc), on as i32);
+                }
+                if let Some((d, sc)) = sun {
+                    if let Some(loc) = &self.u_tex_sun_dir {
+                        gl.uniform_3_f32(Some(loc), d[0], d[1], d[2]);
+                    }
+                    if let Some(loc) = &self.u_tex_sun_col {
+                        gl.uniform_3_f32(Some(loc), sc[0], sc[1], sc[2]);
+                    }
+                }
+                self.sky_u_tex.set(gl, &env, ENV_UNIT);
+                if let Some(loc) = &self.u_tex_shadow_on {
+                    gl.uniform_1_i32(Some(loc), do_shadow as i32);
+                }
+                if let Some(loc) = &self.u_tex_light_mvp {
+                    gl.uniform_matrix_4_f32_slice(Some(loc), false, &lmvps);
+                }
+                if let Some(loc) = &self.u_tex_csm_n {
+                    gl.uniform_1_i32(Some(loc), csm_n);
+                }
+                if let Some(loc) = &self.u_tex_shadow {
+                    gl.uniform_1_i32(Some(loc), 1);
+                }
+                if let Some(loc) = &self.u_tex_clay {
+                    gl.uniform_1_i32(Some(loc), clay as i32);
+                }
+                // Highlight pulse strength once per frame; per-draw u_hl flags the matching material.
+                if let Some(loc) = &self.u_tex_hl_k {
+                    gl.uniform_1_f32(Some(loc), highlight.map(|(_, k)| k).unwrap_or(0.0));
+                }
+                if let Some(loc) = &self.u_tex_hl {
+                    gl.uniform_1_i32(Some(loc), 0);
+                }
+            }
 
             // ---- 3D pass into the offscreen FBO --------------------------
             gl.bind_framebuffer(glow::FRAMEBUFFER, self.fbo);
@@ -368,24 +5674,351 @@ impl Scene3dRenderer {
             gl.enable(glow::DEPTH_TEST);
             gl.depth_func(glow::LESS);
             gl.disable(glow::BLEND);
-            gl.clear_color(0.07, 0.086, 0.11, 1.0);
-            gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+            // The FBO holds linear light now, so the backdrop is authored in sRGB and decoded — a
+            // Raw pipeline keeps the literal bytes it always had.
+            let bg = if color.linearize_vertex {
+                crate::color::srgb_to_linear3([0.07, 0.086, 0.11])
+            } else {
+                [0.07, 0.086, 0.11]
+            };
+            // Per-attachment clears: the backdrop belongs in the DIRECT buffer, and the ambient
+            // buffer starts empty. A single `clear_color` would have written the studio grey into
+            // both, and the composite would then have added it to itself.
+            gl.clear_buffer_f32_slice(glow::COLOR, 0, &[bg[0], bg[1], bg[2], 1.0]);
+            gl.clear_buffer_f32_slice(glow::COLOR, 1, &[0.0, 0.0, 0.0, 1.0]);
+            // Albedo clears to ZERO, which means "background, nothing bounces here". A clear to
+            // grey would make every pixel the model does not cover into a bounce card.
+            gl.clear_buffer_f32_slice(glow::COLOR, 2, &[0.0, 0.0, 0.0, 1.0]);
+            gl.clear(glow::DEPTH_BUFFER_BIT);
+
+            // ---- sky backdrop -------------------------------------------
+            // Drawn over the cleared background, before any geometry, with depth off. Anything the
+            // model covers is simply overwritten, so it costs one full-screen pass and no sorting.
+            // An HDR ENVIRONMENT counts as a sky in its own right. This used to require a valid
+            // analytic dome, which meant an HDRI drew nothing whenever daylight was switched off or
+            // the sun was below the horizon — and in an empty scene the backdrop is the entire
+            // image, so the environment looked as though it had failed to load at all.
+            let have_sky = env.hdri.is_some() || env.sky.map(|s| s.valid).unwrap_or(false);
+            if env.backdrop == crate::env::Backdrop::Sky && have_sky {
+                if let (Some(prog), Some(vao), Some(vbo)) =
+                    (self.sky_prog, self.blit_vao, self.blit_vbo)
+                {
+                    const FULL: [f32; 24] = [
+                        -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0,
+                        0.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0,
+                    ];
+                    let inv = Mat4::from_cols_array(mvp).inverse().to_cols_array();
+                    gl.disable(glow::DEPTH_TEST);
+                    gl.depth_mask(false);
+                    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                    gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&FULL), glow::DYNAMIC_DRAW);
+                    gl.use_program(Some(prog));
+                    if let Some(l) = &self.u_sky_inv_vp {
+                        gl.uniform_matrix_4_f32_slice(Some(l), false, &inv);
+                    }
+                    if let Some(l) = &self.u_sky_cam {
+                        gl.uniform_3_f32(Some(l), cam_pos[0], cam_pos[1], cam_pos[2]);
+                    }
+                    self.sky_u_bg.set(gl, &env, ENV_UNIT);
+                    gl.bind_vertex_array(Some(vao));
+                    gl.draw_arrays(glow::TRIANGLES, 0, 6);
+                    gl.bind_vertex_array(None);
+                    gl.depth_mask(true);
+                    gl.enable(glow::DEPTH_TEST);
+                }
+            }
 
             if !verts.is_empty() {
-                if let (Some(prog), Some(vao), Some(vbo)) = (self.scene_prog, self.scene_vao, self.scene_vbo) {
-                    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-                    gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(verts), glow::DYNAMIC_DRAW);
-                    gl.use_program(Some(prog));
-                    if let Some(loc) = &self.u_mvp {
-                        gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
-                    }
-                    if let Some(loc) = &self.u_alpha {
-                        gl.uniform_1_f32(Some(loc), 1.0); // opaque
-                    }
-                    gl.bind_vertex_array(Some(vao));
-                    gl.draw_arrays(glow::TRIANGLES, 0, verts.len() as i32);
-                    gl.bind_vertex_array(None);
+                self.draw_opaque_batch(gl, verts, mvp, scene_ver, scene_slot);
+            }
+            // The frame-by-frame opaque geometry, in the same pass and the same state, from the
+            // scratch buffer. `None` is what makes it a fresh upload each time, which is right:
+            // it is small and it has genuinely changed.
+            if !dyn_verts.is_empty() {
+                self.draw_opaque_batch(gl, dyn_verts, mvp, None, 0);
+            }
+
+            // ---- furniture pass: every instance, its own model matrix ----
+            // Same opaque state as the scene. Each furniture draws from a persistent GPU buffer
+            // (uploaded once, keyed by asset+colour) with camera·model — so import/move/rotate
+            // of even a multi-million-triangle piece needs no CPU transform and no re-upload.
+            // THE ONE PASS THAT SKIPS WHAT IS OFF SCREEN. The shadow pass above deliberately does
+            // not — a piece behind the camera still casts into shot — and neither does the
+            // eviction set, which would otherwise re-upload it the moment it panned back in.
+            for &(key, verts, ref fmvp, ref model, in_view) in furn {
+                if !in_view {
+                    continue;
                 }
+                self.draw_furn(gl, key, verts, fmvp, model);
+            }
+
+            // ---- textured pass: objects carrying a pasted image ----------
+            // Same opaque state. Upload any referenced textures once, then draw each textured
+            // mesh from its persistent buffer with the bound image + camera·model matrix.
+            // Per-texture reflection / procedural / PBR-map lookups (defaults when absent).
+            // A texture the caller said nothing about reflects its surroundings by the physically
+            // correct amount — the shader's `f0`/split-sum already decides how much that is. The
+            // old 0.0 fallback made "no opinion" mean "matte", which is not a neutral default: it
+            // switched the environment lobe off for every imported material in the scene.
+            let reflect_of = |idx: usize| {
+                tex_reflect
+                    .iter()
+                    .find(|(i, _)| *i == idx)
+                    .map(|(_, r)| *r)
+                    .unwrap_or(1.0)
+            };
+            let proc_of = |idx: usize| {
+                tex_proc
+                    .iter()
+                    .find(|(i, _)| *i == idx)
+                    .map(|(_, p)| *p)
+                    .unwrap_or_default()
+            };
+            let pbr_of = |idx: usize| {
+                tex_pbr
+                    .iter()
+                    .find(|(i, _)| *i == idx)
+                    .map(|(_, p)| *p)
+                    .unwrap_or_default()
+            };
+            let hl_of = |idx: usize| highlight.map(|(h, _)| h == idx).unwrap_or(false);
+            if !tex_draws.is_empty()
+                || !tex_feat.is_empty()
+                || !tex_transp.is_empty()
+                || !tex_feat_transp.is_empty()
+            {
+                // Which indices are used as DATA maps this frame — they need a second, linear
+                // upload. Most textures are albedo-only and get just the sRGB one.
+                let data_maps: std::collections::HashSet<usize> = tex_pbr
+                    .iter()
+                    .flat_map(|(_, p)| [p.normal_idx, p.rough_idx, p.metal_idx, p.ao_idx])
+                    .flatten()
+                    .collect();
+                for &(idx, w, h, rgba) in tex_assets {
+                    let _ = self.ensure_texture(gl, idx, w, h, rgba, true);
+                    if data_maps.contains(&idx) {
+                        let _ = self.ensure_texture(gl, idx, w, h, rgba, false);
+                    }
+                }
+                // Nothing in the OPAQUE textured pass transmits — and this program is shared with
+                // the blended pass below, where the flag is turned back on.
+                if let Some(prog) = self.tex_prog {
+                    gl.use_program(Some(prog));
+                    if let Some(l) = &self.u_tex_tr_on {
+                        gl.uniform_1_i32(Some(l), 0);
+                    }
+                    // Nor can the opaque pass REFLECT the scene: the copy it would march does not
+                    // exist yet — this pass is what fills it.
+                    if let Some(l) = &self.u_tex_ssr_on {
+                        gl.uniform_1_i32(Some(l), 0);
+                    }
+                }
+                // Furniture (persistent per-key buffers + model matrix).
+                for &(tex_idx, mesh_key, verts, ref tmvp, ref model) in tex_draws {
+                    if let Some(img) = self.tex_images.get(&(tex_idx, true)).copied() {
+                        self.draw_textured(
+                            gl,
+                            mesh_key,
+                            verts,
+                            tmvp,
+                            model,
+                            img,
+                            cam_pos,
+                            reflect_of(tex_idx),
+                            proc_of(tex_idx),
+                            pbr_of(tex_idx),
+                            hl_of(tex_idx),
+                        );
+                    }
+                }
+                // Feature surfaces (dynamic, world-space, scene mvp).
+                for &(tex_idx, verts) in tex_feat {
+                    if let Some(img) = self.tex_images.get(&(tex_idx, true)).copied() {
+                        self.draw_textured_dyn(
+                            gl,
+                            verts,
+                            mvp,
+                            img,
+                            cam_pos,
+                            reflect_of(tex_idx),
+                            proc_of(tex_idx),
+                            pbr_of(tex_idx),
+                            hl_of(tex_idx),
+                        );
+                    }
+                }
+            }
+
+            // ---- transparent furniture pass — glass panes etc. ----------
+            // Depth-TESTED against the opaque geometry already in the buffer (so glass behind a
+            // wall is correctly hidden) but with depth writes OFF, so overlapping translucent
+            // faces all show through instead of the nearest one occluding the rest. The caller
+            // hands `transp` back-to-front, which is the ordering blending needs.
+            if !transp.is_empty() || !tex_transp.is_empty() || !tex_feat_transp.is_empty() {
+                // A copy of the opaque scene, taken BEFORE any glass is drawn — a shader cannot
+                // read the buffer it is writing to. Both see-through paths need it: the flat one
+                // to REFRACT, the textured one to FILTER what is behind it by the material's own
+                // colour instead of letting the blender mix it in undyed.
+                let scene_copied = self.scene_copy(gl, vp_w, vp_h);
+                let refract = env.refract.enabled && !transp.is_empty() && scene_copied;
+                if let Some(prog) = self.transp_prog {
+                    gl.use_program(Some(prog));
+                    if let Some(loc) = &self.u_transp_refr_on {
+                        gl.uniform_1_i32(Some(loc), refract as i32);
+                    }
+                    if refract {
+                        // Unit 5: clear of the albedo/normal/roughness maps the textured pass binds
+                        // below, which shares this framebuffer state.
+                        gl.active_texture(glow::TEXTURE5);
+                        gl.bind_texture(glow::TEXTURE_2D, self.refr_tex);
+                        gl.active_texture(glow::TEXTURE0);
+                        if let Some(l) = &self.u_transp_scene {
+                            gl.uniform_1_i32(Some(l), 5);
+                        }
+                        if let Some(l) = &self.u_transp_scene_vp {
+                            gl.uniform_matrix_4_f32_slice(Some(l), false, mvp);
+                        }
+                        if let Some(l) = &self.u_transp_cam {
+                            gl.uniform_3_f32(Some(l), cam_pos[0], cam_pos[1], cam_pos[2]);
+                        }
+                        if let Some(l) = &self.u_transp_refr_vp {
+                            gl.uniform_2_f32(Some(l), vp_w as f32, vp_h as f32);
+                        }
+                        if let Some(l) = &self.u_transp_ior {
+                            gl.uniform_1_f32(Some(l), env.refract.ior.max(1.0));
+                        }
+                        if let Some(l) = &self.u_transp_thick {
+                            gl.uniform_1_f32(Some(l), env.refract.thickness.max(0.0));
+                        }
+                    }
+                }
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                gl.depth_mask(false);
+                for &(key, verts, ref tmvp, ref tmodel) in transp {
+                    self.draw_transp(gl, key, verts, tmvp, tmodel);
+                }
+                if refract {
+                    gl.active_texture(glow::TEXTURE5);
+                    gl.bind_texture(glow::TEXTURE_2D, None);
+                    gl.active_texture(glow::TEXTURE0);
+                }
+                // Textured glass (image shows through). Drawn after the flat glass; the images
+                // were uploaded in the textured pass above.
+                //
+                // Unit 6 for the scene copy: 5 is the AO map in this program (the flat glass pass
+                // above can use 5 only because it binds no maps at all).
+                if scene_copied {
+                    if let Some(prog) = self.tex_prog {
+                        gl.use_program(Some(prog));
+                        gl.active_texture(glow::TEXTURE6);
+                        gl.bind_texture(glow::TEXTURE_2D, self.refr_tex);
+                        gl.active_texture(glow::TEXTURE0);
+                        if let Some(l) = &self.u_tex_tr_on {
+                            gl.uniform_1_i32(Some(l), 1);
+                        }
+                        if let Some(l) = &self.u_tex_tr_scene {
+                            gl.uniform_1_i32(Some(l), 6);
+                        }
+                        if let Some(l) = &self.u_tex_tr_scene_vp {
+                            gl.uniform_matrix_4_f32_slice(Some(l), false, mvp);
+                        }
+                        if let Some(l) = &self.u_tex_tr_vp {
+                            gl.uniform_2_f32(Some(l), vp_w as f32, vp_h as f32);
+                        }
+                        if let Some(l) = &self.u_tex_tr_ior {
+                            gl.uniform_1_f32(Some(l), env.refract.ior.max(1.0));
+                        }
+                        // The Refraction toggle controls the BEND only. Transmission itself is not
+                        // an effect to be switched off — it is what the material says it is, and
+                        // turning it off would put the pool back to being a lid.
+                        let thick = if env.refract.enabled {
+                            env.refract.thickness.max(0.0)
+                        } else {
+                            0.0
+                        };
+                        if let Some(l) = &self.u_tex_tr_thick {
+                            gl.uniform_1_f32(Some(l), thick);
+                        }
+                        // The scene's DEPTH on unit 7, beside its colour on 6. Bound whenever the
+                        // copy exists and NOT only when reflections are on: the medium/container
+                        // test above reads it too, and gating it on an unrelated toggle would put
+                        // the pool's z-fight back the moment someone unticked reflections.
+                        let have_depth = self.refr_depth.is_some();
+                        if have_depth {
+                            gl.active_texture(glow::TEXTURE7);
+                            gl.bind_texture(glow::TEXTURE_2D, self.refr_depth);
+                            gl.active_texture(glow::TEXTURE0);
+                            let inv = Mat4::from_cols_array(mvp).inverse().to_cols_array();
+                            if let Some(l) = &self.u_tex_ssr_depth {
+                                gl.uniform_1_i32(Some(l), 7);
+                            }
+                            if let Some(l) = &self.u_tex_ssr_inv_vp {
+                                gl.uniform_matrix_4_f32_slice(Some(l), false, &inv);
+                            }
+                        }
+                        // SCREEN-SPACE REFLECTIONS proper.
+                        let ssr = env.ssr.enabled && have_depth;
+                        if let Some(l) = &self.u_tex_ssr_on {
+                            gl.uniform_1_i32(Some(l), ssr as i32);
+                        }
+                        if ssr {
+                            if let Some(l) = &self.u_tex_ssr_dist {
+                                gl.uniform_1_f32(Some(l), env.ssr.distance.max(0.1));
+                            }
+                            if let Some(l) = &self.u_tex_ssr_thick {
+                                gl.uniform_1_f32(Some(l), env.ssr.thickness.max(0.01));
+                            }
+                            // The SAME counter the still-frame accumulation averages over, so the
+                            // march's jitter decorrelates across exactly the frames being summed.
+                            if let Some(l) = &self.u_tex_ssr_frame {
+                                gl.uniform_1_i32(Some(l), self.taa_n as i32);
+                            }
+                        }
+                    }
+                }
+                for &(tex_idx, mesh_key, verts, ref tmvp, ref model) in tex_transp {
+                    if let Some(img) = self.tex_images.get(&(tex_idx, true)).copied() {
+                        self.draw_textured(
+                            gl,
+                            mesh_key,
+                            verts,
+                            tmvp,
+                            model,
+                            img,
+                            cam_pos,
+                            reflect_of(tex_idx),
+                            proc_of(tex_idx),
+                            pbr_of(tex_idx),
+                            hl_of(tex_idx),
+                        );
+                    }
+                }
+                // See-through CSG feature solids (world-space, scene mvp); caller sorts back-to-front.
+                for &(tex_idx, verts) in tex_feat_transp {
+                    if let Some(img) = self.tex_images.get(&(tex_idx, true)).copied() {
+                        self.draw_textured_dyn(
+                            gl,
+                            verts,
+                            mvp,
+                            img,
+                            cam_pos,
+                            reflect_of(tex_idx),
+                            proc_of(tex_idx),
+                            pbr_of(tex_idx),
+                            hl_of(tex_idx),
+                        );
+                    }
+                }
+                if scene_copied {
+                    for u in [glow::TEXTURE6, glow::TEXTURE7] {
+                        gl.active_texture(u);
+                        gl.bind_texture(glow::TEXTURE_2D, None);
+                    }
+                    gl.active_texture(glow::TEXTURE0);
+                }
+                gl.depth_mask(true);
+                gl.disable(glow::BLEND);
             }
 
             // ---- overlay pass — selection shade + modifier ghosts --------
@@ -403,6 +6036,12 @@ impl Scene3dRenderer {
                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                     gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(overlay), glow::DYNAMIC_DRAW);
                     gl.use_program(Some(prog));
+                    if let Some(loc) = &self.u_scene_shadow_on {
+                        gl.uniform_1_i32(Some(loc), 0);
+                    } // overlays never shadowed
+                    if let Some(loc) = &self.u_scene_linearize {
+                        gl.uniform_1_i32(Some(loc), lin);
+                    } // UI colours are sRGB
                     if let Some(loc) = &self.u_mvp {
                         gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
                     }
@@ -429,6 +6068,12 @@ impl Scene3dRenderer {
                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                     gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(lines), glow::DYNAMIC_DRAW);
                     gl.use_program(Some(prog));
+                    if let Some(loc) = &self.u_scene_shadow_on {
+                        gl.uniform_1_i32(Some(loc), 0);
+                    } // lines never shadowed
+                    if let Some(loc) = &self.u_scene_linearize {
+                        gl.uniform_1_i32(Some(loc), lin);
+                    } // UI colours are sRGB
                     if let Some(loc) = &self.u_mvp {
                         gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
                     }
@@ -441,74 +6086,3276 @@ impl Scene3dRenderer {
                 }
             }
 
-            // ---- composite the colour texture into the panel rect --------
+            // ---- ambient occlusion over the finished depth buffer --------
+            // After all geometry (so every draw kind is represented) and before the composite (so
+            // the result is available when the two light buffers are added back together).
+            let ao_ready = env.ao.enabled && self.run_ssao(gl, &env.ao, mvp, cam_pos, vp_w, vp_h);
+
+            // ---- post passes, then composite into the panel rect ---------
+            // The scissor stays OFF through the post chain. egui's scissor rect is the panel in
+            // SCREEN coordinates, while bloom and the accumulator render into their own targets
+            // starting at (0, 0) — leaving it enabled clips whatever falls outside the panel's
+            // screen position, so a viewport anywhere but the bottom-left corner gets a pyramid
+            // that is partly never written. It goes back on for the composite, which really does
+            // draw into the panel rect and must be clipped to it.
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            gl.viewport(0, 0, screen_w.max(1), screen_h.max(1)); // restore egui's full-screen viewport
-            gl.enable(glow::SCISSOR_TEST); // egui's scissor (= this rect) is still set
             gl.disable(glow::DEPTH_TEST);
             gl.disable(glow::BLEND);
 
-            let sw = screen_w.max(1) as f32;
-            let sh = screen_h.max(1) as f32;
-            let x0 = 2.0 * vp_left as f32 / sw - 1.0;
-            let x1 = 2.0 * (vp_left + vp_w) as f32 / sw - 1.0;
-            let y0 = 2.0 * vp_from_bottom as f32 / sh - 1.0;
-            let y1 = 2.0 * (vp_from_bottom + vp_h) as f32 / sh - 1.0;
-            // 6 verts: pos.xy, uv
-            let quad: [f32; 24] = [
-                x0, y0, 0.0, 0.0,  x1, y0, 1.0, 0.0,  x1, y1, 1.0, 1.0,
-                x0, y0, 0.0, 0.0,  x1, y1, 1.0, 1.0,  x0, y1, 0.0, 1.0,
-            ];
-            if let (Some(prog), Some(vao), Some(vbo), Some(color)) =
-                (self.blit_prog, self.blit_vao, self.blit_vbo, self.color)
-            {
-                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&quad), glow::DYNAMIC_DRAW);
-                gl.use_program(Some(prog));
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_texture(glow::TEXTURE_2D, Some(color));
-                if let Some(loc) = &self.u_tex {
-                    gl.uniform_1_i32(Some(loc), 0);
+            let quad = panel_quad(vp_left, vp_from_bottom, vp_w, vp_h, screen_w, screen_h);
+            // BLOOM, over the finished scene buffer and before the composite reads it. It writes
+            // into its own pyramid, restores the default framebuffer, and reports whether the
+            // composite may sample the result.
+            let bloom_ready = self.bloom_pass(gl, vp_w as i32, vp_h as i32, ao_ready, color);
+
+            // ACCUMULATE. The resolve composes this sample exactly as the composite would, averages
+            // it into the history, and hands back the running mean for the composite to grade.
+            // The depth buffer was written with the JITTERED camera, so the fog reconstructs world
+            // positions with the same matrix — otherwise every accumulation sample would place the
+            // scene a fraction of a pixel elsewhere and the fog would shimmer along silhouettes.
+            let inv_vp = Mat4::from_cols_array(mvp).inverse().to_cols_array();
+            // ONE BOUNCE of coloured light between visible surfaces, gathered from the G-buffer.
+            // Before the accumulation resolve, so its noise is averaged away by the same sixteen
+            // samples that anti-alias the image — a gather this sparse needs that.
+            let ssgi_ready = self.run_ssgi(gl, &env.gi, ao_ready, mvp, cam_pos, vp_w, vp_h);
+            let accumulated = if taa_on {
+                let t = self.taa_resolve(
+                    gl,
+                    vp_w,
+                    vp_h,
+                    ao_ready,
+                    bloom_ready,
+                    ssgi_ready,
+                    color,
+                    &env.fog,
+                    cam_pos,
+                    &inv_vp,
+                    &env.gi,
+                );
+                if t.is_none() {
+                    // The resolve could not run — no buffers, or the program failed to compile.
+                    // Turn accumulation OFF outright rather than marking it converged: "converged"
+                    // would send the next frame down the re-present path, which would show a
+                    // buffer nothing has ever written and leave the viewport black for good.
+                    // This way the scene is simply drawn every frame, exactly as it did before
+                    // accumulation existed.
+                    self.taa_max = 0;
+                    self.taa_n = 0;
+                    self.taa_valid = false;
                 }
-                gl.bind_vertex_array(Some(vao));
-                gl.draw_arrays(glow::TRIANGLES, 0, 6);
-                gl.bind_vertex_array(None);
-                gl.bind_texture(glow::TEXTURE_2D, None);
+                t
+            } else {
+                None
+            };
+
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.viewport(0, 0, screen_w.max(1), screen_h.max(1)); // restore egui's full-screen viewport
+            gl.enable(glow::SCISSOR_TEST); // egui's scissor (= this rect) is still set
+
+            // Present the accumulated mean when there is one, otherwise this frame's own buffer.
+            if let Some(src) = accumulated.or(self.color) {
+                let composed = accumulated.is_some();
+                self.composite(
+                    gl,
+                    &quad,
+                    src,
+                    composed,
+                    ao_ready,
+                    bloom_ready,
+                    ssgi_ready,
+                    color,
+                    &env.fog,
+                    cam_pos,
+                    &inv_vp,
+                    (vp_left, vp_from_bottom, vp_w, vp_h),
+                );
             }
 
-            // Leave egui's expected state: blend on, program unbound.
+            // Leave egui's expected state: blend on, program unbound, scissor wide open.
+            release_scissor(gl, screen_w, screen_h);
             gl.enable(glow::BLEND);
             gl.use_program(None);
+            self.note_geom(
+                gl,
+                (vp_left, vp_from_bottom, vp_w, vp_h),
+                (screen_w, screen_h),
+                &env,
+                cascades.len(),
+            );
         }
     }
 }
 
-unsafe fn compile(gl: &glow::Context, vs_src: &str, fs_src: &str) -> glow::Program {
-    let program = gl.create_program().expect("create_program");
-    let compile_one = |src: &str, kind: u32| -> glow::Shader {
-        let s = gl.create_shader(kind).expect("create_shader");
+/// Compile + link one program, returning `None` (and reporting to stderr) if the driver rejects it.
+///
+/// This used to `panic!`. A panic here happens inside the egui paint callback, on the GL thread, at
+/// the first 3D frame — the window is already up, so the user sees the app die rather than a shader
+/// error, and every remaining feature dies with it. There is no way to compile GLSL in a unit test
+/// (no context), so the failure mode is real and the honest response is to lose ONE program: the
+/// feature it drove stops drawing, the rest of the viewport still works, and the log says which.
+unsafe fn compile(
+    gl: &glow::Context,
+    name: &str,
+    vs_src: &str,
+    fs_src: &str,
+) -> Option<glow::Program> {
+    let program = gl.create_program().ok()?;
+    let compile_one = |src: &str, kind: u32, stage: &str| -> Option<glow::Shader> {
+        let s = gl.create_shader(kind).ok()?;
         gl.shader_source(s, src);
         gl.compile_shader(s);
         if !gl.get_shader_compile_status(s) {
-            panic!("SIMLUX 3D shader compile failed:\n{}", gl.get_shader_info_log(s));
+            eprintln!(
+                "SIMLUX 3D: {name} {stage} shader failed to compile:\n{}",
+                gl.get_shader_info_log(s)
+            );
+            gl.delete_shader(s);
+            return None;
         }
-        s
+        Some(s)
     };
-    let vs = compile_one(vs_src, glow::VERTEX_SHADER);
-    let fs = compile_one(fs_src, glow::FRAGMENT_SHADER);
+    let Some(vs) = compile_one(vs_src, glow::VERTEX_SHADER, "vertex") else {
+        gl.delete_program(program);
+        return None;
+    };
+    let Some(fs) = compile_one(fs_src, glow::FRAGMENT_SHADER, "fragment") else {
+        gl.delete_shader(vs);
+        gl.delete_program(program);
+        return None;
+    };
     gl.attach_shader(program, vs);
     gl.attach_shader(program, fs);
     gl.link_program(program);
-    if !gl.get_program_link_status(program) {
-        panic!("SIMLUX 3D program link failed:\n{}", gl.get_program_info_log(program));
+    let linked = gl.get_program_link_status(program);
+    if !linked {
+        eprintln!(
+            "SIMLUX 3D: {name} program failed to link:\n{}",
+            gl.get_program_info_log(program)
+        );
     }
     gl.delete_shader(vs);
     gl.delete_shader(fs);
-    program
+    if linked {
+        Some(program)
+    } else {
+        gl.delete_program(program);
+        None
+    }
+}
+
+/// Bind the [`V3`] attribute layout (position, colour, ambient share) on the currently bound VAO +
+/// array buffer. One function because three separate call sites used to spell out the same offsets,
+/// and adding a field to `V3` meant remembering all three.
+unsafe fn v3_attribs(gl: &glow::Context) {
+    let stride = size_of::<V3>() as i32; // 40
+    gl.enable_vertex_attrib_array(0);
+    gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
+    gl.enable_vertex_attrib_array(1);
+    gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, stride, 12);
+    gl.enable_vertex_attrib_array(2);
+    gl.vertex_attrib_pointer_f32(2, 3, glow::FLOAT, false, stride, 24); // normal
+    gl.enable_vertex_attrib_array(3);
+    gl.vertex_attrib_pointer_f32(3, 1, glow::FLOAT, false, stride, 36); // shading mode
+}
+
+/// What the last [`Scene3dRenderer::render`] actually drew with — the numbers that decide WHERE
+/// pixels land, and whether the buffers they land in are the size everyone thinks they are.
+///
+/// Every one of these is invisible from outside the paint callback, which is exactly why a
+/// mismatch between them is so hard to reason about from a screenshot: a viewport that disagrees
+/// with its framebuffer, or an accumulation buffer left at a stale size, both come out as "part of
+/// the picture is wrong" with nothing to point at.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FrameGeom {
+    /// `(left, from_bottom, width, height)` in physical pixels — the rect egui gave the callback,
+    /// and the rect the composite scissors and draws to.
+    pub vp: (i32, i32, i32, i32),
+    pub screen: (i32, i32),
+    /// The offscreen colour/depth target. Must equal the viewport's size.
+    pub fbo: (i32, i32),
+    /// The accumulation buffers. Must equal the viewport's size too — a stale size here means the
+    /// resolve writes a corner of them and the composite stretches the rest over the panel.
+    pub taa: (i32, i32),
+    pub taa_valid: bool,
+    pub taa_n: u32,
+    pub taa_max: u32,
+    /// Top of the bloom pyramid — half the viewport, or (0, 0) when bloom is off.
+    pub bloom0: (i32, i32),
+    /// `GL_FRAMEBUFFER_COMPLETE` for the offscreen target. False means every 3D draw this frame
+    /// was silently discarded by the driver.
+    pub fbo_complete: bool,
+    /// An HDR environment was in use — the one thing that makes the symptom visible, because
+    /// without it every stray pixel is dark and reads as background.
+    pub env: bool,
+    /// Cascades rendered this frame.
+    pub cascades: u32,
+}
+
+impl std::fmt::Display for FrameGeom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "vp={},{} {}×{} screen={}×{} fbo={}×{}{} taa={}×{} n={}/{}{} bloom0={}×{} csm={} env={}",
+            self.vp.0, self.vp.1, self.vp.2, self.vp.3,
+            self.screen.0, self.screen.1,
+            self.fbo.0, self.fbo.1,
+            if self.fbo_complete { "" } else { " INCOMPLETE!" },
+            self.taa.0, self.taa.1, self.taa_n, self.taa_max,
+            if self.taa_valid { "" } else { " (empty)" },
+            self.bloom0.0, self.bloom0.1, self.cascades, self.env,
+        )
+    }
+}
+
+/// The largest value a 16-bit float can hold. Above it, an upload becomes `+Infinity`.
+pub const HALF_MAX: f32 = 65504.0;
+
+/// Bring one radiance sample into half-float range on its way to the GPU.
+///
+/// An HDRI's sun really is brighter than this. Poly Haven's `kloofendal_48d_partly_cloudy` peaks at
+/// **75360**; a clear-sky panorama reaches six figures. Uploaded to an RGB16F texture unchanged,
+/// every one of those texels becomes `+Infinity` — and infinity does not stay put. The bloom bright
+/// pass divides by the pixel's own brightness, `Inf / Inf` is NaN, and the pyramid's blur then
+/// smears that NaN across a wide, power-of-two-aligned block, which the driver finally writes as
+/// solid black. One texel of sun becomes a black rectangle that moves as the sun crosses the frame.
+///
+/// The clamp costs nothing visible: 65504 is orders of magnitude past what the view transform rolls
+/// off to white. And it costs nothing in LIGHTING either — the spherical harmonics and the path
+/// tracer both read the original full-precision map on the CPU, never this copy.
+fn half_safe(v: &f32) -> f32 {
+    // NaNs occur in real EXR files, and would propagate exactly as badly.
+    if v.is_nan() {
+        0.0
+    } else {
+        v.clamp(-HALF_MAX, HALF_MAX)
+    }
+}
+
+/// Open the scissor back up to the whole window before handing control back to egui.
+///
+/// THE NEXT FRAME'S CLEAR IS THE REASON. eframe clears the window at the start of a frame, before
+/// egui has set any clip rect — and `glClear` obeys the scissor box, which is still whatever the
+/// last thing to touch it left behind. Leave ours set to the 3D panel and the next clear wipes only
+/// that rectangle: the panel goes black, and every pixel outside it keeps the PREVIOUS frame's
+/// image. That is exactly "a black rectangle where the 3D view is, with a stale sky frozen around
+/// it, and the boundary moving as I zoom" — the shape of the union of recent panel rects.
+///
+/// egui re-enables scissoring and sets a rect per primitive, so it neither needs nor notices this;
+/// the only consumer is that clear, and it needs the whole window.
+fn release_scissor(gl: &glow::Context, screen_w: i32, screen_h: i32) {
+    unsafe {
+        gl.scissor(0, 0, screen_w.max(1), screen_h.max(1));
+    }
+}
+
+/// The six vertices (pos.xy, uv) that map the viewport texture onto the panel rect it belongs to.
+fn panel_quad(
+    vp_left: i32,
+    vp_from_bottom: i32,
+    vp_w: i32,
+    vp_h: i32,
+    screen_w: i32,
+    screen_h: i32,
+) -> [f32; 24] {
+    let sw = screen_w.max(1) as f32;
+    let sh = screen_h.max(1) as f32;
+    let x0 = 2.0 * vp_left as f32 / sw - 1.0;
+    let x1 = 2.0 * (vp_left + vp_w) as f32 / sw - 1.0;
+    let y0 = 2.0 * vp_from_bottom as f32 / sh - 1.0;
+    let y1 = 2.0 * (vp_from_bottom + vp_h) as f32 / sh - 1.0;
+    [
+        x0, y0, 0.0, 0.0, x1, y0, 1.0, 0.0, x1, y1, 1.0, 1.0, x0, y0, 0.0, 0.0, x1, y1, 1.0, 1.0,
+        x0, y1, 0.0, 1.0,
+    ]
 }
 
 /// Reinterpret a `&[T]` of `Copy` POD as bytes, for `glBufferData`.
 fn bytes<T: Copy>(slice: &[T]) -> &[u8] {
     let len = std::mem::size_of_val(slice);
     unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, len) }
+}
+
+#[cfg(test)]
+mod taa_tests {
+    use super::*;
+
+    /// Project a world point through a matrix and return where it lands, in PIXELS.
+    fn project(m: &[f32; 16], p: Vec3, w: i32, h: i32) -> (f32, f32) {
+        let c = Mat4::from_cols_array(m) * p.extend(1.0);
+        (
+            (c.x / c.w * 0.5 + 0.5) * w as f32,
+            (c.y / c.w * 0.5 + 0.5) * h as f32,
+        )
+    }
+
+    fn camera() -> [f32; 16] {
+        let proj = Mat4::perspective_rh_gl(0.9, 16.0 / 9.0, 0.1, 500.0);
+        let view = Mat4::look_at_rh(Vec3::new(6.0, -8.0, 4.0), Vec3::ZERO, Vec3::Z);
+        (proj * view).to_cols_array()
+    }
+
+    /// The jitter must move the image by EXACTLY the number of pixels asked for. If it does not,
+    /// the samples cluster instead of covering the pixel and the accumulation blurs rather than
+    /// anti-aliases.
+    #[test]
+    fn the_jitter_moves_the_image_by_the_pixels_it_was_given() {
+        let (w, h) = (1600, 900);
+        let m = camera();
+        let p = Vec3::new(1.0, 2.0, 0.5);
+        let base = project(&m, p, w, h);
+        for (jx, jy) in [(0.5, -0.25), (-0.5, 0.5), (0.125, 0.375)] {
+            let j = jitter_mvp(&m, jx, jy, w, h);
+            let moved = project(&j, p, w, h);
+            assert!(
+                (moved.0 - base.0 - jx).abs() < 1e-2,
+                "x moved {} px, wanted {jx}",
+                moved.0 - base.0
+            );
+            assert!(
+                (moved.1 - base.1 - jy).abs() < 1e-2,
+                "y moved {} px, wanted {jy}",
+                moved.1 - base.1
+            );
+        }
+    }
+
+    /// …and by the same amount at EVERY depth.
+    ///
+    /// This is the whole reason the offset is folded into clip space against the `w` row rather
+    /// than added after the perspective divide. Get it wrong and near geometry jitters further
+    /// than far geometry, so accumulating sixteen samples smears the background while sharpening
+    /// the foreground — which reads as a focus artefact nobody would trace back to anti-aliasing.
+    #[test]
+    fn the_jitter_is_the_same_size_at_every_depth() {
+        let (w, h) = (1600, 900);
+        let m = camera();
+        let j = jitter_mvp(&m, 0.4, -0.3, w, h);
+        let near = Vec3::new(0.2, 0.1, 0.0);
+        let far = Vec3::new(20.0, 40.0, 3.0);
+        let dn = {
+            let (a, b) = (project(&m, near, w, h), project(&j, near, w, h));
+            (b.0 - a.0, b.1 - a.1)
+        };
+        let df = {
+            let (a, b) = (project(&m, far, w, h), project(&j, far, w, h));
+            (b.0 - a.0, b.1 - a.1)
+        };
+        assert!(
+            (dn.0 - df.0).abs() < 1e-2 && (dn.1 - df.1).abs() < 1e-2,
+            "near moved {dn:?}, far moved {df:?} — the shift is depth-dependent"
+        );
+    }
+
+    /// Zero jitter must be the identity, because sample 0 is deliberately unjittered: the first
+    /// frame after any change has to be bit-for-bit the image this renderer drew before TAA
+    /// existed, or every drag would start with the picture shifting under the cursor.
+    #[test]
+    fn no_jitter_changes_nothing() {
+        let m = camera();
+        assert_eq!(jitter_mvp(&m, 0.0, 0.0, 1600, 900), m);
+    }
+
+    /// Every sample lands inside its own pixel, and they spread out rather than clustering.
+    #[test]
+    fn the_samples_cover_the_pixel() {
+        let mut quadrants = [0u32; 4];
+        for i in 1..=16u32 {
+            let (x, y) = halton_jitter(i);
+            assert!(
+                x.abs() <= 0.5 && y.abs() <= 0.5,
+                "sample {i} at ({x}, {y}) left the pixel"
+            );
+            quadrants[((x > 0.0) as usize) | (((y > 0.0) as usize) << 1)] += 1;
+        }
+        assert!(
+            quadrants.iter().all(|&n| n >= 3),
+            "samples bunched into a corner: {quadrants:?}"
+        );
+        // Halton's point is that SHORT prefixes are already even, so the image looks right long
+        // before the last sample arrives.
+        let (mut sx, mut sy) = (0.0, 0.0);
+        for i in 1..=4u32 {
+            let (x, y) = halton_jitter(i);
+            sx += x;
+            sy += y;
+        }
+        assert!(
+            sx.abs() < 0.5 && sy.abs() < 0.5,
+            "the first four samples are already lopsided"
+        );
+    }
+
+    /// The running blend must be a TRUE mean, not an exponential fade.
+    ///
+    /// With a fixed blend factor the result never converges and keeps a trace of the first frame
+    /// forever — so a viewport that had been orbiting would settle to something slightly wrong and
+    /// stay there. 1/(n+1) makes the buffer the exact unweighted average of every sample so far.
+    #[test]
+    fn the_accumulation_is_a_true_mean() {
+        let samples: Vec<f32> = (0..16).map(|i| i as f32 * 0.1 + 0.5).collect();
+        let mut acc = 0.0f32;
+        for (n, &s) in samples.iter().enumerate() {
+            let b = 1.0 / (n as f32 + 1.0);
+            acc = acc * (1.0 - b) + s * b; // exactly what `mix(hist, cur, u_blend)` computes
+        }
+        let mean = samples.iter().sum::<f32>() / samples.len() as f32;
+        assert!(
+            (acc - mean).abs() < 1e-5,
+            "accumulated {acc}, true mean {mean}"
+        );
+        assert!(
+            (1.0f32 / 1.0 - 1.0).abs() < 1e-9,
+            "the first sample must replace, not blend"
+        );
+    }
+
+    /// The resolve has to compose the frame EXACTLY as the composite would, or turning
+    /// accumulation on would change what the picture is — not just how clean it is.
+    #[test]
+    fn the_accumulator_composes_the_image_the_composite_does() {
+        for term in ["u_amb", "u_ao", "u_ao_on", "u_bloom_k"] {
+            assert!(
+                TAA_FS.contains(term),
+                "the resolve reads {term}, as the composite does"
+            );
+        }
+        assert!(TAA_FS.contains("c.rgb + a * ao"), "composed identically");
+        assert!(
+            TAA_FS.contains("if (u_bloom_k > 0.0) lit += texture(u_bloom, v_uv).rgb * u_bloom_k;"),
+            "bloom folded in identically"
+        );
+    }
+
+    /// Averaging must happen in scene-referred LINEAR light, before the view transform.
+    ///
+    /// AgX is a curve, and the mean of a curve is not the curve of the mean. It matters most for
+    /// what this unlocks: a noisy signal — soft shadows, screen-space GI — averaged after the tone
+    /// map converges to the wrong answer, not merely a slightly different one.
+    #[test]
+    fn accumulation_happens_before_the_view_transform() {
+        assert!(
+            !TAA_FS.contains("apply_view"),
+            "the resolve must not tone-map"
+        );
+        assert!(
+            !TAA_FS.contains("VIEW_GLSL"),
+            "…nor carry the view transform at all"
+        );
+        assert!(
+            BLIT_FS.contains("apply_view(lit)"),
+            "the composite is still the one place it happens"
+        );
+    }
+
+    /// …and the composite must not add ambient, occlusion or bloom a second time to a buffer that
+    /// already has them folded in.
+    #[test]
+    fn the_composite_does_not_double_count_accumulated_light() {
+        assert!(
+            BLIT_FS.contains("u_composed"),
+            "the composite is told when its input is composed"
+        );
+        assert!(
+            BLIT_FS.contains("(u_composed == 1) ? c.rgb : c.rgb + a * ao"),
+            "…and skips the ambient it already contains"
+        );
+    }
+
+    /// A changed input must produce a different key. This is the whole safety property: if a key
+    /// collides across a real change, the viewport shows a stale image and looks fine doing it.
+    #[test]
+    fn a_changed_input_changes_the_key() {
+        let base = {
+            let mut f = Fnv::new();
+            f.f32s(&[1.0, 2.0, 3.0]);
+            f.0
+        };
+        let moved = {
+            let mut f = Fnv::new();
+            f.f32s(&[1.0, 2.000_001, 3.0]);
+            f.0
+        };
+        assert_ne!(base, moved, "a sub-millimetre camera move went unnoticed");
+        // Length is part of the hash, so a shorter run of the same values is a different frame.
+        let mut a = Fnv::new();
+        a.bytes(&[1, 2, 3]);
+        let mut b = Fnv::new();
+        b.bytes(&[1, 2, 3, 0]);
+        assert_ne!(a.0, b.0, "a trailing zero vanished from the key");
+    }
+
+    /// Settings structs go into the key through `Debug`, which prints every field — so a field
+    /// added later joins the key automatically instead of quietly falling out of it.
+    #[test]
+    fn every_field_of_a_settings_struct_is_in_the_key() {
+        let mut buf = String::new();
+        let hash = |p: &dyn std::fmt::Debug, buf: &mut String| {
+            let mut f = Fnv::new();
+            f.dbg(buf, p);
+            f.0
+        };
+        let base = ProcParams::default();
+        let h0 = hash(&base, &mut buf);
+        // Every field, one at a time — including the ones added last, which is exactly the class
+        // of field a hand-written hash forgets.
+        let mut variants = Vec::new();
+        let mut v = base;
+        v.mode = 2;
+        variants.push(v);
+        let mut v = base;
+        v.col_a = [0.1, 0.2, 0.3];
+        variants.push(v);
+        let mut v = base;
+        v.col_b = [0.1, 0.2, 0.3];
+        variants.push(v);
+        let mut v = base;
+        v.scale = [2.0, 1.0, 1.0];
+        variants.push(v);
+        let mut v = base;
+        v.detail += 1.0;
+        variants.push(v);
+        let mut v = base;
+        v.rough += 0.25;
+        variants.push(v);
+        let mut v = base;
+        v.contrast += 0.25;
+        variants.push(v);
+        let mut v = base;
+        v.ramp = [0.1, 0.9];
+        variants.push(v);
+        let mut v = base;
+        v.rough_lo += 0.25;
+        variants.push(v);
+        let mut v = base;
+        v.rough_hi += 0.25;
+        variants.push(v);
+        let mut v = base;
+        v.bump += 0.5;
+        variants.push(v);
+        for (i, v) in variants.iter().enumerate() {
+            assert_ne!(
+                h0,
+                hash(v, &mut buf),
+                "ProcParams variant {i} hashed the same as the default"
+            );
+        }
+        // The colour pipeline too — including bloom, which changes the image without touching a
+        // single vertex.
+        let c0 = crate::color::ColorPipeline::default();
+        let mut c1 = c0;
+        c1.bloom += 0.1;
+        assert_ne!(
+            hash(&c0, &mut buf),
+            hash(&c1, &mut buf),
+            "a bloom change went unnoticed"
+        );
+        let mut c2 = c0;
+        c2.exposure += 0.5;
+        assert_ne!(
+            hash(&c0, &mut buf),
+            hash(&c2, &mut buf),
+            "an exposure change went unnoticed"
+        );
+    }
+
+    /// The key covers the viewport SIZE separately, because the accumulation buffers are
+    /// viewport-sized: a resize invalidates the history even if every other input is identical.
+    #[test]
+    fn a_resize_invalidates_the_history() {
+        let a = FrameKey {
+            hash: 7,
+            size: (800, 600),
+        };
+        let b = FrameKey {
+            hash: 7,
+            size: (800, 601),
+        };
+        assert_ne!(a, b);
+    }
+
+    /// An orthographic light matrix looking straight down at the origin, covering ±20 m.
+    fn sun_overhead() -> [f32; 16] {
+        let proj = Mat4::orthographic_rh_gl(-20.0, 20.0, -20.0, 20.0, 1.0, 200.0);
+        let view = Mat4::look_at_rh(Vec3::new(0.0, 0.0, 100.0), Vec3::ZERO, Vec3::Y);
+        (proj * view).to_cols_array()
+    }
+
+    /// Where a world point lands in the shadow map, in light-space texture coordinates.
+    fn shadow_uv(m: &[f32; 16], p: Vec3) -> (f32, f32) {
+        let c = Mat4::from_cols_array(m) * p.extend(1.0);
+        (c.x / c.w, c.y / c.w)
+    }
+
+    /// The sun's disc must move the shadow of a HIGH occluder further than a low one.
+    ///
+    /// This is the entire reason for jittering the light rather than blurring the shadow map. A
+    /// blur has one width everywhere: set it soft enough for the eaves and the contact shadow under
+    /// a chair leg detaches from the leg; set it tight enough for the leg and the eaves stay razor
+    /// sharp. Sampling the disc gets the widening for free and gets it right.
+    #[test]
+    fn a_high_occluder_gets_a_wider_penumbra_than_a_low_one() {
+        let up = [0.0f32, 0.0, 1.0];
+        let m = sun_overhead();
+        let half = 5.0f32.to_radians(); // exaggerated so the test reads in metres, not microns
+        let (mut low, mut high) = (0.0f32, 0.0f32);
+        for i in 1..=16 {
+            let (_, s) = jitter_sun(up, Some(m), half, i);
+            let s = s.expect("the shadow matrix travels with the sun");
+            // Two points on the SAME vertical line, one near the ground and one well above it.
+            let a = shadow_uv(&s, Vec3::new(0.0, 0.0, 0.5));
+            let b = shadow_uv(&s, Vec3::new(0.0, 0.0, 10.0));
+            let base = shadow_uv(&m, Vec3::new(0.0, 0.0, 0.5));
+            let base_b = shadow_uv(&m, Vec3::new(0.0, 0.0, 10.0));
+            low = low.max((a.0 - base.0).hypot(a.1 - base.1));
+            high = high.max((b.0 - base_b.0).hypot(b.1 - base_b.1));
+        }
+        assert!(low > 0.0, "the sun did not move at all");
+        assert!(
+            high > low * 3.0,
+            "a 10 m occluder swept {high:.4} and a 0.5 m one {low:.4} — the penumbra is not widening with height"
+        );
+    }
+
+    /// The samples must cover the disc, and stay ON it.
+    ///
+    /// Escaping the disc would put the sun somewhere it is not and lighten shadows that should be
+    /// fully dark; clustering in the middle would make the penumbra too tight at its edges.
+    #[test]
+    fn the_sun_samples_stay_on_their_own_disc() {
+        let dir = Vec3::new(0.3, -0.6, 0.74).normalize();
+        let half = 2.0f32.to_radians();
+        let mut spread = 0.0f32;
+        for i in 1..=32 {
+            let (d, _) = jitter_sun([dir.x, dir.y, dir.z], None, half, i);
+            let d = Vec3::from(d);
+            assert!(
+                (d.length() - 1.0).abs() < 1e-4,
+                "sample {i} is not a unit direction"
+            );
+            let a = d.dot(dir).clamp(-1.0, 1.0).acos();
+            assert!(a <= half * 1.001, "sample {i} left the disc: {a} > {half}");
+            spread = spread.max(a);
+        }
+        assert!(
+            spread > half * 0.8,
+            "every sample huddled near the centre of the disc"
+        );
+    }
+
+    /// Sample 0 and a zero-width sun must both leave everything exactly as it was.
+    ///
+    /// The first frame after any change is the one the user sees while dragging; it has to be the
+    /// image this renderer has always drawn, not a version lit from a slightly wrong direction.
+    #[test]
+    fn no_disc_means_no_change() {
+        let dir = [0.0f32, 0.0, 1.0];
+        let m = sun_overhead();
+        let (d, s) = jitter_sun(dir, Some(m), 0.0, 5);
+        assert_eq!(d, dir, "a zero-width sun moved");
+        assert_eq!(s, Some(m), "…and dragged the shadow matrix with it");
+    }
+
+    /// The disc jitter must NOT be part of the frame key.
+    ///
+    /// It is how the frame is being refined, not a change to what the frame IS. Folding it in
+    /// would restart the accumulation every single frame, so the refinement could never converge —
+    /// and the sun would appear to shimmer instead of the shadows going soft.
+    #[test]
+    fn the_sun_jitter_is_applied_after_the_frame_key() {
+        let src = include_str!("light3d.rs");
+        let key = src
+            .find("let key = FrameKey { hash: f.0")
+            .expect("the frame key");
+        let jit = src
+            .find("let (sun, shadow_mvp) = match sun {")
+            .expect("the sun jitter");
+        assert!(
+            key < jit,
+            "the sun is jittered before the key is taken — accumulation cannot converge"
+        );
+    }
+
+    /// The fog integral, transcribed from the GLSL — the only way to check it without a context.
+    fn transmittance(cam: Vec3, p: Vec3, density: f32, base: f32, falloff: f32) -> f32 {
+        if density <= 0.0 {
+            return 1.0;
+        }
+        let seg = p - cam;
+        let l = seg.length();
+        if l < 1e-4 {
+            return 1.0;
+        }
+        let rho = density * (-falloff * (cam.z - base)).exp();
+        let kdz = falloff * seg.z;
+        let tau = if kdz.abs() < 1e-4 {
+            rho * l
+        } else {
+            rho * l * (1.0 - (-kdz).exp()) / kdz
+        };
+        (-tau.max(0.0)).exp()
+    }
+
+    /// Fog must thin with height, and looking UP through it must pick up less than looking level.
+    ///
+    /// This is the whole reason for height fog over plain distance fog: haze pools in a valley and
+    /// the hills above it stay clear. Uniform fog gets that backwards — it puts as much air between
+    /// you and a rooftop as between you and the road.
+    #[test]
+    fn haze_pools_low_and_thins_with_height() {
+        let (d, base, k) = (0.004f32, 0.0f32, 0.05f32);
+        let cam = Vec3::new(0.0, 0.0, 2.0);
+        let level = transmittance(cam, cam + Vec3::new(200.0, 0.0, 0.0), d, base, k);
+        let upward = transmittance(cam, cam + Vec3::new(150.0, 0.0, 132.0), d, base, k); // same length
+        assert!(
+            upward > level,
+            "looking up through the haze picked up MORE of it ({upward} vs {level})"
+        );
+        // …and a camera up on a roof sees a clearer world than one at street level.
+        let high = Vec3::new(0.0, 0.0, 60.0);
+        let from_roof = transmittance(high, high + Vec3::new(200.0, 0.0, 0.0), d, base, k);
+        assert!(from_roof > level, "the air did not thin with altitude");
+    }
+
+    /// A level look is where the closed form divides by zero — take the limit, don't compute it.
+    ///
+    /// Get this wrong and a bright seam appears along the horizon at exactly eye height, which is
+    /// the one place in the frame a viewer is guaranteed to be looking.
+    #[test]
+    fn a_level_look_has_no_seam() {
+        let (d, k) = (0.003f32, 0.04f32);
+        let cam = Vec3::new(0.0, 0.0, 1.6);
+        let flat = transmittance(cam, cam + Vec3::new(300.0, 0.0, 0.0), d, 0.0, k);
+        assert!(
+            flat.is_finite() && flat > 0.0 && flat < 1.0,
+            "a level look gave {flat}"
+        );
+        // Approaching level from both sides converges on it — no discontinuity to fall into.
+        for eps in [1e-3f32, 1e-4, 1e-5] {
+            for sign in [1.0f32, -1.0] {
+                let t = transmittance(cam, cam + Vec3::new(300.0, 0.0, sign * eps), d, 0.0, k);
+                assert!(
+                    (t - flat).abs() < 5e-3,
+                    "Δz={} jumped to {t} from {flat}",
+                    sign * eps
+                );
+            }
+        }
+    }
+
+    /// Distance is what fog is FOR: further must always mean hazier.
+    #[test]
+    fn further_is_always_hazier() {
+        let cam = Vec3::new(0.0, 0.0, 1.6);
+        let mut last = 1.0;
+        for m in [10.0f32, 50.0, 100.0, 400.0, 1000.0] {
+            let t = transmittance(cam, cam + Vec3::new(m, 0.0, 0.0), 0.002, 0.0, 0.01);
+            assert!(t < last, "{m} m was no hazier than the step before it");
+            last = t;
+        }
+        assert!(
+            last < 0.2,
+            "a kilometre of haze barely touched the image ({last})"
+        );
+    }
+
+    /// Zero density must be a true no-op — the setting has to be genuinely free when off.
+    #[test]
+    fn no_fog_is_no_change() {
+        let cam = Vec3::new(3.0, -2.0, 1.5);
+        assert_eq!(
+            transmittance(cam, cam + Vec3::new(500.0, 20.0, -30.0), 0.0, 0.0, 0.05),
+            1.0
+        );
+    }
+
+    /// The composite and the accumulator must apply fog the SAME way, and neither twice.
+    ///
+    /// The accumulated buffer already has fog folded in; adding it again at the composite would
+    /// square the transmittance and put a second helping of inscatter on top, so switching the
+    /// refinement on would visibly change the weather.
+    #[test]
+    fn fog_is_applied_once_and_identically() {
+        for src in [TAA_FS, BLIT_FS] {
+            assert!(
+                src.contains("apply_fog(lit, v_uv)"),
+                "both compose fog through one helper"
+            );
+            assert!(
+                src.contains("FOG_GLSL"),
+                "…and both include the shared block"
+            );
+        }
+        let block = fog_glsl();
+        assert!(
+            !block.contains("FOG_GLSL_BODY"),
+            "the integral is spliced in"
+        );
+        assert!(
+            block.contains("fog_transmittance"),
+            "…and is the one from crate::env"
+        );
+        assert!(
+            block.contains("if (u_fog_on != 1) return lit;"),
+            "off is a real early-out"
+        );
+        assert!(
+            block.contains("if (d >= 0.999999) return lit;"),
+            "the far plane is sky, not a surface — fogging it flattens the backdrop"
+        );
+    }
+
+    /// Every cascade must be turned by the SAME sample of the sun's disc.
+    ///
+    /// Drawing an independent sample per cascade would light each slice of the view from a
+    /// slightly different sun. The cascades overlap, so the seam between two of them would show a
+    /// step in every shadow — and it would flicker, because the two samples change independently
+    /// each frame. That is much worse than the softness it was meant to buy.
+    #[test]
+    fn one_sun_sample_turns_every_cascade() {
+        let m = sun_overhead();
+        let up = [0.0f32, 0.0, 1.0];
+        let half = 3.0f32.to_radians();
+        let (_, spin) = sun_disc_sample(up, half, 4);
+        let spin = spin.expect("a wide disc yields a rotation");
+        // The same rotation applied to two differently-fitted cascades must move a shared world
+        // point by the same amount in each — that is what "one sun" means.
+        let tight = Mat4::orthographic_rh_gl(-5.0, 5.0, -5.0, 5.0, 1.0, 200.0)
+            * Mat4::look_at_rh(Vec3::new(0.0, 0.0, 100.0), Vec3::ZERO, Vec3::Y);
+        let a = rotate_light(m, spin);
+        let b = rotate_light(tight.to_cols_array(), spin);
+        // Recover each one's implied light direction by seeing where a tall point's shadow lands.
+        let shift = |before: &[f32; 16], after: &[f32; 16], scale: f32| {
+            let p = Vec3::new(0.0, 0.0, 10.0);
+            let f = |m: &[f32; 16]| {
+                let c = Mat4::from_cols_array(m) * p.extend(1.0);
+                (c.x / c.w * scale, c.y / c.w * scale)
+            };
+            let (x0, y0) = f(before);
+            let (x1, y1) = f(after);
+            (x1 - x0, y1 - y0)
+        };
+        // Scaled back to WORLD units by each cascade's own half-extent, so the two are comparable.
+        let sa = shift(&m, &a, 20.0);
+        let sb = shift(&tight.to_cols_array(), &b, 5.0);
+        assert!(
+            (sa.0 - sb.0).abs() < 0.05 && (sa.1 - sb.1).abs() < 0.05,
+            "cascades moved by {sa:?} and {sb:?} — they are not seeing the same sun"
+        );
+    }
+
+    /// The shader must try cascades TIGHTEST-FIRST and use the first that contains the fragment.
+    ///
+    /// Selecting by distance instead is the classic way to get a hard black line across a floor at
+    /// a cascade boundary: a fragment near the edge of the frame is further from the camera than
+    /// the split says, lands outside the cascade it was assigned, and reads whatever happens to be
+    /// in that texel. Containment cannot do that.
+    #[test]
+    fn cascades_are_selected_by_containment() {
+        let g = shadow_glsl();
+        assert!(
+            g.contains(&format!("u_light_mvp[{CASCADE_MAX}]")),
+            "the array is sized by Rust"
+        );
+        assert!(
+            !g.contains("CASCADE_MAX_GLSL"),
+            "…and the token is fully substituted"
+        );
+        assert!(
+            g.contains("sampler2DArray"),
+            "one array texture, so the layer can be chosen at runtime"
+        );
+        // The out-of-bounds branch must CONTINUE to the next cascade, not return.
+        let body = g.split("for (int c = 0").nth(1).expect("the cascade loop");
+        let oob = body.find("p.x < 0.0").expect("the bounds test");
+        let cont = body[oob..]
+            .find("continue;")
+            .expect("…falls through to the next cascade");
+        let ret = body[oob..].find("return 1.0;").unwrap_or(usize::MAX);
+        assert!(
+            cont < ret,
+            "a fragment outside a cascade gives up instead of trying the next"
+        );
+        assert!(
+            g.trim_end().ends_with("}"),
+            "…and the loop ends with an unshadowed fallback"
+        );
+    }
+
+    /// The shadow depth pass must run with egui's SCISSOR OFF.
+    ///
+    /// egui leaves the scissor set to the 3D panel's rect in WINDOW coordinates. The shadow map is
+    /// a 2048² texture with its own coordinate space, so that rectangle lands somewhere arbitrary
+    /// inside it — and `glClear` obeys the scissor exactly as draws do. Leave it on and the depth
+    /// map is only cleared and only drawn inside a window-shaped patch; every texel outside keeps
+    /// whatever was in that memory, which reads as an occluder standing right there and comes out
+    /// as hard black shadow.
+    ///
+    /// The giveaway is that the patch is fixed in WINDOW space while the map is in LIGHT space, so
+    /// orbiting slides the scene across its boundary and the black region swims with the camera —
+    /// which looks precisely like the sun being pinned to the viewpoint.
+    #[test]
+    fn the_shadow_pass_runs_outside_egui_scissor() {
+        let src = include_str!("light3d.rs");
+        let bind = src
+            .find("gl.bind_framebuffer(glow::FRAMEBUFFER, Some(sfbo));")
+            .expect("the shadow FBO bind");
+        let clear = src[bind..]
+            .find("gl.clear(glow::DEPTH_BUFFER_BIT)")
+            .expect("the depth clear")
+            + bind;
+        let off = src[bind..clear].find("gl.disable(glow::SCISSOR_TEST)");
+        assert!(
+            off.is_some(),
+            "the shadow map is cleared and drawn while egui's window-space scissor is still active"
+        );
+    }
+
+    /// NO screen-space pass may build a normal by differentiating a WORLD position.
+    ///
+    /// This bug was found and fixed three separate times in three shaders — the textured pass, the
+    /// glass pass, and then SSAO and SSGI — because each one had written it independently. The
+    /// shape is always the same: recover a position at survey coordinates (~6852 m here, where an
+    /// f32 ULP is 0.8 mm, the size of a close-up pixel footprint), then take `dFdx`/`dFdy` of it.
+    /// The derivative is then mostly cancellation noise, and every one of these shaders feeds that
+    /// noise into a normal.
+    ///
+    /// Two legitimate ways out, and this test accepts only those. A pass with vertices interpolates
+    /// a REBASED position from them (`v_qpos`). A full-screen pass reconstructs CAMERA-RELATIVE
+    /// (`rel_at`), which needs no absolute coordinates at all because occlusion and bounce are
+    /// local comparisons.
+    ///
+    /// A fourth site would be a real regression, not a style question, so it is worth a test that
+    /// no new shader can quietly sidestep.
+    #[test]
+    fn no_screen_space_pass_differentiates_a_world_position() {
+        for (name, src) in [
+            ("ssao", SSAO_FS.to_string()),
+            ("ssgi", SSGI_FS.to_string()),
+            ("transparent", assemble_transp_fs()),
+            ("textured", assemble_tex_fs()),
+        ] {
+            assert!(
+                !src.contains("world_at("),
+                "{name}: a world-space depth reconstruction is the bug — reconstruct relative to \
+                 the camera (`rel_at`) instead"
+            );
+            for bad in ["dFdx(v_wpos)", "dFdy(v_wpos)"] {
+                assert!(!src.contains(bad),
+                    "{name}: {bad} differentiates an un-rebased position, which is cancellation noise");
+            }
+        }
+        // The glass pass keeps `P` for the WORLD position it needs for the refraction ray, so
+        // there the name itself is the tell — its normal must come from `Q`.
+        let transp = assemble_transp_fs();
+        for bad in ["dFdx(P)", "dFdy(P)"] {
+            assert!(
+                !transp.contains(bad),
+                "transparent: {bad} — the pane's normal must come from the rebased Q, not world P"
+            );
+        }
+        // …and the two passes that DO build a normal this way must be doing it the accepted way.
+        assert!(
+            SSAO_FS.contains("vec3 P = rel_at(v_uv);")
+                && SSAO_FS.contains("cross(dFdx(P), dFdy(P))"),
+            "SSAO's normal must come from a camera-relative reconstruction"
+        );
+        assert!(
+            SSGI_FS.contains("vec3 P = rel_at(v_uv);"),
+            "SSGI's gather must work camera-relative too"
+        );
+    }
+
+    /// Factoring the camera translation out must happen in f64, and must actually remove it.
+    ///
+    /// Doing `vp · T(cam)` in f32 would leave a residue of about one ULP at the camera's distance
+    /// — ~0.8 mm on this project — in the translation column, which is precisely the error the
+    /// whole exercise exists to delete. The cancellation is exact in f64.
+    #[test]
+    fn the_camera_translation_factors_out_exactly() {
+        // A camera 6852 m from the origin, looking down at the model — the real project's siting.
+        let eye = glam::Vec3::new(3516.0, -6846.0, 12.0);
+        let view =
+            glam::Mat4::look_at_rh(eye, glam::Vec3::new(3516.0, -6838.0, 1.4), glam::Vec3::Z);
+        let proj = glam::Mat4::perspective_rh_gl(0.9, 1.5, 0.1, 500.0);
+        let vp = (proj * view).to_cols_array();
+        let (rel_vp, rel_inv) = camera_relative_vp(&vp, eye.to_array());
+
+        let world = glam::Vec3::new(3516.0, -6840.0, 3.0); // ~11 m in front of the camera
+        let want = world - eye;
+        let clip = glam::Mat4::from_cols_array(&vp) * world.extend(1.0);
+
+        // FORWARD: projecting the camera-relative position lands in the same clip position the
+        // world matrix gives the world one. That is what "the translation is factored out" means.
+        //
+        // The tolerance is relative and loose on purpose. `vp` ARRIVES as f32 built at 6852 m, so
+        // it already carries ~one ULP there (~0.8 mm) before this function sees it, and no amount
+        // of f64 downstream can recover what was never in the input. That residue is harmless
+        // because it is a CONSTANT offset shared by every fragment — the fault being fixed is the
+        // per-pixel one, where neighbouring fragments disagree and the derivative between them is
+        // noise. Working relative is what makes those neighbours consistent.
+        let clip_rel = glam::Mat4::from_cols_array(&rel_vp) * want.extend(1.0);
+        assert!(
+            (clip_rel - clip).truncate().length() / clip.w.abs() < 1e-4,
+            "rel_vp does not agree with vp: {clip_rel:?} vs {clip:?}"
+        );
+
+        // BACKWARD: the reconstruction hands back an 11 m relative position, not a 6852 m absolute
+        // one. That is the whole point — every value downstream stays at scene scale.
+        //
+        // The tolerance is 10 mm, and the residual is worth naming because it is NOT this
+        // function's doing: a depth round-trip amplifies error by dz/d(ndc_z) ≈ z²/2·near, which
+        // at 11 m with a 0.1 m near plane is ~580 m per unit of NDC. Feed it clip coordinates
+        // that are merely f32-exact and ~7 mm comes back out. It is harmless here for the reason
+        // the whole exercise is about: that error is a SMOOTH function of depth, so neighbouring
+        // fragments agree and the derivative between them is clean. The world-space version was
+        // not smooth — it was a 0.8 mm lattice that neighbouring fragments landed on differently.
+        // For reference the actual depth-buffer quantum at this range is z²/(near·2²⁴) ≈ 0.07 mm,
+        // an order below the 0.8 mm the world reconstruction threw away before it even started.
+        let ndc = clip.truncate() / clip.w;
+        let back = glam::Mat4::from_cols_array(&rel_inv) * ndc.extend(1.0);
+        let rel = back.truncate() / back.w;
+        assert!(
+            (rel - want).length() < 1e-2,
+            "expected the camera-relative {want:?}, got {rel:?}"
+        );
+        assert!(
+            rel.length() < 20.0,
+            "…which must be at SCENE scale, not survey scale"
+        );
+    }
+
+    /// A refracting pane builds its normal from an INTERPOLATED rebased position, never from a
+    /// depth-buffer reconstruction.
+    ///
+    /// The reconstruction is what this test used to require, and it was the bug. The transparent
+    /// vertex format carries no normal, so the shader recovered the pane's world position from
+    /// `gl_FragCoord.z` through the scene's inverse view-projection, then differentiated it. On a
+    /// plan sited at survey coordinates that position lands near 6852 m, where an f32 ULP is
+    /// 0.8 mm — the size of a close-up pixel footprint — and the reconstruction adds the depth
+    /// buffer's own nonlinearity on top. `dFdx` of that is mostly cancellation noise.
+    ///
+    /// The consequence was severe because of what the normal feeds: a FIFTH-POWER Fresnel term,
+    /// which turns a small angular error into a swing between 0.04 and ~1.0, and the refraction
+    /// offset, which then samples the scene copy somewhere arbitrary. Panes speckled and smeared,
+    /// and the pattern reshuffled whenever the camera moved. The branch writes OPAQUE, so the
+    /// artefact REPLACED the glass rather than tinting it.
+    ///
+    /// The fix is the one the textured pass needed: interpolate a small value. `u_model` and
+    /// `u_uv_org` are threaded into the pass so the vertex shader can emit `v_qpos` — the verts
+    /// are local, so the world placement has to come in separately.
+    #[test]
+    fn a_refracting_pane_builds_its_normal_from_a_rebased_vertex_position() {
+        assert!(
+            TRANSP_VS.contains("v_qpos = (u_model * vec4(a_pos, 1.0)).xyz - u_uv_org;"),
+            "the rebase must happen per vertex — verts are LOCAL, so the world model is required"
+        );
+        assert!(
+            TRANSP_FS.contains("normalize(cross(dFdx(Q), dFdy(Q)))"),
+            "the normal must come from the rebased position"
+        );
+        assert!(
+            !TRANSP_FS.contains("gl_FragCoord.z"),
+            "reconstructing position from depth is the bug — it quantises before the derivative"
+        );
+        assert!(
+            !TRANSP_FS.contains("dFdx(P)"),
+            "and the un-rebased world position must never be differentiated"
+        );
+        // World metres are still needed for the ray itself, and f32 is ample there.
+        assert!(
+            TRANSP_FS.contains("vec3 P = Q + u_uv_org;"),
+            "the refraction ray works in world space, which is fine at metre scale"
+        );
+        // The SCENE matrix, not the draw's own: `u_mvp` is camera·model here.
+        assert!(
+            TRANSP_FS.contains("u_scene_vp"),
+            "there is no world-space projection to re-project with"
+        );
+        assert!(
+            !TRANSP_FS.contains("inverse(u_mvp)"),
+            "inverting the draw matrix lands in model space"
+        );
+    }
+
+    /// A refracting pane must be written OPAQUE.
+    ///
+    /// It has already fetched and composed the refracted background itself. Letting the blender
+    /// mix that against the framebuffer would fold in the UNBENT pixel sitting underneath, which
+    /// halves the displacement and leaves a ghost of the straight-through image.
+    #[test]
+    fn a_refracting_pane_replaces_rather_than_blends() {
+        let f = TRANSP_FS
+            .find("if (u_refr_on == 1)")
+            .expect("the refraction branch");
+        let branch = &TRANSP_FS[f..TRANSP_FS[f..]
+            .find("        frag = vec4(tint, v_a);")
+            .unwrap()
+            + f];
+        assert!(
+            branch.contains("frag = vec4(mix(behind * tint, tint, max(v_a, f)), 1.0);"),
+            "the refracted pane does not write opaque alpha"
+        );
+        assert!(
+            branch.contains("return;"),
+            "…and does not leave before the blended path"
+        );
+        // Total internal reflection returns a zero vector; the pane must go clear, not black.
+        assert!(
+            branch.contains("if (dot(Rf, Rf) < 1e-6) uv1 = uv;"),
+            "total internal reflection is unhandled"
+        );
+    }
+
+    /// The scene copy must be taken BEFORE any glass is drawn, or a pane refracts itself.
+    #[test]
+    fn the_scene_copy_precedes_the_transparent_pass() {
+        let src = include_str!("light3d.rs");
+        let copy = src
+            .find("let scene_copied = self.scene_copy(gl, vp_w, vp_h);")
+            .expect("the copy call");
+        let draw = src
+            .find("self.draw_transp(gl, key, verts, tmvp)")
+            .expect("the flat glass draw");
+        let tex = src
+            .find("for &(tex_idx, mesh_key, verts, ref tmvp, ref model) in tex_transp")
+            .expect("the textured glass draw");
+        assert!(
+            copy < draw,
+            "the scene is copied after the flat glass has already been drawn into it"
+        );
+        assert!(copy < tex, "…or after the TEXTURED glass has");
+    }
+
+    /// Transmission must FILTER what is behind the surface, not uncover it.
+    ///
+    /// Alpha blending composes `src·α + dst·(1−α)`: the surface covers part of the pixel and the
+    /// rest is a hole. That is right for a wire mesh and wrong for water — it lets the background
+    /// through at full strength and undyed, so 45%-transmissive water over pale pool tiles came
+    /// out pale, its own teal diluted away instead of tinting what lay beneath it.
+    #[test]
+    fn transmission_tints_the_background_rather_than_uncovering_it() {
+        let src = assemble_tex_fs();
+        let br = src
+            .find("if (u_tr_on == 1 && alpha < 0.999)")
+            .expect("the transmission branch");
+        let end = src[br..].find("return;").expect("its early out") + br;
+        let branch = &src[br..end];
+        assert!(
+            branch.contains("behind * albedo * transmit"),
+            "what comes through must be filtered by the material's own colour"
+        );
+        assert!(
+            branch.contains("frag = vec4(spec + body * alpha + behind * albedo * transmit, 1.0);"),
+            "…and the whole result composed here, at alpha 1, so the blender cannot re-mix it"
+        );
+        // The reflection is NOT part of what fades away as the surface transmits more.
+        assert!(
+            branch.contains("vec3 body = max(direct - spec, vec3(0.0)) + ambient;"),
+            "the specular has to be separated out before the diffuse is scaled by transmission"
+        );
+        assert!(branch.contains("amb_out = vec4(0.0, 0.0, 0.0, 1.0);"),
+            "the scene copy already carries the ambient behind this surface — adding it twice would double it");
+    }
+
+    /// Fine-scale position is read REBASED, and the rebase happens in the vertex shader.
+    ///
+    /// The first attempt at this subtracted `u_uv_org` in the FRAGMENT shader. That reads as a
+    /// fix and is not one: `v_wpos` arrives already interpolated, and on a survey plan at
+    /// X≈3500, Y≈−6850 an f32 ULP is 6850·2⁻²³ ≈ 0.8 mm, so the coordinate is quantised to a
+    /// 0.8 mm lattice BEFORE the subtraction. Moving a number that has already lost its low bits
+    /// does not bring them back. Rebasing per VERTEX interpolates a value near zero instead.
+    ///
+    /// Two separate symptoms, one cause, which is why fixing only the texture lookup left half
+    /// the problem on screen:
+    ///   · the texture coordinate steps in 0.8 mm bands — banding that crawls with the camera;
+    ///   · dFdx/dFdy of that same value is catastrophic cancellation, because 0.8 mm is the size
+    ///     of a close-up pixel footprint. The geometric normal, the normal-map TBN and the
+    ///     procedural bump are all built from those derivatives, so they jitter pixel to pixel
+    ///     and light as black speckle that reshuffles whenever the camera moves.
+    ///
+    /// `v_wpos` itself must stay: shadow lookup, sun, the camera vector, SSR and the transmission
+    /// re-projection all need true world metres, and all of them are coarse enough not to care.
+    #[test]
+    fn fine_scale_position_is_rebased_in_the_vertex_shader() {
+        assert!(
+            TEX_VS.contains("v_qpos = v_wpos - u_uv_org;"),
+            "the rebase must happen per vertex, so what gets interpolated is already small"
+        );
+        assert!(
+            TEX_VS.contains("uniform vec3 u_uv_org;"),
+            "…which means the vertex stage needs the uniform too"
+        );
+
+        let src = assemble_tex_fs();
+        assert!(
+            !src.contains("v_wpos - u_uv_org"),
+            "rebasing in the fragment shader is the bug — the bits are gone before it runs"
+        );
+        for d in ["dFdx(v_wpos)", "dFdy(v_wpos)"] {
+            assert!(
+                !src.contains(d),
+                "{d}: differentiating the un-rebased position is cancellation noise, not a normal"
+            );
+        }
+        for call in [
+            "proc_field(v_qpos)",
+            "proc_bump(N, v_qpos, field)",
+            "cross(dFdx(v_qpos), dFdy(v_qpos))",
+            "dFdx(v_qpos), dp2 = dFdy(v_qpos)",
+        ] {
+            assert!(src.contains(call), "{call} must read the rebased position");
+        }
+        // The lighting reads that legitimately want world metres are still world metres.
+        assert!(
+            src.contains("normalize(u_cam - v_wpos)") && src.contains("shadow_lit(v_wpos)"),
+            "lighting is coarse and needs the true world position — do not rebase it"
+        );
+    }
+
+    /// A MEDIUM's surface lying ON an opaque one is the container, and must not be drawn.
+    ///
+    /// Modelled water is a closed box in a pool liner — measured on the villa, five of its six
+    /// faces are exactly coplanar with the tiles. Drawing them put two coincident surfaces into a
+    /// per-pixel z-fight, and because the transmission branch composes an OPAQUE result, whichever
+    /// won overwrote the other: triangular wedges crawling over the water as the camera moved.
+    ///
+    /// Two things this must NOT be keyed on. Not `gl_FrontFacing` — facing depends on winding
+    /// surviving an exporter, an axis conversion and an instance matrix, and if any of those flips
+    /// it the discard takes the surface you can see instead of the one you cannot (which is exactly
+    /// what happened: the pool lost its water and showed bare liner). And not alpha — an
+    /// alpha-cutout leaf card is see-through too, and it is a single sheet lying on nothing.
+    #[test]
+    fn a_medium_lying_on_its_container_is_not_drawn() {
+        let src = assemble_tex_fs();
+        let at = src
+            .find("if (u_transmission > 0.0 && u_tr_on == 1)")
+            .expect("the contact test");
+        let block = &src[at..at + 500];
+        assert!(
+            block.contains(
+                "distance(ssr_world(suv, sd), u_cam) - distance(v_wpos, u_cam) < 0.02) discard;"
+            ),
+            "the test is distance in front of what is already there, in metres"
+        );
+        assert!(
+            block.contains("sd < 0.99999"),
+            "sky behind the surface is not a container"
+        );
+        assert!(
+            !block.contains("gl_FrontFacing"),
+            "and it must not depend on winding"
+        );
+        assert!(!block.contains("v_a"), "…nor on coverage");
+        // Before any shading work — everything after it would be wasted on a discarded fragment.
+        let shade = src
+            .find("vec3 Ng = normalize(cross(dFdx(v_qpos)")
+            .expect("the shading");
+        assert!(at < shade, "discard first");
+    }
+
+    /// The depth copy is bound whenever it exists, not only when reflections are switched on.
+    ///
+    /// The medium/container test reads the same texture. Gating the bind on the SSR toggle would
+    /// put the pool's z-fight straight back the moment anyone unticked reflections — an unrelated
+    /// setting silently breaking the water.
+    #[test]
+    fn the_depth_copy_is_bound_independently_of_the_reflection_toggle() {
+        let src = include_str!("light3d.rs");
+        let bind = src
+            .find("let have_depth = self.refr_depth.is_some();")
+            .expect("the bind gate");
+        let ssr = src
+            .find("let ssr = env.ssr.enabled && have_depth;")
+            .expect("the SSR gate");
+        assert!(
+            bind < ssr,
+            "the depth is bound before, and independently of, the SSR decision"
+        );
+        let between = &src[bind..ssr];
+        assert!(
+            between.contains("gl.bind_texture(glow::TEXTURE_2D, self.refr_depth);"),
+            "…and the bind itself is not inside the SSR branch"
+        );
+    }
+
+    /// SSR must REPLACE the sky reflection where it finds geometry, never add to it.
+    ///
+    /// Adding would double-count: the environment lobe has already contributed a sky reflection
+    /// for that ray, and a surface reflecting both the tree and the sky the tree is standing in
+    /// front of is brighter than either. It would also make the effect pop in and out — every
+    /// pixel where the trace lost confidence would visibly drop a whole reflection.
+    #[test]
+    fn ssr_replaces_the_sky_reflection_rather_than_adding_to_it() {
+        let src = assemble_tex_fs();
+        let at = src.find("vec3 with_ssr(").expect("the substitution");
+        let body = &src[at..at + 900];
+        assert!(
+            body.contains(
+                "return mix(sky_spec, hit.rgb * w, hit.a * (1.0 - smoothstep(0.15, 0.35, rgh)));"
+            ),
+            "the trace's confidence blends the two; it never sums them"
+        );
+        assert!(
+            body.contains("if (u_ssr_on != 1 || rgh >= 0.35) return sky_spec;"),
+            "a rough surface keeps the sky — one ray cannot stand in for a wide lobe"
+        );
+        // BOTH lighting branches must route through it. Shipping it in the daylight branch only
+        // meant studio mode — which has no environment to reflect at all — silently got nothing.
+        assert!(
+            src.contains("with_ssr(env_sample(R, rough) * env_w, R, rough, env_w)"),
+            "the daylight branch substitutes the scene for the sky"
+        );
+        assert!(
+            src.contains("with_ssr(vec3(v_shade) * env_w, R, rough, env_w)"),
+            "…and so does studio mode"
+        );
+    }
+
+    /// The march must be sized over the part of the ray that is ON SCREEN.
+    ///
+    /// A reflected ray leaves the frame long before it runs out: off a pool the villa is ten metres
+    /// away and the ray is forty, so most of it is sky above the top of the screen. Sizing the
+    /// march over the whole segment put nearly every sample out there — six of ninety-six anywhere
+    /// useful — and the trace stepped clean over the building it was supposed to reflect.
+    #[test]
+    fn the_march_is_sized_over_the_visible_part_of_the_ray() {
+        assert!(SSR_GLSL.contains("if (abs(d.x) > 1e-6) tmax = min(tmax, max((0.0 - uv0.x) / d.x, (1.0 - uv0.x) / d.x));"),
+            "the segment is clipped to the viewport");
+        assert!(
+            SSR_GLSL.contains("float px = length(d * tmax * u_tr_vp);"),
+            "…and the step count comes from the CLIPPED length, not the whole ray"
+        );
+        assert!(
+            SSR_GLSL.contains("float s = tmax * (float(i) - jit) / float(steps);"),
+            "…so every step lands inside the frame"
+        );
+        assert!(
+            SSR_GLSL.contains("if (tmax <= 1e-4) return vec4(0.0);"),
+            "a ray that leaves immediately has nothing to find"
+        );
+    }
+
+    /// A miss must cost nothing. Every early-out in the trace returns zero confidence so the
+    /// caller silently keeps the sky, which is what makes the edge of the effect invisible.
+    #[test]
+    fn a_lost_reflection_ray_falls_back_to_the_sky() {
+        assert!(
+            SSR_GLSL.contains("if (hit_s < 0.0) return vec4(0.0);"),
+            "a ray that hit nothing"
+        );
+        assert!(
+            SSR_GLSL.contains("float edge = smoothstep(0.0, 0.12, min(e.x, e.y));"),
+            "…and one that hit near the frame edge fades out rather than stopping dead"
+        );
+        assert!(
+            SSR_GLSL.contains("float reach = 1.0 - smoothstep(0.75, 1.0, hi);"),
+            "…as does one that ran to the end of its reach"
+        );
+        assert!(
+            SSR_GLSL.contains("if (sd >= 0.99999) { prev = s; continue; }"),
+            "sky along the ray is not a hit — the march carries on past it"
+        );
+        assert!(
+            SSR_GLSL.contains(
+                "if (distance(Q, cam) - distance(S, cam) > u_ssr_thick) return vec4(0.0);"
+            ),
+            "…and a ray that merely slid behind a distant surface has not hit it either"
+        );
+    }
+
+    /// The march has to step in SCREEN space, not along the world ray.
+    ///
+    /// This is what produced the triangular bands that slid about as the camera turned. A step of
+    /// fixed world length covers a wide span of pixels near the camera and a fraction of one far
+    /// away, so the depth buffer is sampled at a density that varies across the image and with the
+    /// view — and every gap between samples is a surface the march can step straight over. Fixing
+    /// the step in PIXELS makes what the trace finds independent of where the camera is standing.
+    #[test]
+    fn the_march_steps_in_pixels_not_in_metres() {
+        assert!(
+            SSR_GLSL.contains("float px = length(d * tmax * u_tr_vp);"),
+            "the ray's length is measured on screen"
+        );
+        assert!(
+            SSR_GLSL.contains("int steps = int(clamp(px / 3.0, 12.0, 96.0));"),
+            "…and the step count comes from that, so each step is a few pixels wherever it is"
+        );
+        // Perspective-correct depth: 1/w and z/w are what interpolate linearly across the screen.
+        assert!(
+            SSR_GLSL.contains("float zn0 = c0.z / c0.w, zn1 = c1.z / c1.w;"),
+            "NDC z at both ends"
+        );
+        assert!(
+            SSR_GLSL.contains("float rd = mix(zn0, zn1, s) * 0.5 + 0.5;"),
+            "…so the ray's depth at each pixel is a mix, not a fresh projection"
+        );
+        // The correction that must NOT be here. z_ndc is already `z_clip/w`; dividing it by an
+        // interpolated 1/w a second time yields z_CLIP — tens to thousands rather than 0..1 — so
+        // the very first step compared as "behind the scene", reported a hit at the fragment
+        // itself, and the thickness test then discarded it. The trace never returned a hit at all.
+        assert!(
+            !SSR_GLSL.contains("/ mix(iw"),
+            "z_ndc is already divided by w; dividing again gives z_clip"
+        );
+        assert!(
+            !SSR_GLSL.contains("P + R * t"),
+            "no world-space stepping survives"
+        );
+    }
+
+    /// Residual banding must be broken up per pixel AND per frame.
+    ///
+    /// Per-pixel alone would freeze one dither pattern into the image and the still-frame
+    /// accumulation would average sixteen copies of the same artefact. Varying with the frame the
+    /// accumulator is summing over is what lets it resolve away to nothing.
+    #[test]
+    fn the_march_is_jittered_by_the_accumulation_frame() {
+        assert!(
+            SSR_GLSL.contains("uniform int       u_ssr_frame;"),
+            "the trace knows the frame"
+        );
+        let j = SSR_GLSL.find("float jit =").expect("the jitter");
+        assert!(
+            SSR_GLSL[j..j + 200].contains("u_ssr_frame"),
+            "…and the jitter varies with it"
+        );
+        assert!(
+            SSR_GLSL.contains("float s = tmax * (float(i) - jit) / float(steps);"),
+            "the jitter offsets the sample position, not the result"
+        );
+        let src = include_str!("light3d.rs");
+        assert!(
+            src.contains("gl.uniform_1_i32(Some(l), self.taa_n as i32); }"),
+            "and it is fed the SAME counter the accumulation averages over"
+        );
+    }
+
+    /// The march has to read a COPY of the depth, not the buffer being drawn into.
+    ///
+    /// Sampling a texture that is attached to the current framebuffer is undefined in GL even when
+    /// writes to it are masked off, and the transparent pass draws with the scene's own depth
+    /// attached for testing. A blit costs one pass and removes the question.
+    #[test]
+    fn ssr_marches_a_copy_of_the_depth_not_the_live_buffer() {
+        let src = include_str!("light3d.rs");
+        assert!(
+            SSR_GLSL.contains("uniform sampler2D u_ssr_depth;"),
+            "its own depth sampler"
+        );
+        assert!(
+            src.contains("glow::DEPTH_BUFFER_BIT, glow::NEAREST,"),
+            "the depth is blitted aside"
+        );
+        let blit = src.find("glow::DEPTH_BUFFER_BIT").expect("the blit");
+        let bind = src
+            .find("gl.bind_texture(glow::TEXTURE_2D, self.refr_depth);")
+            .expect("the bind");
+        assert!(
+            blit < bind,
+            "the copy has to exist before the pass that reads it"
+        );
+    }
+
+    /// The OPAQUE textured pass shares its program with the blended one, so the transmission flag
+    /// has to be switched off for it — otherwise every solid surface would try to read the scene
+    /// copy (which at that point in the frame does not even exist yet).
+    #[test]
+    fn the_opaque_textured_pass_does_not_transmit() {
+        let src = include_str!("light3d.rs");
+        let off = src
+            .find("if let Some(l) = &self.u_tex_tr_on { gl.uniform_1_i32(Some(l), 0); }")
+            .expect("the opaque pass clears the flag");
+        let on = src
+            .find("if let Some(l) = &self.u_tex_tr_on { gl.uniform_1_i32(Some(l), 1); }")
+            .expect("the blended pass sets it");
+        assert!(
+            off < on,
+            "the flag must be cleared BEFORE the opaque draws and set only after them"
+        );
+    }
+
+    /// A loaded ENVIRONMENT must light the scene whether or not the analytic sun is switched on.
+    ///
+    /// Two independent lights, and the shader has to treat them so. Gating the environment's
+    /// irradiance on the sun meant loading an HDRI lit nothing: the backdrop showed a real place
+    /// while every surface kept the fixed studio lamp — a light that does not move with the sun
+    /// controls, casts no shadow, and is two-sided, so no face ever reads as turned away.
+    #[test]
+    fn an_environment_lights_the_scene_without_the_sun() {
+        for (name, src) in [
+            ("scene", assemble_scene_fs()),
+            ("textured", assemble_tex_fs()),
+        ] {
+            assert!(
+                src.contains("bool ibl = (u_sky_on == 1 || u_env_on == 1);"),
+                "{name}: environment lighting is not independent of the sun"
+            );
+            let ibl = src.find("if (ibl) {").expect("the environment branch");
+            let studio = src[ibl..].find("} else {").expect("the studio fallback") + ibl;
+            let branch = &src[ibl..studio];
+            assert!(
+                branch.contains("sh_ambient(N)"),
+                "{name}: the environment branch does not use the environment's own irradiance"
+            );
+            // The DIRECT sun must be NESTED inside it, not the other way round.
+            assert!(
+                branch.contains("if (u_sun_on == 1)") || branch.contains("if (u_sky_on == 1)"),
+                "{name}: the sun is not nested inside the environment branch"
+            );
+        }
+    }
+
+    /// The studio lamp is the NO-ENVIRONMENT fallback, and it is two-sided on purpose — which is
+    /// exactly why it must not be reached when an environment exists. It has also never been
+    /// derived from the camera, and must not start being: a light that follows the viewer cannot
+    /// produce an accurate render.
+    #[test]
+    fn the_studio_lamp_is_only_the_no_environment_fallback() {
+        let src = assemble_tex_fs();
+        let studio = src
+            .find("abs(dot(N, normalize(STUDIO_DIR)))")
+            .expect("the studio key light");
+        let ibl = src.find("bool ibl =").expect("the environment test");
+        assert!(
+            ibl < studio,
+            "the studio lamp is chosen before anyone asks about the environment"
+        );
+        assert!(
+            src.contains("const vec3 STUDIO_DIR = vec3(0.35, 0.25, 0.9);"),
+            "the studio direction is no longer a fixed world-space constant"
+        );
+    }
+
+    /// Bounced light must be coloured by what it LANDS on, not just by what it left.
+    ///
+    /// This is the whole reason the albedo G-buffer exists. Every other buffer holds light already
+    /// multiplied by albedo, inseparably, so a bounce computed without it would land identically
+    /// on a white floor and a black one — which reads as fog, not as bounce.
+    #[test]
+    fn bounced_light_is_multiplied_by_the_receiver_albedo() {
+        assert!(
+            SSGI_FS.contains("u_alb"),
+            "the gather reads the albedo buffer"
+        );
+        assert!(
+            SSGI_FS.contains("frag = vec4(alb * gi"),
+            "…and multiplies the bounce by it"
+        );
+        // A surface with no albedo is background, glass or a UI swatch: it must bounce nothing
+        // rather than a black-but-present term.
+        assert!(
+            SSGI_FS.contains("if (alb.r + alb.g + alb.b <= 0.0) { frag = vec4(0.0); return; }"),
+            "a zero-albedo pixel still contributes"
+        );
+    }
+
+    /// Light must not pour through walls.
+    ///
+    /// A gather that only checks the RECEIVER's cosine happily reads the far side of a wall and
+    /// lights the room next door through it — the single most recognisable screen-space GI
+    /// failure, and the reason the emitter's normal is reconstructed at all.
+    #[test]
+    fn the_emitter_must_face_the_receiver() {
+        assert!(
+            SSGI_FS.contains("normal_at(su, Q)"),
+            "the emitter's normal is reconstructed"
+        );
+        assert!(
+            SSGI_FS.contains("if (-dot(normal_at(su, Q), to) <= 0.0) continue;"),
+            "…and a back-facing emitter is dropped"
+        );
+        // The reconstruction must NOT use screen derivatives: the point is fetched from a texture,
+        // so its derivative across the quad describes nothing.
+        let f = SSGI_FS.find("vec3 normal_at(").expect("the reconstruction");
+        let body = &SSGI_FS[f..f + 320];
+        assert!(
+            !body.contains("dFdx"),
+            "the emitter normal is taken from a texture-fetched value"
+        );
+        // The sky is not a bounce card either — it is already lighting the scene through its SH.
+        assert!(
+            SSGI_FS.contains(">= 0.99999) continue;"),
+            "the sky is gathered from"
+        );
+    }
+
+    /// The receiver's cosine must be applied ONCE.
+    ///
+    /// The gather draws directions cosine-weighted (`cos = sqrt(1 - a)`), so the receiver's cosine
+    /// and the diffuse BRDF's 1/π are already carried by the sampling — the estimator is albedo
+    /// times the plain MEAN of what those directions saw. Multiplying by `dot(N, to)` as well
+    /// applies it twice, and the two together average about a third, which is enough to make the
+    /// whole effect invisible at a strength of 1. It is the kind of mistake that reads as "the
+    /// slider is too weak" rather than as a bug, so it is worth pinning.
+    #[test]
+    fn the_receiver_cosine_is_not_applied_twice() {
+        // Cosine-weighted sampling, which is what carries the cosine.
+        assert!(
+            SSGI_FS.contains("ct = sqrt(1.0 - a)"),
+            "the directions are not cosine-weighted"
+        );
+        // The accumulation line must not re-apply it.
+        let acc = SSGI_FS
+            .lines()
+            .find(|l| l.contains("gi +="))
+            .expect("the accumulation");
+        assert!(
+            !acc.contains("cos_r") && !acc.contains("dot(N, to)"),
+            "the receiver cosine is applied a second time when accumulating: {acc}"
+        );
+        // …and the emitter test must be a rejection too, not a weight.
+        assert!(
+            !acc.contains("cos_e") && !acc.contains("normal_at"),
+            "the emitter cosine is used as a weight rather than a rejection: {acc}"
+        );
+    }
+
+    /// The gather's jitter must vary with the accumulation sample, or the refinement converges to
+    /// its own bias: sixteen frames averaging the same eight directions is still eight directions.
+    #[test]
+    fn the_gather_decorrelates_across_accumulation_samples() {
+        assert!(SSGI_FS.contains("u_frame"), "the gather has no frame index");
+        let f = SSGI_FS.find("float rot =").expect("the per-pixel spin");
+        assert!(
+            SSGI_FS[f..f + 200].contains("u_frame"),
+            "the spin does not vary with the accumulation sample"
+        );
+    }
+
+    /// Both composition shaders must fold the bounce in identically, and before the view transform.
+    #[test]
+    fn the_bounce_is_composed_the_same_in_both_shaders() {
+        let line = "if (u_ssgi_k > 0.0) lit += texture(u_ssgi, v_uv).rgb * u_ssgi_k;";
+        assert!(BLIT_FS.contains(line), "the composite folds the bounce in");
+        assert!(
+            TAA_FS.contains(line),
+            "…and the accumulator does it identically"
+        );
+        let add = BLIT_FS.find("u_ssgi_k").expect("the composite adds it");
+        let view = BLIT_FS
+            .find("apply_view(lit)")
+            .expect("…then the view transform");
+        assert!(
+            add < view,
+            "bounced light goes in before the transform, not after"
+        );
+    }
+
+    /// It must be OFF by default — a viewpoint-dependent term has no business appearing in
+    /// someone's scene without being asked for, least of all in a lighting application.
+    #[test]
+    fn bounced_light_is_opt_in() {
+        assert!(
+            !crate::env::GiSettings::default().enabled,
+            "GI is on by default"
+        );
+        assert!(!crate::env::EnvRender::default().gi.enabled);
+        // …and the lux view, which is a measurement, must never get it at all.
+        assert!(
+            !crate::env::EnvRender::none().gi.enabled,
+            "the lux view would be relit"
+        );
+    }
+
+    /// An HDRI's sun must not reach the GPU as infinity.
+    ///
+    /// This is the bug that turned a loaded environment into a black rectangle wandering across the
+    /// viewport. A stock Poly Haven sky peaks at 75360 against half-float's 65504 ceiling, so every
+    /// sun texel arrived from the texture already `+Inf`. The bloom bright pass divides by the
+    /// pixel's own brightness — `Inf / Inf` is NaN — and the pyramid's blur then spread that NaN
+    /// across a whole mip level's worth of screen, which the driver writes as black. The
+    /// power-of-two edges in the screenshots were the mip blocks.
+    #[test]
+    fn an_hdri_sun_survives_the_trip_to_the_gpu() {
+        // The exact peak from the environment that broke it.
+        assert!(
+            75360.0 > HALF_MAX,
+            "the premise: this HDRI is brighter than half-float holds"
+        );
+        for v in [75360.0f32, 1.0e9, f32::INFINITY, HALF_MAX * 2.0] {
+            let out = half_safe(&v);
+            assert!(out.is_finite(), "{v} still reaches the GPU as {out}");
+            assert!(
+                out <= HALF_MAX,
+                "{v} clamped to {out}, still above the ceiling"
+            );
+        }
+        // NaN in a source EXR would propagate exactly as badly.
+        assert_eq!(half_safe(&f32::NAN), 0.0);
+        // Ordinary values are untouched — this must not dim a normal sky.
+        for v in [0.0f32, 0.5, 1.0, 12.75, 60000.0] {
+            assert_eq!(half_safe(&v), v, "a value inside range was altered");
+        }
+        // Both uploads go through it: the backdrop copy AND the roughness chain. The chain is the
+        // one that feeds reflections, so a missed clamp there blackens every glossy surface.
+        let src = include_str!("light3d.rs");
+        // Assembled at runtime so this test's own source does not count as a third match.
+        let needle = format!("flatten().map({})", "half_safe");
+        assert_eq!(
+            src.matches(&needle).count(),
+            2,
+            "both the backdrop and the prefiltered chain must be clamped on upload"
+        );
+    }
+
+    /// …and bloom must survive an infinite pixel even so.
+    ///
+    /// The upload clamp fixes the environment, but an emissive material can blow the buffer just as
+    /// well. The bright pass is where infinity becomes NaN, so that is where it has to be stopped —
+    /// belt as well as braces, because the failure is silent and enormous.
+    #[test]
+    fn the_bright_pass_cannot_produce_a_nan() {
+        let fs = BLOOM_PRE_FS.replace("BLOOM_CEILING", "4000.0");
+        assert!(!fs.contains("BLOOM_CEILING"), "the ceiling is substituted");
+        let clamp = fs
+            .find("c = min(max(c, vec3(0.0)), vec3(4000.0));")
+            .expect("the clamp");
+        let guard = fs
+            .find("if (any(isnan(c))) c = vec3(0.0);")
+            .expect("the NaN guard");
+        let div = fs
+            .find("/ max(br, 1e-5)")
+            .expect("the division that makes NaN");
+        assert!(
+            clamp < div && guard < div,
+            "the clamp must come BEFORE the division, not after"
+        );
+        // The ceiling has to leave headroom: the downsample sums four taps before averaging.
+        assert!(
+            4000.0 * 4.0 < HALF_MAX,
+            "the pyramid's own sums could overflow the ceiling"
+        );
+    }
+
+    /// The callback must not leave a narrowed scissor behind it.
+    ///
+    /// eframe clears the window at the start of the NEXT frame, before egui sets any clip rect, and
+    /// `glClear` obeys the scissor box. A scissor left at the 3D panel means that clear wipes only
+    /// that rectangle — the panel goes black and every pixel outside it keeps the previous frame's
+    /// image. It looks like a black hole where the viewport is with a frozen sky around it, and the
+    /// boundary walks about as panels resize, because what you are seeing is the union of several
+    /// frames' rects.
+    #[test]
+    fn the_callback_leaves_the_scissor_wide_open() {
+        let src = include_str!("light3d.rs");
+        assert!(
+            src.contains("fn release_scissor("),
+            "there is no place that reopens the scissor"
+        );
+        // BOTH exits — the ordinary one and the converged re-present — must call it. The converged
+        // path is the easy one to forget, because it returns early.
+        let calls = src
+            .matches("release_scissor(gl, screen_w, screen_h)")
+            .count();
+        assert!(
+            calls >= 2,
+            "only {calls} of the render's exits reopen the scissor"
+        );
+        // …and it must open to the WINDOW, not to the viewport it just drew.
+        let f = src.find("fn release_scissor(").expect("the helper");
+        assert!(
+            src[f..f + 300].contains("gl.scissor(0, 0, screen_w.max(1), screen_h.max(1))"),
+            "the scissor is reopened to something smaller than the window"
+        );
+    }
+
+    /// The composite must clip to its OWN viewport rect, not to whatever egui left set.
+    ///
+    /// egui scissors a callback to its CLIP rect — the enclosing panel — which can be larger than
+    /// the rect the 3D view was actually allocated inside it. Trusting that meant a quad that was
+    /// even slightly wrong painted the scene over its neighbours, which is exactly what a stray
+    /// rectangle of 3D across the rest of the window looks like.
+    #[test]
+    fn the_composite_clips_to_its_own_rect() {
+        let src = include_str!("light3d.rs");
+        let f = src.find("unsafe fn composite(").expect("the composite");
+        let body = &src[f..f + 1200];
+        assert!(
+            body.contains("gl.scissor(rect.0, rect.1"),
+            "the composite sets its own scissor"
+        );
+        assert!(
+            body.contains("gl.enable(glow::SCISSOR_TEST)"),
+            "…and enables it itself"
+        );
+    }
+
+    /// The converged path must never present a buffer nothing has written.
+    ///
+    /// That path re-presents the accumulation buffer INSTEAD of drawing the scene, so an empty
+    /// buffer does not show up as one bad frame — the viewport goes black and stays black, because
+    /// the whole point of the path is that there is no next render to correct it.
+    #[test]
+    fn the_converged_path_needs_a_real_image_to_present() {
+        let mut r = Scene3dRenderer::default();
+        r.taa_max = 16;
+        r.taa_n = 16;
+        r.taa_valid = false;
+        assert!(
+            !(r.taa_max > 0 && r.taa_valid && r.taa_n >= r.taa_max),
+            "would present an empty buffer"
+        );
+        r.taa_valid = true;
+        assert!(
+            r.taa_max > 0 && r.taa_valid && r.taa_n >= r.taa_max,
+            "…but a written one is fine"
+        );
+        // And the guard is really the one the renderer uses.
+        let src = include_str!("light3d.rs");
+        assert!(
+            src.contains("if taa_on && self.taa_valid && self.taa_n >= self.taa_max"),
+            "the re-present path does not check that the buffer holds anything"
+        );
+    }
+
+    /// A resolve that cannot run must turn accumulation OFF, not declare it finished.
+    ///
+    /// "Finished" sends the very next frame down the re-present path, which shows the buffer the
+    /// resolve just failed to write. Turning it off falls back to drawing the scene every frame —
+    /// exactly what the renderer did before accumulation existed.
+    #[test]
+    fn a_failed_resolve_falls_back_to_drawing_the_scene() {
+        let src = include_str!("light3d.rs");
+        let f = src
+            .find("The resolve could not run")
+            .expect("the failure path");
+        let body = &src[f..f + 1000];
+        assert!(
+            body.contains("self.taa_max = 0;"),
+            "accumulation is switched off"
+        );
+        assert!(
+            body.contains("self.taa_valid = false;"),
+            "…and the buffer is marked empty"
+        );
+        assert!(
+            !body.contains("self.taa_n = self.taa_max;"),
+            "it must not fake convergence"
+        );
+    }
+
+    /// The offscreen post passes must run with egui's SCISSOR OFF.
+    ///
+    /// egui's scissor rect is the panel in SCREEN coordinates; bloom's pyramid and the accumulation
+    /// buffer are their own targets starting at (0, 0). With the scissor left on, every pixel of
+    /// those targets that falls outside the panel's screen position is simply never written — so a
+    /// viewport anywhere but the bottom-left corner gets a partly-stale pyramid, and the bug moves
+    /// as the user resizes their panels. This is a source-ORDER property with no runtime hook, so
+    /// it is asserted against the source; the real code comes first in the file, before this test.
+    #[test]
+    fn the_post_passes_run_outside_egui_scissor() {
+        let src = include_str!("light3d.rs");
+        let bloom = src
+            .find("let bloom_ready = self.bloom_pass(")
+            .expect("the bloom pass");
+        let taa = src
+            .find("let t = self.taa_resolve(")
+            .expect("the accumulation resolve");
+        let scissor = src
+            .find("gl.enable(glow::SCISSOR_TEST); // egui's scissor")
+            .expect("the composite re-enables the scissor");
+        assert!(
+            bloom < scissor,
+            "bloom renders its pyramid inside egui's scissor"
+        );
+        assert!(
+            taa < scissor,
+            "the accumulator renders inside egui's scissor"
+        );
+    }
+
+    /// A fresh renderer must not claim to be converging — nothing has asked for accumulation yet,
+    /// and a caller that repaints on this alone would spin at full speed forever.
+    #[test]
+    fn accumulation_is_off_until_it_is_asked_for() {
+        let r = Scene3dRenderer::default();
+        assert!(!r.taa_converging());
+        assert_eq!(r.taa_progress(), (0, 0));
+    }
+
+    /// A frame that has NOT yet held still must not ask for repaints.
+    ///
+    /// This is what stops a scene whose draw list is rebuilt slightly differently every frame from
+    /// driving itself: repaint → key changes → repaint, at full speed, on a viewport nobody is
+    /// touching, with the loop powered by the very requests meant to end it.
+    #[test]
+    fn a_frame_that_never_holds_still_does_not_drive_repaints() {
+        let mut r = Scene3dRenderer::default();
+        r.taa_max = 16;
+        r.taa_n = 1;
+        r.taa_stable = false;
+        assert!(
+            !r.taa_converging(),
+            "a frame still changing asked to be redrawn"
+        );
+        r.taa_stable = true;
+        assert!(r.taa_converging(), "a settled frame stopped refining early");
+        r.taa_n = 16;
+        assert!(
+            !r.taa_converging(),
+            "a converged frame kept asking for more"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bloom_tests {
+    use super::*;
+
+    /// The bright pass must compose the image the SAME WAY the composite does.
+    ///
+    /// The composite adds the ambient MRT and multiplies it by AO before the view transform. If the
+    /// bright pass read only the colour attachment, everything lit by the sky would be invisible to
+    /// bloom — a window blazing with ambient would not glow, while a sunlit patch beside it would,
+    /// for no reason a user could ever deduce.
+    #[test]
+    fn bloom_sees_the_same_image_the_composite_does() {
+        for term in ["u_amb", "u_ao", "u_ao_on"] {
+            assert!(
+                BLOOM_PRE_FS.contains(term),
+                "the bright pass reads {term}, as the composite does"
+            );
+            assert!(BLIT_FS.contains(term), "…and the composite still reads it");
+        }
+        assert!(
+            BLOOM_PRE_FS.contains("c += a * ao;"),
+            "composed identically"
+        );
+        assert!(BLIT_FS.contains("c.rgb + a * ao"), "composed identically");
+    }
+
+    /// Bloom is added to SCENE-REFERRED light, inside `apply_view`'s argument. Added afterwards it
+    /// would lift display values toward white — a wash, not a glow — and no amount of tuning the
+    /// threshold would fix it.
+    #[test]
+    fn bloom_is_added_before_the_view_transform() {
+        let add = BLIT_FS.find("u_bloom_k").expect("the composite adds bloom");
+        let view = BLIT_FS
+            .find("apply_view(lit)")
+            .expect("…and then applies the view transform");
+        assert!(
+            add < view,
+            "bloom goes in before the transform, not after it"
+        );
+        // And it is skippable, so a scene with bloom off pays for no texture fetch.
+        assert!(
+            BLIT_FS.contains("if (u_bloom_k > 0.0)"),
+            "zero bloom costs nothing"
+        );
+    }
+
+    /// The threshold has a soft KNEE. A hard cutoff makes a contour crawl visibly across a surface
+    /// as the exposure changes, because pixels cross the threshold one at a time.
+    #[test]
+    fn the_bright_pass_has_a_soft_knee() {
+        assert!(BLOOM_PRE_FS.contains("u_knee"), "there is a knee");
+        assert!(
+            BLOOM_PRE_FS.contains("soft * soft"),
+            "…and it is quadratic, not linear"
+        );
+        // The default is on but gentle: this is a lighting app, so sources should glow by default.
+        let d = crate::color::ColorPipeline::default();
+        assert!(d.bloom > 0.0 && d.bloom < 0.15, "on, gently: {}", d.bloom);
+        assert_eq!(
+            d.bloom_threshold, 1.0,
+            "only brighter-than-white blooms by default"
+        );
+        // …and the passthrough pipeline, which exists to change nothing, must not bloom.
+        assert_eq!(crate::color::ColorPipeline::passthrough().bloom, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fragment shaders are assembled by string substitution and [`compile`] **panics** on a
+    /// bad one — at first paint, with the window already up. A GL context is not available in a
+    /// unit test, so this checks the failures that substitution actually causes: a placeholder left
+    /// unreplaced, a helper used before it is pasted in, or a uniform the Rust side looks up by a
+    /// name the source never declares.
+    fn assembled() -> Vec<(&'static str, String)> {
+        vec![
+            // Through the SAME assembly helpers the renderer uses — a test that built the shader
+            // slightly differently from `ensure_init` would be testing a shader nobody compiles.
+            ("scene", assemble_scene_fs()),
+            ("transp", assemble_transp_fs()),
+            ("textured", assemble_tex_fs()),
+            (
+                "blit",
+                BLIT_FS
+                    .replace("FOG_GLSL", &fog_glsl())
+                    .replace("VIEW_GLSL", crate::color::VIEW_GLSL),
+            ),
+            ("sky", assemble_sky_fs()),
+            ("ssao", SSAO_FS.to_string()),
+            ("blur", BLUR_FS.to_string()),
+        ]
+    }
+
+    #[test]
+    fn every_shader_placeholder_is_substituted() {
+        for (name, src) in assembled() {
+            for token in [
+                "SHADOW_GLSL",
+                "SRGB_GLSL",
+                "VIEW_GLSL",
+                "SKY_GLSL",
+                "ENV_BRDF_GLSL",
+                "ALBEDO_OUT_GLSL",
+                "FOG_GLSL",
+                "CASCADE_MAX_GLSL",
+                "BLOOM_CEILING",
+            ] {
+                assert!(
+                    !src.contains(token),
+                    "{name}: `{token}` left unreplaced — the shader would not compile"
+                );
+            }
+            assert!(
+                src.starts_with("\n    #version 330 core") || src.contains("#version 330 core"),
+                "{name}: no #version"
+            );
+            let (open, close) = (src.matches('{').count(), src.matches('}').count());
+            assert_eq!(open, close, "{name}: unbalanced braces ({open} vs {close})");
+        }
+    }
+
+    /// Every pass that draws into the main framebuffer must write ALL THREE colour attachments.
+    ///
+    /// With three draw buffers bound, a shader that declares only `location = 0` leaves the others
+    /// UNDEFINED — not zero. GLSL will happily compile it, so the failure never announces itself:
+    /// it shows up as garbage in the ambient or albedo term, and only for whichever pass forgot,
+    /// which makes it look like a bug in that one material rather than a missing output.
+    #[test]
+    fn every_geometry_pass_writes_all_three_render_targets() {
+        for (name, src) in assembled() {
+            // The post passes write to single-attachment targets and are exempt.
+            if matches!(name, "blit" | "ssao" | "blur") {
+                assert!(
+                    !src.contains("location=1"),
+                    "{name} draws to one target; it must not declare a second"
+                );
+                continue;
+            }
+            assert!(
+                src.contains("layout(location=0) out"),
+                "{name}: no explicit attachment-0 output"
+            );
+            assert!(
+                src.contains("layout(location=1) out"),
+                "{name}: does not write the ambient attachment"
+            );
+            assert!(
+                src.contains("amb_out ="),
+                "{name}: declares the ambient output but never assigns it"
+            );
+            assert!(
+                src.contains("layout(location=2) out"),
+                "{name}: does not write the albedo attachment"
+            );
+            assert!(
+                src.contains("alb_out ="),
+                "{name}: declares the albedo output but never assigns it"
+            );
+        }
+    }
+
+    /// …and every path THROUGH those shaders must assign the albedo, not just the common one.
+    ///
+    /// The early `return` for a UI swatch is the trap: it writes two of the three outputs and
+    /// leaves on the spot, so grid lines and selection tints would carry undefined albedo into the
+    /// bounce. Counting assignments against returns is crude, but it catches exactly that shape.
+    #[test]
+    fn every_early_return_assigns_the_albedo_first() {
+        for (name, src) in assembled() {
+            if matches!(name, "blit" | "ssao" | "blur") {
+                continue;
+            }
+            let main = src.find("void main()").expect("a main");
+            let body = &src[main..];
+            // Each `return;` inside main must be preceded by an `alb_out =` since the last one.
+            let mut cursor = 0usize;
+            let mut assigned = 0usize;
+            while let Some(r) = body[cursor..].find("return;") {
+                let at = cursor + r;
+                assigned += body[cursor..at].matches("alb_out =").count();
+                assert!(
+                    assigned > 0,
+                    "{name}: a path returns from main without ever assigning alb_out"
+                );
+                cursor = at + 7;
+            }
+        }
+    }
+
+    /// Ambient occlusion must reach the picture through the AMBIENT buffer and nothing else. If it
+    /// ever multiplies the composite as a whole, a crease in direct sunlight goes grey — the single
+    /// most common way SSAO is wrong, and it looks "atmospheric" enough to survive review.
+    #[test]
+    fn occlusion_only_scales_the_ambient_term() {
+        let blit = BLIT_FS.replace("VIEW_GLSL", crate::color::VIEW_GLSL);
+        assert!(
+            blit.contains("c.rgb + a * ao"),
+            "the composite must add direct + ambient·AO:\n{blit}"
+        );
+        for (name, src) in assembled() {
+            // The composite applies it and the blur produces it; nothing else may touch it.
+            if matches!(name, "blit" | "blur") {
+                continue;
+            }
+            // As a whole token: `u_aomap` (a material's baked AO map) is a different thing and is
+            // allowed anywhere.
+            assert!(
+                !src.contains("u_ao;") && !src.contains("u_ao,") && !src.contains("u_ao)"),
+                "{name} must not sample the screen-space occlusion buffer itself"
+            );
+        }
+    }
+
+    /// Every helper a shader calls must be pasted in ahead of its first use — GLSL has no forward
+    /// declarations, so an out-of-order include is a compile error, not a link warning.
+    #[test]
+    fn shader_helpers_are_defined_before_use() {
+        for (name, src) in assembled() {
+            for func in [
+                "srgb_to_lin",
+                "shadow_lit",
+                "apply_view",
+                "d_ggx",
+                "v_smith",
+                "f_schlick",
+                "sh_ambient",
+                "sky_radiance",
+                "env_sample",
+                "rel_at",
+                "ssr_world",
+                "ssr_trace",
+            ] {
+                let def = src
+                    .find(&format!("{func}("))
+                    .filter(|_| src.contains(&format!(" {func}(")));
+                // Every return type the helpers actually use — `vec3`/`float` alone missed
+                // `ssr_trace`, which returns a vec4 (rgb + confidence) and so read as undefined.
+                let def_at = ["vec2", "vec3", "vec4", "float", "bool"]
+                    .iter()
+                    .find_map(|ty| src.find(&format!("{ty} {func}(")));
+                let Some(def_at) = def_at else {
+                    // Not used by this shader at all is fine; used-but-undefined is not.
+                    assert!(
+                        !src.contains(&format!("{func}(")),
+                        "{name}: calls `{func}` but never defines it"
+                    );
+                    continue;
+                };
+                let _ = def;
+                let first_call = src[def_at + 1..]
+                    .find(&format!("{func}("))
+                    .map(|i| i + def_at + 1);
+                assert!(
+                    first_call.is_some(),
+                    "{name}: `{func}` defined but never called"
+                );
+            }
+        }
+    }
+
+    /// Uniform names are strings on both sides — a typo silently yields `None` and the value never
+    /// reaches the GPU, which shows up as "the slider does nothing" rather than as an error.
+    #[test]
+    fn every_looked_up_uniform_exists_in_its_shader() {
+        // A uniform may live in either stage — the lookup is against the LINKED program.
+        let tex = format!("{TEX_VS}{}", assemble_tex_fs());
+        // Every name the sky/IBL block declares, so `SkyUniforms::locate` cannot go looking for one
+        // the surface shader does not have.
+        let sky_names = [
+            "u_perez",
+            "u_perez_norm",
+            "u_zenith_xy",
+            "u_sky_scale",
+            "u_sky_sun",
+            "u_sky_ground",
+            "u_sky_sun_col",
+            "u_sky_on",
+            "u_sh",
+        ];
+        for u in [
+            "u_mvp",
+            "u_img",
+            "u_cam",
+            "u_reflect",
+            "u_proc",
+            "u_col_a",
+            "u_col_b",
+            "u_pscale",
+            "u_detail",
+            "u_prough",
+            "u_pcontrast",
+            "u_ramp",
+            "u_model",
+            "u_sun_on",
+            "u_sun_dir",
+            "u_sun_col",
+            "u_emission",
+            "u_hl",
+            "u_hl_k",
+            "u_nrm",
+            "u_rough",
+            "u_has_nrm",
+            "u_has_rough",
+            "u_rough_base",
+            "u_shadow_on",
+            "u_light_mvp",
+            "u_shadow",
+            "u_clay",
+            "u_metallic",
+            "u_ior",
+            "u_coat",
+            "u_coat_rough",
+            "u_sheen",
+            "u_sheen_tint",
+        ]
+        .into_iter()
+        .chain(sky_names)
+        {
+            assert!(
+                tex.contains(&format!("{u};"))
+                    || tex.contains(&format!("{u} "))
+                    || tex.contains(&format!("{u}[")),
+                "textured shader has no `{u}`"
+            );
+        }
+        let blit = BLIT_FS
+            .replace("FOG_GLSL", &fog_glsl())
+            .replace("VIEW_GLSL", crate::color::VIEW_GLSL);
+        for u in [
+            "u_tex",
+            "u_view",
+            "u_exposure",
+            "u_look",
+            "u_amb",
+            "u_ao",
+            "u_ao_on",
+            "u_fog_depth",
+            "u_fog_inv_vp",
+            "u_fog_cam",
+            "u_fog_col",
+            "u_fog_density",
+            "u_fog_base",
+            "u_fog_falloff",
+            "u_fog_on",
+        ] {
+            assert!(blit.contains(u), "blit shader has no `{u}`");
+        }
+        let scene = SCENE_FS
+            .replace("SHADOW_GLSL", &shadow_glsl())
+            .replace("SRGB_GLSL", crate::color::SRGB_GLSL);
+        for u in [
+            "u_mvp",
+            "u_alpha",
+            "u_model",
+            "u_shadow_on",
+            "u_light_mvp",
+            "u_shadow",
+            "u_linearize",
+        ] {
+            assert!(
+                scene.contains(u) || SCENE_VS.contains(u),
+                "scene shader has no `{u}`"
+            );
+        }
+        let sky = format!(
+            "{BLIT_VS}{}",
+            SKY_FS.replace("SKY_GLSL", crate::env::SKY_GLSL)
+        );
+        for u in ["u_inv_vp", "u_cam"].into_iter().chain(sky_names) {
+            assert!(sky.contains(u), "sky shader has no `{u}`");
+        }
+        // No `u_cam`: SSAO works CAMERA-RELATIVE, so the camera is the origin. See
+        // `camera_relative_vp` — a world reconstruction here quantises at survey coordinates and
+        // the normal is a derivative of it.
+        for u in ["u_depth", "u_vp", "u_inv_vp", "u_radius", "u_strength"] {
+            assert!(SSAO_FS.contains(u), "ssao shader has no `{u}`");
+        }
+        assert!(
+            !SSAO_FS.contains("u_cam"),
+            "SSAO must not reintroduce an absolute camera position"
+        );
+        assert!(BLUR_FS.contains("u_ao"), "blur shader has no `u_ao`");
+    }
+
+    /// The clearcoat must reflect about the GEOMETRIC normal, and the base must lose what it took.
+    ///
+    /// Both are the whole point. Using the bumped normal would make a lacquered board's reflection
+    /// ripple with the grain, which is a shiny bump map and not varnish at all. And a second
+    /// specular lobe added on top of a finished BSDF without taking anything away creates light —
+    /// the easiest way there is to break energy conservation while still producing a picture.
+    #[test]
+    fn the_clearcoat_is_smooth_over_the_grain_and_pays_for_itself() {
+        let fs = assemble_tex_fs();
+        let coat = fs
+            .split("if (u_coat > 0.0)")
+            .nth(1)
+            .expect("the clearcoat block");
+        assert!(
+            coat.contains("dot(Ng, V)"),
+            "the coat reflects about the GEOMETRIC normal"
+        );
+        assert!(
+            coat.contains("reflect(-V, Ng)"),
+            "…including its environment lobe"
+        );
+        assert!(
+            !coat.contains("dot(N, Hc)"),
+            "…and never about the bumped one"
+        );
+        // The attenuation must come BEFORE the coat's own lobes, or it would dim the very
+        // reflection it is adding instead of the material underneath.
+        let loss = coat
+            .find("direct *= (1.0 - loss)")
+            .expect("the base is attenuated");
+        let add = coat
+            .find("vec3 coat_key = vec3(d_ggx")
+            .expect("the coat's sun lobe");
+        assert!(loss < add, "the coat dims itself instead of the base");
+        // Both coat lobes are SPECULAR, so both must join `spec` — transmission scales the
+        // diffuse away and a lacquered surface still mirrors the room at any transmission.
+        assert!(
+            coat.contains("direct += coat_key; spec += coat_key;"),
+            "the coat's key lobe is specular"
+        );
+        assert!(
+            coat.contains("direct += coat_env; spec += coat_env;"),
+            "…and so is its environment lobe"
+        );
+        assert!(
+            coat.contains("ambient *= (1.0 - loss)"),
+            "the ambient pays too, not just the direct"
+        );
+    }
+
+    /// Sheen must be a GRAZING term, and it must survive when the sun is not the light.
+    ///
+    /// A velvet curtain in a north-facing room is the single most likely place anyone would put
+    /// one; if the effect only existed under direct sun that is exactly where it would vanish.
+    #[test]
+    fn sheen_grazes_and_survives_without_a_sun() {
+        let fs = assemble_tex_fs();
+        let sheen = fs
+            .split("if (u_sheen > 0.0)")
+            .nth(1)
+            .expect("the sheen block");
+        assert!(
+            sheen.contains("pow(clamp(1.0 - max(dot(V, Hs)"),
+            "a Fresnel-shaped rim, not a flat lift"
+        );
+        assert!(
+            sheen.contains("ambient += u_sheen_tint"),
+            "…that also shows under sky light alone"
+        );
+        assert!(
+            sheen.contains("amb_irr"),
+            "…using the same irradiance the diffuse ambient came from"
+        );
+        // Both branches of the lighting must define what the shared block reads, or the studio
+        // path would compile against an uninitialised direction.
+        for v in ["Ldir =", "Lrad =", "shf =", "amb_irr ="] {
+            assert!(
+                fs.matches(v).count() >= 2,
+                "`{v}` is not set by both the daylight and studio branches"
+            );
+        }
+    }
+
+    /// The surface shader must NOT tone-map any more — that moved to the composite. Two transforms
+    /// in series is the kind of thing that looks "nearly right" and quietly crushes every midtone.
+    #[test]
+    fn tone_mapping_happens_only_at_the_composite() {
+        let tex = TEX_FS
+            .replace("SHADOW_GLSL", &shadow_glsl())
+            .replace("SRGB_GLSL", crate::color::SRGB_GLSL);
+        assert!(
+            !tex.contains("exp(-col)"),
+            "the old `1 - exp(-x)` tone-map is still in the surface shader"
+        );
+        assert!(
+            !tex.contains("apply_view"),
+            "the surface shader must not run the view transform"
+        );
+        let blit = BLIT_FS.replace("VIEW_GLSL", crate::color::VIEW_GLSL);
+        assert!(
+            blit.contains("apply_view"),
+            "the composite must run the view transform"
+        );
+    }
+}
+
+/// THE VIEWER DRAWS WHAT IT IS GIVEN.
+///
+/// `build_scene_verts` used to skip `material == CEILING` unconditionally, which made the SIMLUX
+/// hide-ceilings toggle dead code for the whole life of the toggle — the reported "hide ceiling in
+/// simlux doesnt work". The old test for it grepped `app.rs` for the string "hide_ceilings"; it
+/// could not observe behaviour and could not see this file at all, so it passed throughout.
+#[cfg(test)]
+mod the_viewer_draws_what_it_is_given {
+    use cad_light::{default_materials, Mesh, Triangle, Vertex};
+
+    fn quad(material: u32, z: f32) -> Mesh {
+        Mesh {
+            vertices: vec![
+                Vertex::new(0.0, 0.0, z),
+                Vertex::new(1.0, 0.0, z),
+                Vertex::new(1.0, 1.0, z),
+                Vertex::new(0.0, 1.0, z),
+            ],
+            triangles: vec![Triangle { a: 0, b: 1, c: 2 }, Triangle { a: 0, b: 2, c: 3 }],
+            material,
+        }
+    }
+
+    /// A ceiling mesh must reach the vertex buffer. THIS IS THE TEST THAT WOULD HAVE CAUGHT IT:
+    /// against the old code the two counts were equal, because the ceiling was dropped here.
+    #[test]
+    fn a_ceiling_mesh_reaches_the_buffer() {
+        let mats = default_materials();
+        let floor_only = super::build_scene_verts(&[quad(0, 0.0)], &mats, None).len();
+        let with_ceiling =
+            super::build_scene_verts(&[quad(0, 0.0), quad(2, 3.0)], &mats, None).len();
+        assert!(
+            with_ceiling > floor_only,
+            "material 2 must be drawn when it is passed in — {with_ceiling} verts against \
+             {floor_only} without it. Hiding it is the caller's decision, not this function's.",
+        );
+        assert_eq!(
+            with_ceiling - floor_only,
+            6,
+            "and it must be the whole ceiling: two triangles, six vertices",
+        );
+    }
+
+    /// Every material it is handed gets drawn — no material is special here.
+    #[test]
+    fn no_material_is_silently_dropped() {
+        let mats = default_materials();
+        let base = super::build_scene_verts(&[], &mats, None).len();
+        for mat in [0u32, 1, 2, cad_light::MATERIAL_FURNITURE] {
+            let n = super::build_scene_verts(&[quad(mat, 1.0)], &mats, None).len();
+            assert_eq!(n - base, 6, "material {mat} was dropped by the viewer");
+        }
+    }
+}
+
+/// A luminaire drawn at ITS REAL SIZE, from the dimensions the IES/LDT file declares.
+///
+/// Asked for as: "i need to see the illuminare as the dimensions in the ies/ldt files not the
+/// diamond icon." [`push_luminaire_marker`] is an octahedron sized by CAMERA DISTANCE, clamped to
+/// 100–600 mm across — deliberately a constant-on-screen glyph, with no link to the photometry. It
+/// stays, because most profiles declare no dimensions at all (this crate's own IES fixture is
+/// `0 0 0`, and both synthesised profiles are all-zero), and a body of size zero is nothing to look
+/// at. When the file DOES declare a housing, this draws it.
+///
+/// `pos` is the PHOTOMETRIC CENTRE and the body hangs DOWNWARD from it, spanning `[z - h, z]`.
+/// `mount_height` / `ceiling_above` put that centre at the ceiling, so a body centred on `pos` would
+/// push half the fitting through the slab.
+///
+/// `rot_deg` rotates the footprint about Z — the same `Luminaire::rotation_deg` the physics already
+/// honours (`calc.rs` subtracts it from the azimuth), which until now nothing set and nothing drew.
+///
+/// SHADING is pre-computed on the CPU with `nx = ny = nz = 0, mode = 0`, exactly as every other
+/// surface in the SIMLUX view is: that view renders with `ColorPipeline::passthrough()` and
+/// `EnvRender::none()`, so a body with real normals would be the one object in it responding to
+/// lighting the room does not have.
+pub fn push_luminaire_body(
+    out: &mut Vec<V3>,
+    pos: [f32; 3],
+    shape: cad_light::Aperture,
+    h: f32,
+    rot_deg: f32,
+) {
+    /// The aperture face — the bit that emits — keeps the marker's amber so a fitting still reads
+    /// as a light. The body is dark anodised, like a real extrusion.
+    const LENS: [f32; 3] = [1.0, 0.86, 0.38];
+    const BODY: [f32; 3] = [0.16, 0.17, 0.18];
+
+    let h = h.max(0.004); // a declared height of 0 would be a zero-volume sliver
+    let (z1, z0) = (pos[2], pos[2] - h); // top at the mounting point, hanging down
+    let (c, s) = (rot_deg.to_radians().cos(), rot_deg.to_radians().sin());
+    // Footprint point → world, rotated about Z through the luminaire's own centre.
+    let fp = |dx: f32, dy: f32| [pos[0] + dx * c - dy * s, pos[1] + dx * s + dy * c];
+
+    let mut quad = |a: [f32; 3], b: [f32; 3], d: [f32; 3], e: [f32; 3], base: [f32; 3]| {
+        let n = (glam::Vec3::from(b) - glam::Vec3::from(a))
+            .cross(glam::Vec3::from(d) - glam::Vec3::from(a))
+            .normalize_or_zero();
+        let col = shade(base, n);
+        for p in [a, b, d, a, d, e] {
+            out.push(V3 {
+                x: p[0],
+                y: p[1],
+                z: p[2],
+                r: col[0],
+                g: col[1],
+                b: col[2],
+                nx: 0.0,
+                ny: 0.0,
+                nz: 0.0,
+                mode: 0.0,
+            });
+        }
+    };
+
+    match shape {
+        cad_light::Aperture::Rect { l, w } => {
+            let (hl, hw) = (l as f32 * 0.5, w as f32 * 0.5);
+            let p = |sx: f32, sy: f32, z: f32| {
+                let q = fp(sx * hl, sy * hw);
+                [q[0], q[1], z]
+            };
+            // Bottom = the aperture, wound so its normal points DOWN into the room.
+            quad(
+                p(-1.0, -1.0, z0),
+                p(-1.0, 1.0, z0),
+                p(1.0, 1.0, z0),
+                p(1.0, -1.0, z0),
+                LENS,
+            );
+            // Top and the four sides: the housing.
+            quad(
+                p(-1.0, -1.0, z1),
+                p(1.0, -1.0, z1),
+                p(1.0, 1.0, z1),
+                p(-1.0, 1.0, z1),
+                BODY,
+            );
+            for (a, b) in [
+                ((-1.0, -1.0), (1.0, -1.0)),
+                ((1.0, -1.0), (1.0, 1.0)),
+                ((1.0, 1.0), (-1.0, 1.0)),
+                ((-1.0, 1.0), (-1.0, -1.0)),
+            ] {
+                quad(
+                    p(a.0, a.1, z0),
+                    p(b.0, b.1, z0),
+                    p(b.0, b.1, z1),
+                    p(a.0, a.1, z1),
+                    BODY,
+                );
+            }
+        }
+        cad_light::Aperture::Round { d } => {
+            const N: usize = 24;
+            let r = d as f32 * 0.5;
+            let ring: Vec<[f32; 2]> = (0..N)
+                .map(|i| {
+                    let a = i as f32 / N as f32 * std::f32::consts::TAU;
+                    fp(r * a.cos(), r * a.sin())
+                })
+                .collect();
+            let cen_lo = [pos[0], pos[1], z0];
+            let cen_hi = [pos[0], pos[1], z1];
+            for i in 0..N {
+                let (p0, p1) = (ring[i], ring[(i + 1) % N]);
+                let lo0 = [p0[0], p0[1], z0];
+                let lo1 = [p1[0], p1[1], z0];
+                let hi0 = [p0[0], p0[1], z1];
+                let hi1 = [p1[0], p1[1], z1];
+                // Aperture disc (facing down), top disc, and the wall between them.
+                quad(cen_lo, lo1, lo0, cen_lo, LENS);
+                quad(cen_hi, hi0, hi1, cen_hi, BODY);
+                quad(lo0, lo1, hi1, hi0, BODY);
+            }
+        }
+    }
+}
+
+/// A FITTING IS DRAWN AT ITS REAL SIZE.
+///
+/// "i need to see the illuminare as the dimensions in the ies/ldt files not the diamond icon."
+#[cfg(test)]
+mod a_luminaire_is_drawn_at_its_real_size {
+    use cad_light::Aperture;
+
+    fn aabb(v: &[super::V3]) -> ([f32; 3], [f32; 3]) {
+        let mut lo = [f32::MAX; 3];
+        let mut hi = [f32::MIN; 3];
+        for p in v {
+            for (k, c) in [p.x, p.y, p.z].into_iter().enumerate() {
+                lo[k] = lo[k].min(c);
+                hi[k] = hi[k].max(c);
+            }
+        }
+        (lo, hi)
+    }
+
+    /// A 1200 × 300 × 80 mm fitting must measure 1200 × 300 × 80 mm.
+    #[test]
+    fn a_rectangular_body_has_the_declared_dimensions() {
+        let mut v = Vec::new();
+        super::push_luminaire_body(
+            &mut v,
+            [2.0, 5.0, 3.0],
+            Aperture::Rect { l: 1.2, w: 0.3 },
+            0.08,
+            0.0,
+        );
+        let (lo, hi) = aabb(&v);
+        assert!(
+            (hi[0] - lo[0] - 1.2).abs() < 1e-5,
+            "length {:.4}",
+            hi[0] - lo[0]
+        );
+        assert!(
+            (hi[1] - lo[1] - 0.3).abs() < 1e-5,
+            "width {:.4}",
+            hi[1] - lo[1]
+        );
+        assert!(
+            (hi[2] - lo[2] - 0.08).abs() < 1e-5,
+            "height {:.4}",
+            hi[2] - lo[2]
+        );
+    }
+
+    /// It HANGS from the mounting point. `position.z` is where the photometric centre goes, and
+    /// `mount_z` puts that at the ceiling — a body centred on it would push half the fitting
+    /// through the slab.
+    #[test]
+    fn the_body_hangs_below_the_mounting_point() {
+        let mut v = Vec::new();
+        super::push_luminaire_body(
+            &mut v,
+            [0.0, 0.0, 3.0],
+            Aperture::Rect { l: 1.2, w: 0.3 },
+            0.08,
+            0.0,
+        );
+        let (lo, hi) = aabb(&v);
+        assert!(
+            (hi[2] - 3.0).abs() < 1e-5,
+            "the top sits at the mounting height, got {:.4}",
+            hi[2]
+        );
+        assert!(
+            (lo[2] - 2.92).abs() < 1e-5,
+            "and it hangs down, got {:.4}",
+            lo[2]
+        );
+    }
+
+    /// ROTATION IS APPLIED. This is the test that catches `rotation_deg` being ignored — which it
+    /// was everywhere until now, so every linear fitting lay along +X.
+    #[test]
+    fn the_footprint_turns_with_the_fitting() {
+        let mut v = Vec::new();
+        super::push_luminaire_body(
+            &mut v,
+            [0.0, 0.0, 3.0],
+            Aperture::Rect { l: 1.2, w: 0.3 },
+            0.08,
+            90.0,
+        );
+        let (lo, hi) = aabb(&v);
+        assert!(
+            (hi[0] - lo[0] - 0.3).abs() < 1e-5,
+            "turned 90 deg: x is the WIDTH, got {:.4}",
+            hi[0] - lo[0]
+        );
+        assert!(
+            (hi[1] - lo[1] - 1.2).abs() < 1e-5,
+            "…and y is the length, got {:.4}",
+            hi[1] - lo[1]
+        );
+    }
+
+    /// A round fitting is a cylinder of the declared diameter, not a box.
+    #[test]
+    fn a_round_body_is_a_disc_of_the_declared_diameter() {
+        let mut v = Vec::new();
+        super::push_luminaire_body(
+            &mut v,
+            [1.0, 1.0, 2.5],
+            Aperture::Round { d: 0.2 },
+            0.05,
+            0.0,
+        );
+        let (lo, hi) = aabb(&v);
+        // A 24-gon inscribed in the circle is a hair under the diameter across the flats.
+        assert!(
+            (hi[0] - lo[0] - 0.2).abs() < 0.004,
+            "diameter x {:.4}",
+            hi[0] - lo[0]
+        );
+        assert!(
+            (hi[1] - lo[1] - 0.2).abs() < 0.004,
+            "diameter y {:.4}",
+            hi[1] - lo[1]
+        );
+        assert!(
+            (hi[2] - lo[2] - 0.05).abs() < 1e-5,
+            "height {:.4}",
+            hi[2] - lo[2]
+        );
+    }
+
+    /// Every vertex is a whole triangle's worth — a mesh with a partial triangle renders as
+    /// garbage, and that is easy to do wrong when hand-winding quads.
+    #[test]
+    fn the_output_is_whole_triangles() {
+        for shape in [
+            Aperture::Rect { l: 1.2, w: 0.3 },
+            Aperture::Round { d: 0.2 },
+        ] {
+            let mut v = Vec::new();
+            super::push_luminaire_body(&mut v, [0.0, 0.0, 3.0], shape, 0.08, 17.0);
+            assert!(!v.is_empty(), "{shape:?} produced nothing");
+            assert_eq!(v.len() % 3, 0, "{shape:?} left a partial triangle");
+        }
+    }
+
+    /// A zero height would be a zero-volume sliver; it is floored so the fitting is still visible.
+    #[test]
+    fn a_zero_height_still_draws_something() {
+        let mut v = Vec::new();
+        super::push_luminaire_body(
+            &mut v,
+            [0.0, 0.0, 3.0],
+            Aperture::Rect { l: 0.6, w: 0.6 },
+            0.0,
+            0.0,
+        );
+        let (lo, hi) = aabb(&v);
+        assert!(
+            hi[2] - lo[2] > 0.0,
+            "a flat fitting must still have some body"
+        );
+    }
+}
+
+/// THE SLOW-FRAME REPORT HAS TO BE RIGHT, or it sends the next investigation somewhere else.
+///
+/// A viewport grinding at `n=1/16` on every frame is temporal accumulation restarting for ever,
+/// and from outside that is indistinguishable from an orbit in progress. The report names which
+/// GROUP of inputs moved — so if the naming is wrong, the number it produces is worse than none.
+#[cfg(test)]
+mod the_restart_reason_names_the_right_input {
+    use super::*;
+
+    /// THE NAMES LINE UP WITH THE SECTIONS. The reason is chosen by zipping the names against the
+    /// hashes, so a name list one short would silently never report the last group — and the last
+    /// group is the material passes, which is where a per-frame `Debug` of a float would sit.
+    #[test]
+    fn there_is_exactly_one_name_per_section() {
+        assert_eq!(
+            Scene3dRenderer::TAA_SECTION_NAMES.len(),
+            Scene3dRenderer::TAA_SECTIONS,
+            "a section with no name can never be reported",
+        );
+        assert!(
+            Scene3dRenderer::TAA_SECTION_NAMES
+                .iter()
+                .all(|n| !n.is_empty()),
+            "an empty name reads as 'no reason given'",
+        );
+    }
+
+    /// THE FIRST DIFFERENCE IS THE CULPRIT, and the rest follow from it.
+    ///
+    /// Each section hash folds in every earlier one, so once the camera moves EVERY later section
+    /// differs too. Reporting all of them would point at everything on every restart, which is the
+    /// same as pointing at nothing — the reason has to be the first.
+    ///
+    /// CALLS THE REAL FUNCTION. The first version of this test re-implemented the search, and
+    /// passed against a renderer changed to report the LAST section that moved.
+    #[test]
+    fn the_reason_is_the_first_section_that_moved_not_all_of_them() {
+        // Cumulative by construction: a change in group 1 changes 1..=6 and leaves 0 alone.
+        let was = [10u64, 20, 30, 40, 50, 60, 70];
+        let now = [10u64, 99, 98, 97, 96, 95, 94];
+        assert_eq!(
+            Scene3dRenderer::taa_first_changed(&now, &was),
+            Scene3dRenderer::TAA_SECTION_NAMES[1],
+            "the reason must be the FIRST group that changed",
+        );
+    }
+
+    /// AND A FRAME THAT DID NOT MOVE REPORTS NOTHING. An always-populated reason would make every
+    /// converged frame look like a restart.
+    #[test]
+    fn an_unchanged_frame_gives_no_reason() {
+        let same = [1u64, 2, 3, 4, 5, 6, 7];
+        assert_eq!(
+            Scene3dRenderer::taa_first_changed(&same, &same),
+            "",
+            "an unchanged frame named a culprit",
+        );
+    }
+}
+
+/// THE RESULT DRAWN AS ITS OWN SHEET — the fix for a false-colour view that could not show a band.
+#[cfg(test)]
+mod the_lux_overlay {
+    use super::*;
+    use crate::isolux::Field;
+
+    fn plane(w: f32, d: f32) -> cad_light::CalcPlane {
+        cad_light::CalcPlane {
+            origin: cad_light::Vertex::new(0.0, 0.0, 0.8),
+            width: w,
+            depth: d,
+            cols: 4,
+            rows: 4,
+        }
+    }
+
+    /// A field that steps from 0 to 400 lx exactly halfway across in x.
+    fn step_field(nx: usize, ny: usize) -> Field {
+        let mut v = vec![0.0; (nx + 1) * (ny + 1)];
+        for j in 0..=ny {
+            for i in 0..=nx {
+                v[j * (nx + 1) + i] = if i as f64 >= nx as f64 * 0.5 {
+                    400.0
+                } else {
+                    0.0
+                };
+            }
+        }
+        Field {
+            nx,
+            ny,
+            v,
+            inside: vec![true; nx * ny],
+        }
+    }
+
+    /// THE SHEET SHOWS A BAND EDGE — which the floor's own vertices could not.
+    ///
+    /// The measurement behind this whole change: the floor of a 9.58 × 7.58 m room is FOURTEEN
+    /// triangles, so a heatmap baked into its vertices had nowhere to put a boundary. A sheet at
+    /// the field's own resolution has one quad per sample, so the edge lands where the value is.
+    ///
+    /// A RAMP, not a step. The first version of this used a step field and asserted that every
+    /// vertex left of it was dark — and failed, correctly: a quad is coloured by its CELL value,
+    /// so the one quad STRADDLING a discontinuity takes the average and picks a side, putting one
+    /// of its corners on the far side of the boundary. That is not a defect, it is what a
+    /// discontinuity means on a finite grid. A ramp has a band edge at a well-defined place, which
+    /// is the thing actually worth pinning.
+    #[test]
+    fn the_band_edge_lands_where_the_value_reaches_it() {
+        // 0 → 400 lx across 10 m, so 200 lx is at x = 5.0 m.
+        let (nx, ny) = (20, 4);
+        let mut v = vec![0.0; (nx + 1) * (ny + 1)];
+        for j in 0..=ny {
+            for i in 0..=nx {
+                v[j * (nx + 1) + i] = 400.0 * i as f64 / nx as f64;
+            }
+        }
+        let f = Field {
+            nx,
+            ny,
+            v,
+            inside: vec![true; nx * ny],
+        };
+        let p = plane(10.0, 4.0);
+        let mut out = Vec::new();
+        let paint = |lux: f64| {
+            if lux >= 200.0 {
+                [1.0, 1.0, 1.0]
+            } else {
+                [0.0, 0.0, 0.0]
+            }
+        };
+        push_lux_sheet(&mut out, &f, &p, 0.0, &paint);
+
+        assert_eq!(out.len(), nx * ny * 6, "one quad — six vertices — per cell");
+        assert!(
+            out.iter().any(|v| v.r > 0.5),
+            "the bright side never got painted"
+        );
+        assert!(
+            out.iter().any(|v| v.r < 0.5),
+            "the dark side never got painted"
+        );
+        // One cell is 0.5 m. Outside a cell of the edge, the colour is decided.
+        let cell = 10.0 / nx as f32;
+        for v in &out {
+            if v.x < 5.0 - cell {
+                assert!(
+                    v.r < 0.5,
+                    "a vertex at x = {:.3} m is bright, well below 200 lx",
+                    v.x
+                );
+            } else if v.x > 5.0 + cell {
+                assert!(
+                    v.r > 0.5,
+                    "a vertex at x = {:.3} m is dark, well above 200 lx",
+                    v.x
+                );
+            }
+        }
+    }
+
+    /// IT IS LAID OVER THE PLANE IT WAS CALCULATED ON, in metres — not over some normalised square.
+    #[test]
+    fn the_sheet_covers_the_plane_it_was_calculated_on() {
+        let f = step_field(8, 6);
+        let p = cad_light::CalcPlane {
+            origin: cad_light::Vertex::new(2.5, -4.0, 0.8),
+            width: 9.58,
+            depth: 7.58,
+            cols: 8,
+            rows: 6,
+        };
+        let mut out = Vec::new();
+        push_lux_sheet(&mut out, &f, &p, 1.25, &|_| [0.5, 0.5, 0.5]);
+        let (mut lo, mut hi) = ((f32::MAX, f32::MAX), (f32::MIN, f32::MIN));
+        for v in &out {
+            assert!(
+                (v.z - 1.25).abs() < 1e-6,
+                "the sheet left its height: z = {}",
+                v.z
+            );
+            lo = (lo.0.min(v.x), lo.1.min(v.y));
+            hi = (hi.0.max(v.x), hi.1.max(v.y));
+        }
+        assert!(
+            (lo.0 - 2.5).abs() < 1e-4 && (lo.1 + 4.0).abs() < 1e-4,
+            "starts at {lo:?}"
+        );
+        assert!(
+            (hi.0 - (2.5 + 9.58)).abs() < 1e-4 && (hi.1 - (-4.0 + 7.58)).abs() < 1e-4,
+            "ends at {hi:?}",
+        );
+    }
+
+    /// A CELL THE CALCULATION EXCLUDED IS NOT PAINTED. The buried cells under the furniture are
+    /// left out of the statistics; colouring them anyway would put a reading back on the drawing
+    /// that the numbers beside it deny.
+    #[test]
+    fn an_excluded_cell_gets_no_colour() {
+        let mut f = step_field(10, 10);
+        for i in 0..f.nx {
+            f.inside[i] = false; // the whole bottom row
+        }
+        let mut out = Vec::new();
+        push_lux_sheet(&mut out, &f, &plane(10.0, 10.0), 0.0, &|_| [1.0, 0.0, 0.0]);
+        assert_eq!(out.len(), 10 * 9 * 6, "the masked row was painted anyway");
+        for v in &out {
+            assert!(
+                v.y >= 1.0 - 1e-4,
+                "a vertex at y = {:.3} m is in the excluded row",
+                v.y
+            );
+        }
+    }
+
+    /// AN ISOLUX LINE IS WHERE THE VALUE IS, IN METRES. The tracer works in lattice units; this is
+    /// the step that puts it on the plan, and getting it wrong would draw a plausible curve in the
+    /// wrong place — the hardest kind of error to notice.
+    #[test]
+    fn the_line_lands_at_the_right_place_on_the_plan() {
+        // A field rising 0 → 500 lx across a 10 m plane: the 300 lx line is at x = 6 m.
+        let (nx, ny) = (10, 4);
+        let mut v = vec![0.0; (nx + 1) * (ny + 1)];
+        for j in 0..=ny {
+            for i in 0..=nx {
+                v[j * (nx + 1) + i] = 500.0 * i as f64 / nx as f64;
+            }
+        }
+        let f = Field {
+            nx,
+            ny,
+            v,
+            inside: vec![true; nx * ny],
+        };
+        let segs = crate::isolux::trace(&f, 300.0);
+        assert!(!segs.is_empty());
+        let p = plane(10.0, 4.0);
+        let mut out = Vec::new();
+        let w = 0.02;
+        push_isolux_lines(&mut out, &segs, nx, ny, &p, 0.5, w, [0.0, 0.0, 0.0]);
+        assert!(!out.is_empty(), "the segments produced no geometry");
+        for vv in &out {
+            assert!((vv.z - 0.5).abs() < 1e-6, "a ribbon left its height");
+            // Half the ribbon width either side, plus the square end caps.
+            assert!(
+                (vv.x - 6.0).abs() <= w,
+                "a ribbon vertex at x = {:.4} m, but the 300 lx line is at 6.0 m",
+                vv.x,
+            );
+        }
+    }
+
+    /// THE OVERLAY IS FINER THAN THE GRID. The report interpolates its band edges; a sheet at one
+    /// quad per calculated cell would staircase where the report curves, which is the exact
+    /// difference this work exists to remove.
+    #[test]
+    fn the_overlay_supersamples_the_calculated_grid() {
+        // The project this came from: 38 × 30.
+        let (nx, ny) = crate::app::CadApp::overlay_res(38, 30);
+        assert!(
+            nx > 38 && ny > 30,
+            "a 38 × 30 grid was drawn at {nx} × {ny} — no finer than itself"
+        );
+        assert_eq!(
+            (nx % 38, ny % 30),
+            (0, 0),
+            "the supersample must be a whole multiple"
+        );
+        // …AND IT STAYS AFFORDABLE, which is not a nicety: this is rebuilt EVERY FRAME. The
+        // 128 × 128 case is the one that caught the real gap — `MAX_GRID_POINTS` is 16,384, so a
+        // grid past the budget is reachable on a real project, and the fallback used to hand back
+        // the full grid and spend 98,000 vertices a frame on it.
+        for (c, r) in [
+            (38, 30),
+            (128, 128),
+            (16, 8),
+            (200, 80),
+            (128, 128),
+            (16_384, 1),
+        ] {
+            let (x, y) = crate::app::CadApp::overlay_res(c, r);
+            assert!(
+                x * y <= crate::app::CadApp::OVERLAY_BUDGET,
+                "a {c} × {r} grid asked for {x} × {y} = {} cells",
+                x * y,
+            );
+            // THE FLOOR OF TWO BELONGS TO THE COARSENING PATH, which is the only one that can
+            // degenerate an axis. A source grid that is genuinely one row deep is drawn one row
+            // deep, and asserting otherwise would demand the overlay invent detail the
+            // calculation does not have.
+            if x < c || y < r {
+                assert!(
+                    x >= 2 && y >= 2,
+                    "a {c} × {r} grid was coarsened to {x} × {y}"
+                );
+            }
+            // Coarsening is only ever a LAST resort — while the budget allows it, the overlay must
+            // be at least as fine as the data it is drawing.
+            if c * r <= crate::app::CadApp::OVERLAY_BUDGET {
+                assert!(
+                    x >= c && y >= r,
+                    "a {c} × {r} grid was drawn COARSER, at {x} × {y}"
+                );
+            }
+        }
+    }
+}
+
+/// FORENSIC PROBE — what the overlay costs, per frame.
+///
+/// `cargo test -p cad_app --bin simlux --release what_the_overlay_costs_a_frame -- --ignored --nocapture`
+#[cfg(test)]
+mod overlay_cost_probe {
+    /// Not an assertion — a measurement, printed. The SIMLUX view rebuilds its whole vertex buffer
+    /// every frame, so a sheet that scales with the grid is the one thing here worth timing.
+    #[test]
+    #[ignore]
+    fn what_the_overlay_costs_a_frame() {
+        // The real project: 38 × 30 at 0.252 m.
+        let (gc, gr) = (38u32, 30u32);
+        let mut values = Vec::with_capacity((gc * gr) as usize);
+        for r in 0..gr {
+            for c in 0..gc {
+                let (x, y) = (c as f64 / gc as f64, r as f64 / gr as f64);
+                values.push(300.0 + 900.0 * ((x * 9.0).sin() * (y * 7.0).cos()).abs());
+            }
+        }
+        let grid = cad_light::LuxGrid::from_values(gc, gr, values);
+        let plane = cad_light::CalcPlane {
+            origin: cad_light::Vertex::new(0.0, 0.0, 0.8),
+            width: 9.58,
+            depth: 7.58,
+            cols: gc,
+            rows: gr,
+        };
+        let (nx, ny) = crate::app::CadApp::overlay_res(gc as usize, gr as usize);
+        let bands = [50.0_f64, 100.0, 200.0, 300.0];
+
+        let t0 = std::time::Instant::now();
+        let n = 100;
+        let mut verts = 0usize;
+        for _ in 0..n {
+            let f = crate::isolux::sample(&grid, &[], nx, ny);
+            let mut out = Vec::new();
+            super::push_lux_sheet(&mut out, &f, &plane, 0.0, &|_| [0.5, 0.5, 0.5]);
+            for t in bands {
+                let segs = crate::isolux::trace(&f, t);
+                super::push_isolux_lines(&mut out, &segs, nx, ny, &plane, 0.01, 0.02, [0.0; 3]);
+            }
+            verts = out.len();
+        }
+        let per = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        println!("grid {gc} x {gr}  ->  overlay {nx} x {ny}");
+        println!("  {verts} vertices, {:.3} ms to build", per);
+        println!("  a 60 fps frame is 16.7 ms");
+    }
+}
+
+/// EVERY FURNITURE INSTANCE WAS SUBMITTED EVERY FRAME, on screen or not — 26 of them and
+/// 7,036,129 triangles on the reference gym plan, to look at the inside of one machine.
+///
+/// The danger in a culler is not the one it drops, it is the one it drops WRONGLY: geometry that
+/// blinks out at the edge of a pan is a far worse bug than the frames it saves. So these tests are
+/// mostly about what must NOT be culled.
+#[cfg(test)]
+mod frustum_culling {
+    use super::*;
+
+    /// Camera 10 m out along +X, looking at the origin, Z up — the same call the viewport makes.
+    fn cam() -> [f32; 16] {
+        mvp(0.0, 0.0, 10.0, [0.0, 0.0, 0.0], 16.0 / 9.0, false)
+    }
+
+    fn cube(c: [f32; 3], r: f32) -> ([f32; 3], [f32; 3]) {
+        (
+            [c[0] - r, c[1] - r, c[2] - r],
+            [c[0] + r, c[1] + r, c[2] + r],
+        )
+    }
+
+    #[test]
+    fn what_the_camera_is_looking_at_is_kept() {
+        let (mn, mx) = cube([0.0, 0.0, 0.0], 0.5);
+        assert!(aabb_in_frustum(&cam(), mn, mx));
+    }
+
+    /// A BOX THAT SWALLOWS THE CAMERA — the case the obvious implementation gets wrong.
+    ///
+    /// Testing "outside ANY plane" rejects this, because a box spanning the whole view need not
+    /// have a single corner inside it: every corner is outside left OR right, and outside top OR
+    /// bottom. Counting per plane and demanding all eight on the same side is what keeps it. The
+    /// room you are standing in is exactly this box, so getting it wrong empties the screen.
+    #[test]
+    fn a_box_the_camera_is_inside_is_kept() {
+        let (mn, mx) = cube([0.0, 0.0, 0.0], 100.0);
+        assert!(
+            aabb_in_frustum(&cam(), mn, mx),
+            "the surrounding room must not be culled"
+        );
+    }
+
+    #[test]
+    fn something_far_off_to_the_side_is_culled() {
+        let (mn, mx) = cube([0.0, 500.0, 0.0], 1.0);
+        assert!(!aabb_in_frustum(&cam(), mn, mx));
+        let (mn, mx) = cube([0.0, 0.0, 500.0], 1.0);
+        assert!(!aabb_in_frustum(&cam(), mn, mx), "and above it");
+    }
+
+    /// The camera sits at x = +10 looking toward the origin, so x = +50 is squarely behind it.
+    #[test]
+    fn something_behind_the_camera_is_culled() {
+        let (mn, mx) = cube([50.0, 0.0, 0.0], 1.0);
+        assert!(!aabb_in_frustum(&cam(), mn, mx));
+    }
+
+    /// AT THE EDGE, IN IS IN. A culler that is a little too eager is not visibly different from a
+    /// correct one until something pops at the frame edge, which is precisely when it is noticed.
+    /// Walk a box in from far outside and check it is kept from the moment it touches the frustum.
+    #[test]
+    fn a_box_crossing_the_edge_is_kept_before_it_is_fully_in() {
+        let m = cam();
+        // Far enough out to be culled; then step toward the axis until it is kept, and check that
+        // once kept it STAYS kept all the way in — no gap, no flicker.
+        let mut first_kept = None;
+        for i in 0..=200 {
+            let y = 20.0 - i as f32 * 0.1;
+            let (mn, mx) = cube([0.0, y, 0.0], 1.0);
+            let kept = aabb_in_frustum(&m, mn, mx);
+            match (first_kept, kept) {
+                (None, true) => first_kept = Some(y),
+                (Some(at), false) => panic!("culled again at y={y} after first keeping at y={at}"),
+                _ => {}
+            }
+        }
+        let at = first_kept.expect("it must be kept by the time it reaches the axis");
+        assert!(
+            at > 1.0,
+            "a box 1 m across must be kept while still off-axis, not only at y=0"
+        );
+    }
+
+    /// The parallel projection is the other half of the viewport and has its own clip volume.
+    #[test]
+    fn the_orthographic_view_culls_too() {
+        let m = mvp(0.0, 0.0, 10.0, [0.0, 0.0, 0.0], 16.0 / 9.0, true);
+        let (mn, mx) = cube([0.0, 0.0, 0.0], 0.5);
+        assert!(aabb_in_frustum(&m, mn, mx), "what it is looking at is kept");
+        let (mn, mx) = cube([0.0, 500.0, 0.0], 1.0);
+        assert!(
+            !aabb_in_frustum(&m, mn, mx),
+            "and what is far to the side is not"
+        );
+    }
+
+    /// A DEGENERATE BOX IS STILL A BOX. Assets with no geometry cache `[0,0,0]` bounds, and a
+    /// zero-extent AABB at the origin must not be treated as "nothing to see".
+    #[test]
+    fn a_zero_sized_box_at_the_target_is_kept() {
+        assert!(aabb_in_frustum(&cam(), [0.0; 3], [0.0; 3]));
+    }
+
+    /// EACH PLANE PAIR EARNS ITS PLACE.
+    ///
+    /// The cases above are all caught by more than one plane at once — a box 500 m to the side is
+    /// past the far plane as well as past the right one, and anything behind the eye has negative
+    /// `w`, which puts it outside BOTH of every opposing pair. Deleting a whole pair left every one
+    /// of them passing, which means three of the six planes were untested code.
+    ///
+    /// These sit where exactly one pair can catch them. The camera is 10 m out with a 45° field and
+    /// a far plane at 80 m, so at the target the view is about ±7.4 m wide and ±4.1 m tall.
+    #[test]
+    fn every_plane_pair_is_the_only_one_catching_something() {
+        let m = cam();
+        // 20 m to the side, level with the axis and 22 m from the eye: inside near and far,
+        // vertically centred, so only LEFT/RIGHT can reject it.
+        //
+        // BOTH SIDES, and that is not symmetry for its own sake — with only the +Y case here,
+        // deleting the LEFT plane broke nothing and it was untested code. Same for the −Z case
+        // below and the BOTTOM plane. A culler with a dead plane looks perfect until the day
+        // something sails through it.
+        let (mn, mx) = cube([0.0, 20.0, 0.0], 1.0);
+        assert!(
+            !aabb_in_frustum(&m, mn, mx),
+            "the right plane must cull this"
+        );
+        let (mn, mx) = cube([0.0, -20.0, 0.0], 1.0);
+        assert!(
+            !aabb_in_frustum(&m, mn, mx),
+            "the left plane must cull this"
+        );
+        // The same, turned into the vertical: only TOP/BOTTOM can reject these.
+        let (mn, mx) = cube([0.0, 0.0, 20.0], 1.0);
+        assert!(!aabb_in_frustum(&m, mn, mx), "the top plane must cull this");
+        let (mn, mx) = cube([0.0, 0.0, -20.0], 1.0);
+        assert!(
+            !aabb_in_frustum(&m, mn, mx),
+            "the bottom plane must cull this"
+        );
+        // Straight down the view axis, 110 m from the eye and past the 80 m far plane: dead centre
+        // of the frame, so only FAR can reject it.
+        let (mn, mx) = cube([-100.0, 0.0, 0.0], 1.0);
+        assert!(!aabb_in_frustum(&m, mn, mx), "the far plane must cull this");
+        // 40 mm in front of the eye, inside the 100 mm near plane, on the axis and with positive
+        // `w` — so the side planes read it as inside and only NEAR can reject it.
+        let (mn, mx) = cube([9.96, 0.0, 0.0], 0.01);
+        assert!(
+            !aabb_in_frustum(&m, mn, mx),
+            "the near plane must cull this"
+        );
+    }
+}
+
+/// BLOCK UNTIL THE GPU HAS ACTUALLY FINISHED.
+///
+/// The one thing that turns "how far ahead the driver let us run" into GPU time. Bracketing a draw
+/// with this is the only way to tell a slow GPU from a slow frame around it, and inter-frame wall
+/// time cannot — it is the whole app's frame.
+///
+/// A STALL, deliberately: it costs exactly the parallelism it exists to measure, so it belongs
+/// behind the recorder and nowhere else. Lives here because this is the module that owns the `glow`
+/// trait import; `app.rs` sees a different re-export of the crate and cannot call it directly.
+pub fn gl_finish(gl: &glow::Context) {
+    use glow::HasContext as _;
+    unsafe { gl.finish() };
 }

@@ -130,25 +130,9 @@
 
 // Re-exports — single import surface for consumers.
 pub use cad_kernel::snap::{
-    find_all_snaps,
-    find_snap,
-    perpendicular_extended,
-    perpendicular_from,
-    snap_to,
-    tangent_points_extended,
-    SnapHit,
-    SnapKind,
-    SnapSet,
+    find_all_snaps, find_snap, perpendicular_extended, perpendicular_from, snap_to,
+    tangent_points_extended, SnapHit, SnapKind, SnapSet,
 };
 pub use cad_kernel::{
-    Arc,
-    Circle,
-    DObject,
-    Ellipse,
-    EllipseArc,
-    Geom,
-    Line,
-    UniformGrid,
-    Vec2,
-    EPS,
+    Arc, Circle, DObject, Ellipse, EllipseArc, Geom, Line, UniformGrid, Vec2, EPS,
 };

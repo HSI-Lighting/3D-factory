@@ -56,7 +56,10 @@ struct Aabb {
 
 impl Aabb {
     fn empty() -> Self {
-        Self { min: Vec3::splat(f32::INFINITY), max: Vec3::splat(f32::NEG_INFINITY) }
+        Self {
+            min: Vec3::splat(f32::INFINITY),
+            max: Vec3::splat(f32::NEG_INFINITY),
+        }
     }
     fn union_pt(&mut self, p: Vec3) {
         self.min = self.min.min(p);
@@ -152,7 +155,12 @@ impl RtScene {
         }
         best.map(|ti| {
             let tri = &self.tris[ti as usize];
-            Hit { t: best_t, point: r.o + r.d * best_t, normal: tri.normal(), material: tri.material }
+            Hit {
+                t: best_t,
+                point: r.o + r.d * best_t,
+                normal: tri.normal(),
+                material: tri.material,
+            }
         })
     }
 
@@ -162,7 +170,10 @@ impl RtScene {
         if dist < 1e-5 || self.nodes.is_empty() {
             return false;
         }
-        let r = Ray { o: from, d: d / dist };
+        let r = Ray {
+            o: from,
+            d: d / dist,
+        };
         let inv_d = r.d.recip();
         let tmax = dist - 1e-3;
         let mut stack = [0u32; 64];
@@ -193,7 +204,13 @@ impl RtScene {
 
 fn build(tris: &[Tri], idx: &mut [u32], nodes: &mut Vec<Node>, start: u32, count: u32) -> u32 {
     let self_i = nodes.len() as u32;
-    nodes.push(Node { aabb: Aabb::empty(), left: 0, right: 0, start, count });
+    nodes.push(Node {
+        aabb: Aabb::empty(),
+        left: 0,
+        right: 0,
+        start,
+        count,
+    });
 
     let (mut bb, mut cb) = (Aabb::empty(), Aabb::empty());
     for &t in idx[start as usize..(start + count) as usize].iter() {
@@ -285,7 +302,12 @@ mod tests {
     use super::*;
 
     fn tri(a: [f32; 3], b: [f32; 3], c: [f32; 3], m: u32) -> Tri {
-        Tri { a: a.into(), b: b.into(), c: c.into(), material: m }
+        Tri {
+            a: a.into(),
+            b: b.into(),
+            c: c.into(),
+            material: m,
+        }
     }
 
     #[test]
@@ -298,9 +320,18 @@ mod tests {
         let mut rng = Rng::seeded(42);
         let mut tris = Vec::new();
         for i in 0..200u32 {
-            let base = Vec3::new(rng.next_f32() * 10.0, rng.next_f32() * 10.0, rng.next_f32() * 10.0);
+            let base = Vec3::new(
+                rng.next_f32() * 10.0,
+                rng.next_f32() * 10.0,
+                rng.next_f32() * 10.0,
+            );
             let o = |r: &mut Rng| Vec3::new(r.next_f32(), r.next_f32(), r.next_f32()) * 0.5;
-            tris.push(Tri { a: base, b: base + o(&mut rng), c: base + o(&mut rng), material: i });
+            tris.push(Tri {
+                a: base,
+                b: base + o(&mut rng),
+                c: base + o(&mut rng),
+                material: i,
+            });
         }
         let scene = RtScene::new(tris.clone());
         for _ in 0..64 {
@@ -313,7 +344,10 @@ mod tests {
                     best = best.min(h);
                 }
             }
-            let bvh = scene.closest_hit(&ray).map(|h| h.t).unwrap_or(f32::INFINITY);
+            let bvh = scene
+                .closest_hit(&ray)
+                .map(|h| h.t)
+                .unwrap_or(f32::INFINITY);
             assert!((bvh - best).abs() < 1e-3 || (bvh.is_infinite() && best.is_infinite()));
         }
     }
