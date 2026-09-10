@@ -1,6 +1,5 @@
 use super::*;
 
-
 // ---- snap markers & dashed extension line ---------------------------------
 
 /// Per-snap-kind glyph at the snap point. Each kind gets a distinct shape so
@@ -1788,7 +1787,7 @@ pub(super) struct DimGeo {
 
 impl DimGeo {
     /// Every structural line, role-agnostic — for the dashed overlay.
-    pub(super)     fn all_lines(&self) -> Vec<(Vec2, Vec2)> {
+    pub(super) fn all_lines(&self) -> Vec<(Vec2, Vec2)> {
         let mut v = self.ext_lines.clone();
         if let Some(dl) = self.dim_line {
             v.push(dl);
@@ -2191,7 +2190,11 @@ pub(super) fn draw_wall_style_preview(
     );
 }
 
-pub(super) fn draw_dim_style_preview(painter: &egui::Painter, rect: egui::Rect, style: &cad_kernel::DimStyle) {
+pub(super) fn draw_dim_style_preview(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    style: &cad_kernel::DimStyle,
+) {
     let pad = 16.0_f32;
     let (xmin, xmax, ymin, ymax) = (-5.0_f32, 44.0, -3.0, 31.0);
     let ww = xmax - xmin;

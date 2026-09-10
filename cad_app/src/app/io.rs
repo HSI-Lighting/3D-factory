@@ -1,6 +1,5 @@
 use super::*;
 
-
 // ================= DWG open (from dokkandar/Auto_RASM, cross-platform) =================
 
 /// Locate a DWG→DXF converter. Order: `RUSTCAD_DWGCONV` env override, the repo
@@ -86,7 +85,11 @@ pub(super) fn dxf_to_dwg_converter() -> Option<String> {
 /// Run the converter `conv` to turn `dwg` into `out` (a .dxf). A `{in}/{out}`
 /// template runs via the shell; a bare path is spawned directly. `.cmd`/`.bat`
 /// wrappers on Windows are launched through `cmd /c` (they are not PE exes).
-pub(super) fn run_dwg_conversion(conv: &str, dwg: &str, out: &std::path::Path) -> Result<(), String> {
+pub(super) fn run_dwg_conversion(
+    conv: &str,
+    dwg: &str,
+    out: &std::path::Path,
+) -> Result<(), String> {
     let _ = std::fs::remove_file(out);
     let out_s = out.to_string_lossy().to_string();
     let status = if conv.contains("{in}") {

@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// Short one-letter badge string for the active osnap kinds, shown on the
 /// toolbar button so the user can see at a glance what's enabled.
 pub(super) fn active_snap_letters(s: SnapSet) -> String {
@@ -19,7 +18,12 @@ pub(super) fn active_snap_letters(s: SnapSet) -> String {
 // ---- Registry-driven settings page widgets --------------------------------
 
 /// A left-sidebar section entry: name + variable count, selectable.
-pub(super) fn settings_section_item(ui: &mut egui::Ui, name: &str, count: usize, selected: bool) -> bool {
+pub(super) fn settings_section_item(
+    ui: &mut egui::Ui,
+    name: &str,
+    count: usize,
+    selected: bool,
+) -> bool {
     let h = 26.0;
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::click());
@@ -136,7 +140,13 @@ pub(super) fn env_u8(ui: &mut egui::Ui, key: &str, desc: &str, v: &mut u8, lo: u
     });
 }
 
-pub(super) fn env_u8_choice(ui: &mut egui::Ui, key: &str, desc: &str, v: &mut u8, choices: &[&str]) {
+pub(super) fn env_u8_choice(
+    ui: &mut egui::Ui,
+    key: &str,
+    desc: &str,
+    v: &mut u8,
+    choices: &[&str],
+) {
     env_row(ui, key, desc, |ui| {
         let sel = (*v as usize).min(choices.len().saturating_sub(1));
         egui::ComboBox::from_id_salt(key)
@@ -586,7 +596,11 @@ pub(super) fn paint_pattern_preview(
 ///
 /// `size` = pixel diameter (the widget allocates a square `size × (size
 /// + 32)` — extra 32 px for the readout).
-pub(super) fn polar_angle_picker(ui: &mut egui::Ui, angle_deg: &mut f64, size: f32) -> egui::Response {
+pub(super) fn polar_angle_picker(
+    ui: &mut egui::Ui,
+    angle_deg: &mut f64,
+    size: f32,
+) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(size, size + 32.0), egui::Sense::click_and_drag());
     let painter = ui.painter_at(rect);
@@ -860,7 +874,10 @@ pub(super) fn spline_is_effectively_closed(s: &Spline) -> bool {
 /// applying `xform` to each geometry. Used by the script `copy` op — the
 /// copies must be independent of their sources, which cloned handles would
 /// not be (two dobjects sharing one handle corrupt the spatial index).
-pub(super) fn duplicate_dobjects(sources: &[DObject], xform: impl Fn(&Geom) -> Geom) -> Vec<DObject> {
+pub(super) fn duplicate_dobjects(
+    sources: &[DObject],
+    xform: impl Fn(&Geom) -> Geom,
+) -> Vec<DObject> {
     let mut hmap: HashMap<cad_kernel::Handle, cad_kernel::Handle> =
         HashMap::with_capacity(sources.len());
     let mut out: Vec<DObject> = Vec::with_capacity(sources.len());
@@ -919,7 +936,11 @@ pub(super) fn doc_entity_style_summary(doc: &Document, d: &DObject) -> (String, 
     (color, linetype, lineweight, d.style.visible)
 }
 
-pub(super) fn preview_transform(doc: &mut Document, indices: &[usize], f: impl Fn(&Geom) -> Geom) -> usize {
+pub(super) fn preview_transform(
+    doc: &mut Document,
+    indices: &[usize],
+    f: impl Fn(&Geom) -> Geom,
+) -> usize {
     let mut targets: Vec<usize> = Vec::new();
     let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for &i in indices {
@@ -951,7 +972,11 @@ pub(super) fn preview_transform(doc: &mut Document, indices: &[usize], f: impl F
 }
 
 /// P1 preview helper — per-entity style change against the shadow document.
-pub(super) fn preview_style(doc: &mut Document, indices: &[usize], mut f: impl FnMut(&mut DObject)) -> usize {
+pub(super) fn preview_style(
+    doc: &mut Document,
+    indices: &[usize],
+    mut f: impl FnMut(&mut DObject),
+) -> usize {
     let mut n = 0;
     for &i in indices {
         if let Some(d) = doc.dobjects.get_mut(i) {
@@ -1000,7 +1025,9 @@ pub(super) struct PlotStyleEdit {
 }
 
 /// Label + optional swatch rgb for a plot color.
-pub(super) fn lbl_plot_color(c: cad_kernel::plotstyle::PlotColor) -> (String, Option<(u8, u8, u8)>) {
+pub(super) fn lbl_plot_color(
+    c: cad_kernel::plotstyle::PlotColor,
+) -> (String, Option<(u8, u8, u8)>) {
     use cad_kernel::plotstyle::PlotColor as PC;
     match c {
         PC::UseObject => ("Use object color".into(), None),
@@ -1080,7 +1107,12 @@ pub(super) fn lbl_fill(f: cad_kernel::plotstyle::FillStyle) -> &'static str {
 
 /// An On/Off dropdown that shows "*Varies*" for a mixed selection and writes the
 /// picked bool to `out` (applied to all selected styles after the frame).
-pub(super) fn on_off_combo(ui: &mut egui::Ui, id: &str, common: Option<bool>, out: &mut Option<bool>) {
+pub(super) fn on_off_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    common: Option<bool>,
+    out: &mut Option<bool>,
+) {
     let txt = match common {
         Some(true) => "On",
         Some(false) => "Off",
@@ -1170,7 +1202,7 @@ impl PlotProp {
         PlotProp::JoinStyle,
         PlotProp::FillStyle,
     ];
-    pub(super)     fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             PlotProp::Color => "Color",
             PlotProp::Dither => "Dither",
@@ -1187,7 +1219,7 @@ impl PlotProp {
         }
     }
     /// §1a store-only (round-trips + editable, but no plot effect yet).
-    pub(super)     fn store_only(self) -> bool {
+    pub(super) fn store_only(self) -> bool {
         matches!(
             self,
             PlotProp::Dither
@@ -1611,7 +1643,8 @@ pub(super) const CTB_BUILTINS: [(&str, Option<&str>); 4] = [
 /// Lowercased names a saved CTB must NOT collide with — the built-in display
 /// names + canonical keys. The pickers dedup against these case-insensitively,
 /// so a colliding file could never be selected/assigned.
-pub(super) const CTB_RESERVED: [&str; 5] = ["none", "monochrome", "grayscale", "full color", "fullcolor"];
+pub(super) const CTB_RESERVED: [&str; 5] =
+    ["none", "monochrome", "grayscale", "full color", "fullcolor"];
 
 /// The default table for a BUILT-IN CTB — the same semantics the hardcoded
 /// `apply_ctb` transform implements when no saved file exists: monochrome →
@@ -1646,7 +1679,11 @@ pub(super) const LYR_DANGER: egui::Color32 = egui::Color32::from_rgb(0xE5, 0x48,
 /// Rasterize an SVG glyph (from `layer_glyphs.rs`) to a white texture at a
 /// generous resolution; `blit_layer_glyph` tints it per state. `key` names the
 /// texture (e.g. "on", "off", "close").
-pub(super) fn raster_layer_glyph(ctx: &egui::Context, key: &str, svg: &str) -> Option<egui::TextureHandle> {
+pub(super) fn raster_layer_glyph(
+    ctx: &egui::Context,
+    key: &str,
+    svg: &str,
+) -> Option<egui::TextureHandle> {
     use resvg::{tiny_skia, usvg};
     let opt = usvg::Options::default();
     let tree = usvg::Tree::from_data(svg.as_bytes(), &opt).ok()?;
@@ -2092,7 +2129,11 @@ pub(super) fn sample_path_points(g: &Geom, n: usize) -> Vec<Vec2> {
 /// DIVIDE / MEASURE mark positions along `geom`: divide → `n` equal parts
 /// (n marks on a closed loop, n−1 interior marks on an open curve); measure
 /// → as many `dist`-long steps from the start as fit.
-pub(super) fn divmeasure_positions_for(geom: &Geom, count_or_dist: f64, is_measure: bool) -> Vec<Vec2> {
+pub(super) fn divmeasure_positions_for(
+    geom: &Geom,
+    count_or_dist: f64,
+    is_measure: bool,
+) -> Vec<Vec2> {
     let pts = sample_path_points(geom, 600);
     if pts.len() < 2 {
         return Vec::new();
@@ -2834,7 +2875,7 @@ pub(super) enum QatAction {
 
 impl QatAction {
     /// Every action offered in the customize drop window, in display order.
-    pub(super)     fn all() -> [QatAction; 6] {
+    pub(super) fn all() -> [QatAction; 6] {
         [
             QatAction::New,
             QatAction::Open,
@@ -2845,11 +2886,11 @@ impl QatAction {
         ]
     }
     /// The shortcuts shown by default (first run / before customization).
-    pub(super)     fn default_set() -> Vec<QatAction> {
+    pub(super) fn default_set() -> Vec<QatAction> {
         QatAction::all().to_vec()
     }
     /// Human label for the customize list + tooltips.
-    pub(super)     fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             QatAction::New => "New",
             QatAction::Open => "Open…",
@@ -2973,7 +3014,12 @@ pub(super) fn qat_button(ui: &mut egui::Ui, act: QatAction) -> bool {
 
 /// Simple geometric glyphs for the QAT actions (placeholder art — clean and
 /// recognizable without needing image assets).
-pub(super) fn paint_qat_icon(painter: &egui::Painter, r: egui::Rect, act: QatAction, col: egui::Color32) {
+pub(super) fn paint_qat_icon(
+    painter: &egui::Painter,
+    r: egui::Rect,
+    act: QatAction,
+    col: egui::Color32,
+) {
     let st = egui::Stroke::new(1.6, col);
     match act {
         QatAction::New => {
@@ -3261,7 +3307,7 @@ pub(super) struct QSelectState {
 }
 
 impl Default for QSelectState {
-        fn default() -> Self {
+    fn default() -> Self {
         QSelectState {
             open: false,
             kind_filter: None,
@@ -3328,7 +3374,7 @@ pub(super) enum FlyItem {
 
 impl FlyItem {
     /// A plain command row: icon + name → `act` on click.
-    pub(super)     fn act(icon: FlyIcon, name: &str, act: FlyAct) -> Self {
+    pub(super) fn act(icon: FlyIcon, name: &str, act: FlyAct) -> Self {
         FlyItem::Row {
             icon,
             name: name.into(),
@@ -3340,7 +3386,7 @@ impl FlyItem {
         }
     }
     /// A §8 checkbox row: cyan check in the slot when `on`; click toggles via `act`.
-    pub(super)     fn toggle(name: &str, on: bool, act: FlyAct) -> Self {
+    pub(super) fn toggle(name: &str, on: bool, act: FlyAct) -> Self {
         FlyItem::Row {
             icon: FlyIcon::None,
             name: name.into(),
@@ -3352,7 +3398,7 @@ impl FlyItem {
         }
     }
     /// A submenu row: opens child `menu` on ▸ hover (§9 nesting).
-    pub(super)     fn sub(icon: FlyIcon, name: &str, menu: FlyMenu) -> Self {
+    pub(super) fn sub(icon: FlyIcon, name: &str, menu: FlyMenu) -> Self {
         FlyItem::Row {
             icon,
             name: name.into(),
@@ -3364,7 +3410,7 @@ impl FlyItem {
         }
     }
     /// The `(name, RowT)` this row measures + paints as (color-correct; §1/§2).
-    pub(super)     fn meas(&self) -> (&str, RowT<'_>) {
+    pub(super) fn meas(&self) -> (&str, RowT<'_>) {
         match self {
             FlyItem::Divider => ("", RowT::Plain),
             FlyItem::Heading(t) | FlyItem::Disabled(t) => (t.as_str(), RowT::Plain),

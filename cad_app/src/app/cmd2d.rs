@@ -1645,7 +1645,13 @@ impl CadApp {
     /// `color_aci`: `Some(aci)` sets the instance color explicitly;
     /// `None` inherits the first selected dobject's style (layer/color).
     /// `smart` marks the definition as a smart block.
-    pub(super) fn apply_block_create(&mut self, name: &str, base: Vec2, color_aci: Option<u8>, smart: bool) {
+    pub(super) fn apply_block_create(
+        &mut self,
+        name: &str,
+        base: Vec2,
+        color_aci: Option<u8>,
+        smart: bool,
+    ) {
         if self.selection.is_empty() {
             self.history.push("  ! block: empty selection".into());
             return;
@@ -4470,7 +4476,12 @@ impl CadApp {
         }
     }
 
-    pub(super) fn apply_trim_pick(&mut self, cutters: &[usize], target_idx: usize, pick: Vec2) -> bool {
+    pub(super) fn apply_trim_pick(
+        &mut self,
+        cutters: &[usize],
+        target_idx: usize,
+        pick: Vec2,
+    ) -> bool {
         let before_dobj_count = self.doc.dobjects.len();
         let _trim_pick_dbg = (cutters.to_vec(), target_idx, pick);
         // Snapshot ONCE per click so undo rolls back this single trim.
@@ -4594,7 +4605,12 @@ impl CadApp {
     }
 
     /// Returns true iff the extend actually mutated the document.
-    pub(super) fn apply_extend_pick(&mut self, bounds: &[usize], target_idx: usize, pick: Vec2) -> bool {
+    pub(super) fn apply_extend_pick(
+        &mut self,
+        bounds: &[usize],
+        target_idx: usize,
+        pick: Vec2,
+    ) -> bool {
         self.snapshot_doc();
         let edge_mode = self.env.EdgMod;
         // Same self-exclusion rule as trim. BlockRef boundaries are
@@ -5208,7 +5224,14 @@ impl CadApp {
     //   * Line/Wall pair                        → centerline path (curved walls)
     //   * anything with Arc / Polyline-end      → generalized kernel solver
     // ---------------------------------------------------------------------
-    pub(super) fn apply_fillet(&mut self, r: f64, idx1: usize, pick1: Vec2, idx2: usize, pick2: Vec2) {
+    pub(super) fn apply_fillet(
+        &mut self,
+        r: f64,
+        idx1: usize,
+        pick1: Vec2,
+        idx2: usize,
+        pick2: Vec2,
+    ) {
         if idx1 == idx2 {
             // Two segments of the SAME polyline → round that corner in place.
             self.apply_fillet_corner(r, idx1, pick1, pick2);
@@ -6306,7 +6329,12 @@ impl CadApp {
     /// DIVIDE / MEASURE commit: place POINT marks along the picked curve —
     /// `count_or_dist` is a whole segment COUNT (divide) or a positive
     /// segment LENGTH (measure). One undo entry; one history report.
-    pub(super) fn apply_divmeasure_marks(&mut self, obj_idx: usize, count_or_dist: f64, is_measure: bool) {
+    pub(super) fn apply_divmeasure_marks(
+        &mut self,
+        obj_idx: usize,
+        count_or_dist: f64,
+        is_measure: bool,
+    ) {
         let Some(geom) = self.doc.dobjects.get(obj_idx).map(|d| d.geom.clone()) else {
             self.history
                 .push("  ! divide/measure: curve is gone".into());
@@ -7546,7 +7574,10 @@ impl CadApp {
         }
     }
 
-    pub(super) fn drain_pline_pending(&mut self, closed: bool) -> (Vec<PolyVertex>, Vec<(f64, f64)>) {
+    pub(super) fn drain_pline_pending(
+        &mut self,
+        closed: bool,
+    ) -> (Vec<PolyVertex>, Vec<(f64, f64)>) {
         let n = self.pending.len();
         // Per-segment widths (parallel to bulges). seg_count = n-1 open, n
         // closed. Empty result when every segment is thin, so plain polylines

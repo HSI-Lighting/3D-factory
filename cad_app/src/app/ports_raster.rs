@@ -1,6 +1,5 @@
 use super::*;
 
-
 // ============ raster editor (from dokkandar/Auto_RASM) ============
 
 /// Output geometry a buffer layer converts its marked line-work into.

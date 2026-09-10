@@ -7300,7 +7300,6 @@ impl CadApp {
 
     // ---- commands & math -----------------------------------------------
 
-
     /// True when ANY command / draw tool / modify flow is mid-operation. Used
     /// by command-internal undo to decide whether a bare "U" is an in-command
     /// step-back (something active) or a global undo (nothing active).

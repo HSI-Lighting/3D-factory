@@ -9,7 +9,6 @@ use super::*;
 // pub(crate) so the shell, panel and tests can reach them.
 
 impl CadApp {
-
     // ===================================================================
     // Floating ACI color picker — the polar AutoRasm wheel.
     // ===================================================================

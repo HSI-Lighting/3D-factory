@@ -566,7 +566,11 @@ impl CadApp {
     /// click handling for that frame — otherwise saying where a sofa goes also starts a line.
     /// Like [`Self::simlux_pointer_2d`] it does not feed `canvas_locked`: panning and zooming to
     /// find the right spot must keep working while an object waits.
-    pub(super) fn factory_placing_pointer_2d(&mut self, resp: &egui::Response, rect: egui::Rect) -> bool {
+    pub(super) fn factory_placing_pointer_2d(
+        &mut self,
+        resp: &egui::Response,
+        rect: egui::Rect,
+    ) -> bool {
         if self.factory.awaiting_place.is_none() {
             return false;
         }
@@ -1595,7 +1599,11 @@ impl CadApp {
 
     /// Common tail for a 3D `feed`/`type_value`: apply, log the committed params, keep
     /// or drop the op.
-    pub(super) fn factory_after_feed(&mut self, md: cad_solid::modify::Modify, f: cad_solid::modify::Feed) {
+    pub(super) fn factory_after_feed(
+        &mut self,
+        md: cad_solid::modify::Modify,
+        f: cad_solid::modify::Feed,
+    ) {
         use cad_solid::modify::Feed;
         match f {
             Feed::NeedMore | Feed::AppliedContinue => {
@@ -3392,7 +3400,13 @@ impl CadApp {
 
     /// Assign stored texture `idx` to the current selection (furniture instance or feature[s])
     /// and tint by its average colour so it shows even before the textured pass. One undo step.
-    pub(super) fn apply_texture_index_to_selection(&mut self, idx: usize, name: &str, w: u32, h: u32) {
+    pub(super) fn apply_texture_index_to_selection(
+        &mut self,
+        idx: usize,
+        name: &str,
+        w: u32,
+        h: u32,
+    ) {
         // PAINT-SINGLE-SURFACE mode: don't cover the whole solid — arm this texture as the
         // brush and let the user click individual faces (each wall face its own texture).
         if self.factory.paint_surface_mode {
@@ -5815,7 +5829,9 @@ impl CadApp {
     /// Containment is tested with the loop's first point, which is ON its own boundary and inside
     /// or outside every OTHER loop unambiguously — the loops here come from distinct drawn
     /// entities, so two of them sharing an edge is a drawing to fix rather than a case to model.
-    pub(super) fn nest_loops(loops: Vec<Vec<glam::Vec2>>) -> Vec<(Vec<glam::Vec2>, Vec<Vec<glam::Vec2>>)> {
+    pub(super) fn nest_loops(
+        loops: Vec<Vec<glam::Vec2>>,
+    ) -> Vec<(Vec<glam::Vec2>, Vec<Vec<glam::Vec2>>)> {
         let n = loops.len();
         if n < 2 {
             return loops.into_iter().map(|l| (l, Vec::new())).collect();
@@ -7058,7 +7074,13 @@ impl CadApp {
     /// Emit a `FactoryOp` recorder event stamped with the current model size (features,
     /// Union bodies, triangles). `features_before` is captured by the caller before the
     /// op ran. No-op unless recording — this is the "record what's going on in 3D" tap.
-    pub(super) fn factory_op_evt(&mut self, op: &str, source: &str, detail: String, features_before: usize) {
+    pub(super) fn factory_op_evt(
+        &mut self,
+        op: &str,
+        source: &str,
+        detail: String,
+        features_before: usize,
+    ) {
         if !self.dbg.recording {
             return;
         }

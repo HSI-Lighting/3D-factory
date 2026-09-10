@@ -1,6 +1,5 @@
 use super::*;
 
-
 // ============ GPU render merge (from dokkandar/Auto_RASM): ported items ============
 
 /// Per-frame cap on how many dobjects the CPU (egui painter) render path
@@ -179,7 +178,10 @@ pub(super) fn ear_clip(poly: &[Vec2]) -> Vec<[Vec2; 3]> {
 /// analog of `wall_face_screen_pts` (uses `cad_wall::solve_faces`), so GPU
 /// walls render identically to the CPU path. X-junction face splitting is a
 /// separate ext feature not ported here.
-pub(super) fn wall_face_world_pts(app: &CadApp, w: &cad_kernel::Wall) -> (Vec<Vec<Vec2>>, Vec<Vec<Vec2>>) {
+pub(super) fn wall_face_world_pts(
+    app: &CadApp,
+    w: &cad_kernel::Wall,
+) -> (Vec<Vec<Vec2>>, Vec<Vec<Vec2>>) {
     if w.is_curved() {
         let n = match cad_kernel::bulge_arc(w.start, w.end, w.bulge) {
             Some((_c, r, _a0, sweep)) => {
@@ -225,7 +227,7 @@ impl CadApp {
     /// Switch the render mode directly (CPU / GPU / APX are mutually
     /// exclusive). No-op if already in that mode. Marks the GPU batch dirty
     /// so the next frame rebuilds for the new path.
-    pub(super)     fn set_render_mode(&mut self, m: RenderMode) {
+    pub(super) fn set_render_mode(&mut self, m: RenderMode) {
         if self.render_mode == m {
             return;
         }
@@ -239,7 +241,7 @@ impl CadApp {
     /// multiplied by the per-dobject linetype scale) so the GPU path can walk
     /// dashes. `None` = solid (continuous, or a non-stroked geom). Mirrors the
     /// resolution in `paint_dobject_with_style`.
-    pub(super)     fn effective_dash_pattern(&self, e: &DObject) -> Option<Vec<f32>> {
+    pub(super) fn effective_dash_pattern(&self, e: &DObject) -> Option<Vec<f32>> {
         use cad_kernel::LinetypeTable;
         if !matches!(
             e.geom,
@@ -278,7 +280,7 @@ impl CadApp {
     /// dobject index `i`. World space. Pattern → clipped lines/circles; solid
     /// → ear-clipped fill/hole triangles per boundary loop. Non-hatch or a
     /// missing index yields an empty entry. Cached by `hatch_cache`.
-    pub(super)     fn build_hatch_cache_entry(&self, i: usize) -> HatchCacheEntry {
+    pub(super) fn build_hatch_cache_entry(&self, i: usize) -> HatchCacheEntry {
         let mut out = HatchCacheEntry::default();
         let Some(d) = self.doc.dobjects.get(i) else {
             return out;

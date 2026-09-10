@@ -3189,7 +3189,11 @@ impl CadApp {
     /// click (and as the worker-failure text fallback). `scope` limits
     /// which Text dobjects are rendered — pass the viewport scope (text
     /// outside it provably can't contain the in-view seed).
-    pub(super) fn text_hatch_loops_at(&self, seed: Vec2, scope: &[usize]) -> Option<Vec<Vec<Vec2>>> {
+    pub(super) fn text_hatch_loops_at(
+        &self,
+        seed: Vec2,
+        scope: &[usize],
+    ) -> Option<Vec<Vec<Vec2>>> {
         let geom = self.text_hatch_geom(scope);
         let area = |pts: &[Vec2]| -> f64 {
             let n = pts.len();
@@ -3494,7 +3498,10 @@ impl CadApp {
     /// single writer of `self.doc`, D3). Read ops build owned replies; write
     /// ops go through the SAME seams as typed commands so undo / index / GPU
     /// dirty flags all behave identically (D4).
-    pub(super) fn apply_script_op(&mut self, op: cad_script::ScriptOp) -> cad_script::ScriptOpReply {
+    pub(super) fn apply_script_op(
+        &mut self,
+        op: cad_script::ScriptOp,
+    ) -> cad_script::ScriptOpReply {
         use cad_script::{ScriptOp as Op, ScriptOpReply as R};
         // Slice 5 preview: while a ghost pass runs, every op lands in the
         // shadow document — the real doc is never touched (no undo, no
@@ -5604,7 +5611,12 @@ impl CadApp {
 
     /// Write the edited values back onto instance `idx`'s BlockRef
     /// (parallel by index to the definition's AttrDefs). One undo step.
-    pub(super) fn attedit_write_values(&mut self, idx: usize, tags: &[String], values: &[String]) -> bool {
+    pub(super) fn attedit_write_values(
+        &mut self,
+        idx: usize,
+        tags: &[String],
+        values: &[String],
+    ) -> bool {
         if self
             .doc
             .dobjects
